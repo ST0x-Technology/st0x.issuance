@@ -1,0 +1,24 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT view_id\n        FROM tokenized_asset_view\n        WHERE substr(view_id, 1, length(?)) = ?\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "view_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tokenized_asset_view",
+            "name": "view_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [true]
+  },
+  "hash": "ab2ecf586a65712dd2318c589bd93044c0c37f78d0b4b2d2105352786de18961"
+}

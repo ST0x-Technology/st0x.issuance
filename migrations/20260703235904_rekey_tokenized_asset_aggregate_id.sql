@@ -32,17 +32,67 @@ WHERE aggregate_type = 'TokenizedAsset'
   );
 DROP TABLE rekey_precondition;
 
+-- Corporate-action freeze is a property of the underlying equity, not of a
+-- per-network listing, so `Frozen`/`Unfrozen` events move to the
+-- underlying-keyed `Underlying` aggregate instead of being rekeyed to
+-- `{underlying}:base`. Their aggregate_id is already the bare underlying (the
+-- pre-multichain TokenizedAsset id) and their JSON payloads are unchanged —
+-- only aggregate_type and the event_type prefix are rewritten. The sequence
+-- offset parks the moved rows far above any real sequence so the
+-- resequencing pass below can assign 1..N without transient primary-key
+-- collisions (PK is (aggregate_type, aggregate_id, sequence)).
+UPDATE events
+SET aggregate_type = 'Underlying',
+    event_type = replace(
+        event_type, 'TokenizedAssetEvent::', 'UnderlyingEvent::'
+    ),
+    sequence = sequence + 1000000
+WHERE aggregate_type = 'TokenizedAsset'
+  AND event_type IN (
+    'TokenizedAssetEvent::Frozen',
+    'TokenizedAssetEvent::Unfrozen'
+  );
+
+-- Removing freeze events leaves gaps in the surviving TokenizedAsset streams,
+-- and the moved Underlying streams start at offset+N rather than 1. Restore
+-- contiguous 1..N sequences on both, preserving relative order. The rank is
+-- computed into a temp table first: a correlated subquery against `events`
+-- itself would observe rows already renumbered earlier in the same UPDATE,
+-- making the result depend on SQLite's unspecified row-visit order. The
+-- offset applied to the not-yet-resequenced TokenizedAsset rows guarantees no
+-- target value (1..N) collides with any current value mid-update.
+UPDATE events
+SET sequence = sequence + 1000000
+WHERE aggregate_type = 'TokenizedAsset'
+  AND sequence < 1000000;
+
+CREATE TEMP TABLE reseq AS
+SELECT rowid AS event_rowid,
+       ROW_NUMBER() OVER (
+           PARTITION BY aggregate_type, aggregate_id ORDER BY sequence
+       ) AS new_sequence
+FROM events
+WHERE aggregate_type IN ('TokenizedAsset', 'Underlying');
+
+UPDATE events
+SET sequence = (
+    SELECT new_sequence FROM reseq WHERE event_rowid = events.rowid
+)
+WHERE rowid IN (SELECT event_rowid FROM reseq);
+
+DROP TABLE reseq;
+
 UPDATE events
 SET aggregate_id = aggregate_id || ':base'
 WHERE aggregate_type = 'TokenizedAsset'
   AND aggregate_id != ''
   AND aggregate_id NOT GLOB '*:*';
 
-UPDATE snapshots
-SET aggregate_id = aggregate_id || ':base'
-WHERE aggregate_type = 'TokenizedAsset'
-  AND aggregate_id != ''
-  AND aggregate_id NOT GLOB '*:*';
+-- TokenizedAsset snapshots predate the freeze split, so their payloads carry
+-- the now-removed `status` field; they are pure caches, so drop them and let
+-- replay rebuild (the pre-migration wiring never wrote snapshots anyway).
+DELETE FROM snapshots
+WHERE aggregate_type = 'TokenizedAsset';
 
 -- View ids mirrored aggregate ids pre-migration; drop so projection catch-up
 -- rebuilds from the rekeyed event log (schema version bump also clears this).

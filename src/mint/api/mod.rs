@@ -13,6 +13,7 @@ use super::{
 };
 use crate::account::{AccountView, view::find_by_client_id};
 use crate::tokenized_asset::view::load_asset_by_network;
+use crate::underlying::load_freeze_status;
 
 mod confirm;
 mod initiate;
@@ -55,6 +56,9 @@ pub(crate) enum MintApiError {
     AssetQueryFailed(
         #[source] crate::tokenized_asset::view::TokenizedAssetViewError,
     ),
+
+    #[error("Failed to query underlying freeze status")]
+    FreezeStatusQueryFailed(#[source] crate::underlying::UnderlyingViewError),
 
     #[error("Failed to query account")]
     AccountQueryFailed(#[source] crate::account::view::AccountViewError),
@@ -99,6 +103,10 @@ impl<'r> Responder<'r, 'static> for MintApiError {
             Self::AssetQueryFailed(e) => {
                 Self::handle_query_error(&e, "Failed to query enabled assets")
             }
+            Self::FreezeStatusQueryFailed(e) => Self::handle_query_error(
+                &e,
+                "Failed to query underlying freeze status",
+            ),
             Self::AccountQueryFailed(e) => {
                 Self::handle_query_error(&e, "Failed to query account")
             }
@@ -206,19 +214,30 @@ pub(crate) async fn validate_asset_exists(
     // frozen asset still exists and stays supported — it is rejected with a
     // distinct `AssetFrozen` error so the suspension is observable and not
     // conflated with de-listing.
-    let Some(asset) = asset
+    if asset
         .filter(|asset| asset.token == *token && asset.network == *network)
-    else {
+        .is_none()
+    {
         return Err(MintApiError::AssetNotAvailable);
-    };
+    }
 
-    if asset.status.is_frozen() {
+    // The corporate-action freeze is underlying-scoped: one freeze gates
+    // minting on every network's listing of this underlying.
+    let status =
+        load_freeze_status(pool, underlying).await.map_err(|query_error| {
+            error!(target: "mint", error = %query_error,
+                "Failed to query underlying freeze status"
+            );
+            MintApiError::FreezeStatusQueryFailed(query_error)
+        })?;
+
+    if status.is_frozen() {
         warn!(
             target: "mint",
             underlying = %underlying.as_str(),
             token = %token.0,
             network = %network,
-            "Rejecting mint for frozen asset"
+            "Rejecting mint for frozen underlying"
         );
         return Err(MintApiError::AssetFrozen);
     }

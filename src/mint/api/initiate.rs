@@ -120,6 +120,7 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
+    use crate::underlying::{Underlying, UnderlyingCommand};
 
     #[tokio::test]
     async fn test_initiate_mint_returns_issuer_request_id() {
@@ -237,13 +238,18 @@ mod tests {
             ..
         } = harness;
 
-        tokenized_asset_store
+        let (underlying_store, _underlying_projection) =
+            event_sorcery::StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build underlying store");
+        underlying_store
             .send(
-                &AssetKey::new(underlying.clone(), Network::Base),
-                TokenizedAssetCommand::Freeze,
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
             )
             .await
-            .expect("Failed to freeze asset");
+            .expect("Failed to freeze underlying");
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -312,7 +318,7 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::WARN,
-            &["Rejecting mint for frozen asset"]
+            &["Rejecting mint for frozen underlying"]
         ));
     }
 
@@ -331,17 +337,22 @@ mod tests {
             ..
         } = harness;
 
-        // Keep an Arc handle so we can dispatch Unfreeze after Rocket takes
-        // ownership of the managed store.
-        let asset_store = tokenized_asset_store.clone();
+        // The freeze store outlives the Rocket build so the test can dispatch
+        // Unfreeze mid-flight; freeze/unfreeze address the underlying-keyed
+        // Underlying aggregate.
+        let (underlying_store, _underlying_projection) =
+            event_sorcery::StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build underlying store");
 
-        asset_store
+        underlying_store
             .send(
-                &AssetKey::new(underlying.clone(), Network::Base),
-                TokenizedAssetCommand::Freeze,
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
             )
             .await
-            .expect("Failed to freeze asset");
+            .expect("Failed to freeze underlying");
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -385,18 +396,18 @@ mod tests {
         // rather than some unrelated validation failure.
         assert!(logs_contain_at!(
             tracing::Level::WARN,
-            &["Rejecting mint for frozen asset"]
+            &["Rejecting mint for frozen underlying"]
         ));
 
         // Unfreezing must let new mints through again — the whole point of the
         // toggle is that issuance resumes after Unfreeze.
-        asset_store
+        underlying_store
             .send(
-                &AssetKey::new(underlying.clone(), Network::Base),
-                TokenizedAssetCommand::Unfreeze,
+                &underlying,
+                UnderlyingCommand::Unfreeze { underlying: underlying.clone() },
             )
             .await
-            .expect("Failed to unfreeze asset");
+            .expect("Failed to unfreeze underlying");
 
         let unfrozen_response = client
             .post("/inkind/issuance")

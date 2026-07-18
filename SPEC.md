@@ -665,9 +665,6 @@ pre-multichain store keyed by bare `UnderlyingSymbol`.
 - `underlying`, `token`: Symbol identifiers
 - `network`: Blockchain network
 - `vault`: On-chain vault contract address
-- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
-  rejected, but the asset stays supported and in-flight redemptions still
-  complete)
 - `added_at`: Timestamp
 
 **Commands:**
@@ -675,25 +672,61 @@ pre-multichain store keyed by bare `UnderlyingSymbol`.
 - `Add { underlying, token, network, vault }` - Add a new supported asset.
   Re-adding with a different vault updates the vault address; re-adding with the
   same vault is a no-op.
-- `Freeze` - Stop accepting new mints for this asset (idempotent — freezing a
-  frozen asset is a no-op).
-- `Unfreeze` - Resume accepting mints (idempotent).
 
 **Events:**
 
 - `Added { underlying, token, network, vault, added_at }` - New asset added
 - `VaultAddressUpdated { vault, previous_vault, updated_at }` - Vault address
   changed
-- `Frozen { frozen_at }` - Asset frozen (new mints rejected)
-- `Unfrozen { unfrozen_at }` - Asset unfrozen (mints resume)
 
 **Command -> Event Mappings:**
 
-| Command    | Events Produced                 | Notes                                                         |
-| ---------- | ------------------------------- | ------------------------------------------------------------- |
-| `Add`      | `Added` / `VaultAddressUpdated` | New asset, or vault update if re-added with a different vault |
-| `Freeze`   | `Frozen`                        | No event if already frozen (idempotent)                       |
-| `Unfreeze` | `Unfrozen`                      | No event if already enabled (idempotent)                      |
+| Command | Events Produced                 | Notes                                                         |
+| ------- | ------------------------------- | ------------------------------------------------------------- |
+| `Add`   | `Added` / `VaultAddressUpdated` | New asset, or vault update if re-added with a different vault |
+
+### Underlying Aggregate
+
+The `Underlying` aggregate holds per-underlying state that is a property of the
+underlying equity itself, independent of which networks it is tokenized on.
+Today that is exactly one thing: the corporate-action freeze status. The
+aggregate id is the bare `UnderlyingSymbol` (e.g. `AAPL`).
+
+A scheduled corporate action (dividend record date, split) is an event on the
+underlying equity, so it applies to every tokenization of that equity on every
+network — two listings of the same underlying with different freeze status
+during a corporate action is an invalid state, and keying freeze by
+`UnderlyingSymbol` makes it unrepresentable. Per-network state (vault address,
+token symbol) stays on `TokenizedAsset`.
+
+**Aggregate State:**
+
+- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
+  rejected across all networks, but listings stay supported and in-flight
+  redemptions still complete)
+
+A stream originates on the first `Frozen` event; an underlying with no stream is
+`Enabled` by definition.
+
+**Commands:**
+
+- `Freeze` - Stop accepting new mints for every listing of this underlying
+  (idempotent — freezing a frozen underlying is a no-op).
+- `Unfreeze` - Resume accepting mints (idempotent; a no-op when no stream
+  exists).
+
+**Events:**
+
+- `Frozen { frozen_at }` - Underlying frozen (new mints rejected on all
+  networks)
+- `Unfrozen { unfrozen_at }` - Underlying unfrozen (mints resume)
+
+**Command -> Event Mappings:**
+
+| Command    | Events Produced | Notes                                    |
+| ---------- | --------------- | ---------------------------------------- |
+| `Freeze`   | `Frozen`        | No event if already frozen (idempotent)  |
+| `Unfreeze` | `Unfrozen`      | No event if already enabled (idempotent) |
 
 **Freeze State Machine:**
 
@@ -726,7 +759,12 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 
 - `issuer freeze <UNDERLYING>` — dispatch the `Freeze` command.
 - `issuer unfreeze <UNDERLYING>` — dispatch the `Unfreeze` command.
-- `issuer status <UNDERLYING>` — print the asset's current freeze status.
+- `issuer status <UNDERLYING>` — print the underlying's current freeze status.
+
+Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
+network argument: one freeze covers every listing of the underlying. The CLI
+resolves existence by checking that the underlying has at least one listing (on
+any network) and reports "not found" otherwise.
 
 Each subcommand opens the same event store, prints the resolved asset and its
 current status, requires confirmation before a mutating action, and dispatches
@@ -734,12 +772,13 @@ the CQRS command through the `Store` (never writing the `events` table
 directly); freeze/unfreeze are idempotent. The trigger is deliberately a local
 action on the issuer host, not a remotely pushable endpoint.
 
-From the multichain cutover (see the [Multi-chain](#multi-chain) section) every
-subcommand is network-aware: it takes a required `--network <NETWORK>` flag
-(wire value) and resolves the asset by `{underlying}:{network}` —
-underlying-only lookups are no longer possible once the aggregate is rekeyed,
-and there is deliberately no default network so an operator can never freeze the
-wrong chain's listing by omission.
+Freeze, unfreeze, and status are deliberately **not** network-aware: they
+address the `Underlying` aggregate, and a corporate action applies to every
+listing of the underlying, so a per-network freeze is not expressible from the
+CLI. Listing-scoped subcommands (asset addition and any future per-listing
+action) resolve by `{underlying}:{network}` and take a required
+`--network <NETWORK>` flag (wire value) — there is deliberately no default
+network so an operator can never target the wrong chain's listing by omission.
 
 ## Services
 
@@ -1170,14 +1209,16 @@ deterministic ordering.
 
 Internal service-to-service endpoint (internal auth) consumed by the liquidity
 rebalance guard to skip frozen assets before starting a rebalancing flow.
-Returns the asset's `status` (`enabled` or `frozen`), or `404` if the asset is
-unknown.
+Returns the underlying's `status` (`enabled` or `frozen`), or `404` when the
+underlying has no listing on any network (unknown asset).
 
-From the multichain cutover (see the [Multi-chain](#multi-chain) section) this
-endpoint and its sibling detail lookup `GET /tokenized-assets/{underlying}`
-(same internal auth, returning the full asset record instead of just the status)
-require a `?network=` query parameter and return `422` when it is missing; the
-liquidity freeze guard fail-closes on 422.
+Freeze status is a property of the `Underlying` aggregate, not of a per-network
+listing, so this endpoint takes **no** `network` parameter: one answer covers
+every listing of the underlying. The sibling detail lookup
+`GET /tokenized-assets/{underlying}` (same internal auth, returning the full
+per-network asset record) does require a `?network=` query parameter and returns
+`422` when it is missing; its `status` field reports the underlying's freeze
+status.
 
 **Response:**
 
@@ -1188,18 +1229,17 @@ liquidity freeze guard fail-closes on 422.
 }
 ```
 
-- `status` — `"enabled"` when the asset accepts new mints, or `"frozen"` when
-  new mints are gated (the rebalance guard skips frozen assets). A frozen asset
-  stays supported/listed (see the freeze invariant under "TokenizedAsset
+- `status` — `"enabled"` when the underlying accepts new mints, or `"frozen"`
+  when new mints are gated (the rebalance guard skips frozen assets). A frozen
+  asset stays supported/listed (see the freeze invariant under "Underlying
   Aggregate") — freezing gates only new minting, it never de-lists.
 
 **Status Codes:**
 
-- `200`: asset found — returns its `status` (`"enabled"` or `"frozen"`)
+- `200`: underlying has at least one listing — returns its `status` (`"enabled"`
+  or `"frozen"`)
 - `401`: missing or invalid internal API key
-- `404`: asset unknown
-- `422`: missing `?network=` (from the multichain cutover -- see the Multi-chain
-  section). Consumers must treat this as fail-closed, never as `"enabled"`
+- `404`: underlying has no listing on any network (unknown asset)
 - `500`: database or view-deserialization failure — the status is
   **indeterminate**. A consumer must NOT treat any non-`404` failure as
   `"enabled"`; treat `500` as "unknown, retry" rather than proceeding.
@@ -1663,20 +1703,24 @@ The configured `backfill_start_block` is only the first-run seed; after a
 successful range, the service persists a per-(network, vault)
 `transfer_poll:{network}:{vault_address_lowercase}` row in the
 `poll_checkpoints` SQL table and the next startup resumes at
-`last_processed_block + 1`. For Base only, `load_transfer_poll` falls back to
-the legacy global key `transfer_poll` when the per-vault row does not exist yet.
-The checkpoint advances only after the requested range succeeds, and writes are
-monotonic so a shorter later range cannot move progress backward. Idempotency is
-still guaranteed by the `IssuerRedemptionRequestId` derived from each
-transaction hash — the Redemption aggregate rejects duplicate detections.
+`last_processed_block + 1`. On upgrade from the pre-multichain global
+`transfer_poll` cursor, `TransferPoller::seed_per_vault_checkpoints` copies that
+legacy value onto vaults already monitored at startup and then deletes the
+global row — a one-shot migration. Runtime-added vaults deliberately do **not**
+inherit the legacy cursor (they scan from `backfill_start_block`) so history
+below the old global head is not skipped. The checkpoint advances only after the
+requested range succeeds, and writes are monotonic so a shorter later range
+cannot move progress backward. Idempotency is still guaranteed by the
+`IssuerRedemptionRequestId` derived from each transaction hash — the Redemption
+aggregate rejects duplicate detections.
 
 This mirrors the receipt backfill pattern, where per-(network, vault)
 checkpoints are tracked under `receipt_backfill:<network>:<vault_lowercase>` in
 the same `poll_checkpoints` table, with the legacy
-`receipt_backfill:<vault_lowercase>` fallback for Base. Both checkpoints are
-intentionally not event-sourced: they are single mutable values whose history
-has no audit worth keeping, and modeling them as aggregates was the root cause
-of the 2026-05-19 OOM (RAI-617).
+`receipt_backfill:<vault_lowercase>` load-time fallback for Base. Transfer-poll
+and receipt-backfill checkpoints are intentionally not event-sourced: they are
+single mutable values whose history has no audit worth keeping, and modeling
+them as aggregates was the root cause of the 2026-05-19 OOM (RAI-617).
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
@@ -2577,39 +2621,39 @@ shape. Parsing those variables into `Config::chains` is its own change; until it
 lands, the flat legacy vars remain the only live config path. Checkpoints are
 keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
-`receipt_backfill:<network>:<vault_address_lowercase>`, with the pre-multichain
-rows (`transfer_poll`, `receipt_backfill:<vault_lowercase>`) readable as
-Base-only fallbacks. Once staging and production migrate, the flat-var mapping
-and those legacy checkpoint fallbacks are deleted.
+`receipt_backfill:<network>:<vault_address_lowercase>`. The pre-multichain
+`transfer_poll` row is migrated once by
+`TransferPoller::seed_per_vault_checkpoints` (then deleted); receipt backfill
+still reads `receipt_backfill:<vault_lowercase>` as a Base-only load-time
+fallback. Once staging and production migrate, the flat-var mapping and that
+receipt-backfill legacy fallback are deleted.
 
 **Asset identity (breaking):** `TokenizedAsset` aggregate id becomes the
-`AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`). The internal asset
-endpoints (the `InternalAuth`-guarded `GET /tokenized-assets/{underlying}`
-detail lookup and its `GET /tokenized-assets/{underlying}/status` freeze-status
-companion, consumed by `st0x-issuance-client`) require `?network=` (422 if
-missing). This is a **lockstep break** with `st0x-issuance-client` and the
-liquidity freeze guard -- no dual-read or optional-default transition. Alpaca
+`AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`), and freeze status
+moves off `TokenizedAsset` onto the underlying-keyed `Underlying` aggregate (see
+the Underlying Aggregate section; the rekey migration re-types shipped
+`Frozen`/`Unfrozen` events onto it). The `InternalAuth`-guarded
+`GET /tokenized-assets/{underlying}` detail lookup requires `?network=` (422 if
+missing). The `GET /tokenized-assets/{underlying}/status` freeze-status
+companion — the one route the liquidity freeze guard consumes — stays
+underlying-keyed with an unchanged response shape, so `st0x-issuance-client`'s
+status call and the liquidity freeze guard are **not** part of the break. Alpaca
 ITN list (`GET /tokenized-assets`) keeps `{ tokens, networks[] }`; see token
 listing above for merge semantics.
 
-**Cutover:** Lockstep deploy -- issuance, `st0x-issuance-client`, and the
-liquidity freeze guard must ship in the same deploy window. No dual-read or
-versioned transition; callers without `?network=` get **422** immediately after
-cutover. Liquidity freeze guard **fail-closes** on 422 (rebalancing stops) if it
-calls issuance without `?network=` after cutover.
+**Cutover:** Issuance deploys with the rekey migration; the liquidity freeze
+guard keeps working across the window because the status route's contract is
+unchanged. No dual-read or versioned transition is needed for the freeze path.
 
-**Rollback:** Roll back all three deployables together. If issuance rolls back
-alone (with the pre-deployment database restore applied) while liquidity still
-sends `?network=`, freeze/status calls succeed -- the old server ignores the
-unknown query parameter. Without the restore, reverted code looks assets up by
-the old `{underlying}` keys, every lookup against the rekeyed store returns
-**404**, and consumers read 404 as "asset unknown" rather than a fail-closed
-error -- a code-only rollback silently un-gates frozen assets. If liquidity
-rolls back alone while issuance requires `?network=`, freeze guard gets 422 and
-rebalancing **fail-closes** until liquidity is restored or issuance is rolled
-back. Do not leave a mixed-version window in production. The same cutover
-applies the aggregate-store rekey: a code rollback after the rekey has run must
-be accompanied by a database restore from the pre-deployment backup. The
+**Rollback:** Issuance rollback requires the pre-deployment database restore.
+Without it, reverted code looks assets up by the old `{underlying}` keys, every
+lookup against the rekeyed store returns **404**, and — because the migration
+also moved `Frozen`/`Unfrozen` events off the `TokenizedAsset` streams — a
+code-only rollback cannot see freeze state at all: consumers read 404 as "asset
+unknown" rather than a fail-closed error, silently un-gating frozen assets. Do
+not leave a mixed-version window in production. The same cutover applies the
+aggregate-store rekey: a code rollback after the rekey has run must be
+accompanied by a database restore from the pre-deployment backup. The
 backup/restore procedure is the
 `docs/runbooks/tokenized-asset-aggregate-rekey.md` runbook, which ships with the
 rekey change itself.

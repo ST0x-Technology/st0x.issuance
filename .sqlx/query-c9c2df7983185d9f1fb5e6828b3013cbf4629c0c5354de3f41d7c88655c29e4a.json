@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM underlying_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c9c2df7983185d9f1fb5e6828b3013cbf4629c0c5354de3f41d7c88655c29e4a"
+}

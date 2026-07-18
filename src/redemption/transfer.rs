@@ -353,6 +353,7 @@ mod tests {
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
+    use crate::underlying::{Underlying, UnderlyingCommand};
     use crate::vault::mock::MockVaultService;
 
     fn setup_test_store(pool: &SqlitePool) -> Arc<Store<Redemption>> {
@@ -421,21 +422,19 @@ mod tests {
 
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
-        let (asset_store, _projection) =
-            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
                 .build(())
                 .await
                 .unwrap();
-        asset_store
+        underlying_store
             .send(
-                &AssetKey::new(
-                    UnderlyingSymbol::new("AAPL").unwrap(),
-                    Network::Base,
-                ),
-                TokenizedAssetCommand::Freeze,
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
             )
             .await
-            .expect("Failed to freeze asset");
+            .expect("Failed to freeze underlying");
 
         let store = setup_test_store(&pool);
 
