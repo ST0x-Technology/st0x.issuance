@@ -337,18 +337,22 @@ async fn test_mint_recovery_after_view_deletion()
     Ok(())
 }
 
-/// Tests restart recovery from `MintIntended` after the exact transaction
-/// broadcast and mined but before submission was durably recorded.
+/// Tests restart recovery from `Minting` after the on-chain deposit mined but
+/// before `MintTxSubmitted` was durably recorded.
+///
+/// Under the durable submit job, prepare+broadcast are one step — there is no
+/// intermediate `MintTxIntended` event. The crash window that used to sit on
+/// `MintIntended` is now: aggregate still in `Minting`, receipt already on
+/// chain / in inventory.
 ///
 /// Scenario:
 /// 1. Complete a mint normally (creates on-chain receipt)
-/// 2. Roll back the event store to `MintIntended` (keep the persisted raw tx)
-/// 3. Restart service — views are cleared and rebuilt repopulates from rolled-back events
-/// 4. Recovery detects the existing receipt via receipt inventory and records
-///    mint success without re-minting
+/// 2. Roll back the event store to `MintingStarted`
+/// 3. Restart service — views rebuild; recovery finds the existing receipt and
+///    records success without re-minting
 #[tracing_test::traced_test]
 #[tokio::test]
-async fn test_mint_recovery_from_intended_state_when_receipt_exists()
+async fn test_mint_recovery_from_minting_state_when_receipt_exists()
 -> Result<(), Box<dyn std::error::Error>> {
     let _recovery_test_guard = recovery_test_guard().await;
 
@@ -410,15 +414,16 @@ async fn test_mint_recovery_from_intended_state_when_receipt_exists()
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    // Keep the exact persisted intent but remove MintTxSubmitted and every
-    // later event, reproducing a crash after broadcast and mining.
+    // Keep MintingStarted but remove MintTxSubmitted and every later event,
+    // reproducing a crash after the durable submit job broadcast/mined but
+    // before RecordTxSubmitted persisted.
     let aggregate_id = issuer_request_id.clone();
     sqlx::query(
         r"
         DELETE FROM events
         WHERE aggregate_type = 'Mint'
           AND aggregate_id = ?
-          AND sequence > 4
+          AND sequence > 3
         ",
     )
     .bind(&aggregate_id)
@@ -436,8 +441,8 @@ async fn test_mint_recovery_from_intended_state_when_receipt_exists()
     .fetch_one(&query_pool)
     .await?;
     assert_eq!(
-        event_count.count, 4,
-        "Expected the lifecycle prefix through MintTxIntended"
+        event_count.count, 3,
+        "Expected the lifecycle prefix through MintingStarted"
     );
 
     query_pool.close().await;
