@@ -1,6 +1,7 @@
 mod api;
 mod cmd;
 mod event;
+pub(crate) mod job;
 pub(crate) mod recovery;
 mod view;
 
@@ -178,6 +179,26 @@ impl std::str::FromStr for IssuerMintRequestId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct MintExternalTxId(String);
+
+impl MintExternalTxId {
+    pub(crate) const fn from_string(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MintExternalTxId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Mint {
     Initiated {
@@ -228,6 +249,14 @@ pub(crate) enum Mint {
         initiated_at: DateTime<Utc>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
+        /// Failure history carried across a retry transition
+        /// (`MintingFailed` -> `Minting` via `MintRetryStarted`); `None` on
+        /// the first submission attempt. Preserving it keeps the automatic
+        /// retry schedule escalating and the retry `external_tx_id` correct
+        /// when the retry itself fails. `serde(default)` keeps pre-retry
+        /// snapshots deserializable.
+        #[serde(default)]
+        retry: Option<MintRetryContext>,
     },
     /// Exact signed transaction persisted before broadcast.
     TxIntended {
@@ -363,6 +392,26 @@ struct KnownMintTx {
     tx_id: TxId,
 }
 
+struct ConfirmedMint {
+    tx_id: TxId,
+    tx_hash: B256,
+    receipt_id: U256,
+    shares_minted: U256,
+    gas_used: u64,
+    block_number: u64,
+}
+
+/// Failure history preserved across a `MintRetryStarted` transition
+/// (`MintingFailed` -> `Minting`). Without it a failed retry would restart
+/// the automatic-retry schedule at attempt 1 and lose the
+/// `TxSubmitted` predecessor that the retry `external_tx_id` is
+/// derived from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MintRetryContext {
+    attempts: u32,
+    failed_from: Box<Mint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutomaticRetryDecision {
     Ready,
@@ -391,11 +440,17 @@ impl Mint {
     }
 
     /// Traverses the `failed_from` chain to find the last state before
-    /// any failure. If this mint is not in `MintingFailed`, returns `self`.
+    /// any failure. A `Minting` state that resumed from a failure delegates
+    /// to the preserved chain so retry derivations (attempt number, known
+    /// Fireblocks tx) survive the retry transition. If this mint carries no
+    /// failure history, returns `self`.
     fn non_failed_predecessor(&self) -> &Self {
         match self {
             Self::MintingFailed { failed_from, .. } => {
                 failed_from.non_failed_predecessor()
+            }
+            Self::Minting { retry: Some(context), .. } => {
+                context.failed_from.non_failed_predecessor()
             }
             _ => self,
         }
@@ -450,6 +505,24 @@ impl Mint {
             })
             .unwrap_or(0)
             + 1
+    }
+
+    /// `external_tx_id` override for a durable `SubmitMintJob`: `Some(retry-N)`
+    /// when this `Minting` state resumed from a failure (so Fireblocks does not
+    /// dedupe the retry against the failed submission), `None` for a first
+    /// submission (the backend derives the base deterministic id).
+    pub(super) fn retry_submission_external_tx_id(
+        &self,
+    ) -> Option<MintExternalTxId> {
+        let Self::Minting { issuer_request_id, retry: Some(_), .. } = self
+        else {
+            return None;
+        };
+
+        Some(MintExternalTxId::from_string(Self::retry_mint_external_tx_id(
+            issuer_request_id,
+            self.next_retry_attempt(),
+        )))
     }
 
     const fn automatic_retry_delay(attempt: u32) -> Option<ChronoDuration> {
@@ -1010,6 +1083,179 @@ impl Mint {
             issuer_request_id,
             completed_at: Utc::now(),
         }])
+    }
+
+    /// Records a successful on-chain mint submission reported by a durable
+    /// `SubmitMintJob`. Pure — emits `MintTxSubmitted` from the payload.
+    /// Accepts `Minting` and legacy `TxIntended` (pre-jobs prepare path the
+    /// submit job can still resume). Idempotent: a no-op once the mint has
+    /// advanced past those states, so an at-least-once job re-run cannot
+    /// double-record the submission.
+    fn handle_record_tx_submitted(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        external_tx_id: MintExternalTxId,
+        tx_id: TxId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::TxIntended { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintTxSubmitted {
+                    issuer_request_id,
+                    external_tx_id: external_tx_id.into_string(),
+                    tx_id,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::TxSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInMintingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a confirmed on-chain mint reported by a durable `ConfirmMintJob`.
+    /// Pure — emits `TokensMinted` from the payload. Idempotent: a no-op once
+    /// the mint has advanced past `TxSubmitted`. Rejects a report
+    /// whose `tx_id` does not match the stored submission, so a
+    /// stale confirm job re-driven after a retry cannot record an old
+    /// transaction's result against a newer submission.
+    fn handle_record_tokens_minted(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        confirmed: ConfirmedMint,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let ConfirmedMint {
+            tx_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+        } = confirmed;
+
+        match self {
+            Self::TxSubmitted {
+                issuer_request_id: expected_id,
+                tx_id: stored_tx_id,
+                ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                if stored_tx_id != &tx_id {
+                    return Err(MintError::TxIdMismatch {
+                        expected: stored_tx_id.clone(),
+                        provided: tx_id,
+                    });
+                }
+
+                Ok(vec![MintEvent::TokensMinted {
+                    issuer_request_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    gas_used,
+                    block_number,
+                    minted_at: Utc::now(),
+                }])
+            }
+            Self::CallbackPending { .. } | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInSubmittedState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a sent Alpaca callback reported by a durable `SendCallbackJob`.
+    /// Pure — emits `MintCompleted`. Idempotent: a no-op once the mint is
+    /// already `Completed`.
+    fn handle_record_callback_sent(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::CallbackPending {
+                issuer_request_id: expected_id, ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintCompleted {
+                    issuer_request_id,
+                    completed_at: Utc::now(),
+                }])
+            }
+            Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInCallbackPendingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a mint side-effect failure reported by a durable submission or
+    /// confirmation job. Pure — emits `MintingFailed` from the payload.
+    /// Idempotent and lenient: a stale failure report for a mint that already
+    /// failed or advanced is ignored, so an at-least-once job re-run is safe.
+    fn handle_record_mint_failed(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        error: String,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::TxIntended { issuer_request_id: expected_id, .. }
+            | Self::TxSubmitted { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintingFailed {
+                    issuer_request_id,
+                    error,
+                    failed_at: Utc::now(),
+                }])
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Retries a failed mint by transitioning `MintingFailed` -> `Minting`,
+    /// advancing the automatic-retry attempt counter. Pure — emits
+    /// `MintRetryStarted`. Recovery sends this before re-enqueuing a
+    /// `SubmitMintJob`. Idempotent: a no-op if the mint already left
+    /// `MintingFailed` (e.g. a concurrent retry already started).
+    fn handle_retry_mint(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::MintingFailed { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintRetryStarted {
+                    issuer_request_id,
+                    tx_hash: None,
+                    started_at: Utc::now(),
+                }])
+            }
+            _ => Ok(vec![]),
+        }
     }
 
     async fn handle_recover(
@@ -1585,6 +1831,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at: started_at,
+            retry: None,
         };
     }
 
@@ -1612,6 +1859,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: _,
         }
         | Self::TxIntended {
             issuer_request_id,
@@ -1662,6 +1910,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: _,
         } = self.clone()
         else {
             return;
@@ -1780,17 +2029,21 @@ impl Mint {
 
         // First failure from a live state: seed the attempt counter from the
         // TxSubmitted predecessor's retry number when present, else 1
-        // (a submission that failed before RPC accepted it).
-        let attempts = match self {
-            Self::TxSubmitted { external_tx_id, .. } => {
+        // (a submission that failed before the tx was accepted). A retrying
+        // Minting state keeps escalating the preserved failure history and
+        // its predecessor chain instead of restarting from scratch.
+        let (attempts, failed_from) = match self {
+            Self::TxSubmitted { external_tx_id, .. } => (
                 Self::retry_attempt_from_external_tx_id(external_tx_id)
                     .unwrap_or(0)
-                    + 1
+                    + 1,
+                Box::new(self.clone()),
+            ),
+            Self::Minting { retry: Some(context), .. } => {
+                (context.attempts + 1, context.failed_from.clone())
             }
-            _ => 1,
+            _ => (1, Box::new(self.clone())),
         };
-
-        let failed_from = Box::new(self.clone());
 
         let (Self::Minting {
             issuer_request_id,
@@ -1980,6 +2233,8 @@ impl Mint {
             wallet,
             initiated_at,
             journal_confirmed_at,
+            attempts,
+            failed_from,
             ..
         } = self.clone()
         else {
@@ -1998,6 +2253,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at: started_at,
+            retry: Some(MintRetryContext { attempts, failed_from }),
         };
     }
     fn handle_close_mint(
@@ -2112,7 +2368,8 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::PrepareMint { .. } => {
+            MintCommand::PrepareMint { .. }
+            | MintCommand::RecordTxSubmitted { .. } => {
                 Err(MintError::NotInMintingState {
                     current_state: "Uninitialized".to_string(),
                 })
@@ -2122,16 +2379,20 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::ConfirmMint { .. } => {
+            MintCommand::ConfirmMint { .. }
+            | MintCommand::RecordTokensMinted { .. } => {
                 Err(MintError::NotInSubmittedState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::SendCallback { .. } => {
+            MintCommand::SendCallback { .. }
+            | MintCommand::RecordCallbackSent { .. } => {
                 Err(MintError::NotInCallbackPendingState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
+            MintCommand::RecordMintFailed { .. }
+            | MintCommand::RetryMint { .. } => Ok(vec![]),
             MintCommand::Recover { .. }
             | MintCommand::RecoverWalletStep { .. }
             | MintCommand::RecoverFromReceipt { .. }
@@ -2196,6 +2457,43 @@ impl EventSourced for Mint {
             }
             MintCommand::SendCallback { issuer_request_id } => {
                 self.handle_send_callback(services, issuer_request_id).await
+            }
+            MintCommand::RecordTxSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+            } => self.handle_record_tx_submitted(
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+            ),
+            MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+            } => self.handle_record_tokens_minted(
+                issuer_request_id,
+                ConfirmedMint {
+                    tx_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    gas_used,
+                    block_number,
+                },
+            ),
+            MintCommand::RecordCallbackSent { issuer_request_id } => {
+                self.handle_record_callback_sent(issuer_request_id)
+            }
+            MintCommand::RecordMintFailed { issuer_request_id, error } => {
+                self.handle_record_mint_failed(issuer_request_id, error)
+            }
+            MintCommand::RetryMint { issuer_request_id } => {
+                self.handle_retry_mint(issuer_request_id)
             }
             MintCommand::Recover { issuer_request_id, mode } => {
                 self.handle_recover(services, issuer_request_id, mode).await
@@ -2435,9 +2733,9 @@ pub(crate) mod tests {
 
     use super::{
         AutomaticRetryDecision, ClientId, IssuerMintRequestId, Mint,
-        MintCommand, MintError, MintEvent, MintRecoveryMode, MintServices,
-        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
-        UnderlyingSymbol, find_by_issuer_request_id,
+        MintCommand, MintError, MintEvent, MintExternalTxId, MintRecoveryMode,
+        MintServices, MintView, Network, Quantity, TokenSymbol,
+        TokenizationRequestId, UnderlyingSymbol, find_by_issuer_request_id,
         has_unresolved_mint_intent,
     };
     use crate::alpaca::mock::MockAlpacaService;
@@ -2774,6 +3072,446 @@ pub(crate) mod tests {
                 failed_at,
             },
         ]
+    }
+
+    pub(super) fn events_through_minting(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let now = Utc::now();
+        vec![
+            MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok-123"),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: now,
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: now,
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: now,
+            },
+        ]
+    }
+
+    pub(super) fn events_through_tx_submitted(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_minting(issuer_request_id);
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: "ext-1".to_string(),
+            tx_id: TxId::Legacy("fb-1".to_string()),
+            submitted_at: Utc::now(),
+        });
+        events
+    }
+
+    pub(super) fn events_through_tokens_minted(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_tx_submitted(issuer_request_id);
+        events.push(MintEvent::TokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            receipt_id: uint!(42_U256),
+            shares_minted: uint!(100_000000000000000000_U256),
+            gas_used: 21_000,
+            block_number: 1_000,
+            minted_at: Utc::now(),
+        });
+        events
+    }
+
+    fn events_through_completed(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_tokens_minted(issuer_request_id);
+        events.push(MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at: Utc::now(),
+        });
+        events
+    }
+
+    #[tokio::test]
+    async fn record_tx_submitted_from_minting_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintTxSubmitted { tx_id, .. }
+                if tx_id == &TxId::Legacy("fb-1".to_string())
+        ));
+    }
+
+    /// `SubmitMintJob` can resume a legacy `TxIntended` mint; recording the
+    /// submission must not reject with `NotInMintingState`.
+    #[tokio::test]
+    async fn record_tx_submitted_from_tx_intended_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: Utc::now(),
+        });
+
+        let recorded = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events)
+            .when(MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
+            })
+            .await
+            .events();
+
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(
+            &recorded[0],
+            MintEvent::MintTxSubmitted { tx_id, .. }
+                if tx_id == &TxId::Legacy("fb-1".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_tx_submitted_is_idempotent_once_submitted() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordTxSubmitted {
+                issuer_request_id,
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording an already-submitted mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_from_tx_submitted_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let expected_tx_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_id: TxId::Legacy("fb-1".to_string()),
+                tx_hash: expected_tx_hash,
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let MintEvent::TokensMinted {
+            issuer_request_id: _,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at: _,
+        } = &events[0]
+        else {
+            panic!("Expected TokensMinted, got {:?}", events[0]);
+        };
+        assert_eq!(*tx_hash, expected_tx_hash);
+        assert_eq!(*receipt_id, uint!(7_U256));
+        assert_eq!(*shares_minted, uint!(100_000000000000000000_U256));
+        assert_eq!(*gas_used, 21_000);
+        assert_eq!(*block_number, 1_234);
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_is_idempotent_once_minted() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tokens_minted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_id: TxId::Legacy("fb-1".to_string()),
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording an already-minted mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_rejects_mismatched_tx_id() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let error = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_id: TxId::Legacy("fb-stale".to_string()),
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::TxIdMismatch { .. })
+            ),
+            "a confirm report for a different signing-backend tx must be \
+             rejected, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn retry_transition_preserves_attempts_and_predecessor_chain() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+
+        let mut mint =
+            replay::<Mint>(events_through_minting(&issuer_request_id))
+                .unwrap()
+                .unwrap();
+
+        mint.apply_event(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: Mint::base_mint_external_tx_id(&issuer_request_id),
+            tx_id: TxId::Legacy("fb-1".to_string()),
+            submitted_at: now,
+        });
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "terminal signer failure".to_string(),
+            failed_at: now,
+        });
+
+        mint.apply_event(MintEvent::MintRetryStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: None,
+            started_at: now,
+        });
+
+        assert!(
+            matches!(mint.non_failed_predecessor(), Mint::TxSubmitted { .. }),
+            "the retry transition must preserve the failed predecessor chain"
+        );
+        assert_eq!(
+            mint.retry_submission_external_tx_id(),
+            Some(MintExternalTxId::from_string(format!(
+                "mint-{issuer_request_id}-retry-1"
+            ))),
+            "a retry submission must not reuse the failed submission's \
+             external_tx_id (the signing backend would dedupe it away)"
+        );
+
+        // The retry's own submission failing must escalate the schedule,
+        // not restart it at attempt 1.
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "retry submission rejected".to_string(),
+            failed_at: now,
+        });
+
+        let Mint::MintingFailed { attempts, failed_from, .. } = &mint else {
+            panic!("Expected MintingFailed after a failed retry, got {mint:?}");
+        };
+        assert_eq!(
+            *attempts, 2,
+            "the attempt counter must survive the retry transition"
+        );
+        assert!(
+            matches!(failed_from.as_ref(), Mint::TxSubmitted { .. }),
+            "the predecessor chain must survive a failed retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_callback_sent_from_callback_pending_completes() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tokens_minted(&issuer_request_id))
+            .when(MintCommand::RecordCallbackSent {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], MintEvent::MintCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn record_callback_sent_is_idempotent_once_completed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_completed(&issuer_request_id))
+            .when(MintCommand::RecordCallbackSent { issuer_request_id })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording the callback for a completed mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_from_minting_emits_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "submission rejected".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintingFailed { error, .. }
+                if error == "submission rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_from_fireblocks_submitted_emits_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "confirmation failed".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintingFailed { error, .. }
+                if error == "confirmation failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_is_ignored_once_completed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_completed(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "stale failure report".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "a stale failure report for a completed mint must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_mint_from_minting_failed_emits_retry_started() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(minting_events_for_retry(
+                &issuer_request_id,
+                "ext-1".to_string(),
+                failed_at,
+            ))
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintRetryStarted { tx_hash: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_mint_is_idempotent_when_not_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "retrying a mint that is not in MintingFailed must be a no-op"
+        );
     }
 
     prop_compose! {
@@ -3432,10 +4170,15 @@ pub(crate) mod tests {
             initiated_at: state_initiated_at,
             journal_confirmed_at: state_journal_confirmed_at,
             minting_started_at: state_minting_started_at,
+            retry: state_retry,
         } = mint
         else {
             panic!("Expected Minting state, got {mint:?}");
         };
+        assert!(
+            state_retry.is_none(),
+            "a first MintingStarted must not carry retry history"
+        );
 
         assert_eq!(state_issuer_id, issuer_request_id);
         assert_eq!(state_tok_id, tokenization_request_id);
@@ -3476,6 +4219,7 @@ pub(crate) mod tests {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: None,
         };
 
         let tx_hash = b256!(
@@ -3546,6 +4290,7 @@ pub(crate) mod tests {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: None,
         };
 
         let error_message = "Transaction failed: insufficient gas";
