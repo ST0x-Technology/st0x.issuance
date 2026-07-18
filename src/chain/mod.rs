@@ -12,7 +12,7 @@ use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::config::{InvalidRpcScheme, wss_to_http};
@@ -55,11 +55,21 @@ pub(crate) async fn validate_configured_asset_networks<P: Sync>(
     registry: &ChainRegistry<P>,
 ) -> Result<(), AssetNetworkValidationError> {
     list_enabled_assets(pool).await?.iter().try_for_each(|asset| {
-        registry
-            .get_required(asset.network)
-            .map(drop)
-            .map_err(AssetNetworkValidationError::from)
-    })
+        registry.get_required(asset.network).map(drop).map_err(|error| {
+            warn!(
+                target: "startup",
+                network = %asset.network,
+                underlying = %asset.underlying,
+                "Enabled asset network is not configured"
+            );
+            AssetNetworkValidationError::from(error)
+        })
+    })?;
+    info!(
+        target: "startup",
+        "Validated configured networks for all enabled assets"
+    );
+    Ok(())
 }
 
 /// Startup validation error: every live asset's network must have a chain
@@ -107,8 +117,14 @@ impl<P> ChainRegistry<P> {
         &self,
         network: Network,
     ) -> Result<&ChainRuntime<P>, ChainRegistryError> {
-        self.get(network)
-            .ok_or(ChainRegistryError::NetworkNotConfigured { network })
+        self.get(network).ok_or_else(|| {
+            debug!(
+                target: "startup",
+                %network,
+                "Chain registry lookup missed configured network"
+            );
+            ChainRegistryError::NetworkNotConfigured { network }
+        })
     }
 
     pub(crate) fn base(&self) -> Result<&ChainRuntime<P>, ChainRegistryError> {
@@ -121,12 +137,24 @@ pub(crate) fn validate_chain_configs(
 ) -> Result<(), ChainRegistryError> {
     configs.iter().tuple_combinations().try_for_each(|(first, second)| {
         if first.network == second.network {
+            warn!(
+                target: "startup",
+                network = %second.network,
+                "Duplicate chain configuration for network"
+            );
             return Err(ChainRegistryError::DuplicateNetwork {
                 network: second.network,
             });
         }
 
         if first.chain_id == second.chain_id {
+            warn!(
+                target: "startup",
+                chain_id = second.chain_id,
+                first = %first.network,
+                second = %second.network,
+                "Duplicate chain_id across networks"
+            );
             return Err(ChainRegistryError::DuplicateChainId {
                 chain_id: second.chain_id,
                 first: first.network,
@@ -183,7 +211,12 @@ async fn build_chain_runtime(
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
         SignerConfig::Turnkey(env) => resolve_turnkey_signer(env, chain_id)?,
     };
-    info!(signer_kind = ?resolved.kind, %network, "Signer backend resolved");
+    info!(
+        target: "startup",
+        signer_kind = ?resolved.kind,
+        %network,
+        "Signer backend resolved"
+    );
 
     let signing_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
@@ -212,8 +245,11 @@ mod tests {
     use alloy::primitives::address;
     use event_sorcery::StoreBuilder;
     use sqlx::sqlite::SqlitePoolOptions;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
     };
@@ -229,6 +265,7 @@ mod tests {
         }
     }
 
+    #[traced_test]
     #[test]
     fn validate_rejects_duplicate_network() {
         let configs = vec![base_config(8453), base_config(8453)];
@@ -240,8 +277,13 @@ mod tests {
             ),
             "expected duplicate network rejection"
         );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Duplicate chain configuration for network", "base"]
+        ));
     }
 
+    #[traced_test]
     #[test]
     fn get_required_errors_on_miss() {
         let registry: ChainRegistry<()> =
@@ -254,8 +296,13 @@ mod tests {
             ),
             "expected unconfigured network rejection"
         );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Chain registry lookup missed configured network", "base"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn validate_configured_asset_networks_passes_with_no_assets() {
         let pool = SqlitePoolOptions::new()
@@ -273,8 +320,13 @@ mod tests {
             ChainRegistry { runtimes: HashMap::new() };
 
         validate_configured_asset_networks(&pool, &registry).await.unwrap();
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Validated configured networks for all enabled assets"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn validate_configured_asset_networks_rejects_unconfigured_network() {
         let pool = SqlitePoolOptions::new()
@@ -322,8 +374,13 @@ mod tests {
             ),
             "expected enabled asset on an unconfigured network to fail startup validation"
         );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Enabled asset network is not configured", "AAPL", "base"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn validate_configured_asset_networks_passes_with_configured_asset() {
         let pool = SqlitePoolOptions::new()
@@ -373,5 +430,9 @@ mod tests {
         };
 
         validate_configured_asset_networks(&pool, &registry).await.unwrap();
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Validated configured networks for all enabled assets"]
+        ));
     }
 }
