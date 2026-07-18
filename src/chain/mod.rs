@@ -27,6 +27,8 @@ use crate::wallet::{
     turnkey::resolve_turnkey_signer,
 };
 
+const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
+
 pub(crate) struct ChainConfig {
     pub(crate) network: Network,
     pub(crate) chain_id: u64,
@@ -143,7 +145,8 @@ pub(crate) async fn build_chain_registry(
     validate_chain_configs(&configs)?;
 
     let runtimes = stream::iter(configs)
-        .then(|config| build_chain_runtime(config, signer))
+        .map(|config| build_chain_runtime(config, signer))
+        .buffer_unordered(MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY)
         .map_ok(|runtime| (runtime.network, runtime))
         .try_collect()
         .await?;
@@ -230,10 +233,13 @@ mod tests {
     fn validate_rejects_duplicate_network() {
         let configs = vec![base_config(8453), base_config(8453)];
 
-        assert!(matches!(
-            validate_chain_configs(&configs),
-            Err(ChainRegistryError::DuplicateNetwork { .. })
-        ));
+        assert!(
+            matches!(
+                validate_chain_configs(&configs),
+                Err(ChainRegistryError::DuplicateNetwork { .. })
+            ),
+            "expected duplicate network rejection"
+        );
     }
 
     #[test]
@@ -241,10 +247,13 @@ mod tests {
         let registry: ChainRegistry<()> =
             ChainRegistry { runtimes: HashMap::new() };
 
-        assert!(matches!(
-            registry.get_required(Network::Base),
-            Err(ChainRegistryError::NetworkNotConfigured { .. })
-        ));
+        assert!(
+            matches!(
+                registry.get_required(Network::Base),
+                Err(ChainRegistryError::NetworkNotConfigured { .. })
+            ),
+            "expected unconfigured network rejection"
+        );
     }
 
     #[tokio::test]
@@ -304,12 +313,15 @@ mod tests {
         let registry: ChainRegistry<()> =
             ChainRegistry { runtimes: HashMap::new() };
 
-        assert!(matches!(
-            validate_configured_asset_networks(&pool, &registry).await,
-            Err(AssetNetworkValidationError::ChainRegistry(
-                ChainRegistryError::NetworkNotConfigured { .. }
-            ))
-        ));
+        assert!(
+            matches!(
+                validate_configured_asset_networks(&pool, &registry).await,
+                Err(AssetNetworkValidationError::ChainRegistry(
+                    ChainRegistryError::NetworkNotConfigured { .. }
+                ))
+            ),
+            "expected enabled asset on an unconfigured network to fail startup validation"
+        );
     }
 
     #[tokio::test]

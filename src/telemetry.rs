@@ -60,8 +60,10 @@
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::ExporterBuildError;
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{
+    ExporterBuildError, Protocol, SpanExporter, WithExportConfig,
+    WithHttpConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{
     BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider,
@@ -124,12 +126,12 @@ impl HyperDxConfig {
         // (https://www.hyperdx.io/docs/install/opentelemetry). `/v1/traces` is
         // the standard OTLP/HTTP traces path; the exporter is built
         // `.with_http()`, so the wire format is OTLP/HTTP protobuf.
-        let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        let otlp_exporter = SpanExporter::builder()
             .with_http()
             .with_http_client(http_client)
             .with_endpoint("https://in-otel.hyperdx.io/v1/traces")
             .with_headers(headers)
-            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .with_protocol(Protocol::HttpBinary)
             .build()?;
 
         let batch_exporter = BatchSpanProcessor::builder(otlp_exporter)
