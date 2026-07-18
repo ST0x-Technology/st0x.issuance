@@ -336,7 +336,7 @@ impl From<AggregateError<LifecycleError<Redemption>>>
 mod tests {
     use alloy::primitives::{Address, address, b256};
     use async_trait::async_trait;
-    use chrono::Utc;
+    use chrono::{NaiveDate, Utc};
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -352,8 +352,9 @@ mod tests {
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::alpaca::{
-        AlpacaError, AlpacaService, Fees, RedeemRequest, RedeemRequestStatus,
-        RedeemResponse, TokenizationRequest, TokenizationRequestType,
+        AlpacaError, AlpacaService, DividendAnnouncement, Fees, RedeemRequest,
+        RedeemRequestStatus, RedeemResponse, TokenizationRequest,
+        TokenizationRequestType,
     };
     use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
@@ -673,6 +674,16 @@ mod tests {
                 _tokenization_request_id: &TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
                 unreachable!("redeem test should not poll request status")
+            }
+
+            async fn list_dividend_announcements(
+                &self,
+                _since: NaiveDate,
+                _until: NaiveDate,
+            ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
+                unreachable!(
+                    "redeem test should not list dividend announcements"
+                )
             }
         }
 

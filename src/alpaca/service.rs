@@ -417,10 +417,7 @@ impl AlpacaService for RealAlpacaService {
                 }
                 status => {
                     let body = response.text().await?;
-                    Err(AlpacaError::Api {
-                        status_code: status.as_u16(),
-                        body,
-                    })
+                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
                 }
             }
         })
@@ -433,7 +430,9 @@ impl AlpacaService for RealAlpacaService {
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
             tracing::debug!(
                 target: "alpaca",
-                "Alpaca announcements API call failed with {err}, retrying after {dur:?}"
+                error = %err,
+                retry_after = ?dur,
+                "Alpaca announcements API call failed; retrying"
             );
         })
         .await

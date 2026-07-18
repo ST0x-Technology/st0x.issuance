@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::UnderlyingSymbol;
 use super::schedule::{FreezeScheduleError, FreezeScheduler};
@@ -61,6 +61,11 @@ pub(crate) struct SyncSummary {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CorporateActionsSyncError {
+    #[error(
+        "adding the {days}-day announcement horizon to {since} exceeds the \
+         representable date range"
+    )]
+    AnnouncementHorizonOverflow { since: NaiveDate, days: u64 },
     #[error(transparent)]
     Alpaca(#[from] AlpacaError),
     #[error(transparent)]
@@ -99,7 +104,10 @@ impl CorporateActionsSync {
         let since = now.date_naive();
         let until = since
             .checked_add_days(Days::new(ANNOUNCEMENT_HORIZON_DAYS))
-            .unwrap_or(since);
+            .ok_or(CorporateActionsSyncError::AnnouncementHorizonOverflow {
+                since,
+                days: ANNOUNCEMENT_HORIZON_DAYS,
+            })?;
 
         let announcements =
             self.alpaca.list_dividend_announcements(since, until).await?;
@@ -127,8 +135,15 @@ impl CorporateActionsSync {
                 continue;
             }
 
+            // `ex_date_window` only fails when `checked_add_days` overflows —
+            // the announcement IS dated, so counting it as undated would lie
+            // in the pass summary. Log and move on instead.
             let Some((freeze_at, unfreeze_at)) = ex_date_window(ex_date) else {
-                summary.skipped_undated += 1;
+                warn!(target: "tokenized_asset",
+                    underlying = %initiating_symbol,
+                    %ex_date,
+                    "Failed to compute freeze window for ex-date"
+                );
                 continue;
             };
 
@@ -182,7 +197,7 @@ pub(crate) fn spawn_corporate_actions_sync(mut sync: CorporateActionsSync) {
 
             match sync.sync_once(Utc::now()).await {
                 Ok(summary) => {
-                    info!(target: "tokenized_asset",
+                    debug!(target: "tokenized_asset",
                         armed = summary.armed.len(),
                         skipped_unsupported = summary.skipped_unsupported,
                         skipped_undated = summary.skipped_undated,
@@ -191,7 +206,7 @@ pub(crate) fn spawn_corporate_actions_sync(mut sync: CorporateActionsSync) {
                     );
                 }
                 Err(error) => {
-                    warn!(target: "tokenized_asset",
+                    debug!(target: "tokenized_asset",
                         error = %error,
                         "Corporate-actions freeze sync pass failed; retrying \
                          at the next interval"
@@ -249,7 +264,8 @@ mod tests {
     async fn sync_once_arms_supported_and_skips_the_rest() {
         let harness = TestHarness::new().await;
         let underlying = harness.setup_account_and_asset().await.underlying;
-        let scheduler = FreezeScheduler::new(&harness.apalis_pool);
+        let scheduler =
+            FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
         let now = Utc::now();
         let upcoming_ex_date =
             now.date_naive().checked_add_days(Days::new(7)).unwrap();
@@ -304,7 +320,8 @@ mod tests {
     async fn sync_once_is_idempotent_across_passes() {
         let harness = TestHarness::new().await;
         let underlying = harness.setup_account_and_asset().await.underlying;
-        let scheduler = FreezeScheduler::new(&harness.apalis_pool);
+        let scheduler =
+            FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
         let now = Utc::now();
         let ex_date = now.date_naive().checked_add_days(Days::new(7)).unwrap();
 
@@ -326,13 +343,33 @@ mod tests {
         assert_eq!(second.armed, vec![(underlying, ex_date)]);
     }
 
+    #[tokio::test]
+    async fn sync_once_rejects_an_unrepresentable_announcement_horizon() {
+        let harness = TestHarness::new().await;
+        let scheduler =
+            FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
+        let alpaca = Arc::new(MockAlpacaService::new_success());
+        let mut sync =
+            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let now = NaiveDate::MAX.and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+        assert!(matches!(
+            sync.sync_once(now).await.unwrap_err(),
+            super::CorporateActionsSyncError::AnnouncementHorizonOverflow {
+                since: NaiveDate::MAX,
+                days: super::ANNOUNCEMENT_HORIZON_DAYS,
+            }
+        ));
+    }
+
     // A fetch failure aborts the pass with the Alpaca error so the worker
     // loop logs it and retries next interval.
     #[tokio::test]
     async fn sync_once_propagates_fetch_failures() {
         let harness = TestHarness::new().await;
         harness.setup_account_and_asset().await;
-        let scheduler = FreezeScheduler::new(&harness.apalis_pool);
+        let scheduler =
+            FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
 
         let alpaca = Arc::new(MockAlpacaService::new_failure("api down"));
 
