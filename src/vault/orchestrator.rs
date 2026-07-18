@@ -34,6 +34,22 @@ pub(crate) struct OrchestratorBurnParams {
     pub(crate) external_tx_id: Option<BurnExternalTxId>,
 }
 
+/// Consumed receipt-pointer range from the `Burned` event, half-open:
+/// receipts strictly inside
+/// `[first_receipt_id, next_burn_receipt_id_after)` were drained by the
+/// burn. Named fields (not a tuple) because this is embedded in persisted
+/// redemption events — the payload must self-describe which bound is which,
+/// permanently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BurnRange {
+    /// `Burned.firstReceiptId` — the pre-burn pointer value (may itself
+    /// have been partially consumed by an earlier burn).
+    pub(crate) first_receipt_id: U256,
+    /// `Burned.nextBurnReceiptIdAfter` — the pointer's new value, the
+    /// receipt the next burn resumes from (exclusive end).
+    pub(crate) next_burn_receipt_id_after: U256,
+}
+
 /// Result of a confirmed `ST0xOrchestrator.burn()`, parsed from the
 /// orchestrator's `Burned` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +57,7 @@ pub(crate) struct OrchestratorBurnResult {
     pub(crate) tx_hash: B256,
     /// `Burned.amount` — total shares pulled and burned.
     pub(crate) shares_burned: U256,
-    /// Consumed receipt pointer range:
-    /// `(Burned.firstReceiptId, Burned.nextBurnReceiptIdAfter)`.
-    pub(crate) burn_range: (U256, U256),
+    pub(crate) burn_range: BurnRange,
     pub(crate) gas_used: u64,
     pub(crate) block_number: u64,
 }
