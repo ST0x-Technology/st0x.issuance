@@ -51,8 +51,17 @@ pub fn test_alpaca_legacy_auth() -> (String, String, String) {
     (basic_auth, api_key, api_secret)
 }
 
-/// Anvil local chain ID
+/// Anvil local chain ID (Base test runtime).
 pub const ANVIL_CHAIN_ID: u64 = 31337;
+
+/// ReceiptInventory aggregate id for integration tests (`{chain_id}:{vault:#x}`).
+#[must_use]
+pub fn receipt_inventory_aggregate_id(chain_id: u64, vault: Address) -> String {
+    format!("{chain_id}:{vault:#x}")
+}
+
+/// Chain ID for the Ethereum test runtime in multichain integration tests.
+pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 
 fn test_config() -> Result<Config, anyhow::Error> {
     Ok(Config {
@@ -69,6 +78,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
         subgraph_url: Url::parse("http://localhost:0/subgraph")?,
+        chains: Vec::new(),
     })
 }
 
@@ -109,13 +119,15 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Create mock services for Mint aggregate
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let mint_services = MintServices {
-        vault: Arc::new(MockVaultService::new_success()),
-        alpaca: Arc::new(MockAlpacaService::new_success()),
-        pool: pool.clone(),
+    let mint_services = MintServices::with_single_vault(
+        Network::Base,
+        ANVIL_CHAIN_ID,
+        Arc::new(MockVaultService::new_success()),
+        Arc::new(MockAlpacaService::new_success()),
+        Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+        pool.clone(),
         bot,
-        receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
-    };
+    );
 
     // Setup Mint store (event-sorcery), mirroring the production wiring: the
     // reactor keeps receipt_inventory_view in sync with Mint events.
@@ -219,6 +231,7 @@ pub struct LocalEvm {
     pub wallet_address: Address,
     pub private_key: B256,
     pub endpoint: String,
+    pub chain_id: u64,
 }
 
 impl LocalEvm {
@@ -231,7 +244,17 @@ impl LocalEvm {
     /// - Provider connection fails
     /// - Any contract deployment step fails
     pub async fn new() -> Result<Self, LocalEvmError> {
-        let anvil = Anvil::new().spawn();
+        Self::with_chain_id(ANVIL_CHAIN_ID).await
+    }
+
+    /// Creates a new [`LocalEvm`] on an Anvil instance with the given chain ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Anvil startup, provider connection, or contract
+    /// deployment fails.
+    pub async fn with_chain_id(chain_id: u64) -> Result<Self, LocalEvmError> {
+        let anvil = Anvil::new().chain_id(chain_id).spawn();
         let endpoint = anvil.ws_endpoint();
 
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
@@ -252,6 +275,7 @@ impl LocalEvm {
             wallet_address,
             private_key,
             endpoint,
+            chain_id,
         })
     }
 

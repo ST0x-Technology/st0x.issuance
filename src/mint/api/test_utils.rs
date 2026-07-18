@@ -16,6 +16,7 @@ use crate::auth::test_auth_config;
 use crate::config::{Config, Environment, LogLevel};
 use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
@@ -26,7 +27,7 @@ pub(crate) fn test_config() -> Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
-        chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+        chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
@@ -37,6 +38,7 @@ pub(crate) fn test_config() -> Config {
         alpaca: AlpacaConfig::test_default(),
         subgraph_url: Url::parse("http://localhost:0/subgraph")
             .expect("valid test URL"),
+        chains: Vec::new(),
     }
 }
 
@@ -114,15 +116,15 @@ impl TestHarness {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let mint_services = MintServices {
-            vault: vault.clone(),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            pool: pool.clone(),
+        let mint_services = MintServices::with_single_vault(
+            Network::Base,
+            ANVIL_CHAIN_ID,
+            vault.clone(),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+            pool.clone(),
             bot,
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_inventory_store,
-            )),
-        };
+        );
 
         let (mint_store, _mint_projection) =
             StoreBuilder::<Mint>::new(pool.clone())

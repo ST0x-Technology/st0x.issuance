@@ -910,12 +910,14 @@ mod tests {
             .dispatch()
             .await;
 
-        // `Network` is a closed enum, so an unsupported network is
-        // unrepresentable: the request is rejected at JSON deserialization
-        // (Rocket's data guard -> 422) before the handler's asset-availability
-        // check runs. A mismatched-but-parseable network can no longer be
-        // expressed, so the old handler-level 400 path is unreachable here.
-        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert_eq!(response.status(), Status::BadRequest);
+        assert!(
+            response
+                .into_string()
+                .await
+                .unwrap()
+                .contains("Token not available on the network")
+        );
     }
 
     #[tokio::test]

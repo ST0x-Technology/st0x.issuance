@@ -110,6 +110,7 @@ pub(crate) struct BurnManager {
     receipt_service: Arc<dyn ReceiptService>,
     bot_wallet: Address,
     automatic_recovery_lock: Arc<Mutex<()>>,
+    receipt_chain_id: u64,
 }
 
 impl BurnManager {
@@ -123,12 +124,14 @@ impl BurnManager {
     ///   aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
+    /// * `receipt_chain_id` - Chain id for receipt inventory aggregate keys
     pub(crate) fn new(
         vault_service: Arc<dyn VaultService>,
         view_pool: Pool<Sqlite>,
         store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
+        receipt_chain_id: u64,
     ) -> Self {
         Self {
             vault_service,
@@ -137,6 +140,7 @@ impl BurnManager {
             receipt_service,
             bot_wallet,
             automatic_recovery_lock: Arc::new(Mutex::new(())),
+            receipt_chain_id,
         }
     }
 
@@ -362,7 +366,11 @@ impl BurnManager {
         let mut stuck: Vec<(Address, IssuerRedemptionRequestId)> = Vec::new();
 
         for vault in vaults {
-            match self.receipt_service.reserved_redemptions(*vault).await {
+            match self
+                .receipt_service
+                .reserved_redemptions(self.receipt_chain_id, *vault)
+                .await
+            {
                 Ok(redemptions) => {
                     stuck
                         .extend(redemptions.into_iter().map(|id| (*vault, id)));
@@ -1734,6 +1742,7 @@ impl BurnManager {
         let plan = self
             .receipt_service
             .for_burn(
+                self.receipt_chain_id,
                 vault,
                 issuer_request_id,
                 Shares::new(burn_shares),
@@ -1907,6 +1916,7 @@ impl BurnManager {
         let result = self
             .receipt_service
             .reserve_burn(
+                self.receipt_chain_id,
                 execution.vault,
                 issuer_request_id.clone(),
                 execution.planned_burns.clone(),
@@ -2216,7 +2226,11 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
         self.receipt_service
-            .release_burn(vault, issuer_request_id.clone())
+            .release_burn(
+                self.receipt_chain_id,
+                vault,
+                issuer_request_id.clone(),
+            )
             .await?;
         Ok(())
     }
@@ -2229,7 +2243,11 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
         self.receipt_service
-            .settle_burn(vault, issuer_request_id.clone())
+            .settle_burn(
+                self.receipt_chain_id,
+                vault,
+                issuer_request_id.clone(),
+            )
             .await?;
         Ok(())
     }
@@ -2438,7 +2456,8 @@ mod tests {
         BurnPlan, BurnTrackingError, CqrsReceiptService, MintedReceiptParams,
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
         ReceiptInventoryError, ReceiptLookupError, ReceiptRegistrationError,
-        ReceiptService, ReceiptSource, RecoveredReceipt, Shares,
+        ReceiptService, ReceiptSource, ReceiptVaultKey, RecoveredReceipt,
+        Shares,
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
@@ -2446,7 +2465,7 @@ mod tests {
         BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId,
         RedemptionError,
     };
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
@@ -2594,6 +2613,7 @@ mod tests {
 
         async fn for_burn(
             &self,
+            chain_id: u64,
             vault: Address,
             redemption_issuer_request_id: &IssuerRedemptionRequestId,
             shares_to_burn: Shares,
@@ -2601,6 +2621,7 @@ mod tests {
         ) -> Result<BurnPlan, BurnTrackingError> {
             self.inner
                 .for_burn(
+                    chain_id,
                     vault,
                     redemption_issuer_request_id,
                     shares_to_burn,
@@ -2611,17 +2632,24 @@ mod tests {
 
         async fn reserve_burn(
             &self,
+            chain_id: u64,
             vault: Address,
             redemption_issuer_request_id: IssuerRedemptionRequestId,
             burns: Vec<BurnRecord>,
         ) -> Result<(), ReceiptRegistrationError> {
             self.inner
-                .reserve_burn(vault, redemption_issuer_request_id, burns)
+                .reserve_burn(
+                    chain_id,
+                    vault,
+                    redemption_issuer_request_id,
+                    burns,
+                )
                 .await
         }
 
         async fn release_burn(
             &self,
+            _chain_id: u64,
             _vault: Address,
             _redemption_issuer_request_id: IssuerRedemptionRequestId,
         ) -> Result<(), ReceiptRegistrationError> {
@@ -2634,26 +2662,33 @@ mod tests {
 
         async fn settle_burn(
             &self,
+            chain_id: u64,
             vault: Address,
             redemption_issuer_request_id: IssuerRedemptionRequestId,
         ) -> Result<(), ReceiptRegistrationError> {
-            self.inner.settle_burn(vault, redemption_issuer_request_id).await
+            self.inner
+                .settle_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
         }
 
         async fn reserved_redemptions(
             &self,
+            chain_id: u64,
             vault: Address,
         ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
         {
-            self.inner.reserved_redemptions(vault).await
+            self.inner.reserved_redemptions(chain_id, vault).await
         }
 
         async fn find_by_issuer_request_id(
             &self,
+            chain_id: u64,
             vault: &Address,
             issuer_request_id: &IssuerMintRequestId,
         ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
-            self.inner.find_by_issuer_request_id(vault, issuer_request_id).await
+            self.inner
+                .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
+                .await
         }
     }
 
@@ -2825,7 +2860,7 @@ mod tests {
         ) {
             self.receipt_inventory_store
                 .send(
-                    &vault,
+                    &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                     ReceiptInventoryCommand::DiscoverReceipt {
                         receipt_id: ReceiptId::from(receipt_id),
                         balance: Shares::from(balance),
@@ -2980,6 +3015,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3015,7 +3051,7 @@ mod tests {
         // settle wiring were removed the reservation would linger here.
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3074,6 +3110,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -3166,6 +3203,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3182,6 +3220,7 @@ mod tests {
             .await;
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -3192,7 +3231,10 @@ mod tests {
             .await
             .expect("seeding reservation should succeed");
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![issuer_request_id.clone()],
             "reservation should be held before force-complete"
         );
@@ -3233,7 +3275,7 @@ mod tests {
         // settle wiring were removed the reservation would linger here.
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3289,6 +3331,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -3296,6 +3339,7 @@ mod tests {
         harness.discover_receipt(vault, uint!(42_U256), uint!(17_U256)).await;
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -3333,7 +3377,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id)
@@ -3389,6 +3433,7 @@ mod tests {
                 store.clone(),
                 receipt_service.clone(),
                 owner,
+                ANVIL_CHAIN_ID,
             );
             let issuer_request_id = IssuerRedemptionRequestId::random();
             create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -3398,6 +3443,7 @@ mod tests {
                 .await;
             receipt_service
                 .reserve_burn(
+                    ANVIL_CHAIN_ID,
                     vault,
                     issuer_request_id.clone(),
                     vec![BurnRecord {
@@ -3445,7 +3491,10 @@ mod tests {
                 "scenario {scenario} changed the redemption"
             );
             assert_eq!(
-                receipt_service.reserved_redemptions(vault).await.unwrap(),
+                receipt_service
+                    .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                    .await
+                    .unwrap(),
                 vec![issuer_request_id],
                 "scenario {scenario} released the reservation"
             );
@@ -3481,6 +3530,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3546,6 +3596,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3595,6 +3646,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -3635,6 +3687,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         // An unknown redemption is Uninitialized — force-complete must refuse
@@ -3678,6 +3731,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3786,6 +3840,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let receipt_info = ReceiptInformation::new(
@@ -3799,7 +3854,7 @@ mod tests {
 
         receipt_inventory_store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(99_U256)),
                     balance: Shares::from(
@@ -3871,6 +3926,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let receipt_info = ReceiptInformation::new(
@@ -3886,7 +3942,7 @@ mod tests {
 
         receipt_inventory_store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(99_U256)),
                     balance: Shares::from(
@@ -3949,6 +4005,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3994,7 +4051,7 @@ mod tests {
         // reuse shares that are about to be consumed.
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -4023,6 +4080,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4055,7 +4113,7 @@ mod tests {
 
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -4084,6 +4142,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4116,7 +4175,7 @@ mod tests {
 
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -4145,6 +4204,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4177,7 +4237,7 @@ mod tests {
 
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -4203,6 +4263,7 @@ mod tests {
             store.clone(),
             failing_receipt_service,
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
@@ -4229,7 +4290,10 @@ mod tests {
             Redemption::BurnSubmitted { .. }
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![issuer_request_id.clone()]
         );
         let recovery_attempts: i64 = sqlx::query_scalar(
@@ -4269,6 +4333,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4310,6 +4375,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4371,6 +4437,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4420,6 +4487,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4515,6 +4583,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4562,6 +4631,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4617,6 +4687,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4658,6 +4729,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         manager.recover_burning_redemptions().await;
@@ -4681,6 +4753,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4730,6 +4803,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4770,6 +4844,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4832,6 +4907,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4909,6 +4985,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4983,6 +5060,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5052,6 +5130,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5069,6 +5148,7 @@ mod tests {
 
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -5112,7 +5192,7 @@ mod tests {
 
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -5147,6 +5227,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5165,6 +5246,7 @@ mod tests {
 
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -5204,7 +5286,7 @@ mod tests {
 
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -5248,6 +5330,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let tx_id = TxId::random();
 
@@ -5266,6 +5349,7 @@ mod tests {
 
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -5316,7 +5400,7 @@ mod tests {
         // still-pending tx may yet consume.
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -5389,7 +5473,7 @@ mod tests {
         );
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .expect("exhausted reservation query should succeed")
                 .contains(issuer_request_id),
@@ -5480,6 +5564,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let recovery_manager = manager.clone();
         let recovery_id = issuer_request_id.clone();
@@ -5578,6 +5663,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let recovery_manager = manager.clone();
         let recovery_id = issuer_request_id.clone();
@@ -5648,6 +5734,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let outcome = manager
@@ -5756,6 +5843,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
 
         let outcome = manager
@@ -5846,6 +5934,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
 
         let outcome = manager
@@ -5922,6 +6011,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         assert_eq!(
@@ -6003,6 +6093,7 @@ mod tests {
         // Seed a reservation so the test verifies it is settled on confirm.
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -6076,6 +6167,7 @@ mod tests {
             restarted_store.clone(),
             restarted_receipt_service.clone(),
             recovery_owner,
+            ANVIL_CHAIN_ID,
         );
         let result = manager.recover_single_burning(&issuer_request_id).await;
 
@@ -6104,7 +6196,7 @@ mod tests {
 
         assert!(
             restarted_receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -6129,7 +6221,7 @@ mod tests {
         ));
         assert!(
             restarted_receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .expect("restart reservation query should succeed")
                 .contains(&issuer_request_id),
@@ -6138,6 +6230,7 @@ mod tests {
         let contender = IssuerRedemptionRequestId::random();
         let availability = restarted_receipt_service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &contender,
                 Shares::new(uint!(1_U256)),
@@ -6183,6 +6276,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6302,6 +6396,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             recovery_owner,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6420,6 +6515,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
@@ -6568,6 +6664,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6575,6 +6672,7 @@ mod tests {
         harness.discover_receipt(vault, uint!(42_U256), uint!(17_U256)).await;
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -6628,7 +6726,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id)
@@ -6681,6 +6779,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             owner,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6744,6 +6843,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6757,6 +6857,7 @@ mod tests {
             .await;
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -6795,7 +6896,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id)
@@ -6842,6 +6943,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6911,6 +7013,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -6924,6 +7027,7 @@ mod tests {
             .await;
         receipt_service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -6982,7 +7086,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -7063,6 +7167,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
@@ -7097,7 +7202,10 @@ mod tests {
             "the exact persisted transaction must remain recoverable: {updated:?}"
         );
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![issuer_request_id],
             "ambiguous broadcast must retain the receipt reservation"
         );
@@ -7139,6 +7247,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
@@ -7172,7 +7281,10 @@ mod tests {
             "the submitted transaction must remain recoverable: {updated:?}"
         );
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![issuer_request_id],
             "ambiguous confirmation must retain the receipt reservation"
         );
@@ -7196,6 +7308,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7232,7 +7345,7 @@ mod tests {
         // Reservation must be released since nothing landed on-chain.
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -7349,6 +7462,7 @@ mod tests {
             store.clone(),
             failing_receipt_service,
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
@@ -7373,7 +7487,10 @@ mod tests {
         );
         assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![issuer_request_id.clone()],
             "failed release must leave the reservation visible for retry"
         );
@@ -7423,6 +7540,7 @@ mod tests {
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7524,7 +7642,7 @@ mod tests {
         harness
             .receipt_inventory_store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::ReserveBurn {
                     redemption_issuer_request_id: redemption.clone(),
                     burns: vec![crate::redemption::BurnRecord {
@@ -7552,6 +7670,7 @@ mod tests {
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         // Receipt 1 funds the real burn; receipt 2 will hold the stuck
@@ -7593,7 +7712,7 @@ mod tests {
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id)
@@ -7604,7 +7723,7 @@ mod tests {
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -7730,6 +7849,7 @@ mod tests {
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         harness
@@ -7769,7 +7889,7 @@ mod tests {
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -7792,6 +7912,7 @@ mod tests {
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
+            ANVIL_CHAIN_ID,
         );
 
         harness
@@ -7820,7 +7941,7 @@ mod tests {
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),

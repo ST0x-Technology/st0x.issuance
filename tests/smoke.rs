@@ -9,8 +9,8 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::{Network, initialize_rocket};
 
 use crate::harness::create_provider;
 
@@ -106,11 +106,14 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &client_id,
-        "smoke-r1-m1",
-        "1.0",
-        UNDERLYING,
-        TOKEN,
+        harness::MintFlowRequest {
+            client_id: &client_id,
+            tokenization_request_id: "smoke-r1-m1",
+            quantity: "1.0",
+            underlying: UNDERLYING,
+            token: TOKEN,
+            network: Network::Base,
+        },
     )
     .await?;
     let shares_r1 = harness::wait_for_shares(&vault, user_wallet).await?;
@@ -129,11 +132,14 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &client_id,
-        "smoke-r2-m1",
-        "1.5",
-        UNDERLYING,
-        TOKEN,
+        harness::MintFlowRequest {
+            client_id: &client_id,
+            tokenization_request_id: "smoke-r2-m1",
+            quantity: "1.5",
+            underlying: UNDERLYING,
+            token: TOKEN,
+            network: Network::Base,
+        },
     )
     .await?;
     let shares_after_first =
@@ -142,11 +148,14 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &client_id,
-        "smoke-r2-m2",
-        "0.5",
-        UNDERLYING,
-        TOKEN,
+        harness::MintFlowRequest {
+            client_id: &client_id,
+            tokenization_request_id: "smoke-r2-m2",
+            quantity: "0.5",
+            underlying: UNDERLYING,
+            token: TOKEN,
+            network: Network::Base,
+        },
     )
     .await?;
     let shares_r2 =
@@ -166,11 +175,14 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &client_id,
-        "smoke-r3-m1",
-        "2.0",
-        UNDERLYING,
-        TOKEN,
+        harness::MintFlowRequest {
+            client_id: &client_id,
+            tokenization_request_id: "smoke-r3-m1",
+            quantity: "2.0",
+            underlying: UNDERLYING,
+            token: TOKEN,
+            network: Network::Base,
+        },
     )
     .await?;
     let shares_r3 = harness::wait_for_shares(&vault, user_wallet).await?;

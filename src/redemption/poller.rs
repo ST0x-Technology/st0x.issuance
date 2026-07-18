@@ -192,7 +192,8 @@ where
         &self,
     ) -> Result<(), TransferPollError> {
         let Some(global) =
-            poll_checkpoint::load(&self.pool, TRANSFER_POLL).await?
+            poll_checkpoint::load_checkpoint_block(&self.pool, TRANSFER_POLL)
+                .await?
         else {
             return Ok(());
         };
@@ -213,11 +214,17 @@ where
             // checkpoint below the legacy global, and `advance`'s monotonic
             // forward-jump would silently skip every redemption between its
             // cursor and the global block.
-            if poll_checkpoint::load(&self.pool, &name).await?.is_some() {
+            if poll_checkpoint::load_checkpoint_block(&self.pool, &name)
+                .await?
+                .is_some()
+            {
                 continue;
             }
 
-            poll_checkpoint::advance(&self.pool, &name, global).await?;
+            poll_checkpoint::advance_checkpoint_block(
+                &self.pool, &name, global,
+            )
+            .await?;
         }
 
         Ok(())
@@ -302,8 +309,11 @@ where
         head: u64,
     ) -> Result<(), TransferPollError> {
         let checkpoint_name = poll_checkpoint::transfer_poll_name(vault);
-        let last_processed =
-            poll_checkpoint::load(&self.pool, &checkpoint_name).await?;
+        let last_processed = poll_checkpoint::load_checkpoint_block(
+            &self.pool,
+            &checkpoint_name,
+        )
+        .await?;
 
         let cursor = match last_processed {
             None => self.backfill_start_block,
@@ -360,8 +370,12 @@ where
                 }
             }
 
-            poll_checkpoint::advance(&self.pool, &checkpoint_name, chunk_to)
-                .await?;
+            poll_checkpoint::advance_checkpoint_block(
+                &self.pool,
+                &checkpoint_name,
+                chunk_to,
+            )
+            .await?;
 
             // The advance above moved the cursor past these transfers, making
             // the skip permanent: real user tokens in the redemption wallet
@@ -594,7 +608,7 @@ mod tests {
         create_transfer_log, setup_test_db_with_asset,
     };
     use crate::redemption::{IssuerRedemptionRequestId, Redemption};
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
@@ -667,6 +681,7 @@ mod tests {
                 store.clone(),
                 receipt_service,
                 bot_wallet,
+                ANVIL_CHAIN_ID,
             ));
 
         let provider = ProviderBuilder::new()
@@ -778,7 +793,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -824,7 +839,7 @@ mod tests {
 
         // Checkpoint still advances even with no detections
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -853,7 +868,7 @@ mod tests {
             setup_test_poller(vault, bot_wallet, None, &asserter, 50).await;
 
         // Pre-seed the vault's checkpoint at 200
-        poll_checkpoint::advance(
+        poll_checkpoint::advance_checkpoint_block(
             &setup.pool,
             &poll_checkpoint::transfer_poll_name(vault),
             200,
@@ -899,7 +914,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -984,7 +999,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -1019,7 +1034,7 @@ mod tests {
 
         // No checkpoint saved since we skipped
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -1051,9 +1066,13 @@ mod tests {
         // A leftover global checkpoint from before the per-vault migration.
         // The vault has no per-vault checkpoint, so poll_once must ignore the
         // global value and scan from backfill_start_block (50).
-        poll_checkpoint::advance(&setup.pool, TRANSFER_POLL, 200)
-            .await
-            .unwrap();
+        poll_checkpoint::advance_checkpoint_block(
+            &setup.pool,
+            TRANSFER_POLL,
+            200,
+        )
+        .await
+        .unwrap();
 
         setup.poller.poll_once().await.unwrap();
 
@@ -1066,7 +1085,7 @@ mod tests {
              global checkpoint"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -1089,14 +1108,18 @@ mod tests {
         let setup =
             setup_test_poller(vault, bot_wallet, None, &asserter, 0).await;
 
-        poll_checkpoint::advance(&setup.pool, TRANSFER_POLL, 200)
-            .await
-            .unwrap();
+        poll_checkpoint::advance_checkpoint_block(
+            &setup.pool,
+            TRANSFER_POLL,
+            200,
+        )
+        .await
+        .unwrap();
 
         setup.poller.seed_per_vault_checkpoints().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -1123,7 +1146,7 @@ mod tests {
             setup_test_poller(vault, bot_wallet, None, &asserter, 0).await;
 
         // The vault scanned partway (block 100) before the restart...
-        poll_checkpoint::advance(
+        poll_checkpoint::advance_checkpoint_block(
             &setup.pool,
             &poll_checkpoint::transfer_poll_name(vault),
             100,
@@ -1131,14 +1154,18 @@ mod tests {
         .await
         .unwrap();
         // ...and a stale legacy global sits far ahead at block 5000.
-        poll_checkpoint::advance(&setup.pool, TRANSFER_POLL, 5000)
-            .await
-            .unwrap();
+        poll_checkpoint::advance_checkpoint_block(
+            &setup.pool,
+            TRANSFER_POLL,
+            5000,
+        )
+        .await
+        .unwrap();
 
         setup.poller.seed_per_vault_checkpoints().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault),
             )
@@ -1183,7 +1210,7 @@ mod tests {
         ));
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault_b),
             )
@@ -1193,7 +1220,7 @@ mod tests {
             "the healthy vault must advance its checkpoint to head"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault_a),
             )
@@ -1284,14 +1311,18 @@ mod tests {
         let setup =
             setup_test_poller(vault_a, bot_wallet, None, &asserter, 0).await;
 
-        poll_checkpoint::advance(&setup.pool, TRANSFER_POLL, 200)
-            .await
-            .unwrap();
+        poll_checkpoint::advance_checkpoint_block(
+            &setup.pool,
+            TRANSFER_POLL,
+            200,
+        )
+        .await
+        .unwrap();
 
         setup.poller.seed_per_vault_checkpoints().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault_a),
             )
@@ -1301,7 +1332,9 @@ mod tests {
             "the legacy vault must inherit the global checkpoint"
         );
         assert_eq!(
-            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
+            poll_checkpoint::load_checkpoint_block(&setup.pool, TRANSFER_POLL)
+                .await
+                .unwrap(),
             None,
             "the migration must consume the legacy global row"
         );
@@ -1312,7 +1345,7 @@ mod tests {
         setup.poller.seed_per_vault_checkpoints().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
                 &poll_checkpoint::transfer_poll_name(vault_b),
             )

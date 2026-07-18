@@ -3,6 +3,7 @@ pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
 pub(crate) mod reconcile;
+mod vault_key;
 pub(crate) mod view;
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -30,6 +31,7 @@ pub(crate) use burn_tracking::{
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 use reconcile::ReconcileError;
+pub(crate) use vault_key::ReceiptVaultKey;
 
 const RECEIPT_INVENTORY_MAX_ATTEMPTS: usize = 3;
 
@@ -224,6 +226,7 @@ impl ReceiptMetadata {
 
 /// Parameters for registering a newly minted receipt.
 pub(crate) struct MintedReceiptParams {
+    pub(crate) chain_id: u64,
     pub(crate) vault: Address,
     pub(crate) receipt_id: ReceiptId,
     pub(crate) shares: Shares,
@@ -260,6 +263,7 @@ pub(crate) trait ReceiptService: Send + Sync {
     /// replaces that reservation.
     async fn for_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: &IssuerRedemptionRequestId,
         shares_to_burn: Shares,
@@ -268,6 +272,7 @@ pub(crate) trait ReceiptService: Send + Sync {
 
     async fn reserve_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
         burns: Vec<BurnRecord>,
@@ -275,12 +280,14 @@ pub(crate) trait ReceiptService: Send + Sync {
 
     async fn release_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError>;
 
     async fn settle_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError>;
@@ -289,6 +296,7 @@ pub(crate) trait ReceiptService: Send + Sync {
     /// for startup reservation recovery.
     async fn reserved_redemptions(
         &self,
+        chain_id: u64,
         vault: Address,
     ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>;
 
@@ -298,6 +306,7 @@ pub(crate) trait ReceiptService: Send + Sync {
     /// Returns None if no receipt exists with this issuer_request_id.
     async fn find_by_issuer_request_id(
         &self,
+        chain_id: u64,
         vault: &Address,
         issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>;
@@ -330,9 +339,11 @@ impl CqrsReceiptService {
 /// so a future reader cannot silently diverge on the `None` case.
 pub(crate) async fn load_inventory(
     store: &Store<ReceiptInventory>,
+    chain_id: u64,
     vault: &Address,
 ) -> Result<ReceiptInventory, SendError<ReceiptInventory>> {
-    Ok(store.load(vault).await?.unwrap_or_default())
+    let key = ReceiptVaultKey::new(chain_id, *vault);
+    Ok(store.load(&key).await?.unwrap_or_default())
 }
 
 const fn receipt_inventory_operation(
@@ -387,12 +398,14 @@ where
 
 pub(crate) async fn send_receipt_inventory_command(
     store: &Store<ReceiptInventory>,
+    chain_id: u64,
     vault: &Address,
     command: ReceiptInventoryCommand,
 ) -> Result<(), SendError<ReceiptInventory>> {
+    let key = ReceiptVaultKey::new(chain_id, *vault);
     let operation = receipt_inventory_operation(&command);
     retry_receipt_inventory_conflicts(*vault, operation, || {
-        store.send(vault, command.clone())
+        store.send(&key, command.clone())
     })
     .await
 }
@@ -469,6 +482,7 @@ impl ReceiptService for CqrsReceiptService {
 
         send_receipt_inventory_command(
             &self.store,
+            params.chain_id,
             &params.vault,
             ReceiptInventoryCommand::DiscoverReceipt {
                 receipt_id: params.receipt_id,
@@ -487,12 +501,13 @@ impl ReceiptService for CqrsReceiptService {
 
     async fn for_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: &IssuerRedemptionRequestId,
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError> {
-        let inventory = load_inventory(&self.store, &vault).await?;
+        let inventory = load_inventory(&self.store, chain_id, &vault).await?;
 
         let receipts = inventory
             .receipts_with_balance_excluding(redemption_issuer_request_id);
@@ -501,12 +516,14 @@ impl ReceiptService for CqrsReceiptService {
 
     async fn reserve_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
         burns: Vec<BurnRecord>,
     ) -> Result<(), ReceiptRegistrationError> {
         send_receipt_inventory_command(
             &self.store,
+            chain_id,
             &vault,
             ReceiptInventoryCommand::ReserveBurn {
                 redemption_issuer_request_id,
@@ -520,11 +537,13 @@ impl ReceiptService for CqrsReceiptService {
 
     async fn release_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
         send_receipt_inventory_command(
             &self.store,
+            chain_id,
             &vault,
             ReceiptInventoryCommand::ReleaseBurn {
                 redemption_issuer_request_id,
@@ -537,11 +556,13 @@ impl ReceiptService for CqrsReceiptService {
 
     async fn settle_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
         send_receipt_inventory_command(
             &self.store,
+            chain_id,
             &vault,
             ReceiptInventoryCommand::SettleBurn {
                 redemption_issuer_request_id,
@@ -554,18 +575,21 @@ impl ReceiptService for CqrsReceiptService {
 
     async fn reserved_redemptions(
         &self,
+        chain_id: u64,
         vault: Address,
     ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError> {
-        let inventory = load_inventory(&self.store, &vault).await?;
+        let inventory = load_inventory(&self.store, chain_id, &vault).await?;
         Ok(inventory.reserved_redemptions())
     }
 
     async fn find_by_issuer_request_id(
         &self,
+        chain_id: u64,
         vault: &Address,
         issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
-        let receipt_inventory = load_inventory(&self.store, vault).await?;
+        let receipt_inventory =
+            load_inventory(&self.store, chain_id, vault).await?;
 
         let Some(receipt_id) =
             receipt_inventory.find_by_issuer_request_id(issuer_request_id)
@@ -1096,7 +1120,7 @@ impl ReceiptInventory {
 
 #[async_trait]
 impl EventSourced for ReceiptInventory {
-    type Id = Address;
+    type Id = ReceiptVaultKey;
     type Event = ReceiptInventoryEvent;
     type Command = ReceiptInventoryCommand;
     type Error = ReceiptInventoryError;
@@ -1208,7 +1232,7 @@ mod tests {
 
     use super::*;
     use crate::prepare_event_sourced_startup;
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
 
     const TEST_OA_SCHEMA: &str =
         "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
@@ -1383,7 +1407,7 @@ mod tests {
 
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: make_receipt_id(99),
                     balance: make_shares(500),
@@ -1397,7 +1421,8 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
@@ -1421,7 +1446,7 @@ mod tests {
         // instead of degrading to an empty inventory).
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::ReserveBurn {
                     redemption_issuer_request_id: "red-00000000"
                         .parse()
@@ -1433,7 +1458,7 @@ mod tests {
             .unwrap();
 
         let inventory = store
-            .load(&vault)
+            .load(&ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault))
             .await
             .expect("load must not fail on a non-Discovered genesis event")
             .expect("a persisted stream must materialize an inventory");
@@ -1456,7 +1481,7 @@ mod tests {
 
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 discover_itn_receipt_cmd(
                     make_receipt_id(42),
                     make_shares(100),
@@ -1468,7 +1493,8 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let found = inventory.find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, Some(make_receipt_id(42)));
     }
@@ -1489,7 +1515,7 @@ mod tests {
 
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
                 discover_itn_receipt_cmd(
                     make_receipt_id(42),
                     make_shares(100),
@@ -1505,6 +1531,7 @@ mod tests {
 
         service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000001".parse().unwrap(),
                 vec![BurnRecord {
@@ -1516,7 +1543,11 @@ mod tests {
             .unwrap();
 
         let recovered = service
-            .find_by_issuer_request_id(&vault, &issuer_request_id)
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &vault,
+                &issuer_request_id,
+            )
             .await
             .unwrap()
             .expect("ITN receipt must be found by issuer_request_id");
@@ -1534,7 +1565,8 @@ mod tests {
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let issuer_request_id = IssuerMintRequestId::random();
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let found = inventory.find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, None);
     }
@@ -1551,7 +1583,7 @@ mod tests {
         // Discover an external receipt (no issuer_request_id)
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 discover_receipt_cmd(
                     make_receipt_id(42),
                     make_shares(100),
@@ -1562,7 +1594,8 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
 
         // External receipts should not be indexed by issuer_request_id
         let random_id = IssuerMintRequestId::random();
@@ -1672,7 +1705,7 @@ mod tests {
         for (i, (id, balance)) in receipts.into_iter().enumerate() {
             store
                 .send(
-                    &vault,
+                    &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                     discover_receipt_cmd(
                         make_receipt_id(id),
                         make_shares(balance),
@@ -1773,6 +1806,7 @@ mod tests {
                 first_barrier.wait().await;
                 send_receipt_inventory_command(
                     &first_store,
+                    ANVIL_CHAIN_ID,
                     &vault,
                     discover_receipt_cmd(
                         first_receipt_id,
@@ -1791,6 +1825,7 @@ mod tests {
                 second_barrier.wait().await;
                 send_receipt_inventory_command(
                     &second_store,
+                    ANVIL_CHAIN_ID,
                     &vault,
                     discover_receipt_cmd(
                         second_receipt_id,
@@ -1813,7 +1848,7 @@ mod tests {
                 .expect("second receipt should persist after retry");
         }
 
-        let inventory = load_inventory(&store, &vault)
+        let inventory = load_inventory(&store, ANVIL_CHAIN_ID, &vault)
             .await
             .expect("inventory should load");
         let expected_receipt_count = usize::try_from(pair_count * 2)
@@ -1914,6 +1949,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 &planning_redemption(),
                 make_shares(150),
@@ -1933,6 +1969,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 &planning_redemption(),
                 make_shares(100),
@@ -1953,6 +1990,7 @@ mod tests {
 
         let result = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 &planning_redemption(),
                 make_shares(100),
@@ -1973,6 +2011,7 @@ mod tests {
 
         let result = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 &planning_redemption(),
                 make_shares(100),
@@ -1993,6 +2032,7 @@ mod tests {
 
         let result = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 &planning_redemption(),
                 make_shares(50),
@@ -2013,6 +2053,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 &planning_redemption(),
                 make_shares(100),
@@ -2033,6 +2074,7 @@ mod tests {
 
         service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000001".parse().unwrap(),
                 vec![BurnRecord {
@@ -2045,6 +2087,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(50),
@@ -2066,6 +2109,7 @@ mod tests {
 
         service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000001".parse().unwrap(),
                 vec![BurnRecord {
@@ -2078,6 +2122,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(90),
@@ -2100,6 +2145,7 @@ mod tests {
 
         let err = service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000001".parse().unwrap(),
                 vec![
@@ -2137,6 +2183,7 @@ mod tests {
 
         service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 redemption_id.clone(),
                 vec![BurnRecord {
@@ -2149,6 +2196,7 @@ mod tests {
 
         let err = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(1),
@@ -2159,10 +2207,14 @@ mod tests {
 
         assert!(matches!(err, BurnTrackingError::InsufficientBalance { .. }));
 
-        service.release_burn(vault, redemption_id).await.unwrap();
+        service
+            .release_burn(ANVIL_CHAIN_ID, vault, redemption_id)
+            .await
+            .unwrap();
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(100),
@@ -2448,17 +2500,27 @@ mod tests {
             "red-00000001".parse().unwrap();
 
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 60)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 60)],
+            )
             .await
             .unwrap();
 
-        service.settle_burn(vault, redemption_id).await.unwrap();
+        service
+            .settle_burn(ANVIL_CHAIN_ID, vault, redemption_id)
+            .await
+            .unwrap();
 
         // The mirror balance itself must drop 100 -> 40 and the reservation
         // must be cleared. Checking internals distinguishes a real settlement
         // from merely leaving the reservation in place (which would leave the
         // same 40 available but a stale 100 mirror).
-        let inventory = load_inventory(&service.store, &vault).await.unwrap();
+        let inventory = load_inventory(&service.store, ANVIL_CHAIN_ID, &vault)
+            .await
+            .unwrap();
         let metadata = inventory
             .receipts
             .get(&make_receipt_id(1))
@@ -2471,6 +2533,7 @@ mod tests {
 
         let err = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(41),
@@ -2489,12 +2552,22 @@ mod tests {
             "red-00000001".parse().unwrap();
 
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 100)],
+            )
             .await
             .unwrap();
-        service.settle_burn(vault, redemption_id).await.unwrap();
+        service
+            .settle_burn(ANVIL_CHAIN_ID, vault, redemption_id)
+            .await
+            .unwrap();
 
-        let inventory = load_inventory(&service.store, &vault).await.unwrap();
+        let inventory = load_inventory(&service.store, ANVIL_CHAIN_ID, &vault)
+            .await
+            .unwrap();
         assert!(
             inventory.receipts_with_balance().is_empty(),
             "a fully settled receipt must be depleted and removed"
@@ -2575,15 +2648,27 @@ mod tests {
             "red-00000001".parse().unwrap();
 
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 100)],
+            )
             .await
             .unwrap();
-        service.release_burn(vault, redemption_id.clone()).await.unwrap();
+        service
+            .release_burn(ANVIL_CHAIN_ID, vault, redemption_id.clone())
+            .await
+            .unwrap();
         // Second release must NOT over-credit the balance.
-        service.release_burn(vault, redemption_id).await.unwrap();
+        service
+            .release_burn(ANVIL_CHAIN_ID, vault, redemption_id)
+            .await
+            .unwrap();
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(100),
@@ -2595,6 +2680,7 @@ mod tests {
 
         let err = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(101),
@@ -2611,12 +2697,17 @@ mod tests {
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         service
-            .release_burn(vault, "red-00000001".parse().unwrap())
+            .release_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                "red-00000001".parse().unwrap(),
+            )
             .await
             .expect("releasing with no reservation must be a no-op");
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(100),
@@ -2634,6 +2725,7 @@ mod tests {
 
         service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000001".parse().unwrap(),
                 vec![burn(1, 60)],
@@ -2643,6 +2735,7 @@ mod tests {
 
         let err = service
             .reserve_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 "red-00000002".parse().unwrap(),
                 vec![burn(1, 60)],
@@ -2665,17 +2758,28 @@ mod tests {
             "red-00000001".parse().unwrap();
 
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 60)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 60)],
+            )
             .await
             .unwrap();
         // Re-delivery of the same reservation must not double-count itself.
         service
-            .reserve_burn(vault, redemption_id, vec![burn(1, 60)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id,
+                vec![burn(1, 60)],
+            )
             .await
             .expect("re-reserving the same redemption must succeed");
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(40),
@@ -2699,17 +2803,32 @@ mod tests {
 
         // First attempt reserves receipt 1; the retry reserves receipt 2.
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 100)],
+            )
             .await
             .unwrap();
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(2, 100)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(2, 100)],
+            )
             .await
             .unwrap();
 
-        service.settle_burn(vault, redemption_id).await.unwrap();
+        service
+            .settle_burn(ANVIL_CHAIN_ID, vault, redemption_id)
+            .await
+            .unwrap();
 
-        let inventory = load_inventory(&service.store, &vault).await.unwrap();
+        let inventory = load_inventory(&service.store, ANVIL_CHAIN_ID, &vault)
+            .await
+            .unwrap();
 
         // Receipt 1's stale reservation was cleared by the retry, so settle
         // left it untouched; only receipt 2 was consumed (and depleted).
@@ -2735,13 +2854,19 @@ mod tests {
             "red-00000001".parse().unwrap();
 
         service
-            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                redemption_id.clone(),
+                vec![burn(1, 100)],
+            )
             .await
             .unwrap();
 
         // Another redemption sees receipt 1 fully reserved.
         let other = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &"red-00000002".parse().unwrap(),
                 make_shares(100),
@@ -2755,7 +2880,13 @@ mod tests {
 
         // The same redemption re-planning excludes its own reservation.
         let plan = service
-            .for_burn(vault, &redemption_id, make_shares(100), make_shares(0))
+            .for_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                &redemption_id,
+                make_shares(100),
+                make_shares(0),
+            )
             .await
             .unwrap();
         assert_eq!(plan.allocations[0].burn_amount, make_shares(100));
@@ -3106,6 +3237,7 @@ mod tests {
 
         service
             .register_minted_receipt(MintedReceiptParams {
+                chain_id: ANVIL_CHAIN_ID,
                 vault,
                 receipt_id: make_receipt_id(1),
                 shares: make_shares(100),
@@ -3119,6 +3251,7 @@ mod tests {
 
         let plan = service
             .for_burn(
+                ANVIL_CHAIN_ID,
                 vault,
                 &planning_redemption(),
                 make_shares(50),
@@ -3145,6 +3278,7 @@ mod tests {
 
         service
             .register_minted_receipt(MintedReceiptParams {
+                chain_id: ANVIL_CHAIN_ID,
                 vault,
                 receipt_id: make_receipt_id(42),
                 shares: make_shares(200),
@@ -3157,7 +3291,11 @@ mod tests {
             .expect("Registration should succeed");
 
         let found = service
-            .find_by_issuer_request_id(&vault, &issuer_request_id)
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &vault,
+                &issuer_request_id,
+            )
             .await
             .expect("Lookup should succeed");
 
@@ -3185,6 +3323,7 @@ mod tests {
 
             service
                 .register_minted_receipt(MintedReceiptParams {
+                    chain_id: ANVIL_CHAIN_ID,
                     vault,
                     receipt_id: make_receipt_id(7),
                     shares: make_shares(500),
@@ -3197,7 +3336,8 @@ mod tests {
                 .expect("Registration should succeed (idempotent)");
         }
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
 
         assert_eq!(
@@ -3221,6 +3361,7 @@ mod tests {
 
         service
             .register_minted_receipt(MintedReceiptParams {
+                chain_id: ANVIL_CHAIN_ID,
                 vault,
                 receipt_id: make_receipt_id(42),
                 shares: make_shares(100),
@@ -3232,7 +3373,8 @@ mod tests {
             .await
             .expect("Registration should succeed");
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
@@ -3344,5 +3486,199 @@ mod tests {
             stale_snapshot_count, 0,
             "Startup must clear incompatible ReceiptInventory snapshots"
         );
+    }
+
+    /// Executes the real migration file (via `include_str!`) so the test
+    /// cannot drift from what production runs. Running the sequence twice
+    /// proves both the rekey and its idempotency: legacy EIP-55 vault ids
+    /// gain the `8453:` prefix and lowercase casing exactly once, and
+    /// already-rekeyed ids are untouched.
+    #[tokio::test]
+    async fn rekey_migration_rekeys_legacy_receipt_ids_and_is_idempotent() {
+        const REKEY_MIGRATION: &str = include_str!(
+            "../../migrations/20260710155219_rekey_receipt_inventory_aggregate_id.sql"
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let legacy_vault =
+            address!("0xabcdef1234567890abcdef1234567890abcdef12");
+        let legacy_id = legacy_vault.to_string();
+        // The fixture must be genuinely mixed-case EIP-55: with an
+        // all-same-character address, lowercase and EIP-55 coincide and the
+        // case normalization would go untested.
+        assert_ne!(legacy_id, format!("{legacy_vault:#x}"));
+
+        let rekeyed_vault =
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let rekeyed_id = format!("8453:{rekeyed_vault:#x}");
+
+        for aggregate_id in [legacy_id.as_str(), rekeyed_id.as_str()] {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES (
+                    'ReceiptInventory',
+                    ?,
+                    1,
+                    'ReceiptInventoryEvent::Discovered',
+                    '1.0',
+                    '{}',
+                    '{}'
+                )
+                ",
+            )
+            .bind(aggregate_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'ReceiptInventory',
+                ?,
+                1,
+                0,
+                '{}',
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(legacy_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for pass in 1..=2 {
+            sqlx::raw_sql(REKEY_MIGRATION).execute(&pool).await.unwrap();
+
+            let mut event_ids: Vec<String> = sqlx::query_scalar(
+                "
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'ReceiptInventory'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            event_ids.sort();
+
+            let mut expected =
+                vec![format!("8453:{legacy_vault:#x}"), rekeyed_id.clone()];
+            expected.sort();
+            assert_eq!(
+                event_ids, expected,
+                "pass {pass}: legacy id must be rekeyed to \
+                 8453:{{vault_lowercase}} and rekeyed ids left untouched"
+            );
+
+            let snapshot_ids: Vec<String> = sqlx::query_scalar(
+                "
+                SELECT aggregate_id
+                FROM snapshots
+                WHERE aggregate_type = 'ReceiptInventory'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot_ids,
+                vec![format!("8453:{legacy_vault:#x}")],
+                "pass {pass}: snapshot id must follow the rekey"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rekey_migration_aborts_on_unexpected_receipt_ids() {
+        const REKEY_MIGRATION: &str = include_str!(
+            "../../migrations/20260710155219_rekey_receipt_inventory_aggregate_id.sql"
+        );
+
+        for unexpected_id in
+            ["", "not-an-address", "0xabc:0xdef", ":0xabc", "8453:"]
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .unwrap();
+
+            sqlx::migrate!().run(&pool).await.unwrap();
+
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES (
+                    'ReceiptInventory',
+                    ?,
+                    1,
+                    'ReceiptInventoryEvent::Discovered',
+                    '1.0',
+                    '{}',
+                    '{}'
+                )
+                ",
+            )
+            .bind(unexpected_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let result = sqlx::raw_sql(REKEY_MIGRATION).execute(&pool).await;
+            assert!(
+                result.is_err(),
+                "migration must abort on unexpected id {unexpected_id:?}"
+            );
+
+            let untouched: String = sqlx::query_scalar(
+                "
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'ReceiptInventory'
+                ",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                untouched, unexpected_id,
+                "aborted migration must leave the row untouched"
+            );
+        }
     }
 }

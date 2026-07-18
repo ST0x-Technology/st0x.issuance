@@ -1885,7 +1885,8 @@ mod tests {
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
+        ReceiptInventoryCommand, ReceiptService, ReceiptSource,
+        ReceiptVaultKey, Shares,
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
@@ -2018,7 +2019,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.receipt_inventory_store
                 .send(
-                    &self.vault,
+                    &ReceiptVaultKey::new(
+                        crate::test_utils::ANVIL_CHAIN_ID,
+                        self.vault,
+                    ),
                     ReceiptInventoryCommand::ReleaseBurn {
                         redemption_issuer_request_id: issuer_request_id.clone(),
                     },
@@ -2793,6 +2797,7 @@ mod tests {
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            chains: Vec::new(),
         };
 
         let pool = setup_pool().await;
@@ -2979,7 +2984,7 @@ mod tests {
 
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(U256::from(99)),
                     balance: Shares::from(U256::from(100)),
@@ -2997,7 +3002,7 @@ mod tests {
 
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::ReserveBurn {
                     redemption_issuer_request_id: issuer_request_id.clone(),
                     burns: vec![BurnRecord {
@@ -3010,7 +3015,10 @@ mod tests {
             .expect("receipt reservation should succeed");
 
         let inventory = store
-            .load(&vault)
+            .load(&ReceiptVaultKey::new(
+                crate::test_utils::ANVIL_CHAIN_ID,
+                vault,
+            ))
             .await
             .expect("receipt inventory should load")
             .expect("receipt inventory should exist");
@@ -3087,6 +3095,7 @@ mod tests {
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            chains: Vec::new(),
         };
 
         rocket::build()
@@ -3365,8 +3374,14 @@ mod tests {
             let planned_burn = planned_burns.first().unwrap();
             assert_eq!(planned_burn.receipt_id, U256::from(99));
             assert_eq!(planned_burn.shares_burned, U256::from(100));
-            let receipt_inventory =
-                receipt_inventory_store.load(&vault).await.unwrap().unwrap();
+            let receipt_inventory = receipt_inventory_store
+                .load(&ReceiptVaultKey::new(
+                    crate::test_utils::ANVIL_CHAIN_ID,
+                    vault,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 receipt_inventory.reserved_redemptions(),
                 vec![metadata.issuer_request_id.clone()],
@@ -3581,8 +3596,14 @@ mod tests {
                 1,
             ))
         );
-        let receipt_inventory =
-            receipt_inventory_store.load(&vault).await.unwrap().unwrap();
+        let receipt_inventory = receipt_inventory_store
+            .load(&ReceiptVaultKey::new(
+                crate::test_utils::ANVIL_CHAIN_ID,
+                vault,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(receipt_inventory.reserved_redemptions().is_empty());
         let resumed_events: i64 = sqlx::query_scalar(
             "
@@ -3936,6 +3957,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            chains: Vec::new(),
         }
     }
 
@@ -4036,7 +4058,7 @@ mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         receipt_store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(U256::from(42)),
                     balance: Shares::new(U256::from(17)),
@@ -4052,6 +4074,7 @@ mod tests {
         let receipt_service = CqrsReceiptService::new(receipt_store);
         receipt_service
             .reserve_burn(
+                crate::test_utils::ANVIL_CHAIN_ID,
                 vault,
                 metadata.issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -4084,7 +4107,10 @@ mod tests {
             Some(Redemption::Closed { .. })
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![metadata.issuer_request_id.clone()],
             "acknowledged close must retain the unresolved reservation"
         );
@@ -4143,7 +4169,7 @@ mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         receipt_store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(U256::from(42)),
                     balance: Shares::new(U256::from(17)),
@@ -4159,6 +4185,7 @@ mod tests {
         let receipt_service = Arc::new(CqrsReceiptService::new(receipt_store));
         receipt_service
             .reserve_burn(
+                crate::test_utils::ANVIL_CHAIN_ID,
                 vault,
                 issuer_request_id.clone(),
                 vec![BurnRecord {
@@ -4175,6 +4202,7 @@ mod tests {
                 store,
                 receipt_service.clone(),
                 owner,
+                crate::test_utils::ANVIL_CHAIN_ID,
             ));
 
         (burn_recovery, receipt_service)
@@ -4341,7 +4369,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty()
@@ -4414,7 +4442,7 @@ mod tests {
         ));
         assert!(
             receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .is_empty()
@@ -4498,7 +4526,10 @@ mod tests {
             Some(Redemption::BurnIntended { .. })
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![metadata.issuer_request_id]
         );
         let proving_hash = format!("{proving_burn_tx_hash:?}");
@@ -4574,7 +4605,10 @@ mod tests {
             Some(Redemption::BurnIntended { .. })
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![metadata.issuer_request_id]
         );
         assert!(logs_contain_at!(
@@ -4646,7 +4680,10 @@ mod tests {
             Some(Redemption::BurnIntended { .. })
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![metadata.issuer_request_id]
         );
         let persisted_hash = format!("{:?}", persisted_tx.hash);
@@ -4717,7 +4754,10 @@ mod tests {
             Some(Redemption::BurnIntended { .. })
         ));
         assert_eq!(
-            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            receipt_service
+                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
             vec![metadata.issuer_request_id]
         );
         let persisted_hash = format!("{:?}", persisted_tx.hash);
