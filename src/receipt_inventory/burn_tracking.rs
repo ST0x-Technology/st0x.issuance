@@ -367,7 +367,7 @@ mod tests {
         BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionEvent,
         TokensBurnedData,
     };
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::TxId;
 
     async fn setup_test_db() -> Pool<Sqlite> {
@@ -518,6 +518,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
                 wallet: address!("0x1111111111111111111111111111111111111111"),
                 quantity: Quantity::new(dec!(10)),
                 tx_hash: b256!(

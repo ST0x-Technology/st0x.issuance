@@ -2,6 +2,7 @@ use alloy::primitives::{Address, B256, U256};
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -27,10 +28,9 @@ use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MultiBurnEntry, SendableTxWithHash, TxId,
-    VaultError, VaultService, VerifiedBurn, VerifiedShareTransfer,
+    VaultError, VaultService,
 };
 
-const WALLET_INTENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, Copy)]
@@ -38,40 +38,6 @@ struct BurnRecoveryBudget {
     attempts: u32,
     exhausted: bool,
     last_transaction: Option<(B256, u64)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingBurnRecovery {
-    Reserved(BurnRecoveryAction),
-    ReplacementPrepared,
-}
-
-fn recovery_burn_entries(planned_burns: &[BurnRecord]) -> Vec<MultiBurnEntry> {
-    planned_burns
-        .iter()
-        .map(|burn| MultiBurnEntry {
-            receipt_id: burn.receipt_id,
-            burn_shares: burn.shares_burned,
-            receipt_info: None,
-            receipt_info_bytes: None,
-        })
-        .collect()
-}
-
-const fn recovery_action_for_status(
-    status: BurnTxStatus,
-) -> Option<BurnRecoveryAction> {
-    match status {
-        BurnTxStatus::StillMineable => Some(BurnRecoveryAction::Rebroadcast),
-        BurnTxStatus::ProvablyDead => Some(BurnRecoveryAction::Replace),
-        BurnTxStatus::Mined | BurnTxStatus::Reverted => None,
-    }
-}
-
-fn terminal_classification_error() -> BurnManagerError {
-    BurnManagerError::InvalidAggregateState {
-        current_state: "terminal burn classification".to_string(),
-    }
 }
 
 /// Outcome of recovering a single redemption stuck in a burning state.
@@ -103,14 +69,15 @@ pub(crate) enum RecoveryOutcome {
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
 #[derive(Clone)]
 pub(crate) struct BurnManager {
-    /// Used only for balance queries during recovery (not for burns - those go through aggregate)
-    vault_service: Arc<dyn VaultService>,
+    /// Per-network vault services for balance queries and Fireblocks recovery.
+    vault_services: HashMap<Network, Arc<dyn VaultService>>,
+    /// Per-network EVM chain ids for receipt inventory aggregate keys.
+    chain_ids: HashMap<Network, u64>,
     view_pool: Pool<Sqlite>,
     store: Arc<Store<Redemption>>,
     receipt_service: Arc<dyn ReceiptService>,
     bot_wallet: Address,
     automatic_recovery_lock: Arc<Mutex<()>>,
-    receipt_chain_id: u64,
 }
 
 impl BurnManager {
@@ -118,14 +85,84 @@ impl BurnManager {
     ///
     /// # Arguments
     ///
-    /// * `vault_service` - Vault service for balance queries during recovery
+    /// * `vault_services` - Per-network vault services for recovery paths
     /// * `view_pool` - Database pool for querying views
     /// * `store` - Event-sorcery store for dispatching commands and loading
     ///   aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
-    /// * `receipt_chain_id` - Chain id for receipt inventory aggregate keys
+    /// * `chain_ids` - Per-network EVM chain ids for receipt inventory keys
     pub(crate) fn new(
+        vault_services: HashMap<Network, Arc<dyn VaultService>>,
+        chain_ids: HashMap<Network, u64>,
+        view_pool: Pool<Sqlite>,
+        store: Arc<Store<Redemption>>,
+        receipt_service: Arc<dyn ReceiptService>,
+        bot_wallet: Address,
+    ) -> Self {
+        Self {
+            vault_services,
+            chain_ids,
+            view_pool,
+            store,
+            receipt_service,
+            bot_wallet,
+            automatic_recovery_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn vault_for(
+        &self,
+        network: Network,
+    ) -> Result<&Arc<dyn VaultService>, RedemptionError> {
+        self.vault_services
+            .get(&network)
+            .ok_or(RedemptionError::NetworkNotConfigured { network })
+    }
+
+    fn chain_id_for(&self, network: Network) -> Result<u64, RedemptionError> {
+        self.chain_ids
+            .get(&network)
+            .copied()
+            .ok_or(RedemptionError::NetworkNotConfigured { network })
+    }
+
+    /// Terminalizes a redemption whose network has no configured vault
+    /// service by recording a burn failure. Returns `Ok` once the failure is
+    /// persisted — the redemption is handled (as `BurnFailed`), not stuck, so
+    /// callers report the recovery as executed rather than failed.
+    async fn record_burn_failure_for_unconfigured_network(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
+        tx_id: Option<TxId>,
+        planned_burns: Vec<super::BurnRecord>,
+    ) -> Result<(), BurnManagerError> {
+        let error =
+            format!("No vault service configured for network {network}");
+
+        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+            %network,
+            "{error}"
+        );
+
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error,
+                    tx_id,
+                    planned_burns,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
         vault_service: Arc<dyn VaultService>,
         view_pool: Pool<Sqlite>,
         store: Arc<Store<Redemption>>,
@@ -134,13 +171,13 @@ impl BurnManager {
         receipt_chain_id: u64,
     ) -> Self {
         Self {
-            vault_service,
+            vault_services: HashMap::from([(Network::Base, vault_service)]),
+            chain_ids: HashMap::from([(Network::Base, receipt_chain_id)]),
             view_pool,
             store,
             receipt_service,
             bot_wallet,
             automatic_recovery_lock: Arc::new(Mutex::new(())),
-            receipt_chain_id,
         }
     }
 
@@ -268,10 +305,11 @@ impl BurnManager {
                 acknowledged_unresolved_burn_tx_hash,
             )?;
 
-        let (underlying, recipient, planned_burns) = match &redemption {
-            Redemption::BurnIntended { metadata, planned_burns, .. }
-            | Redemption::BurnSubmitted { metadata, planned_burns, .. } => {
-                (metadata.underlying.clone(), metadata.wallet, planned_burns)
+        let (underlying, network) = match &redemption {
+            Redemption::Burning { metadata, .. }
+            | Redemption::BurnIntended { metadata, .. }
+            | Redemption::BurnSubmitted { metadata, .. } => {
+                (metadata.underlying.clone(), metadata.network)
             }
             other => {
                 return Err(BurnManagerError::InvalidAggregateState {
@@ -280,46 +318,15 @@ impl BurnManager {
             }
         };
 
-        // Burn routing is still Base-only in this PR; network-aware detect →
-        // Alpaca → burn lands in the upstack redemption PR (#215).
-        let vault = find_vault(&self.view_pool, &underlying, &Network::Base)
-            .await?
-            .ok_or(BurnManagerError::AssetNotFound { underlying })?;
+        let vault =
+            find_vault(&self.view_pool, &underlying, &network).await?.ok_or(
+                BurnManagerError::AssetNotFound { underlying, network },
+            )?;
 
-        // Verify the burn actually landed on-chain before recording a terminal
-        // success — never trust the operator-supplied hash blindly.
         let verification = self
-            .vault_service
+            .vault_for(network)?
             .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
             .await?;
-        if burn_tx_hash != persisted_burn_tx.hash
-            && !burn_verification_matches_plan(
-                &verification,
-                planned_burns,
-                self.bot_wallet,
-                recipient,
-                persisted_burn_tx.dust_shares,
-                persisted_burn_tx.nonce,
-            )
-        {
-            let expected_shares_burned = planned_burns
-                .iter()
-                .try_fold(U256::ZERO, |total, burn| {
-                    total.checked_add(burn.shares_burned)
-                })
-                .ok_or(BurnManagerError::SharesOverflow)?;
-            return Err(BurnManagerError::AlternateBurnSemanticsMismatch {
-                expected_burns: planned_burns.clone(),
-                expected_shares_burned,
-                expected_recipient: recipient,
-                expected_dust_shares: persisted_burn_tx.dust_shares,
-                expected_nonce: persisted_burn_tx.nonce,
-                verified_burns: verification.burns.clone(),
-                verified_shares_burned: verification.shares_burned,
-                verified_nonce: verification.nonce,
-                verified_share_transfers: verification.share_transfers.clone(),
-            });
-        }
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_tx_hash = ?burn_tx_hash,
@@ -343,7 +350,8 @@ impl BurnManager {
             )
             .await?;
 
-        self.settle_reserved_burn(vault, issuer_request_id).await?;
+        let chain_id = self.chain_id_for(network)?;
+        self.settle_reserved_burn(chain_id, vault, issuer_request_id).await;
 
         Ok(verification)
     }
@@ -362,18 +370,23 @@ impl BurnManager {
     /// burn recovery. Runs at startup after redemption recovery so in-flight
     /// `BurnSubmitted` reservations have already been confirmed-and-settled (or
     /// left for the ambiguous case) by then.
-    pub(crate) async fn recover_stuck_reservations(&self, vaults: &[Address]) {
-        let mut stuck: Vec<(Address, IssuerRedemptionRequestId)> = Vec::new();
+    pub(crate) async fn recover_stuck_reservations(
+        &self,
+        vaults: &[(u64, Address)],
+    ) {
+        let mut stuck: Vec<(u64, Address, IssuerRedemptionRequestId)> =
+            Vec::new();
 
-        for vault in vaults {
+        for &(chain_id, vault) in vaults {
             match self
                 .receipt_service
-                .reserved_redemptions(self.receipt_chain_id, *vault)
+                .reserved_redemptions(chain_id, vault)
                 .await
             {
                 Ok(redemptions) => {
-                    stuck
-                        .extend(redemptions.into_iter().map(|id| (*vault, id)));
+                    stuck.extend(
+                        redemptions.into_iter().map(|id| (chain_id, vault, id)),
+                    );
                 }
                 Err(error) => {
                     warn!(target: "redemption", %vault, %error,
@@ -392,11 +405,12 @@ impl BurnManager {
             "Recovering reservations against redemption terminal state"
         );
 
-        for (vault, issuer_request_id) in stuck {
-            if let Err(err) =
-                self.resolve_stuck_reservation(vault, &issuer_request_id).await
+        for (chain_id, vault, issuer_request_id) in stuck {
+            if let Err(err) = self
+                .resolve_stuck_reservation(chain_id, vault, &issuer_request_id)
+                .await
             {
-                warn!(target: "redemption", vault = %vault,
+                warn!(target: "redemption", chain_id, vault = %vault,
                     issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to resolve stuck reservation"
@@ -407,6 +421,7 @@ impl BurnManager {
 
     async fn resolve_stuck_reservation(
         &self,
+        chain_id: u64,
         vault: Address,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
@@ -429,7 +444,8 @@ impl BurnManager {
                 debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "Settling reservation for completed redemption"
                 );
-                self.settle_reserved_burn(vault, issuer_request_id).await?;
+                self.settle_reserved_burn(chain_id, vault, issuer_request_id)
+                    .await;
             }
             // All other states are LEFT in place. A definitive failure already
             // released its reservation in the live/recovery paths (gated on
@@ -455,8 +471,20 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         view: &RedemptionView,
     ) -> Result<(), BurnManagerError> {
+        let replacement_already_reserved =
+            self.failed_replacement_already_reserved(issuer_request_id).await?;
+        if !replacement_already_reserved
+            && !self.recovery_budget_available(issuer_request_id, None).await?
+        {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Skipping BurnFailed redemption with exhausted automatic recovery budget"
+            );
+            return Ok(());
+        }
+
         let RedemptionView::BurnFailed {
             underlying,
+            network,
             token,
             wallet,
             quantity,
@@ -478,31 +506,14 @@ impl BurnManager {
             return Ok(());
         };
 
-        let replacement_already_reserved =
-            self.failed_replacement_already_reserved(issuer_request_id).await?;
-        let preparation_already_reserved =
-            self.failed_preparation_already_reserved(issuer_request_id).await?;
-        let recovery_allowed = if replacement_already_reserved
-            || preparation_already_reserved
-        {
-            true
-        } else if tx_id.is_none() {
-            self.reserve_preparation_recovery_attempt(issuer_request_id).await?
-        } else {
-            self.recovery_budget_available(issuer_request_id, None).await?
-        };
-        if !recovery_allowed {
-            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                "Skipping BurnFailed redemption with exhausted automatic recovery budget"
-            );
-            return Ok(());
-        }
-
-        let vault = find_vault(&self.view_pool, underlying, &Network::Base)
+        let vault = find_vault(&self.view_pool, underlying, network)
             .await?
             .ok_or_else(|| BurnManagerError::AssetNotFound {
                 underlying: underlying.clone(),
+                network: *network,
             })?;
+
+        let vault_service = self.vault_for(*network)?;
 
         // If a tx was already submitted before failure, inspect it
         // before deciding whether to confirm, wait, or submit a replacement.
@@ -510,6 +521,7 @@ impl BurnManager {
             return self
                 .recover_burn_failed_with_existing_tx(
                     issuer_request_id,
+                    network,
                     vault,
                     fb_tx_id,
                     dust_quantity,
@@ -531,10 +543,8 @@ impl BurnManager {
         // shares, the burn likely already succeeded on-chain but we crashed before
         // recording it (e.g., RPC timeout via VaultError::PendingTransaction).
         // Skip this redemption to avoid double-burning. Manual intervention required.
-        let on_chain_balance = self
-            .vault_service
-            .get_share_balance(vault, self.bot_wallet)
-            .await?;
+        let on_chain_balance =
+            vault_service.get_share_balance(vault, self.bot_wallet).await?;
 
         if on_chain_balance < total_shares {
             let reason = format!(
@@ -575,6 +585,7 @@ impl BurnManager {
             issuer_request_id: issuer_request_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: *network,
             wallet: *wallet,
             quantity: quantity.clone(),
             detected_tx_hash: *tx_hash,
@@ -649,32 +660,12 @@ impl BurnManager {
         ))
     }
 
-    async fn failed_preparation_already_reserved(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Result<bool, BurnManagerError> {
-        let latest_event = sqlx::query_scalar::<_, String>(
-            "
-            SELECT event_type
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-            ORDER BY sequence DESC
-            LIMIT 1
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_optional(&self.view_pool)
-        .await?;
-
-        Ok(latest_event.as_deref()
-            == Some("RedemptionEvent::BurnPreparationRecoveryAttempted"))
-    }
-
     /// Recovers a BurnFailed redemption that has a previously submitted
     /// transaction. Tries to confirm the existing transaction rather than resubmitting.
     async fn recover_burn_failed_with_existing_tx(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        network: &Network,
         vault: Address,
         tx_id: &TxId,
         dust_quantity: &crate::Quantity,
@@ -686,7 +677,7 @@ impl BurnManager {
             "BurnFailed recovery — confirming previously submitted transaction"
         );
 
-        match self.vault_service.confirm_burn(tx_id, dust_shares).await {
+        match self.vault_for(*network)?.confirm_burn(tx_id, dust_shares).await {
             Ok(result) => {
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     tx_hash = %result.tx_hash,
@@ -720,7 +711,9 @@ impl BurnManager {
                     )
                     .await?;
 
-                self.settle_reserved_burn(vault, issuer_request_id).await?;
+                let chain_id = self.chain_id_for(*network)?;
+                self.settle_reserved_burn(chain_id, vault, issuer_request_id)
+                    .await;
 
                 Ok(())
             }
@@ -728,8 +721,13 @@ impl BurnManager {
                 if should_release_reserved_burn(&err) {
                     // Confirmed on-chain revert: the tx consumed no receipts,
                     // so it is safe to release the reservation and terminalize.
-                    self.release_reserved_burn(vault, issuer_request_id)
-                        .await?;
+                    let chain_id = self.chain_id_for(*network)?;
+                    self.release_reserved_burn(
+                        chain_id,
+                        vault,
+                        issuer_request_id,
+                    )
+                    .await;
 
                     let reason = format!(
                         "Burn transaction confirmation failed for tx {tx_id}: {err}"
@@ -773,12 +771,16 @@ impl BurnManager {
         planned_burns: &[BurnRecord],
         has_submitted: bool,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        let vault =
-            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
-                .await?
-                .ok_or_else(|| BurnManagerError::AssetNotFound {
-                    underlying: metadata.underlying.clone(),
-                })?;
+        let vault = find_vault(
+            &self.view_pool,
+            &metadata.underlying,
+            &metadata.network,
+        )
+        .await?
+        .ok_or_else(|| BurnManagerError::AssetNotFound {
+            underlying: metadata.underlying.clone(),
+            network: metadata.network,
+        })?;
 
         if has_submitted {
             info!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -810,7 +812,9 @@ impl BurnManager {
                     "Burn confirmed successfully during recovery"
                 );
 
-                self.settle_reserved_burn(vault, issuer_request_id).await?;
+                let chain_id = self.chain_id_for(metadata.network)?;
+                self.settle_reserved_burn(chain_id, vault, issuer_request_id)
+                    .await;
 
                 Ok(RecoveryOutcome::ExistingBurnRecorded)
             }
@@ -834,15 +838,22 @@ impl BurnManager {
                 }
 
                 if release_reservation {
-                    // Release before reserving a replacement attempt or
-                    // terminalizing the redemption. A failed release cannot
-                    // consume the finite recovery budget, and a crash after
-                    // the idempotent release leaves the aggregate recoverable.
-                    self.release_reserved_burn(vault, issuer_request_id)
-                        .await?;
                     let exact_recovery = self
                         .reserve_replacement_after_revert(issuer_request_id)
                         .await?;
+                    // Release before terminalizing the redemption. A crash
+                    // after this idempotent release leaves the aggregate in
+                    // its recoverable state, so the same transaction is
+                    // checked again. Recording failure first could strand a
+                    // reservation because burning-state recovery would no
+                    // longer revisit the aggregate.
+                    let chain_id = self.chain_id_for(metadata.network)?;
+                    self.release_reserved_burn(
+                        chain_id,
+                        vault,
+                        issuer_request_id,
+                    )
+                    .await;
                     self.store
                         .send(
                             issuer_request_id,
@@ -870,6 +881,17 @@ impl BurnManager {
                     tx_id: None,
                 }))
             }
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                RedemptionError::NetworkNotConfigured { network },
+            ))) => self
+                .record_burn_failure_for_unconfigured_network(
+                    issuer_request_id,
+                    network,
+                    Some(tx_id.clone()),
+                    planned_burns.to_vec(),
+                )
+                .await
+                .map(|()| RecoveryOutcome::Executed),
             Err(err) => Err(err.into()),
         }
     }
@@ -883,48 +905,25 @@ impl BurnManager {
         external_tx_id: Option<BurnExternalTxId>,
         has_submitted: bool,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        let wallet_guard = self.vault_service.lock_wallet().await;
-        let current = self.store.load(issuer_request_id).await?;
-        let persisted_burn_matches = match &current {
-            Some(Redemption::BurnIntended {
-                sendable_tx: current_tx, ..
-            }) => !has_submitted && current_tx == sendable_tx,
-            Some(Redemption::BurnSubmitted {
-                sendable_tx: current_tx, ..
-            }) => has_submitted && current_tx == sendable_tx,
-            _ => false,
-        };
-        if !persisted_burn_matches {
-            debug!(target: "redemption",
-                issuer_request_id = %issuer_request_id,
-                expected_tx_hash = %sendable_tx.hash,
-                current_state = current
-                    .as_ref()
-                    .map_or("Missing", aggregate_state_name),
-                "Skipping stale persisted burn recovery"
-            );
-            drop(wallet_guard);
-            return Ok(RecoveryOutcome::AlreadyAdvanced);
-        }
-
-        let pending_recovery = self
-            .pending_recovery_action(issuer_request_id, sendable_tx)
-            .await?;
-        if let Some(outcome) = self
-            .exhausted_recovery_outcome(issuer_request_id, sendable_tx)
+        let vault_service = self.vault_for(metadata.network)?;
+        let wallet_guard = vault_service.lock_wallet().await;
+        if !self
+            .recovery_budget_available(issuer_request_id, Some(sendable_tx))
             .await?
         {
-            drop(wallet_guard);
-            return Ok(outcome);
+            debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                "Skipping burn with exhausted automatic recovery budget"
+            );
+            return Ok(RecoveryOutcome::SkippedManualIntervention);
         }
 
-        let status = self
-            .vault_service
+        let status = vault_service
             .classify_burn_tx(self.bot_wallet, sendable_tx)
             .await?;
         let tx_id = sendable_tx.hash.into();
         if matches!(status, BurnTxStatus::Mined | BurnTxStatus::Reverted) {
-            drop(wallet_guard);
             return self
                 .recover_single_burning_shared_inner(
                     issuer_request_id,
@@ -936,44 +935,26 @@ impl BurnManager {
                 )
                 .await;
         }
-        if pending_recovery == Some(PendingBurnRecovery::ReplacementPrepared)
-            && status == BurnTxStatus::StillMineable
-        {
-            self.submit_prepared_replacement(
-                issuer_request_id,
-                metadata,
-                planned_burns,
-                sendable_tx,
-                external_tx_id,
-            )
-            .await?;
-            drop(wallet_guard);
-            info!(target: "redemption",
-                issuer_request_id = %issuer_request_id,
-                tx_hash = %sendable_tx.hash,
-                "Submitted persisted replacement from reserved recovery action"
-            );
-            return Ok(RecoveryOutcome::Executed);
-        }
 
-        let action = recovery_action_for_status(status)
-            .ok_or_else(terminal_classification_error)?;
-        let action_already_reserved =
-            pending_recovery == Some(PendingBurnRecovery::Reserved(action));
-        let vault =
-            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
-                .await?
-                .ok_or_else(|| BurnManagerError::AssetNotFound {
-                    underlying: metadata.underlying.clone(),
-                })?;
-        if !action_already_reserved
-            && !self
-                .recovery_budget_available(issuer_request_id, Some(sendable_tx))
-                .await?
-        {
-            drop(wallet_guard);
-            return Ok(RecoveryOutcome::SkippedManualIntervention);
-        }
+        let action = match status {
+            BurnTxStatus::StillMineable => BurnRecoveryAction::Rebroadcast,
+            BurnTxStatus::ProvablyDead => BurnRecoveryAction::Replace,
+            BurnTxStatus::Mined | BurnTxStatus::Reverted => {
+                return Err(BurnManagerError::InvalidAggregateState {
+                    current_state: "terminal burn classification".to_string(),
+                });
+            }
+        };
+        let vault = find_vault(
+            &self.view_pool,
+            &metadata.underlying,
+            &metadata.network,
+        )
+        .await?
+        .ok_or_else(|| BurnManagerError::AssetNotFound {
+            underlying: metadata.underlying.clone(),
+            network: metadata.network,
+        })?;
         if status == BurnTxStatus::ProvablyDead {
             let unresolved_mint =
                 has_unresolved_mint_intent(&self.view_pool, None).await?;
@@ -992,28 +973,23 @@ impl BurnManager {
                 return Ok(RecoveryOutcome::SkippedManualIntervention);
             }
         }
-        if !action_already_reserved
-            && !self
-                .reserve_recovery_attempt(
-                    issuer_request_id,
-                    sendable_tx,
-                    action,
-                )
-                .await?
+        if !self
+            .reserve_recovery_attempt(issuer_request_id, sendable_tx, action)
+            .await?
         {
             drop(wallet_guard);
             return Ok(RecoveryOutcome::SkippedManualIntervention);
         }
-        if action_already_reserved {
-            info!(target: "redemption",
-                issuer_request_id = %issuer_request_id,
-                tx_hash = %sendable_tx.hash,
-                action = ?action,
-                "Resuming reserved burn recovery action"
-            );
-        }
 
-        let burns = recovery_burn_entries(planned_burns);
+        let burns = planned_burns
+            .iter()
+            .map(|burn| MultiBurnEntry {
+                receipt_id: burn.receipt_id,
+                burn_shares: burn.shares_burned,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            })
+            .collect::<Vec<_>>();
         let command = match status {
             BurnTxStatus::StillMineable => RedemptionCommand::BurnTokens {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1033,24 +1009,42 @@ impl BurnManager {
                 });
             }
         };
-        let command_result = self.store.send(issuer_request_id, command).await;
-        if matches!(
-            command_result,
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::BurnReplacementPreparationFailed { .. }
-            )))
-        ) && action == BurnRecoveryAction::Replace
-            && !self
-                .recovery_budget_available(issuer_request_id, Some(sendable_tx))
-                .await?
-        {
-            drop(wallet_guard);
-            return Ok(RecoveryOutcome::SkippedManualIntervention);
-        }
-        command_result?;
+        self.store.send(issuer_request_id, command).await?;
 
         if status == BurnTxStatus::ProvablyDead {
-            self.submit_replacement_after_dead_burn(issuer_request_id, vault)
+            let Some(Redemption::BurnIntended {
+                planned_burns,
+                sendable_tx,
+                external_tx_id,
+                ..
+            }) = self.store.load(issuer_request_id).await?
+            else {
+                return Err(BurnManagerError::InvalidAggregateState {
+                    current_state: "expected replacement BurnIntended"
+                        .to_string(),
+                });
+            };
+            let replacement_burns = planned_burns
+                .iter()
+                .map(|burn| MultiBurnEntry {
+                    receipt_id: burn.receipt_id,
+                    burn_shares: burn.shares_burned,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                })
+                .collect();
+            self.store
+                .send(
+                    issuer_request_id,
+                    RedemptionCommand::BurnTokens {
+                        issuer_request_id: issuer_request_id.clone(),
+                        vault,
+                        burns: replacement_burns,
+                        dust_shares: sendable_tx.dust_shares,
+                        owner: self.bot_wallet,
+                        external_tx_id,
+                    },
+                )
                 .await?;
         }
         drop(wallet_guard);
@@ -1062,85 +1056,6 @@ impl BurnManager {
             "Automatic burn recovery action accepted"
         );
         Ok(RecoveryOutcome::Executed)
-    }
-
-    async fn submit_replacement_after_dead_burn(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        vault: Address,
-    ) -> Result<(), BurnManagerError> {
-        let Some(Redemption::BurnIntended {
-            planned_burns,
-            sendable_tx,
-            external_tx_id,
-            ..
-        }) = self.store.load(issuer_request_id).await?
-        else {
-            return Err(BurnManagerError::InvalidAggregateState {
-                current_state: "expected replacement BurnIntended".to_string(),
-            });
-        };
-        let replacement_burns = recovery_burn_entries(&planned_burns);
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::BurnTokens {
-                    issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: replacement_burns,
-                    dust_shares: sendable_tx.dust_shares,
-                    owner: self.bot_wallet,
-                    external_tx_id,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn submit_prepared_replacement(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        metadata: &RedemptionMetadata,
-        planned_burns: &[BurnRecord],
-        sendable_tx: &SendableTxWithHash,
-        external_tx_id: Option<BurnExternalTxId>,
-    ) -> Result<(), BurnManagerError> {
-        let vault =
-            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
-                .await?
-                .ok_or_else(|| BurnManagerError::AssetNotFound {
-                    underlying: metadata.underlying.clone(),
-                })?;
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::BurnTokens {
-                    issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: recovery_burn_entries(planned_burns),
-                    dust_shares: sendable_tx.dust_shares,
-                    owner: self.bot_wallet,
-                    external_tx_id,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn exhausted_recovery_outcome(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        sendable_tx: &SendableTxWithHash,
-    ) -> Result<Option<RecoveryOutcome>, BurnManagerError> {
-        if !self.burn_recovery_budget(issuer_request_id).await?.exhausted {
-            return Ok(None);
-        }
-        debug!(target: "redemption",
-            issuer_request_id = %issuer_request_id,
-            tx_hash = %sendable_tx.hash,
-            "Skipping burn with exhausted automatic recovery budget"
-        );
-        Ok(Some(RecoveryOutcome::SkippedManualIntervention))
     }
 
     async fn recover_single_burning(
@@ -1224,12 +1139,13 @@ impl BurnManager {
                 let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
-                    &Network::Base,
+                    &metadata.network,
                 )
                 .await?
                 .ok_or_else(|| {
                     BurnManagerError::AssetNotFound {
                         underlying: metadata.underlying.clone(),
+                        network: metadata.network,
                     }
                 })?;
 
@@ -1245,8 +1161,23 @@ impl BurnManager {
                 // recording it. Skip this redemption to avoid recording a false failure.
                 // Resolve manually via the admin `force-complete` endpoint (records the
                 // verified burn tx) for landed burns, or `close` for ambiguous cases.
-                let on_chain_balance = self
-                    .vault_service
+                let vault_service = match self.vault_for(metadata.network) {
+                    Ok(vault_service) => vault_service,
+                    Err(RedemptionError::NetworkNotConfigured { network }) => {
+                        return self
+                            .record_burn_failure_for_unconfigured_network(
+                                issuer_request_id,
+                                network,
+                                None,
+                                vec![],
+                            )
+                            .await
+                            .map(|()| RecoveryOutcome::Executed);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+
+                let on_chain_balance = vault_service
                     .get_share_balance(vault, self.bot_wallet)
                     .await?;
 
@@ -1344,13 +1275,16 @@ impl BurnManager {
             });
         };
 
-        let Some(vault) =
-            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
-                .await?
+        let Some(vault) = find_vault(
+            &self.view_pool,
+            &metadata.underlying,
+            &metadata.network,
+        )
+        .await?
         else {
             let error_msg = format!(
-                "No vault configured for underlying asset {}",
-                metadata.underlying
+                "No vault configured for underlying asset {} on network {}",
+                metadata.underlying, metadata.network
             );
 
             warn!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -1372,6 +1306,7 @@ impl BurnManager {
 
             return Err(BurnManagerError::AssetNotFound {
                 underlying: metadata.underlying.clone(),
+                network: metadata.network,
             });
         };
 
@@ -1398,6 +1333,7 @@ impl BurnManager {
         let plan = self
             .plan_burn(
                 issuer_request_id,
+                metadata.network,
                 vault,
                 &metadata.underlying,
                 burn_shares,
@@ -1407,6 +1343,7 @@ impl BurnManager {
 
         self.execute_burn_and_record_result(
             issuer_request_id,
+            metadata.network,
             vault,
             plan,
             external_tx_id.clone(),
@@ -1455,9 +1392,7 @@ impl BurnManager {
             WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
               AND event_type IN (
                   'RedemptionEvent::BurnRecoveryAttempted',
-                  'RedemptionEvent::BurnPreparationRecoveryAttempted',
-                  'RedemptionEvent::BurnRecoveryExhausted',
-                  'RedemptionEvent::BurnPreparationRecoveryExhausted'
+                  'RedemptionEvent::BurnRecoveryExhausted'
               )
             ORDER BY sequence
             ",
@@ -1486,16 +1421,6 @@ impl BurnManager {
                         })?;
                     budget.last_transaction = Some((tx_hash, nonce));
                 }
-                RedemptionEvent::BurnPreparationRecoveryAttempted {
-                    ..
-                } => {
-                    budget.attempts =
-                        budget.attempts.checked_add(1).ok_or_else(|| {
-                            BurnManagerError::RecoveryAttemptOverflow {
-                                issuer_request_id: issuer_request_id.clone(),
-                            }
-                        })?;
-                }
                 RedemptionEvent::BurnRecoveryExhausted {
                     tx_hash,
                     nonce,
@@ -1504,74 +1429,11 @@ impl BurnManager {
                     budget.exhausted = true;
                     budget.last_transaction = Some((tx_hash, nonce));
                 }
-                RedemptionEvent::BurnPreparationRecoveryExhausted {
-                    ..
-                } => {
-                    budget.exhausted = true;
-                }
                 _ => {}
             }
         }
 
         Ok(budget)
-    }
-
-    async fn pending_recovery_action(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        sendable_tx: &SendableTxWithHash,
-    ) -> Result<Option<PendingBurnRecovery>, BurnManagerError> {
-        let payloads = sqlx::query_scalar::<_, String>(
-            "
-            SELECT payload
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type IN (
-                  'RedemptionEvent::BurnRecoveryAttempted',
-                  'RedemptionEvent::BurnRecoveryExhausted',
-                  'RedemptionEvent::BurnIntended',
-                  'RedemptionEvent::BurnTxSubmitted',
-                  'RedemptionEvent::BurningFailed'
-              )
-            ORDER BY sequence DESC
-            LIMIT 2
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_all(&self.view_pool)
-        .await?;
-        let events = payloads
-            .iter()
-            .map(|payload| serde_json::from_str::<RedemptionEvent>(payload))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(match events.as_slice() {
-            [
-                RedemptionEvent::BurnRecoveryAttempted {
-                    tx_hash,
-                    nonce,
-                    action,
-                    ..
-                },
-                ..,
-            ] if *tx_hash == sendable_tx.hash
-                && *nonce == sendable_tx.nonce =>
-            {
-                Some(PendingBurnRecovery::Reserved(*action))
-            }
-            [
-                RedemptionEvent::BurnIntended {
-                    sendable_tx: replacement, ..
-                },
-                RedemptionEvent::BurnRecoveryAttempted {
-                    action: BurnRecoveryAction::Replace,
-                    ..
-                },
-            ] if replacement == sendable_tx => {
-                Some(PendingBurnRecovery::ReplacementPrepared)
-            }
-            _ => None,
-        })
     }
 
     async fn recovery_budget_available(
@@ -1588,59 +1450,22 @@ impl BurnManager {
             return Ok(true);
         }
 
-        let transaction = current_transaction
+        let (tx_hash, nonce) = current_transaction
             .map(|transaction| (transaction.hash, transaction.nonce))
-            .or(budget.last_transaction);
-        if let Some((tx_hash, nonce)) = transaction {
-            self.persist_recovery_exhaustion(
-                issuer_request_id,
-                tx_hash,
-                nonce,
-                budget.attempts,
-            )
-            .await?;
-        } else {
-            self.persist_preparation_recovery_exhaustion(
-                issuer_request_id,
-                budget.attempts,
-            )
-            .await?;
-        }
+            .or(budget.last_transaction)
+            .ok_or_else(|| BurnManagerError::InvalidAggregateState {
+                current_state:
+                    "recovery budget reached without a transaction identity"
+                        .to_string(),
+            })?;
+        self.persist_recovery_exhaustion(
+            issuer_request_id,
+            tx_hash,
+            nonce,
+            budget.attempts,
+        )
+        .await?;
         Ok(false)
-    }
-
-    async fn reserve_preparation_recovery_attempt(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Result<bool, BurnManagerError> {
-        let _guard = self.automatic_recovery_lock.lock().await;
-        let budget = self.burn_recovery_budget(issuer_request_id).await?;
-        if budget.exhausted {
-            return Ok(false);
-        }
-        if budget.attempts >= MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS {
-            self.persist_preparation_recovery_exhaustion(
-                issuer_request_id,
-                budget.attempts,
-            )
-            .await?;
-            return Ok(false);
-        }
-        let attempt = budget.attempts.checked_add(1).ok_or_else(|| {
-            BurnManagerError::RecoveryAttemptOverflow {
-                issuer_request_id: issuer_request_id.clone(),
-            }
-        })?;
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
-                    issuer_request_id: issuer_request_id.clone(),
-                    attempt,
-                },
-            )
-            .await?;
-        Ok(true)
     }
 
     async fn reserve_recovery_attempt(
@@ -1708,41 +1533,20 @@ impl BurnManager {
         Ok(())
     }
 
-    async fn persist_preparation_recovery_exhaustion(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        attempts: u32,
-    ) -> Result<(), BurnManagerError> {
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::RecordBurnPreparationRecoveryExhausted {
-                    issuer_request_id: issuer_request_id.clone(),
-                    attempts,
-                },
-            )
-            .await?;
-        error!(target: "redemption",
-            issuer_request_id = %issuer_request_id,
-            attempts,
-            operator_action = "inspect repeated burn preparation failures before manual recovery",
-            "Automatic burn preparation recovery exhausted"
-        );
-        Ok(())
-    }
-
     async fn plan_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
         vault: Address,
         underlying: &UnderlyingSymbol,
         burn_shares: U256,
         dust_shares: U256,
     ) -> Result<BurnPlan, BurnManagerError> {
+        let chain_id = self.chain_id_for(network)?;
         let plan = self
             .receipt_service
             .for_burn(
-                self.receipt_chain_id,
+                chain_id,
                 vault,
                 issuer_request_id,
                 Shares::new(burn_shares),
@@ -1816,62 +1620,32 @@ impl BurnManager {
     async fn execute_burn_and_record_result(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
         vault: Address,
         plan: BurnPlan,
         external_tx_id: Option<BurnExternalTxId>,
     ) -> Result<(), BurnManagerError> {
-        self.execute_burn_with_wallet_intent_timeout(
-            issuer_request_id,
-            vault,
-            plan,
-            external_tx_id,
-            WALLET_INTENT_WAIT_TIMEOUT,
-        )
-        .await
-    }
-
-    async fn execute_burn_with_wallet_intent_timeout(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        vault: Address,
-        plan: BurnPlan,
-        external_tx_id: Option<BurnExternalTxId>,
-        wait_timeout: Duration,
-    ) -> Result<(), BurnManagerError> {
-        let execution = BurnExecutionPlan::new(vault, &plan, external_tx_id);
-        let wallet_guard = if let Ok(result) = tokio::time::timeout(wait_timeout, async {
-            loop {
-                let wallet_guard = self.vault_service.lock_wallet().await;
-                let unresolved_mint =
-                    has_unresolved_mint_intent(&self.view_pool, None).await?;
-                let unresolved_burn = has_unresolved_burn_intent(
-                    &self.view_pool,
-                    Some(issuer_request_id),
-                )
-                .await?;
-                if !unresolved_mint && !unresolved_burn {
-                    return Ok::<_, BurnManagerError>(wallet_guard);
-                }
-
-                drop(wallet_guard);
-                debug!(target: "redemption",
-                    issuer_request_id = %issuer_request_id,
-                    "Waiting for an earlier wallet intent before preparing burn"
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+        let execution =
+            BurnExecutionPlan::new(network, vault, &plan, external_tx_id);
+        let wallet_guard = loop {
+            let wallet_guard = self.vault_for(network)?.lock_wallet().await;
+            let unresolved_mint =
+                has_unresolved_mint_intent(&self.view_pool, None).await?;
+            let unresolved_burn = has_unresolved_burn_intent(
+                &self.view_pool,
+                Some(issuer_request_id),
+            )
+            .await?;
+            if !unresolved_mint && !unresolved_burn {
+                break wallet_guard;
             }
-        })
-        .await {
-            result?
-        } else {
-            warn!(target: "redemption",
+
+            drop(wallet_guard);
+            debug!(target: "redemption",
                 issuer_request_id = %issuer_request_id,
-                wait_ms = wait_timeout.as_millis(),
-                "Deferring burn after wallet-intent wait deadline"
+                "Waiting for an earlier wallet intent before preparing burn"
             );
-            return Err(BurnManagerError::WalletIntentWaitTimeout {
-                issuer_request_id: issuer_request_id.clone(),
-            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
         };
         if !self.is_burn_execution_current(issuer_request_id).await? {
             return Ok(());
@@ -1914,11 +1688,10 @@ impl BurnManager {
         execution: &BurnExecutionPlan,
     ) -> Result<(), BurnManagerError> {
         let result = self
-            .receipt_service
-            .reserve_burn(
-                self.receipt_chain_id,
+            .reserve_with_conflict_retry(
+                execution.network,
                 execution.vault,
-                issuer_request_id.clone(),
+                issuer_request_id,
                 execution.planned_burns.clone(),
             )
             .await;
@@ -1942,7 +1715,7 @@ impl BurnManager {
             )
             .await?;
 
-        Err(error.into())
+        Err(error)
     }
 
     async fn persist_burn_intention(
@@ -1979,8 +1752,14 @@ impl BurnManager {
                     error = %message,
                     "Preparing signed burn tx failed"
                 );
-                self.release_reserved_burn(execution.vault, issuer_request_id)
-                    .await?;
+                // Always release because nothing was submitted on-chain.
+                let chain_id = self.chain_id_for(execution.network)?;
+                self.release_reserved_burn(
+                    chain_id,
+                    execution.vault,
+                    issuer_request_id,
+                )
+                .await;
                 self.store
                     .send(
                         issuer_request_id,
@@ -2049,6 +1828,7 @@ impl BurnManager {
                 );
                 if release_reservation {
                     self.release_before_terminal_failure(
+                        execution.network,
                         execution.vault,
                         issuer_request_id,
                     )
@@ -2131,8 +1911,15 @@ impl BurnManager {
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "Burn confirmed successfully"
                 );
-                self.settle_reserved_burn(execution.vault, issuer_request_id)
-                    .await?;
+                // The burn landed on-chain: consume the reservation so the
+                // mirror balance drops to match.
+                let chain_id = self.chain_id_for(execution.network)?;
+                self.settle_reserved_burn(
+                    chain_id,
+                    execution.vault,
+                    issuer_request_id,
+                )
+                .await;
                 Ok(())
             }
             Err(AggregateError::UserError(LifecycleError::Apply(
@@ -2143,14 +1930,15 @@ impl BurnManager {
                     "Burn confirmation failed"
                 );
                 if release_reservation {
+                    let exact_recovery = self
+                        .reserve_replacement_after_revert(issuer_request_id)
+                        .await?;
                     self.release_before_terminal_failure(
+                        execution.network,
                         execution.vault,
                         issuer_request_id,
                     )
                     .await?;
-                    let exact_recovery = self
-                        .reserve_replacement_after_revert(issuer_request_id)
-                        .await?;
                     self.store
                         .send(
                             issuer_request_id,
@@ -2184,6 +1972,7 @@ impl BurnManager {
 
     async fn release_before_terminal_failure(
         &self,
+        network: Network,
         vault: Address,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
@@ -2191,7 +1980,9 @@ impl BurnManager {
         // recoverable state, so the same transaction is checked again.
         // Recording failure first could strand the reservation because
         // burning-state recovery would no longer revisit the aggregate.
-        self.release_reserved_burn(vault, issuer_request_id).await
+        let chain_id = self.chain_id_for(network)?;
+        self.release_reserved_burn(chain_id, vault, issuer_request_id).await;
+        Ok(())
     }
 
     /// Reserves the recovery action that may sign a fresh transaction after a
@@ -2219,41 +2010,101 @@ impl BurnManager {
         .map(Some)
     }
 
-    /// Releases a redemption's burn reservation, restoring available inventory.
-    async fn release_reserved_burn(
+    /// Reserves planned burns, retrying a bounded number of times on an
+    /// optimistic-concurrency conflict.
+    ///
+    /// Concurrent redemptions for the same vault contend on the single
+    /// `ReceiptInventory` aggregate; a lost commit race is transient and should
+    /// be retried (each `execute` reloads), not treated as a terminal burn
+    /// failure the way a genuine `InsufficientReceiptBalance` is.
+    async fn reserve_with_conflict_retry(
         &self,
+        network: Network,
         vault: Address,
         issuer_request_id: &IssuerRedemptionRequestId,
+        planned_burns: Vec<super::BurnRecord>,
     ) -> Result<(), BurnManagerError> {
-        self.receipt_service
-            .release_burn(
-                self.receipt_chain_id,
-                vault,
-                issuer_request_id.clone(),
-            )
-            .await?;
-        Ok(())
+        const MAX_ATTEMPTS: usize = 3;
+        let chain_id = self.chain_id_for(network)?;
+
+        let mut attempt = 1;
+        loop {
+            match self
+                .receipt_service
+                .reserve_burn(
+                    chain_id,
+                    vault,
+                    issuer_request_id.clone(),
+                    planned_burns.clone(),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ReceiptRegistrationError::Aggregate(
+                    AggregateError::AggregateConflict,
+                )) if attempt < MAX_ATTEMPTS => {
+                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        attempt,
+                        "Reserve hit an optimistic-concurrency conflict; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Releases a redemption's burn reservation, restoring available inventory.
+    ///
+    /// Best-effort: a failure is logged but not propagated. A stuck reservation
+    /// is the failure mode the startup reservation recovery scan
+    /// (`recover_stuck_reservations`) exists to clean up.
+    async fn release_reserved_burn(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        if let Err(err) = self
+            .receipt_service
+            .release_burn(chain_id, vault, issuer_request_id.clone())
+            .await
+        {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to release burn receipt reservation"
+            );
+        }
     }
 
     /// Settles a redemption's burn reservation after on-chain confirmation,
     /// reducing the mirror balance by the reserved amount.
+    ///
+    /// Best-effort: a failure is logged but not propagated. A reservation left
+    /// unsettled here is recovered by the startup reservation recovery scan
+    /// (`recover_stuck_reservations`); reconciliation cannot heal it because a
+    /// landed-but-unsettled burn sits inside the reconcile no-op band.
     async fn settle_reserved_burn(
         &self,
+        chain_id: u64,
         vault: Address,
         issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Result<(), BurnManagerError> {
-        self.receipt_service
-            .settle_burn(
-                self.receipt_chain_id,
-                vault,
-                issuer_request_id.clone(),
-            )
-            .await?;
-        Ok(())
+    ) {
+        if let Err(err) = self
+            .receipt_service
+            .settle_burn(chain_id, vault, issuer_request_id.clone())
+            .await
+        {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to settle burn receipt reservation"
+            );
+        }
     }
 }
 
 struct BurnExecutionPlan {
+    network: Network,
     vault: Address,
     burns: Vec<MultiBurnEntry>,
     planned_burns: Vec<BurnRecord>,
@@ -2263,6 +2114,7 @@ struct BurnExecutionPlan {
 
 impl BurnExecutionPlan {
     fn new(
+        network: Network,
         vault: Address,
         plan: &BurnPlan,
         external_tx_id: Option<BurnExternalTxId>,
@@ -2289,6 +2141,7 @@ impl BurnExecutionPlan {
             .collect();
 
         Self {
+            network,
             vault,
             burns,
             planned_burns,
@@ -2360,77 +2213,16 @@ pub(crate) enum BurnManagerError {
     RedemptionView(#[from] RedemptionViewError),
     #[error("Tokenized asset view error: {0}")]
     TokenizedAssetView(#[from] TokenizedAssetViewError),
-    #[error("Asset not found for underlying: {underlying}")]
-    AssetNotFound { underlying: UnderlyingSymbol },
+    #[error(
+        "Asset not found for underlying: {underlying} on network: {network}"
+    )]
+    AssetNotFound { underlying: UnderlyingSymbol, network: Network },
     #[error("Arithmetic overflow when computing total shares needed")]
     SharesOverflow,
-    #[error(
-        "Alternate proving transaction does not match the persisted burn semantics: expected nonce {expected_nonce}, total shares {expected_shares_burned}, burns {expected_burns:?}, recipient {expected_recipient}, dust {expected_dust_shares}; verified nonce {verified_nonce}, total shares {verified_shares_burned}, burns {verified_burns:?}, transfers {verified_share_transfers:?}"
-    )]
-    AlternateBurnSemanticsMismatch {
-        expected_burns: Vec<BurnRecord>,
-        expected_shares_burned: U256,
-        expected_recipient: Address,
-        expected_dust_shares: U256,
-        expected_nonce: u64,
-        verified_burns: Vec<VerifiedBurn>,
-        verified_shares_burned: U256,
-        verified_nonce: u64,
-        verified_share_transfers: Vec<VerifiedShareTransfer>,
-    },
     #[error("Receipt reservation error: {0}")]
     ReceiptRegistration(#[from] ReceiptRegistrationError),
-    #[error(
-        "Timed out waiting to prepare burn for redemption {issuer_request_id} behind an earlier wallet intent"
-    )]
-    WalletIntentWaitTimeout { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Burn recovery attempt counter overflowed for {issuer_request_id}")]
     RecoveryAttemptOverflow { issuer_request_id: IssuerRedemptionRequestId },
-}
-
-fn burn_verification_matches_plan(
-    verification: &BurnVerification,
-    planned_burns: &[BurnRecord],
-    owner: Address,
-    recipient: Address,
-    dust_shares: U256,
-    expected_nonce: u64,
-) -> bool {
-    let Some(expected_shares_burned) =
-        planned_burns.iter().try_fold(U256::ZERO, |total, burn| {
-            total.checked_add(burn.shares_burned)
-        })
-    else {
-        return false;
-    };
-    let mut expected = planned_burns
-        .iter()
-        .map(|burn| (burn.receipt_id, burn.shares_burned))
-        .collect::<Vec<_>>();
-    let mut verified = verification
-        .burns
-        .iter()
-        .filter(|burn| burn.sender == owner && burn.receiver == recipient)
-        .map(|burn| (burn.receipt_id, burn.shares_burned))
-        .collect::<Vec<_>>();
-    expected.sort_unstable();
-    verified.sort_unstable();
-    let expected_share_transfers = if dust_shares.is_zero() {
-        vec![]
-    } else {
-        vec![(recipient, dust_shares)]
-    };
-    let verified_share_transfers = verification
-        .share_transfers
-        .iter()
-        .map(|transfer| (transfer.recipient, transfer.shares))
-        .collect::<Vec<_>>();
-
-    verification.nonce == expected_nonce
-        && verification.shares_burned == expected_shares_burned
-        && expected == verified
-        && verification.burns.len() == verified.len()
-        && expected_share_transfers == verified_share_transfers
 }
 
 #[cfg(test)]
@@ -2441,17 +2233,17 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
     use tracing_test::traced_test;
 
     use super::{
         BurnManager, BurnManagerError, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
         RecoveryOutcome, Redemption, RedemptionCommand,
-        burn_verification_matches_plan, should_release_reserved_burn,
+        should_release_reserved_burn,
     };
     use crate::mint::IssuerMintRequestId;
-    use crate::mint::{Network, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
         BurnPlan, BurnTrackingError, CqrsReceiptService, MintedReceiptParams,
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -2460,6 +2252,7 @@ mod tests {
         Shares,
     };
     use crate::redemption::BurnExternalTxId;
+    use crate::redemption::RedemptionServices;
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
         BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId,
@@ -2467,14 +2260,13 @@ mod tests {
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
-        AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, BurnVerification, MultiBurnEntry, ReceiptInformation,
-        SendableTxWithHash, TxId, VaultError, VaultService, VerifiedBurn,
-        VerifiedShareTransfer,
+        BurnTxStatus, MultiBurnEntry, ReceiptInformation, SendableTxWithHash,
+        TxId, VaultError, VaultService,
     };
 
     const TEST_WALLET: Address =
@@ -2521,75 +2313,6 @@ mod tests {
         assert!(!should_release_reserved_burn(&VaultError::InvalidReceipt));
     }
 
-    #[test]
-    fn alternate_burn_semantics_require_recipient_and_dust_transfer() {
-        let owner = TEST_WALLET;
-        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let planned_burns = vec![BurnRecord {
-            receipt_id: uint!(42_U256),
-            shares_burned: uint!(17_U256),
-        }];
-        let verification = BurnVerification {
-            block_number: 45_989_009,
-            nonce: 7,
-            shares_burned: uint!(17_U256),
-            burns: vec![VerifiedBurn {
-                sender: owner,
-                receiver: recipient,
-                receipt_id: uint!(42_U256),
-                shares_burned: uint!(17_U256),
-            }],
-            share_transfers: vec![],
-        };
-
-        assert!(!burn_verification_matches_plan(
-            &verification,
-            &planned_burns,
-            owner,
-            recipient,
-            uint!(3_U256),
-            7,
-        ));
-
-        let verification = BurnVerification {
-            share_transfers: vec![VerifiedShareTransfer {
-                recipient,
-                shares: uint!(3_U256),
-            }],
-            ..verification
-        };
-        assert!(burn_verification_matches_plan(
-            &verification,
-            &planned_burns,
-            owner,
-            recipient,
-            uint!(3_U256),
-            7,
-        ));
-        let mismatched_total = BurnVerification {
-            shares_burned: uint!(18_U256),
-            ..verification.clone()
-        };
-        assert!(!burn_verification_matches_plan(
-            &mismatched_total,
-            &planned_burns,
-            owner,
-            recipient,
-            uint!(3_U256),
-            7,
-        ));
-        let replayed_at_another_nonce =
-            BurnVerification { nonce: 8, ..verification };
-        assert!(!burn_verification_matches_plan(
-            &replayed_at_another_nonce,
-            &planned_burns,
-            owner,
-            recipient,
-            uint!(3_U256),
-            7,
-        ));
-    }
-
     struct TestHarness {
         store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
@@ -2598,12 +2321,12 @@ mod tests {
         asset_store: Arc<Store<TokenizedAsset>>,
     }
 
-    struct ReleaseFailingReceiptService {
+    struct SettleFailingReceiptService {
         inner: Arc<dyn ReceiptService>,
     }
 
     #[async_trait::async_trait]
-    impl ReceiptService for ReleaseFailingReceiptService {
+    impl ReceiptService for SettleFailingReceiptService {
         async fn register_minted_receipt(
             &self,
             params: MintedReceiptParams,
@@ -2649,6 +2372,17 @@ mod tests {
 
         async fn release_burn(
             &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .release_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
+        }
+
+        async fn settle_burn(
+            &self,
             _chain_id: u64,
             _vault: Address,
             _redemption_issuer_request_id: IssuerRedemptionRequestId,
@@ -2658,17 +2392,6 @@ mod tests {
                     receipt_id: ReceiptId::from(U256::ZERO),
                 },
             )))
-        }
-
-        async fn settle_burn(
-            &self,
-            chain_id: u64,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner
-                .settle_burn(chain_id, vault, redemption_issuer_request_id)
-                .await
         }
 
         async fn reserved_redemptions(
@@ -2689,84 +2412,6 @@ mod tests {
             self.inner
                 .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
                 .await
-        }
-    }
-
-    struct SettleFailingReceiptService {
-        inner: Arc<dyn ReceiptService>,
-    }
-
-    #[async_trait::async_trait]
-    impl ReceiptService for SettleFailingReceiptService {
-        async fn register_minted_receipt(
-            &self,
-            params: MintedReceiptParams,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner.register_minted_receipt(params).await
-        }
-
-        async fn for_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: &IssuerRedemptionRequestId,
-            shares_to_burn: Shares,
-            dust: Shares,
-        ) -> Result<BurnPlan, BurnTrackingError> {
-            self.inner
-                .for_burn(
-                    vault,
-                    redemption_issuer_request_id,
-                    shares_to_burn,
-                    dust,
-                )
-                .await
-        }
-
-        async fn reserve_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-            burns: Vec<BurnRecord>,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner
-                .reserve_burn(vault, redemption_issuer_request_id, burns)
-                .await
-        }
-
-        async fn release_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner.release_burn(vault, redemption_issuer_request_id).await
-        }
-
-        async fn settle_burn(
-            &self,
-            _vault: Address,
-            _redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            Err(ReceiptRegistrationError::Aggregate(AggregateError::UserError(
-                ReceiptInventoryError::UnknownReceipt {
-                    receipt_id: ReceiptId::from(U256::ZERO),
-                },
-            )))
-        }
-
-        async fn reserved_redemptions(
-            &self,
-            vault: Address,
-        ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
-        {
-            self.inner.reserved_redemptions(vault).await
-        }
-
-        async fn find_by_issuer_request_id(
-            &self,
-            vault: &Address,
-            issuer_request_id: &IssuerMintRequestId,
-        ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
-            self.inner.find_by_issuer_request_id(vault, issuer_request_id).await
         }
     }
 
@@ -2804,7 +2449,10 @@ mod tests {
             // `find_burning`/`find_burn_failed` populated during recovery.
             let store = StoreBuilder::<Redemption>::new(pool.clone())
                 .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-                .build(vault_service)
+                .build(RedemptionServices::with_single_vault(
+                    Network::Base,
+                    vault_service,
+                ))
                 .await
                 .expect("Failed to build redemption store");
 
@@ -2904,6 +2552,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -2951,7 +2600,6 @@ mod tests {
         issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
         owner: Address,
-        dust_shares: U256,
     ) {
         store
             .send(
@@ -2965,36 +2613,13 @@ mod tests {
                         receipt_info: None,
                         receipt_info_bytes: None,
                     }],
-                    dust_shares,
+                    dust_shares: U256::ZERO,
                     owner,
                     external_tx_id: None,
                 },
             )
             .await
             .expect("persisted burn intent should succeed");
-    }
-
-    async fn record_test_recovery_attempts(
-        store: &Store<Redemption>,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        sendable_tx: &SendableTxWithHash,
-        action: BurnRecoveryAction,
-        count: u32,
-    ) {
-        for _ in 0..count {
-            store
-                .send(
-                    issuer_request_id,
-                    RedemptionCommand::RecordBurnRecoveryAttempt {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tx_hash: sendable_tx.hash,
-                        nonce: sendable_tx.nonce,
-                        action,
-                    },
-                )
-                .await
-                .expect("recovery attempt should persist");
-        }
     }
 
     #[tokio::test]
@@ -3009,7 +2634,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3061,110 +2686,7 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn burn_wait_for_earlier_wallet_intent_is_bounded() {
-        let vault_mock = Arc::new(MockVaultService::new_success());
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
-        harness.add_asset(&underlying, vault).await;
-        harness
-            .discover_receipt(
-                vault,
-                uint!(42_U256),
-                uint!(100_000000000000000000_U256),
-            )
-            .await;
-
-        let unresolved_mint_id = IssuerMintRequestId::random().to_string();
-        sqlx::query(
-            "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
-            )
-            VALUES (
-                'Mint',
-                ?,
-                1,
-                'MintEvent::MintTxIntended',
-                '4.0',
-                '{}',
-                '{}'
-            )
-            ",
-        )
-        .bind(unresolved_mint_id)
-        .execute(pool)
-        .await
-        .unwrap();
-
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        let plan = manager
-            .plan_burn(
-                &issuer_request_id,
-                vault,
-                &underlying,
-                uint!(100_000000000000000000_U256),
-                U256::ZERO,
-            )
-            .await
-            .unwrap();
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            manager.execute_burn_with_wallet_intent_timeout(
-                &issuer_request_id,
-                vault,
-                plan,
-                None,
-                Duration::from_millis(100),
-            ),
-        )
-        .await
-        .expect("wallet-intent wait must return before its deadline");
-
-        assert!(matches!(
-            result,
-            Err(BurnManagerError::WalletIntentWaitTimeout {
-                issuer_request_id: blocked_id,
-            }) if blocked_id == issuer_request_id
-        ));
-        assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &[
-                "Deferring burn after wallet-intent wait deadline",
-                &issuer_request_id.to_string(),
-                "wait_ms=100",
-            ]
-        ));
-        let aggregate = store
-            .load(&issuer_request_id)
-            .await
-            .unwrap()
-            .expect("redemption should still exist");
-        assert!(matches!(aggregate, Redemption::Burning { .. }));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_acknowledged_alternate_burn_settles_reservation() {
+    async fn test_force_complete_burn_records_verified_burn() {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let persisted_tx = SendableTxWithHash::valid_for_test(
             7,
@@ -3174,19 +2696,7 @@ mod tests {
         let owner = persisted_tx.signer_for_test();
         let vault_mock = Arc::new(
             MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: owner,
-                        receiver: address!(
-                            "0x1234567890abcdef1234567890abcdef12345678"
-                        ),
-                        receipt_id: uint!(42_U256),
-                        shares_burned: uint!(17_U256),
-                    }],
-                    vec![],
-                )
+                .with_verified_burn(45_989_009, uint!(17_U256))
                 .with_prepared_tx(persisted_tx.clone()),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
@@ -3197,7 +2707,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3238,23 +2748,16 @@ mod tests {
             vec![issuer_request_id.clone()],
             "reservation should be held before force-complete"
         );
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
+        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
 
-        let burn_tx_hash = B256::random();
+        let burn_tx_hash = persisted_tx.hash;
 
         let verification = manager
             .force_complete_burn(
                 &issuer_request_id,
                 burn_tx_hash,
                 "burn confirmed on-chain".to_string(),
-                Some(persisted_tx.hash),
+                None,
             )
             .await
             .expect("force-complete should succeed");
@@ -3282,224 +2785,10 @@ mod tests {
             "force-complete must leave no dangling reservation"
         );
 
-        let proving_hash = format!("{burn_tx_hash:?}");
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &[
-                "Force-completing stuck Burning redemption",
-                "verified on-chain",
-                "acknowledged_unresolved_burn_tx_hash",
-                &proving_hash,
-                &persisted_hash,
-            ]
+            &["Force-completing stuck Burning redemption", "verified on-chain"]
         ));
-    }
-
-    #[tokio::test]
-    async fn force_complete_rejects_alternate_burn_for_another_recipient() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let owner = persisted_tx.signer_for_test();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: owner,
-                        receiver: address!(
-                            "0x9999999999999999999999999999999999999999"
-                        ),
-                        receipt_id: uint!(42_U256),
-                        shares_burned: uint!(17_U256),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            owner,
-            ANVIL_CHAIN_ID,
-        );
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        harness.discover_receipt(vault, uint!(42_U256), uint!(17_U256)).await;
-        receipt_service
-            .reserve_burn(
-                ANVIL_CHAIN_ID,
-                vault,
-                issuer_request_id.clone(),
-                vec![BurnRecord {
-                    receipt_id: uint!(42_U256),
-                    shares_burned: uint!(17_U256),
-                }],
-            )
-            .await
-            .expect("reservation should seed");
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
-
-        let result = manager
-            .force_complete_burn(
-                &issuer_request_id,
-                B256::random(),
-                "another redemption's burn".to_string(),
-                Some(persisted_tx.hash),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(BurnManagerError::AlternateBurnSemanticsMismatch { .. })
-        ));
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { .. }
-        ));
-        assert!(
-            receipt_service
-                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap()
-                .contains(&issuer_request_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn force_complete_forwards_persisted_dust_and_nonce_to_verification()
-    {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let dust_shares = uint!(3_U256);
-
-        for (scenario, verified_nonce, verified_share_transfers) in [
-            ("missing dust transfer", 7, vec![]),
-            (
-                "different nonce",
-                8,
-                vec![VerifiedShareTransfer { recipient, shares: dust_shares }],
-            ),
-        ] {
-            let mut persisted_tx = SendableTxWithHash::valid_for_test(
-                7,
-                vault,
-                Bytes::from_static(&[0xde, 0xad]),
-            );
-            persisted_tx.dust_shares = dust_shares;
-            let owner = persisted_tx.signer_for_test();
-            let vault_mock = Arc::new(
-                MockVaultService::new_success()
-                    .with_verified_burns(
-                        45_989_009,
-                        verified_nonce,
-                        vec![VerifiedBurn {
-                            sender: owner,
-                            receiver: recipient,
-                            receipt_id: uint!(42_U256),
-                            shares_burned: uint!(17_U256),
-                        }],
-                        verified_share_transfers,
-                    )
-                    .with_prepared_tx(persisted_tx.clone()),
-            );
-            let harness =
-                TestHarness::with_vault_mock(vault_mock.clone()).await;
-            let TestHarness { store, receipt_service, pool, .. } = &harness;
-            harness
-                .add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault)
-                .await;
-            let manager = BurnManager::new(
-                vault_mock.clone(),
-                pool.clone(),
-                store.clone(),
-                receipt_service.clone(),
-                owner,
-                ANVIL_CHAIN_ID,
-            );
-            let issuer_request_id = IssuerRedemptionRequestId::random();
-            create_test_redemption_in_burning_state(store, &issuer_request_id)
-                .await;
-            harness
-                .discover_receipt(vault, uint!(42_U256), uint!(17_U256))
-                .await;
-            receipt_service
-                .reserve_burn(
-                    ANVIL_CHAIN_ID,
-                    vault,
-                    issuer_request_id.clone(),
-                    vec![BurnRecord {
-                        receipt_id: uint!(42_U256),
-                        shares_burned: uint!(17_U256),
-                    }],
-                )
-                .await
-                .expect("reservation should seed");
-            persist_test_burn_intent(
-                store,
-                &issuer_request_id,
-                vault,
-                owner,
-                dust_shares,
-            )
-            .await;
-
-            let result = manager
-                .force_complete_burn(
-                    &issuer_request_id,
-                    B256::random(),
-                    scenario.to_string(),
-                    Some(persisted_tx.hash),
-                )
-                .await;
-
-            assert!(
-                matches!(
-                    &result,
-                    Err(BurnManagerError::AlternateBurnSemanticsMismatch {
-                        expected_dust_shares,
-                        expected_nonce,
-                        ..
-                    }) if *expected_dust_shares == dust_shares
-                        && *expected_nonce == persisted_tx.nonce
-                ),
-                "scenario {scenario} unexpectedly succeeded: {result:?}"
-            );
-            assert!(
-                matches!(
-                    load_aggregate(store, &issuer_request_id).await,
-                    Redemption::BurnIntended { .. }
-                ),
-                "scenario {scenario} changed the redemption"
-            );
-            assert_eq!(
-                receipt_service
-                    .reserved_redemptions(ANVIL_CHAIN_ID, vault)
-                    .await
-                    .unwrap(),
-                vec![issuer_request_id],
-                "scenario {scenario} released the reservation"
-            );
-            assert_eq!(vault_mock.verify_burn_call_count(), 1);
-        }
     }
 
     #[tokio::test]
@@ -3524,7 +2813,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3536,14 +2825,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
+        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
 
         let result = manager
             .force_complete_burn(
@@ -3590,7 +2872,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3602,14 +2884,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
+        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
 
         let result = manager
             .force_complete_burn(
@@ -3640,7 +2915,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock,
             pool.clone(),
             store.clone(),
@@ -3681,7 +2956,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3701,7 +2976,7 @@ mod tests {
                     "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
                 ),
                 "wrong state".to_string(),
-                None,
+                None
             )
             .await;
 
@@ -3725,7 +3000,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3834,7 +3109,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3920,7 +3195,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3999,7 +3274,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4074,7 +3349,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4136,7 +3411,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4198,7 +3473,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4245,77 +3520,6 @@ mod tests {
         );
     }
 
-    #[traced_test]
-    #[tokio::test]
-    async fn confirm_revert_release_failure_preserves_recovery_budget() {
-        let vault_mock = Arc::new(MockVaultService::new_confirm_revert());
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let failing_receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(ReleaseFailingReceiptService {
-                inner: receipt_service.clone(),
-            });
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
-            vault_mock,
-            pool.clone(),
-            store.clone(),
-            failing_receipt_service,
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        harness
-            .discover_receipt(
-                vault,
-                uint!(7_U256),
-                uint!(100_000000000000000000_U256),
-            )
-            .await;
-        let aggregate =
-            create_test_redemption_in_burning_state(store, &issuer_request_id)
-                .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(
-            matches!(result, Err(BurnManagerError::ReceiptRegistration(_))),
-            "release failure must surface before reserving recovery: {result:?}"
-        );
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnSubmitted { .. }
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![issuer_request_id.clone()]
-        );
-        let recovery_attempts: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption'
-              AND aggregate_id = ?
-              AND event_type = 'RedemptionEvent::BurnRecoveryAttempted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(recovery_attempts, 0);
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &["Burn confirmation failed", &issuer_request_id.to_string()]
-        ));
-    }
-
     #[tokio::test]
     async fn test_handle_burning_started_with_insufficient_balance() {
         let harness = setup_test_environment().await;
@@ -4327,7 +3531,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4369,7 +3573,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4395,6 +3599,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -4431,7 +3636,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4481,7 +3686,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4518,6 +3723,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -4577,7 +3783,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4625,7 +3831,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4681,7 +3887,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4723,7 +3929,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4733,6 +3939,98 @@ mod tests {
         );
 
         manager.recover_burning_redemptions().await;
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_records_failure_when_network_not_configured()
+    {
+        let harness = setup_test_environment().await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+
+        let blockchain_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new_for_tests(
+            blockchain_service,
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness
+            .asset_store
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Ethereum),
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Ethereum,
+                    vault,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-burn-eth");
+        let token = TokenSymbol::new("tAAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    network: Network::Ethereum,
+                    wallet,
+                    quantity: quantity.clone(),
+                    tx_hash,
+                    block_number: 12345,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    alpaca_quantity: quantity,
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        manager.recover_burning_redemptions().await;
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed after unconfigured-network recovery, got {aggregate:?}"
+        );
     }
 
     #[tokio::test]
@@ -4747,7 +4045,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4797,7 +4095,7 @@ mod tests {
         );
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4838,7 +4136,7 @@ mod tests {
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4865,6 +4163,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -4901,7 +4200,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -4979,7 +4278,7 @@ mod tests {
         );
         let blockchain_service =
             blockchain_service_mock.clone() as Arc<dyn VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -5054,7 +4353,7 @@ mod tests {
         );
         let blockchain_service =
             blockchain_service_mock.clone() as Arc<dyn VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -5124,7 +4423,7 @@ mod tests {
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -5221,7 +4520,7 @@ mod tests {
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -5324,7 +4623,7 @@ mod tests {
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -5443,8 +4742,8 @@ mod tests {
         ));
         assert_eq!(
             vault_mock.burn_classification_call_count(),
-            classifications_at_cap + 1,
-            "the fifth result must be classified before exhaustion is persisted"
+            classifications_at_cap,
+            "reaching the durable cap must persist exhaustion before classification"
         );
         assert_eq!(
             vault_mock.replacement_preparation_call_count(),
@@ -5455,10 +4754,9 @@ mod tests {
             manager.recover_single_burning(issuer_request_id).await,
             Ok(RecoveryOutcome::SkippedManualIntervention)
         ));
-        let classifications_after_exhaustion = classifications_at_cap + 1;
         assert_eq!(
             vault_mock.burn_classification_call_count(),
-            classifications_after_exhaustion,
+            classifications_at_cap,
             "persisted exhaustion must skip classification RPCs"
         );
         assert_eq!(
@@ -5516,534 +4814,6 @@ mod tests {
             1,
             "recovery exhaustion must emit one actionable error"
         );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn persisted_burn_recovery_revalidates_state_under_wallet_lock() {
-        let prepared_tx = SendableTxWithHash::valid_for_test(
-            0,
-            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
-            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_wallet_lock_blocked()
-                .with_burn_tx_status(BurnTxStatus::StillMineable)
-                .with_prepared_tx(prepared_tx),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            TEST_WALLET,
-            U256::ZERO,
-        )
-        .await;
-
-        let stale = load_aggregate(store, &issuer_request_id).await;
-        let Redemption::BurnIntended {
-            metadata,
-            planned_burns,
-            sendable_tx,
-            external_tx_id,
-            ..
-        } = &stale
-        else {
-            panic!("expected persisted burn intent");
-        };
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-        let recovery_manager = manager.clone();
-        let recovery_id = issuer_request_id.clone();
-        let recovery_metadata = metadata.clone();
-        let recovery_planned_burns = planned_burns.clone();
-        let recovery_sendable_tx = sendable_tx.clone();
-        let recovery_external_tx_id = external_tx_id.clone();
-        let persisted_owner = sendable_tx.signer_for_test();
-        let recovery = tokio::spawn(async move {
-            recovery_manager
-                .recover_persisted_burn(
-                    &recovery_id,
-                    &recovery_metadata,
-                    &recovery_planned_burns,
-                    &recovery_sendable_tx,
-                    recovery_external_tx_id,
-                    false,
-                )
-                .await
-        });
-        vault_mock.wait_for_wallet_lock_attempt().await;
-
-        let replacement_tx = SendableTxWithHash::valid_for_test(
-            1,
-            vault,
-            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-        );
-        vault_mock.set_burn_tx_status(BurnTxStatus::ProvablyDead);
-        vault_mock.set_prepared_tx(replacement_tx.clone());
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::ReplaceDeadBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    owner: persisted_owner,
-                },
-            )
-            .await
-            .expect("concurrent replacement should persist a new transaction");
-        let classification_calls_after_replacement =
-            vault_mock.burn_classification_call_count();
-        vault_mock.release_wallet_lock();
-        let outcome = recovery
-            .await
-            .expect("recovery task should join")
-            .expect("stale recovery should be a safe no-op");
-
-        assert_eq!(outcome, RecoveryOutcome::AlreadyAdvanced);
-        assert_eq!(
-            vault_mock.burn_classification_call_count(),
-            classification_calls_after_replacement
-        );
-        assert!(vault_mock.submitted_burn_txs().is_empty());
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { sendable_tx, .. }
-                if sendable_tx == replacement_tx
-        ));
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["Skipping stale persisted burn recovery", "BurnIntended"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn persisted_burn_confirmation_releases_wallet_lock() {
-        let prepared_tx = SendableTxWithHash::valid_for_test(
-            0,
-            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
-            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_confirm_pending_blocked()
-                .with_burn_tx_status(BurnTxStatus::Mined)
-                .with_prepared_tx(prepared_tx),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            TEST_WALLET,
-            U256::ZERO,
-        )
-        .await;
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-        let recovery_manager = manager.clone();
-        let recovery_id = issuer_request_id.clone();
-        let recovery = tokio::spawn(async move {
-            recovery_manager.recover_single_burning(&recovery_id).await
-        });
-
-        vault_mock.wait_for_burn_confirmation().await;
-        assert!(!recovery.is_finished());
-        let wallet_guard = tokio::time::timeout(
-            Duration::from_millis(50),
-            vault_mock.lock_wallet(),
-        )
-        .await
-        .expect("slow confirmation must not retain the wallet lock");
-        drop(wallet_guard);
-        vault_mock.release_burn_confirmation();
-
-        assert!(recovery.await.expect("recovery task should join").is_err());
-        assert!(logs_contain_at!(
-            tracing::Level::INFO,
-            &[
-                "Recovering BurnIntended redemption",
-                "checking existing transaction"
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn restart_resumes_fifth_reserved_rebroadcast() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let prepared_tx = SendableTxWithHash::valid_for_test(
-            0,
-            vault,
-            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_burn_tx_status(BurnTxStatus::StillMineable)
-                .with_prepared_tx(prepared_tx.clone()),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            TEST_WALLET,
-            U256::ZERO,
-        )
-        .await;
-        record_test_recovery_attempts(
-            store,
-            &issuer_request_id,
-            &prepared_tx,
-            BurnRecoveryAction::Rebroadcast,
-            MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-        )
-        .await;
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-
-        let outcome = manager
-            .recover_single_burning(&issuer_request_id)
-            .await
-            .expect("reserved rebroadcast should resume");
-
-        assert_eq!(outcome, RecoveryOutcome::Executed);
-        assert_eq!(vault_mock.submitted_burn_txs(), vec![prepared_tx]);
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnSubmitted { .. }
-        ));
-        vault_mock.set_burn_tx_status(BurnTxStatus::Mined);
-        let confirmation_outcome = manager
-            .recover_single_burning(&issuer_request_id)
-            .await
-            .expect("submitted fifth action should still be confirmed");
-        assert_eq!(confirmation_outcome, RecoveryOutcome::ExistingBurnRecorded);
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::Completed { .. }
-        ));
-        let exhaustion_events: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type = 'RedemptionEvent::BurnRecoveryExhausted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("exhaustion count should load");
-        assert_eq!(exhaustion_events, 0);
-        assert!(logs_contain_at!(
-            tracing::Level::INFO,
-            &["Resuming reserved burn recovery action", "Rebroadcast"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn restart_submits_fifth_prepared_replacement_without_new_attempt() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            0,
-            vault,
-            Bytes::from_static(&[0x55, 0x66, 0x77]),
-        );
-        let replacement_tx = SendableTxWithHash::valid_for_test(
-            1,
-            vault,
-            Bytes::from_static(&[0x55, 0x66, 0x77]),
-        );
-        let owner = persisted_tx.signer_for_test();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
-        record_test_recovery_attempts(
-            store,
-            &issuer_request_id,
-            &persisted_tx,
-            BurnRecoveryAction::Replace,
-            MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-        )
-        .await;
-        vault_mock.set_prepared_tx(replacement_tx.clone());
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::ReplaceDeadBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    owner,
-                },
-            )
-            .await
-            .expect("replacement intent should persist before simulated crash");
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { sendable_tx, .. }
-                if sendable_tx == replacement_tx
-        ));
-        assert!(vault_mock.submitted_burn_txs().is_empty());
-        vault_mock.set_burn_tx_status(BurnTxStatus::StillMineable);
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            owner,
-            ANVIL_CHAIN_ID,
-        );
-
-        let outcome = manager
-            .recover_single_burning(&issuer_request_id)
-            .await
-            .expect("persisted replacement should submit after restart");
-
-        assert_eq!(outcome, RecoveryOutcome::Executed);
-        assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
-        let recovery_attempts: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type = 'RedemptionEvent::BurnRecoveryAttempted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("recovery attempt count should load");
-        assert_eq!(
-            recovery_attempts,
-            i64::from(MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS)
-        );
-        assert!(logs_contain_at!(
-            tracing::Level::INFO,
-            &["Submitted persisted replacement from reserved recovery action"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn fifth_prepared_replacement_consumed_while_down_is_exhausted() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            0,
-            vault,
-            Bytes::from_static(&[0x11, 0x22, 0x33]),
-        );
-        let replacement_tx = SendableTxWithHash::valid_for_test(
-            1,
-            vault,
-            Bytes::from_static(&[0x11, 0x22, 0x33]),
-        );
-        let owner = persisted_tx.signer_for_test();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            owner,
-            U256::ZERO,
-        )
-        .await;
-        record_test_recovery_attempts(
-            store,
-            &issuer_request_id,
-            &persisted_tx,
-            BurnRecoveryAction::Replace,
-            MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-        )
-        .await;
-        vault_mock.set_prepared_tx(replacement_tx.clone());
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::ReplaceDeadBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    owner,
-                },
-            )
-            .await
-            .expect("replacement intent should persist before simulated crash");
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            owner,
-            ANVIL_CHAIN_ID,
-        );
-
-        let outcome = manager
-            .recover_single_burning(&issuer_request_id)
-            .await
-            .expect("consumed fifth replacement should exhaust recovery");
-
-        assert_eq!(outcome, RecoveryOutcome::SkippedManualIntervention);
-        assert!(vault_mock.submitted_burn_txs().is_empty());
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { sendable_tx, .. }
-                if sendable_tx == replacement_tx
-        ));
-        let exhaustion_events: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type = 'RedemptionEvent::BurnRecoveryExhausted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("exhaustion count should load");
-        assert_eq!(exhaustion_events, 1);
-        assert!(logs_contain_at!(
-            tracing::Level::ERROR,
-            &["Automatic burn recovery exhausted", "attempts=5"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn fifth_replacement_preparation_failure_persists_exhaustion() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let prepared_tx = SendableTxWithHash::valid_for_test(
-            0,
-            vault,
-            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
-                .with_prepared_tx(prepared_tx.clone()),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        persist_test_burn_intent(
-            store,
-            &issuer_request_id,
-            vault,
-            TEST_WALLET,
-            U256::ZERO,
-        )
-        .await;
-        record_test_recovery_attempts(
-            store,
-            &issuer_request_id,
-            &prepared_tx,
-            BurnRecoveryAction::Replace,
-            MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-        )
-        .await;
-        vault_mock.reset();
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-
-        assert_eq!(
-            manager
-                .recover_single_burning(&issuer_request_id)
-                .await
-                .expect("fifth preparation failure should exhaust recovery"),
-            RecoveryOutcome::SkippedManualIntervention
-        );
-        assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { sendable_tx, .. }
-                if sendable_tx == prepared_tx
-        ));
-        let exhaustion_events: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type = 'RedemptionEvent::BurnRecoveryExhausted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("exhaustion count should load");
-        assert_eq!(exhaustion_events, 1);
-        assert!(logs_contain_at!(
-            tracing::Level::ERROR,
-            &["Automatic burn recovery exhausted", "attempts=5"]
-        ));
     }
 
     #[traced_test]
@@ -6145,7 +4915,10 @@ mod tests {
                 .with(Arc::new(RedemptionViewReactor::new(
                     restarted_pool.clone(),
                 )))
-                .build(vault_mock.clone())
+                .build(RedemptionServices::with_single_vault(
+                    Network::Base,
+                    vault_mock.clone(),
+                ))
                 .await
                 .expect("restart should rebuild the redemption store");
         let restarted_receipt_store = Arc::new(test_store::<ReceiptInventory>(
@@ -6161,7 +4934,7 @@ mod tests {
             Redemption::BurnIntended { sendable_tx, .. }
                 if sendable_tx == prepared_tx
         ));
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             restarted_pool.clone(),
             restarted_store.clone(),
@@ -6270,7 +5043,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -6356,11 +5129,10 @@ mod tests {
         .await
         .expect("exhaustion event count should load");
         assert_eq!(exhaustion_events, 1);
-        let issuer_request_id_text = issuer_request_id.to_string();
         assert_eq!(
             log_count_at!(
                 tracing::Level::ERROR,
-                &["Automatic burn recovery exhausted", &issuer_request_id_text,]
+                &["Automatic burn recovery exhausted"]
             ),
             1
         );
@@ -6390,7 +5162,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -6509,7 +5281,7 @@ mod tests {
         .await
         .expect("blocking mint intent should seed");
 
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -6658,8 +5430,8 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
-            vault_mock.clone(),
+        let manager = BurnManager::new_for_tests(
+            vault_mock,
             pool.clone(),
             store.clone(),
             receipt_service.clone(),
@@ -6715,9 +5487,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(BurnManagerError::Redemption(
-                RedemptionError::UnresolvedBurnRequiresAcknowledgement {
-                    burn_tx_hash,
-                }
+                RedemptionError::UnresolvedBurnRequiresAcknowledgement { burn_tx_hash }
             )) if burn_tx_hash == persisted_tx.hash
         ));
         assert!(matches!(
@@ -6731,27 +5501,6 @@ mod tests {
                 .unwrap()
                 .contains(&issuer_request_id)
         );
-
-        let wrong_acknowledgement = B256::random();
-        let result = manager
-            .force_complete_burn(
-                &issuer_request_id,
-                other_redemption_hash,
-                "wrong acknowledgement".to_string(),
-                Some(wrong_acknowledgement),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(BurnManagerError::Redemption(
-                RedemptionError::UnresolvedBurnAcknowledgementMismatch {
-                    expected,
-                    provided,
-                }
-            )) if expected == persisted_tx.hash
-                && provided == wrong_acknowledgement
-        ));
-        assert_eq!(vault_mock.verify_burn_call_count(), 0);
     }
 
     #[tokio::test]
@@ -6773,7 +5522,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock,
             pool.clone(),
             store.clone(),
@@ -6837,7 +5586,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -6922,7 +5671,6 @@ mod tests {
         ));
     }
 
-    #[traced_test]
     #[tokio::test]
     async fn test_missing_vault_does_not_consume_recovery_budget() {
         let persisted_tx = SendableTxWithHash::valid_for_test(
@@ -6937,7 +5685,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock,
             pool.clone(),
             store.clone(),
@@ -6965,10 +5713,9 @@ mod tests {
             .await
             .expect("burn intent should persist");
 
-        manager.recover_burning_redemptions().await;
         assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { .. }
+            manager.recover_single_burning(&issuer_request_id).await,
+            Err(BurnManagerError::AssetNotFound { .. })
         ));
         let attempts: i64 = sqlx::query_scalar(
             "
@@ -6984,10 +5731,6 @@ mod tests {
         .await
         .expect("attempt count should load");
         assert_eq!(attempts, 0);
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &["Failed to recover Burning redemption", "Asset not found"]
-        ));
     }
 
     #[traced_test]
@@ -7007,7 +5750,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -7161,8 +5904,9 @@ mod tests {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
-        let manager = BurnManager::new(
-            vault_mock,
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new_for_tests(
+            blockchain_service,
             pool.clone(),
             store.clone(),
             receipt_service.clone(),
@@ -7241,8 +5985,9 @@ mod tests {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
-        let manager = BurnManager::new(
-            vault_mock,
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new_for_tests(
+            blockchain_service,
             pool.clone(),
             store.clone(),
             receipt_service.clone(),
@@ -7302,7 +6047,7 @@ mod tests {
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -7363,147 +6108,6 @@ mod tests {
             tracing::Level::WARN,
             &["Preparing signed burn tx failed"]
         ));
-
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
-                    issuer_request_id: issuer_request_id.clone(),
-                    attempt: 1,
-                },
-            )
-            .await
-            .expect("preparation attempt should survive a simulated restart");
-        manager.recover_burn_failed_redemptions().await;
-        let reserved_attempts: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type =
-                  'RedemptionEvent::BurnPreparationRecoveryAttempted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("reserved preparation attempt count should load");
-        assert_eq!(
-            reserved_attempts, 1,
-            "restart must resume the reserved attempt without another slot"
-        );
-
-        for _ in 0..=MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS {
-            manager.recover_burn_failed_redemptions().await;
-        }
-
-        assert_eq!(
-            vault_mock.burn_preparation_call_count(),
-            usize::try_from(MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS).unwrap() + 1,
-            "the live attempt plus five recovery attempts may prepare"
-        );
-        let preparation_attempts: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type =
-                  'RedemptionEvent::BurnPreparationRecoveryAttempted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("preparation attempt count should load");
-        let preparation_exhausted: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-              AND event_type =
-                  'RedemptionEvent::BurnPreparationRecoveryExhausted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("preparation exhaustion count should load");
-        assert_eq!(
-            preparation_attempts,
-            i64::from(MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS)
-        );
-        assert_eq!(preparation_exhausted, 1);
-        assert_eq!(
-            log_count_at!(
-                tracing::Level::ERROR,
-                &["Automatic burn preparation recovery exhausted"]
-            ),
-            1,
-            "preparation exhaustion must emit one actionable error"
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn prepare_tx_failure_remains_recoverable_when_release_fails() {
-        let vault_mock = Arc::new(MockVaultService::new_prepare_tx_failure());
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        let failing_receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(ReleaseFailingReceiptService {
-                inner: receipt_service.clone(),
-            });
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-
-        let manager = BurnManager::new(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            failing_receipt_service,
-            TEST_WALLET,
-            ANVIL_CHAIN_ID,
-        );
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-
-        harness
-            .discover_receipt(
-                vault,
-                uint!(99_U256),
-                uint!(100_000000000000000000_U256),
-            )
-            .await;
-        let aggregate =
-            create_test_redemption_in_burning_state(store, &issuer_request_id)
-                .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(
-            matches!(result, Err(BurnManagerError::ReceiptRegistration(_))),
-            "release failure must surface instead of terminalizing: {result:?}"
-        );
-        assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![issuer_request_id.clone()],
-            "failed release must leave the reservation visible for retry"
-        );
-
-        let updated = load_aggregate(store, &issuer_request_id).await;
-        assert!(
-            matches!(updated, Redemption::Burning { .. }),
-            "release failure must leave the aggregate recoverable, got {updated:?}"
-        );
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &["Preparing signed burn tx failed"]
-        ));
     }
 
     /// Tests that recovery from `BurnSubmitted` state (crash between submit
@@ -7534,7 +6138,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -7664,7 +6268,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),
@@ -7718,7 +6322,7 @@ mod tests {
                 .contains(&issuer_request_id)
         );
 
-        manager.recover_stuck_reservations(&[vault]).await;
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
 
         assert!(
             harness
@@ -7742,7 +6346,7 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         // Drive the redemption to `Completed` through the real receipt service
         // so the burn settles cleanly; recovery below runs against a
@@ -7750,7 +6354,8 @@ mod tests {
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let manager = BurnManager::new(
-            blockchain_service,
+            HashMap::from([(Network::Base, blockchain_service)]),
+            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
             harness.pool.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
@@ -7803,19 +6408,22 @@ mod tests {
         let recovery_blockchain: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let failing_manager = BurnManager::new(
-            recovery_blockchain,
+            HashMap::from([(Network::Base, recovery_blockchain)]),
+            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
             harness.pool.clone(),
             harness.store.clone(),
             settle_failing,
             TEST_WALLET,
         );
 
-        failing_manager.recover_stuck_reservations(&[vault]).await;
+        failing_manager
+            .recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)])
+            .await;
 
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -7824,10 +6432,21 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::WARN,
             &[
-                "Failed to resolve stuck reservation",
+                "Failed to settle burn receipt reservation",
                 &issuer_request_id.to_string()
             ]
         ));
+
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the next recovery pass must retry and settle the held reservation"
+        );
     }
 
     /// A reservation surviving on a `Failed` redemption is from an *ambiguous*
@@ -7843,7 +6462,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),
@@ -7884,7 +6503,7 @@ mod tests {
         )
         .await;
 
-        manager.recover_stuck_reservations(&[vault]).await;
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
 
         assert!(
             harness
@@ -7906,7 +6525,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),
@@ -7936,7 +6555,7 @@ mod tests {
         )
         .await;
 
-        manager.recover_stuck_reservations(&[vault]).await;
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
 
         assert!(
             harness

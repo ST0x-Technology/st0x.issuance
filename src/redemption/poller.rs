@@ -21,7 +21,11 @@ use super::{
     },
 };
 use crate::bindings;
-use crate::poll_checkpoint::{self, CheckpointError, TRANSFER_POLL};
+use crate::poll_checkpoint::{
+    self, CheckpointError, TRANSFER_POLL, advance_transfer_poll,
+    load_transfer_poll,
+};
+use crate::tokenized_asset::Network;
 use crate::tokenized_asset::TokenizedAssetView;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
@@ -46,17 +50,23 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// continuous failure.
 const MAX_POLL_FAILURES_BEFORE_ALARM: usize = 3;
 
-/// Continuously polls `eth_getLogs` for Transfer events across all vaults.
+/// Continuously polls `eth_getLogs` for Transfer events across all vaults on
+/// one network.
 ///
 /// Replaces the old dual architecture of per-vault `eth_subscribe` detectors
 /// (which could silently die) and one-shot backfillers (which ran once and
-/// exited). This single polling loop:
+/// exited). One poller runs per configured network, each with its own RPC
+/// provider and its own vault set. Each polling loop:
 ///
-/// - Covers all vaults in one RPC call per block range chunk
+/// - Covers all of its network's vaults in one RPC call per block range chunk
 /// - Never misses events (every block is explicitly scanned; on error the
 ///   checkpoint does not advance, so the chunk is retried next pass)
 /// - Fails visibly (if the call fails, we know and retry)
-/// - Persists progress to the `poll_checkpoints` SQL table
+/// - Persists progress to the `poll_checkpoints` SQL table under the
+///   per-network key `transfer_poll:{network}` (e.g. `transfer_poll:ethereum`).
+///   The Base poller additionally falls back to the legacy single-chain
+///   `transfer_poll` key when its per-network key is absent (see
+///   `load_transfer_poll`), so upgrades resume instead of re-scanning history.
 ///
 /// **Dynamic vaults:** the monitored set is re-read from the tokenized-asset
 /// view on every pass (see [`enabled_vaults`]), so an asset added or
@@ -70,6 +80,7 @@ const MAX_POLL_FAILURES_BEFORE_ALARM: usize = 3;
 /// checkpoint are seeded from it once at startup (see
 /// [`Self::seed_per_vault_checkpoints`]) so a deploy does not re-scan them.
 pub(crate) struct TransferPoller<P> {
+    network: Network,
     provider: P,
     bot_wallet: Address,
     backfill_start_block: u64,
@@ -82,6 +93,7 @@ pub(crate) struct TransferPoller<P> {
 
 /// Configuration for constructing a [`TransferPoller`].
 pub(crate) struct TransferPollerConfig<P> {
+    pub(crate) network: Network,
     pub(crate) provider: P,
     pub(crate) bot_wallet: Address,
     pub(crate) backfill_start_block: u64,
@@ -95,6 +107,7 @@ pub(crate) struct TransferPollerConfig<P> {
 impl<P> TransferPoller<P> {
     pub(crate) fn new(config: TransferPollerConfig<P>) -> Self {
         Self {
+            network: config.network,
             provider: config.provider,
             bot_wallet: config.bot_wallet,
             backfill_start_block: config.backfill_start_block,
@@ -198,7 +211,11 @@ where
             return Ok(());
         };
 
-        let assets = list_enabled_assets(&self.pool).await?;
+        let assets = list_enabled_assets(&self.pool)
+            .await?
+            .into_iter()
+            .filter(|asset| asset.network == self.network)
+            .collect::<Vec<_>>();
 
         // Delete the legacy row BEFORE seeding: once it is gone, no later
         // startup can re-apply the migration to vaults that did not exist at
@@ -206,7 +223,7 @@ where
         poll_checkpoint::remove(&self.pool, TRANSFER_POLL).await?;
 
         for vault in enabled_vaults(&assets) {
-            let name = poll_checkpoint::transfer_poll_name(vault);
+            let name = poll_checkpoint::transfer_poll_name(self.network, vault);
             // Only migrate vaults with NO per-vault checkpoint yet — the legacy
             // vaults the old single-cursor poller scanned under the global. A
             // vault that already holds its own checkpoint (a runtime-added vault
@@ -308,12 +325,8 @@ where
         vault: Address,
         head: u64,
     ) -> Result<(), TransferPollError> {
-        let checkpoint_name = poll_checkpoint::transfer_poll_name(vault);
-        let last_processed = poll_checkpoint::load_checkpoint_block(
-            &self.pool,
-            &checkpoint_name,
-        )
-        .await?;
+        let last_processed =
+            load_transfer_poll(&self.pool, self.network, vault).await?;
 
         let cursor = match last_processed {
             None => self.backfill_start_block,
@@ -331,6 +344,7 @@ where
             trace!(
                 target: "redemption",
                 %vault,
+                network = %self.network,
                 cursor,
                 head,
                 "Vault caught up; skipping"
@@ -341,6 +355,7 @@ where
         debug!(
             target: "redemption",
             %vault,
+            network = %self.network,
             from_block = cursor,
             to_block = head,
             "Polling vault for transfer events"
@@ -355,6 +370,7 @@ where
             trace!(
                 target: "redemption",
                 %vault,
+                network = %self.network,
                 chunk_from,
                 chunk_to,
                 logs_found = logs.len(),
@@ -370,12 +386,8 @@ where
                 }
             }
 
-            poll_checkpoint::advance_checkpoint_block(
-                &self.pool,
-                &checkpoint_name,
-                chunk_to,
-            )
-            .await?;
+            advance_transfer_poll(&self.pool, self.network, vault, chunk_to)
+                .await?;
 
             // The advance above moved the cursor past these transfers, making
             // the skip permanent: real user tokens in the redemption wallet
@@ -434,38 +446,42 @@ where
     ) -> Result<ProcessedLog, TransferPollError> {
         let vault = log.address();
 
-        let outcome =
-            match detect_transfer(log, vault, assets, &self.store, &self.pool)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) if err.is_non_transient() => {
-                    debug!(
-                        target: "redemption",
-                        error = %err,
-                        tx_hash = ?log.transaction_hash,
-                        "Skipping non-retryable transfer log"
-                    );
-                    return Ok(ProcessedLog::DroppedNonTransient {
-                        tx_hash: log.transaction_hash,
-                    });
-                }
-                Err(err) => return Err(err.into()),
-            };
+        let outcome = match detect_transfer(
+            log,
+            vault,
+            self.network,
+            assets,
+            &self.store,
+            &self.pool,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) if err.is_non_transient() => {
+                debug!(
+                    target: "redemption",
+                    error = %err,
+                    tx_hash = ?log.transaction_hash,
+                    "Skipping non-retryable transfer log"
+                );
+                return Ok(ProcessedLog::DroppedNonTransient {
+                    tx_hash: log.transaction_hash,
+                });
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         match outcome {
             TransferOutcome::Detected {
                 issuer_request_id,
                 client_id,
                 alpaca_account,
-                network,
             } => {
                 let flow_issuer_request_id = issuer_request_id.clone();
                 let flow = tokio::spawn(drive_redemption_flow(
                     issuer_request_id,
                     client_id,
                     alpaca_account,
-                    network,
                     RedemptionFlowCtx {
                         store: self.store.clone(),
                         redeem_call_manager: self.redeem_call_manager.clone(),
@@ -600,20 +616,25 @@ mod tests {
 
     use super::{TransferPollError, watch_redemption_flow};
     use crate::alpaca::mock::MockAlpacaService;
-    use crate::poll_checkpoint::{self, TRANSFER_POLL};
+    use crate::poll_checkpoint::{
+        self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
+    };
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
     };
-    use crate::redemption::{IssuerRedemptionRequestId, Redemption};
+    use crate::redemption::{
+        IssuerRedemptionRequestId, Redemption, RedemptionServices,
+    };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
-        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
+    use st0x_issuance_dto::AssetKey;
 
     /// `pool` must already have migrations applied — the stores write to the
     /// `events` table on first command dispatch.
@@ -624,8 +645,10 @@ mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
-        let store =
-            Arc::new(test_store::<Redemption>(pool.clone(), vault_service));
+        let store = Arc::new(test_store::<Redemption>(
+            pool.clone(),
+            RedemptionServices::with_single_vault(Network::Base, vault_service),
+        ));
         let receipt_service: Arc<dyn ReceiptService> =
             Arc::new(CqrsReceiptService::new(receipt_store));
 
@@ -674,21 +697,23 @@ mod tests {
 
         let vault_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let burn_manager =
-            Arc::new(crate::redemption::burn_manager::BurnManager::new(
+        let burn_manager = Arc::new(
+            crate::redemption::burn_manager::BurnManager::new_for_tests(
                 vault_service,
                 pool.clone(),
                 store.clone(),
                 receipt_service,
                 bot_wallet,
                 ANVIL_CHAIN_ID,
-            ));
+            ),
+        );
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter.clone());
 
         let poller = super::TransferPoller::new(super::TransferPollerConfig {
+            network: Network::Base,
             provider,
             bot_wallet,
             backfill_start_block,
@@ -711,12 +736,11 @@ mod tests {
                 .await
                 .unwrap();
         let msft = UnderlyingSymbol::new("MSFT").unwrap();
-        let key = AssetKey::new(msft.clone(), Network::Base);
         asset_store
             .send(
-                &key,
+                &AssetKey::new(msft.clone(), Network::Base),
                 TokenizedAssetCommand::Add {
-                    underlying: msft,
+                    underlying: msft.clone(),
                     token: TokenSymbol::new("tMSFT"),
                     network: Network::Base,
                     vault,
@@ -793,12 +817,9 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load_checkpoint_block(
-                &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
-            )
-            .await
-            .unwrap(),
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
             Some(200)
         );
 
@@ -839,12 +860,9 @@ mod tests {
 
         // Checkpoint still advances even with no detections
         assert_eq!(
-            poll_checkpoint::load_checkpoint_block(
-                &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
-            )
-            .await
-            .unwrap(),
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
             Some(200)
         );
 
@@ -868,13 +886,9 @@ mod tests {
             setup_test_poller(vault, bot_wallet, None, &asserter, 50).await;
 
         // Pre-seed the vault's checkpoint at 200
-        poll_checkpoint::advance_checkpoint_block(
-            &setup.pool,
-            &poll_checkpoint::transfer_poll_name(vault),
-            200,
-        )
-        .await
-        .unwrap();
+        advance_transfer_poll(&setup.pool, Network::Base, vault, 200)
+            .await
+            .unwrap();
 
         // Should skip since cursor (201) > head (200)
         setup.poller.poll_once().await.unwrap();
@@ -914,12 +928,9 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load_checkpoint_block(
-                &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
-            )
-            .await
-            .unwrap(),
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
             Some(200)
         );
     }
@@ -999,12 +1010,9 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            poll_checkpoint::load_checkpoint_block(
-                &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
-            )
-            .await
-            .unwrap(),
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
             Some(200)
         );
 
@@ -1034,12 +1042,9 @@ mod tests {
 
         // No checkpoint saved since we skipped
         assert_eq!(
-            poll_checkpoint::load_checkpoint_block(
-                &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
-            )
-            .await
-            .unwrap(),
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
             None
         );
 
@@ -1087,7 +1092,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault),
             )
             .await
             .unwrap(),
@@ -1121,7 +1126,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault),
             )
             .await
             .unwrap(),
@@ -1148,7 +1153,7 @@ mod tests {
         // The vault scanned partway (block 100) before the restart...
         poll_checkpoint::advance_checkpoint_block(
             &setup.pool,
-            &poll_checkpoint::transfer_poll_name(vault),
+            &poll_checkpoint::transfer_poll_name(Network::Base, vault),
             100,
         )
         .await
@@ -1167,7 +1172,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault),
             )
             .await
             .unwrap(),
@@ -1212,7 +1217,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault_b),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault_b),
             )
             .await
             .unwrap(),
@@ -1222,7 +1227,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault_a),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault_a),
             )
             .await
             .unwrap(),
@@ -1324,7 +1329,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault_a),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault_a),
             )
             .await
             .unwrap(),
@@ -1347,7 +1352,7 @@ mod tests {
         assert_eq!(
             poll_checkpoint::load_checkpoint_block(
                 &setup.pool,
-                &poll_checkpoint::transfer_poll_name(vault_b),
+                &poll_checkpoint::transfer_poll_name(Network::Base, vault_b),
             )
             .await
             .unwrap(),

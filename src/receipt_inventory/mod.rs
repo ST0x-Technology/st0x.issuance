@@ -2139,6 +2139,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_same_vault_address_scopes_inventory_by_chain_id() {
+        let store = setup_store().await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let base_chain_id = 8453_u64;
+        let eth_chain_id = 1_u64;
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        for (chain_id, receipt_id, balance) in
+            [(base_chain_id, 1_u64, 100_u64), (eth_chain_id, 2_u64, 200_u64)]
+        {
+            store
+                .send(
+                    &ReceiptVaultKey::new(chain_id, vault),
+                    discover_receipt_cmd(
+                        make_receipt_id(receipt_id),
+                        make_shares(balance),
+                        1000,
+                        tx_hash,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let service = CqrsReceiptService::new(store);
+
+        let base_plan = service
+            .for_burn(
+                base_chain_id,
+                vault,
+                &planning_redemption(),
+                make_shares(50),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            base_plan.allocations[0].receipt.receipt_id,
+            make_receipt_id(1)
+        );
+
+        let eth_plan = service
+            .for_burn(
+                eth_chain_id,
+                vault,
+                &planning_redemption(),
+                make_shares(50),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            eth_plan.allocations[0].receipt.receipt_id,
+            make_receipt_id(2)
+        );
+    }
+
+    #[tokio::test]
     async fn test_reserve_burn_rejects_duplicate_rows_exceeding_balance() {
         let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");

@@ -1720,6 +1720,13 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 }
 ```
 
+The `network` field must be one of Alpaca's published `TokenizationNetwork` wire
+strings (`solana`, `arbitrum`, `ethereum`, `binance`, `base`, `ton`, `tron`,
+`mantle` per
+[Alpaca's redeem callback OpenAPI](https://docs.alpaca.markets/reference/posttokenizationredeem)).
+We currently send `base` or `ethereum` depending on the redemption aggregate's
+network.
+
 The `issuer_request_id` is the full redemption tx hash
 (`IssuerRedemptionRequestId::Full`). Redemptions recorded before this format
 still render legacy `red-{first4bytes}` IDs for their historical events.

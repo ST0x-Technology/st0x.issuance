@@ -24,8 +24,43 @@ pub(crate) const TRANSFER_POLL: &str = "transfer_poll";
 /// from `backfill_start_block` on first appearance instead of inheriting a
 /// global checkpoint that is already past its on-chain history — which would
 /// silently drop the redemptions on that vault below the global checkpoint.
-pub(crate) fn transfer_poll_name(vault: Address) -> String {
-    format!("transfer_poll:{vault:#x}")
+pub(crate) fn transfer_poll_name(network: Network, vault: Address) -> String {
+    format!("transfer_poll:{network}:{vault:#x}")
+}
+
+/// Loads the transfer poll checkpoint for `network`/`vault`, falling back to
+/// the legacy global name when polling Base.
+pub(crate) async fn load_transfer_poll(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+) -> Result<Option<u64>, CheckpointError> {
+    if let Some(block) =
+        load_checkpoint_block(pool, &transfer_poll_name(network, vault)).await?
+    {
+        return Ok(Some(block));
+    }
+
+    if network == Network::Base {
+        load_checkpoint_block(pool, TRANSFER_POLL).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Advances the per-network transfer poll checkpoint.
+pub(crate) async fn advance_transfer_poll(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    advance_checkpoint_block(
+        pool,
+        &transfer_poll_name(network, vault),
+        block_number,
+    )
+    .await
 }
 
 /// Per-network receipt backfill checkpoint name.
@@ -262,6 +297,38 @@ mod tests {
         assert_eq!(
             load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
             Some(999)
+        );
+    }
+
+    /// The Base poller must fall back to the legacy single-chain
+    /// `transfer_poll` key when no per-network checkpoint exists yet --
+    /// otherwise an upgraded deployment restarts from `backfill_start_block`
+    /// and re-processes all historical blocks. Once the per-network key is
+    /// written, it takes precedence, and non-Base networks must never see the
+    /// legacy value.
+    #[tokio::test]
+    async fn load_transfer_poll_falls_back_to_legacy_key_for_base_only() {
+        let pool = setup_pool().await;
+        let vault = address!("00000000000000000000000000000000000000aa");
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 123).await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&pool, Network::Base, vault).await.unwrap(),
+            Some(123),
+            "Base must fall back to the legacy transfer_poll checkpoint"
+        );
+        assert_eq!(
+            load_transfer_poll(&pool, Network::Ethereum, vault).await.unwrap(),
+            None,
+            "non-Base networks must not inherit the legacy Base checkpoint"
+        );
+
+        advance_transfer_poll(&pool, Network::Base, vault, 456).await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&pool, Network::Base, vault).await.unwrap(),
+            Some(456),
+            "the per-vault key must take precedence over the legacy key"
         );
     }
 

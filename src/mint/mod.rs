@@ -521,6 +521,21 @@ impl Mint {
         }
     }
 
+    pub(crate) const fn network(&self) -> Option<Network> {
+        match self {
+            Self::Initiated { network, .. }
+            | Self::JournalConfirmed { network, .. }
+            | Self::JournalRejected { network, .. }
+            | Self::Minting { network, .. }
+            | Self::TxIntended { network, .. }
+            | Self::TxSubmitted { network, .. }
+            | Self::CallbackPending { network, .. }
+            | Self::MintingFailed { network, .. }
+            | Self::Completed { network, .. } => Some(*network),
+            Self::Closed { .. } => None,
+        }
+    }
+
     fn handle_confirm_journal(
         &self,
         provided_id: IssuerMintRequestId,

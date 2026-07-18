@@ -135,8 +135,11 @@ impl RedeemCallManager {
         let (client_id, alpaca_account) =
             self.lookup_account_for_recovery(&metadata.wallet).await?;
 
-        let network =
-            self.lookup_network_for_asset(&metadata.underlying).await?;
+        self.verify_asset_enabled(
+            metadata.underlying.clone(),
+            metadata.network,
+        )
+        .await?;
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
@@ -147,7 +150,6 @@ impl RedeemCallManager {
             issuer_request_id,
             &aggregate,
             client_id,
-            network,
         )
         .await?;
 
@@ -174,19 +176,20 @@ impl RedeemCallManager {
         }
     }
 
-    async fn lookup_network_for_asset(
+    async fn verify_asset_enabled(
         &self,
-        underlying: &UnderlyingSymbol,
-    ) -> Result<Network, RedeemCallManagerError> {
+        underlying: UnderlyingSymbol,
+        network: Network,
+    ) -> Result<(), RedeemCallManagerError> {
         let assets = list_enabled_assets(&self.pool).await?;
 
-        assets
-            .into_iter()
-            .find(|asset| &asset.underlying == underlying)
-            .map(|asset| asset.network)
-            .ok_or_else(|| RedeemCallManagerError::AssetNotFound {
-                underlying: underlying.clone(),
-            })
+        if assets.iter().any(|asset| {
+            asset.underlying == underlying && asset.network == network
+        }) {
+            Ok(())
+        } else {
+            Err(RedeemCallManagerError::AssetNotFound { underlying, network })
+        }
     }
 
     #[tracing::instrument(skip(self, aggregate), fields(
@@ -199,7 +202,6 @@ impl RedeemCallManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
-        network: Network,
     ) -> Result<(), RedeemCallManagerError> {
         let Redemption::Detected { metadata } = aggregate else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
@@ -226,7 +228,7 @@ impl RedeemCallManager {
             token: metadata.token.clone(),
             client_id,
             quantity: alpaca_quantity.clone(),
-            network,
+            network: metadata.network,
             wallet: metadata.wallet,
             tx_hash: metadata.detected_tx_hash,
         };
@@ -312,8 +314,10 @@ pub(crate) enum RedeemCallManagerError {
     AccountNotLinked { wallet: Address },
     #[error("Asset view error: {0}")]
     AssetView(#[from] TokenizedAssetViewError),
-    #[error("Asset not found for underlying: {underlying}")]
-    AssetNotFound { underlying: UnderlyingSymbol },
+    #[error(
+        "Asset not found for underlying: {underlying} on network: {network}"
+    )]
+    AssetNotFound { underlying: UnderlyingSymbol, network: Network },
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
 }
@@ -331,23 +335,31 @@ impl From<AggregateError<LifecycleError<Redemption>>>
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
+    use async_trait::async_trait;
     use chrono::Utc;
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tracing_test::traced_test;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
+    use crate::alpaca::itn::{
+        REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string,
+    };
     use crate::alpaca::mock::MockAlpacaService;
-    use crate::mint::Quantity;
+    use crate::alpaca::{
+        AlpacaError, AlpacaService, Fees, RedeemRequest, RedeemRequestStatus,
+        RedeemResponse, TokenizationRequest, TokenizationRequestType,
+    };
+    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        UnderlyingSymbol,
+        RedemptionServices, UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
@@ -390,7 +402,10 @@ mod tests {
             let redemption_store =
                 StoreBuilder::<Redemption>::new(pool.clone())
                     .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-                    .build(vault_service)
+                    .build(RedemptionServices::with_single_vault(
+                        Network::Base,
+                        vault_service,
+                    ))
                     .await
                     .expect("Failed to build redemption store");
 
@@ -467,6 +482,7 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRedemptionRequestId,
             underlying: &UnderlyingSymbol,
+            network: &Network,
             wallet: Address,
         ) {
             self.redemption_store
@@ -476,6 +492,7 @@ mod tests {
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.as_str())),
+                        network: *network,
                         wallet,
                         quantity: Quantity::new(Decimal::from(100)),
                         tx_hash: b256!(
@@ -517,7 +534,10 @@ mod tests {
             Arc::new(MockVaultService::new_success());
         let store = StoreBuilder::<Redemption>::new(pool.clone())
             .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-            .build(vault_service)
+            .build(RedemptionServices::with_single_vault(
+                Network::Base,
+                vault_service,
+            ))
             .await
             .expect("Failed to build redemption store");
 
@@ -544,6 +564,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -574,7 +595,6 @@ mod tests {
         .await;
 
         let client_id = ClientId::new();
-        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -582,7 +602,6 @@ mod tests {
                 &issuer_request_id,
                 &aggregate,
                 client_id,
-                network,
             )
             .await;
 
@@ -606,6 +625,115 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn test_handle_redemption_detected_sends_ethereum_network_to_alpaca()
+    {
+        struct CapturingRedeemAlpacaService {
+            captured_network: Mutex<Option<Network>>,
+        }
+
+        #[async_trait]
+        impl AlpacaService for CapturingRedeemAlpacaService {
+            async fn send_mint_callback(
+                &self,
+                _request: crate::alpaca::MintCallbackRequest,
+            ) -> Result<(), AlpacaError> {
+                unreachable!("redeem test should not call mint callback")
+            }
+
+            async fn call_redeem_endpoint(
+                &self,
+                request: RedeemRequest,
+            ) -> Result<RedeemResponse, AlpacaError> {
+                *self.captured_network.lock().unwrap() = Some(request.network);
+
+                Ok(RedeemResponse {
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-eth-capture",
+                    ),
+                    issuer_request_id: request.issuer_request_id,
+                    created_at: Utc::now(),
+                    r#type: TokenizationRequestType::Redeem,
+                    status: RedeemRequestStatus::Pending,
+                    underlying: request.underlying,
+                    token: request.token,
+                    quantity: request.quantity,
+                    issuer: "test-issuer".to_string(),
+                    network: request.network,
+                    wallet: request.wallet,
+                    tx_hash: request.tx_hash,
+                    fees: Some(Fees(Decimal::ZERO)),
+                })
+            }
+
+            async fn poll_request_status(
+                &self,
+                _tokenization_request_id: &TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                unreachable!("redeem test should not poll request status")
+            }
+        }
+
+        let (store, pool) = setup_test_store().await;
+        let capture = Arc::new(CapturingRedeemAlpacaService {
+            captured_network: Mutex::new(None),
+        });
+        let alpaca_service = capture.clone() as Arc<dyn AlpacaService>;
+        let manager =
+            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
+        let token = TokenSymbol::new("tTSLA");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    network: Network::Ethereum,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number: 12345,
+                },
+            )
+            .await
+            .unwrap();
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+                ClientId::new(),
+            )
+            .await
+            .expect("Expected ethereum redeem call to succeed");
+
+        assert_eq!(
+            *capture.captured_network.lock().unwrap(),
+            Some(Network::Ethereum),
+            "Redeem callback must send aggregate network on the wire"
+        );
+
+        let wire = Network::Ethereum.as_str();
+        assert!(
+            accepts_network_wire_string(wire),
+            "redeem callback network must be a published Alpaca TokenizationNetwork \
+             value — see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
         let (store, pool) = setup_test_store().await;
         let alpaca_service_mock =
@@ -623,7 +751,6 @@ mod tests {
         .await;
 
         let client_id = ClientId::new();
-        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -631,7 +758,6 @@ mod tests {
                 &issuer_request_id,
                 &aggregate,
                 client_id,
-                network,
             )
             .await;
 
@@ -678,7 +804,6 @@ mod tests {
         };
 
         let client_id = ClientId::new();
-        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -686,7 +811,6 @@ mod tests {
                 &issuer_request_id,
                 &aggregate,
                 client_id,
-                network,
             )
             .await;
 
@@ -748,7 +872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_network_for_asset_success() {
+    async fn test_verify_asset_enabled_success() {
         let harness = TestHarness::new().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -759,14 +883,14 @@ mod tests {
 
         harness.add_asset(&underlying, &network).await;
 
-        let result = manager.lookup_network_for_asset(&underlying).await;
+        let result =
+            manager.verify_asset_enabled(underlying.clone(), network).await;
 
         assert!(result.is_ok(), "Expected success, got {result:?}");
-        assert_eq!(result.unwrap(), network);
     }
 
     #[tokio::test]
-    async fn test_lookup_network_for_asset_not_found() {
+    async fn test_verify_asset_enabled_not_found() {
         let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -774,11 +898,43 @@ mod tests {
 
         let underlying = UnderlyingSymbol::new("UNKNOWN").unwrap();
 
-        let result = manager.lookup_network_for_asset(&underlying).await;
+        let result = manager
+            .verify_asset_enabled(underlying.clone(), Network::Base)
+            .await;
 
         assert!(
             matches!(result, Err(RedeemCallManagerError::AssetNotFound { .. })),
             "Expected AssetNotFound, got {result:?}"
+        );
+    }
+
+    /// An asset enabled on one network must not satisfy the check for another
+    /// network -- otherwise a redemption detected on Ethereum could be
+    /// recovered against Base asset metadata and burned on the wrong chain.
+    #[tokio::test]
+    async fn test_verify_asset_enabled_wrong_network() {
+        let harness = TestHarness::new().await;
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+
+        harness.add_asset(&underlying, &Network::Base).await;
+
+        let result = manager
+            .verify_asset_enabled(underlying.clone(), Network::Ethereum)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(RedeemCallManagerError::AssetNotFound {
+                    ref network,
+                    ..
+                }) if network == &Network::Ethereum
+            ),
+            "Expected AssetNotFound for the unregistered network, got {result:?}"
         );
     }
 
@@ -826,7 +982,12 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
 
         manager.recover_detected_redemptions().await;
@@ -886,7 +1047,12 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &network,
+                wallet,
+            )
             .await;
 
         manager.recover_detected_redemptions().await;
@@ -962,7 +1128,12 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
 
         // No account registered for this wallet — recovery should auto-fail
@@ -1014,7 +1185,12 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
 
         let result = manager.recover_single_detected(&issuer_request_id).await;

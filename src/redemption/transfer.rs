@@ -25,7 +25,6 @@ pub(crate) enum TransferOutcome {
         issuer_request_id: IssuerRedemptionRequestId,
         client_id: ClientId,
         alpaca_account: AlpacaAccountNumber,
-        network: Network,
     },
     AlreadyDetected,
     SkippedMint,
@@ -88,6 +87,7 @@ impl TransferProcessingError {
 pub(crate) async fn detect_transfer(
     log: &alloy::rpc::types::Log,
     vault: Address,
+    network: Network,
     assets: &[TokenizedAssetView],
     store: &Store<Redemption>,
     pool: &Pool<Sqlite>,
@@ -121,7 +121,8 @@ pub(crate) async fn detect_transfer(
         return Ok(TransferOutcome::SkippedNoAccount);
     };
 
-    let (underlying, token, network) = find_matching_asset(assets, vault)?;
+    let (underlying, token, network) =
+        find_matching_asset(assets, vault, network)?;
 
     let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
     let quantity = Quantity::from_u256_with_18_decimals(transfer_event.value)?;
@@ -130,6 +131,7 @@ pub(crate) async fn detect_transfer(
         issuer_request_id: issuer_request_id.clone(),
         underlying,
         token,
+        network,
         wallet: transfer_event.from,
         quantity,
         tx_hash,
@@ -156,7 +158,6 @@ pub(crate) async fn detect_transfer(
         issuer_request_id,
         client_id,
         alpaca_account,
-        network,
     })
 }
 
@@ -175,7 +176,6 @@ pub(crate) async fn drive_redemption_flow(
     issuer_request_id: IssuerRedemptionRequestId,
     client_id: ClientId,
     alpaca_account: AlpacaAccountNumber,
-    network: Network,
     deps: RedemptionFlowCtx,
 ) {
     let redemption = match deps.store.load(&issuer_request_id).await {
@@ -202,7 +202,6 @@ pub(crate) async fn drive_redemption_flow(
             &issuer_request_id,
             &redemption,
             client_id,
-            network,
         )
         .await
     {
@@ -303,8 +302,11 @@ pub(crate) async fn drive_redemption_flow(
 fn find_matching_asset(
     assets: &[TokenizedAssetView],
     vault: Address,
+    network: Network,
 ) -> Result<(UnderlyingSymbol, TokenSymbol, Network), TransferProcessingError> {
-    let mut matching = assets.iter().filter(|asset| asset.vault == vault);
+    let mut matching = assets
+        .iter()
+        .filter(|asset| asset.vault == vault && asset.network == network);
 
     let first = matching
         .next()
@@ -341,6 +343,7 @@ mod tests {
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
     use crate::redemption::Redemption;
+    use crate::redemption::RedemptionServices;
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
     };
@@ -356,7 +359,10 @@ mod tests {
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
 
-        Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
+        Arc::new(test_store::<Redemption>(
+            pool.clone(),
+            RedemptionServices::with_single_vault(Network::Base, vault_service),
+        ))
     }
 
     #[traced_test]
@@ -379,7 +385,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         let outcome = result.expect("Expected success");
         assert!(
@@ -441,7 +449,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         let outcome = result.expect("Expected success");
         assert!(
@@ -488,7 +498,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedMint)),
@@ -523,7 +535,9 @@ mod tests {
         log.transaction_hash = None;
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingTxHash)),
@@ -553,7 +567,9 @@ mod tests {
         log.block_number = None;
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingBlockNumber)),
@@ -587,7 +603,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(
@@ -646,7 +664,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(
@@ -688,7 +708,9 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedNoAccount)),
@@ -721,13 +743,17 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let first = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let first =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
         assert!(
             matches!(first, Ok(TransferOutcome::Detected { .. })),
             "First detection should succeed, got {first:?}"
         );
 
-        let second = detect_transfer(&log, vault, &assets, &store, &pool).await;
+        let second =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
         assert!(
             matches!(second, Ok(TransferOutcome::AlreadyDetected)),
             "Second detection should return AlreadyDetected, got {second:?}"

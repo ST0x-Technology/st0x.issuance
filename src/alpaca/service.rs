@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
     RedeemResponse, TokenizationRequest,
+    itn::{self, REDEEM_CALLBACK_OPENAPI_REFERENCE},
 };
 use crate::mint::TokenizationRequestId;
 
@@ -197,6 +198,13 @@ impl AlpacaService for RealAlpacaService {
         &self,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
+        if !itn::accepts_network_wire_string(request.network.as_str()) {
+            return Err(AlpacaError::UnsupportedTokenizationNetwork {
+                network: request.network,
+                reference: REDEEM_CALLBACK_OPENAPI_REFERENCE,
+            });
+        }
+
         let url = format!(
             "{}/v1/accounts/{}/tokenization/callback/redeem",
             self.base_url.trim_end_matches('/'),
@@ -369,7 +377,10 @@ mod tests {
         AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
         RedeemRequest, TokenizationRequest,
     };
-    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
+    use crate::alpaca::{
+        RedeemRequestStatus, TokenizationRequestType,
+        itn::{REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string},
+    };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::test_utils::logs_contain_at;
@@ -965,6 +976,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_call_redeem_endpoint_sends_ethereum_network_wire_string() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "underlying_symbol": "TSLA",
+                    "token_symbol": "tTSLA",
+                    "client_id": "00000000-0000-0000-0000-000000000456",
+                    "qty": "100",
+                    "network": "ethereum",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                }));
+            then.status(200).json_body(serde_json::json!({
+                "tokenization_request_id": "tok-eth-002",
+                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "created_at": "2025-09-12T17:28:48.642437-04:00",
+                "type": "redeem",
+                "status": "pending",
+                "underlying_symbol": "TSLA",
+                "token_symbol": "tTSLA",
+                "qty": "100",
+                "issuer": "test-issuer",
+                "network": "ethereum",
+                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "fees": "0.0"
+            }));
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let mut request = create_redeem_request();
+        request.underlying = UnderlyingSymbol::new("TSLA").unwrap();
+        request.token = TokenSymbol::new("tTSLA");
+        request.network = Network::Ethereum;
+
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        let wire = response.network.as_str();
+        assert!(
+            accepts_network_wire_string(wire),
+            "redeem callback network must be a published Alpaca TokenizationNetwork \
+             value — see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+        assert_eq!(response.network, Network::Ethereum);
+        mock.assert();
+    }
+
+    #[tokio::test]
     #[traced_test]
     async fn test_poll_request_status_success() {
         let server = MockServer::start();
@@ -1498,7 +1573,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_request_status_parses_ethereum_network_wire_string() {
         let target_id = "00000000-0000-0000-0000-000000000002";
-        let ethereum_json = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000002","issuer_request_id":"0x2222222222222222222222222222222222222222222222222222222222222222","type":"mint","status":"completed","underlying_symbol":"AAPL","token_symbol":"tAAPL","qty":"1","client_external_account_id":"00000000-0000-0000-0000-000000000003","created_at":"2026-06-11T00:02:27.467568Z","updated_at":"2026-06-11T04:02:33.530523Z","wallet_address":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","network":"ethereum","issuer":"st0x","fees":"0","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}"#;
+        let ethereum_redeem_json = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000002","issuer_request_id":"0x2222222222222222222222222222222222222222222222222222222222222222","type":"redeem","status":"completed","underlying_symbol":"AAPL","token_symbol":"tAAPL","qty":"1","client_external_account_id":"00000000-0000-0000-0000-000000000003","created_at":"2026-06-11T00:02:27.467568Z","updated_at":"2026-06-11T04:02:33.530523Z","wallet_address":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","network":"ethereum","issuer":"st0x","fees":"0","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}"#;
 
         let server = MockServer::start();
 
@@ -1506,7 +1581,7 @@ mod tests {
             when.method(GET).path(format!(
                 "/v1/accounts/test-account/tokenization/requests/{target_id}"
             ));
-            then.status(200).body(ethereum_json);
+            then.status(200).body(ethereum_redeem_json);
         });
 
         let service = RealAlpacaService::new(
@@ -1523,12 +1598,18 @@ mod tests {
             .poll_request_status(&TokenizationRequestId::new(target_id))
             .await;
 
-        let request = result.unwrap();
+        let TokenizationRequest::Redeem { network, .. } = result.unwrap()
+        else {
+            panic!("Expected Redeem poll response");
+        };
+
+        let wire = network.as_str();
         assert!(
-            matches!(request, TokenizationRequest::Mint {}),
-            "ethereum mint payload must parse through the real poll path, \
-             got {request:?}"
+            accepts_network_wire_string(wire),
+            "poll response network must be a published Alpaca TokenizationNetwork \
+             value — see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
+        assert_eq!(network, Network::Ethereum);
         mock.assert();
     }
 
