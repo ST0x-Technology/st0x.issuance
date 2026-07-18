@@ -32,7 +32,11 @@ use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptService, Shares,
 };
-use crate::vault::{ReceiptInformation, TxId, VaultError, VaultService};
+use crate::tokenized_asset::Network;
+use crate::vault::{
+    NetworkVaultServices, ReceiptInformation, TxId, UnconfiguredNetworkError,
+    VaultError, VaultService,
+};
 
 /// Failure of a mint side-effect job. A domain rejection is recorded as a
 /// `MintingFailed` event instead (see the module docs); these variants are the
@@ -58,7 +62,11 @@ pub(crate) struct SubmitMintJob {
 
 pub(crate) struct SubmitMintContext {
     pub(crate) mint_store: Arc<Store<Mint>>,
-    pub(crate) vault: Arc<dyn VaultService>,
+    /// Per-network signing backends. Jobs carry a vault address + chain id,
+    /// but the RPC/signer must come from the mint's `network` — a single
+    /// shared `VaultService` would submit every mint against the default
+    /// (Base) chain.
+    pub(crate) vaults: NetworkVaultServices,
     pub(crate) bot: Address,
     pub(crate) confirm_queue: JobQueue<ConfirmMintJob>,
     /// Event-store pool; the post-failure recovery enqueue releases terminal
@@ -66,6 +74,15 @@ pub(crate) struct SubmitMintContext {
     pub(crate) pool: Pool<Sqlite>,
     /// apalis pool the recovery job is pushed to.
     pub(crate) apalis_pool: SqlitePool,
+}
+
+impl SubmitMintContext {
+    fn vault_for(
+        &self,
+        network: Network,
+    ) -> Result<Arc<dyn VaultService>, UnconfiguredNetworkError> {
+        self.vaults.service(network).cloned()
+    }
 }
 
 impl Job<SubmitMintContext> for SubmitMintJob {
@@ -86,10 +103,17 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                 tokenization_request_id,
                 quantity,
                 underlying,
+                network,
                 wallet,
                 journal_confirmed_at,
                 ..
             } => {
+                let Some(vault) =
+                    self.resolve_vault_service(ctx, *network).await?
+                else {
+                    return Ok(());
+                };
+
                 // A quantity that cannot be converted is deterministic for
                 // the persisted mint: record a domain failure instead of
                 // returning a job error apalis would re-drive forever.
@@ -132,9 +156,8 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     .retry_submission_external_tx_id()
                     .map(super::MintExternalTxId::into_string);
 
-                let wallet_guard = ctx.vault.lock_wallet().await;
-                let prepared = match ctx
-                    .vault
+                let wallet_guard = vault.lock_wallet().await;
+                let prepared = match vault
                     .prepare_mint_tx(
                         self.vault,
                         assets,
@@ -153,7 +176,7 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     }
                 };
 
-                let submitted = ctx.vault.submit_mint(&prepared).await;
+                let submitted = vault.submit_mint(&prepared).await;
                 drop(wallet_guard);
 
                 match submitted {
@@ -184,8 +207,14 @@ impl Job<SubmitMintContext> for SubmitMintJob {
             }
             // Crash recovery for a prepare-then-submit job that persisted
             // intent via the inline PrepareMint path before the job rewrite.
-            Mint::TxIntended { prepared_tx, .. } => {
-                match ctx.vault.submit_mint(prepared_tx).await {
+            Mint::TxIntended { prepared_tx, network, .. } => {
+                let Some(vault) =
+                    self.resolve_vault_service(ctx, *network).await?
+                else {
+                    return Ok(());
+                };
+
+                match vault.submit_mint(prepared_tx).await {
                     Ok(submitted) => {
                         let tx_id = submitted.tx_id;
                         ctx.mint_store
@@ -233,6 +262,38 @@ impl Job<SubmitMintContext> for SubmitMintJob {
 }
 
 impl SubmitMintJob {
+    /// Resolves the signing backend for `network`. An unconfigured network is
+    /// deterministic for this deploy, so it is recorded as `MintingFailed`
+    /// instead of surfacing as a job error apalis would re-drive forever.
+    async fn resolve_vault_service(
+        &self,
+        ctx: &SubmitMintContext,
+        network: Network,
+    ) -> Result<Option<Arc<dyn VaultService>>, MintJobError> {
+        match ctx.vault_for(network) {
+            Ok(vault) => Ok(Some(vault)),
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    network = %network,
+                    error = %error,
+                    "No vault service configured for mint network"
+                );
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordMintFailed {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
     async fn record_submission_failure(
         &self,
         ctx: &SubmitMintContext,
@@ -299,7 +360,9 @@ pub(crate) struct ConfirmMintJob {
 
 pub(crate) struct ConfirmMintContext {
     pub(crate) mint_store: Arc<Store<Mint>>,
-    pub(crate) vault: Arc<dyn VaultService>,
+    /// Per-network signing backends; confirm polls the chain that submitted
+    /// the mint (see [`SubmitMintContext::vaults`]).
+    pub(crate) vaults: NetworkVaultServices,
     pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) callback_queue: JobQueue<SendCallbackJob>,
     /// Event-store pool; the post-failure recovery enqueue releases terminal
@@ -307,6 +370,15 @@ pub(crate) struct ConfirmMintContext {
     pub(crate) pool: Pool<Sqlite>,
     /// apalis pool the recovery job is pushed to.
     pub(crate) apalis_pool: SqlitePool,
+}
+
+impl ConfirmMintContext {
+    fn vault_for(
+        &self,
+        network: Network,
+    ) -> Result<Arc<dyn VaultService>, UnconfiguredNetworkError> {
+        self.vaults.service(network).cloned()
+    }
 }
 
 impl Job<ConfirmMintContext> for ConfirmMintJob {
@@ -326,6 +398,7 @@ impl Job<ConfirmMintContext> for ConfirmMintJob {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             journal_confirmed_at,
             ..
         } = &mint
@@ -338,7 +411,36 @@ impl Job<ConfirmMintContext> for ConfirmMintJob {
             return Ok(());
         };
 
-        match ctx.vault.confirm_mint(&self.tx_id).await {
+        let vault = match ctx.vault_for(*network) {
+            Ok(vault) => vault,
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    network = %network,
+                    error = %error,
+                    "No vault service configured for mint network"
+                );
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordMintFailed {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                kick_mint_recovery(
+                    &ctx.pool,
+                    &ctx.apalis_pool,
+                    &self.issuer_request_id,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+
+        match vault.confirm_mint(&self.tx_id).await {
             Ok(result) => {
                 let receipt_info = ReceiptInformation::new(
                     tokenization_request_id.clone(),
@@ -536,6 +638,8 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
+    use std::collections::HashMap;
+
     use super::*;
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::MintEvent;
@@ -549,7 +653,10 @@ mod tests {
         ReceiptLookupError, ReceiptRegistrationError, RecoveredReceipt,
     };
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{
+        ANVIL_CHAIN_ID, ETHEREUM_TEST_CHAIN_ID, logs_contain_at,
+    };
+    use crate::vault::NetworkVault;
     use crate::vault::mock::MockVaultService;
 
     /// Seeds raw `Mint` events directly into the event store so job tests can
@@ -597,7 +704,11 @@ mod tests {
     ) -> SubmitMintContext {
         SubmitMintContext {
             mint_store: harness.mint_store.clone(),
-            vault,
+            vaults: NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                vault,
+            ),
             bot: BOT,
             confirm_queue: JobQueue::new(&harness.apalis_pool),
             pool: harness.pool.clone(),
@@ -612,12 +723,29 @@ mod tests {
     ) -> ConfirmMintContext {
         ConfirmMintContext {
             mint_store: harness.mint_store.clone(),
-            vault,
+            vaults: NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                vault,
+            ),
             receipts,
             callback_queue: JobQueue::new(&harness.apalis_pool),
             pool: harness.pool.clone(),
             apalis_pool: harness.apalis_pool.clone(),
         }
+    }
+
+    fn events_through_minting_on(
+        issuer_request_id: &IssuerMintRequestId,
+        network: Network,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_minting(issuer_request_id);
+        if let MintEvent::Initiated { network: event_network, .. } =
+            &mut events[0]
+        {
+            *event_network = network;
+        }
+        events
     }
 
     fn cqrs_receipts(pool: &Pool<Sqlite>) -> Arc<dyn ReceiptService> {
@@ -726,6 +854,73 @@ mod tests {
         ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
             Ok(None)
         }
+    }
+
+    /// Multichain regression: a mint on Ethereum must call the Ethereum
+    /// `VaultService`, not the Base one that happens to be the process default.
+    #[tokio::test]
+    async fn submit_mint_job_routes_vault_service_by_mint_network() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_minting_on(&issuer_request_id, Network::Ethereum),
+        )
+        .await;
+
+        let base_vault = Arc::new(MockVaultService::new_submit_failure());
+        let eth_vault = Arc::new(MockVaultService::new_success());
+        let ctx = SubmitMintContext {
+            mint_store: harness.mint_store.clone(),
+            vaults: NetworkVaultServices::new(HashMap::from([
+                (
+                    Network::Base,
+                    NetworkVault {
+                        service: base_vault.clone(),
+                        chain_id: ANVIL_CHAIN_ID,
+                    },
+                ),
+                (
+                    Network::Ethereum,
+                    NetworkVault {
+                        service: eth_vault.clone(),
+                        chain_id: ETHEREUM_TEST_CHAIN_ID,
+                    },
+                ),
+            ])),
+            bot: BOT,
+            confirm_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool.clone(),
+            apalis_pool: harness.apalis_pool.clone(),
+        };
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ETHEREUM_TEST_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::TxSubmitted { .. }),
+            "Ethereum mint must submit via the Ethereum vault service, got: \
+             {mint:?}"
+        );
+        assert_eq!(
+            eth_vault.get_wallet_lock_call_count(),
+            1,
+            "Ethereum vault service must prepare/submit the mint"
+        );
+        assert_eq!(
+            base_vault.get_wallet_lock_call_count(),
+            0,
+            "Base vault service must not be used for an Ethereum mint"
+        );
     }
 
     /// A rejected submission must be recorded as a domain failure
