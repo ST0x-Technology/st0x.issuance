@@ -52,6 +52,15 @@ pub(crate) fn job_type<Task>() -> &'static str {
 /// event store's sqlx 0.9 pool but addressing the same SQLite file.
 pub(crate) struct JobQueue<Task>(Storage<Task>);
 
+/// One entry in a [`JobQueue::push_scheduled_batch`] batch: the task, the
+/// `(job_type, idempotency_key)` dedup key apalis enforces, and the delay
+/// before the task becomes due.
+pub(crate) struct ScheduledTask<Task> {
+    pub(crate) task: Task,
+    pub(crate) idempotency_key: String,
+    pub(crate) run_after: Duration,
+}
+
 /// Error returned by [`JobQueue::push_with_idempotency_key`]. Wrapping
 /// [`TaskSinkError`] keeps the failure chain typed so callers can `#[from]` it.
 #[derive(Debug, thiserror::Error)]
@@ -98,15 +107,15 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static>
 
     /// Atomically enqueues a batch of scheduled tasks.
     ///
-    /// The SQLite sink flushes the batch in one statement, so callers whose
+    /// The SQLite sink flushes the batch in one transaction, so callers whose
     /// tasks form one domain operation cannot persist only a prefix when an
     /// insert fails.
     pub(crate) async fn push_scheduled_batch<const N: usize>(
         &mut self,
-        tasks: [(Task, String, Duration); N],
+        tasks: [ScheduledTask<Task>; N],
     ) -> Result<(), QueuePushError> {
         let mut tasks = futures::stream::iter(tasks.map(
-            |(task, idempotency_key, run_after)| {
+            |ScheduledTask { task, idempotency_key, run_after }| {
                 TaskBuilder::new(task)
                     .with_idempotency_key(idempotency_key)
                     .run_after(run_after)

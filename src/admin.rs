@@ -11,7 +11,7 @@ use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::Quantity;
 use crate::alpaca::{
@@ -1923,7 +1923,9 @@ pub(crate) struct ScheduleFreezeWindowResponse {
     responses(
         (status = 200, description = "Freeze window armed",
             body = ScheduleFreezeWindowResponse),
-        (status = 422, description = "Inverted or already-elapsed window"),
+        (status = 404, description = "Underlying has no listing on any network"),
+        (status = 422,
+            description = "Inverted, sub-second, or already-elapsed window"),
         (status = 500, description = "Failed to enqueue the schedule jobs")
     ),
     security(("internal_api_key" = []))
@@ -1942,19 +1944,35 @@ pub(crate) async fn schedule_freeze_window(
     scheduler
         .schedule_window(&underlying, freeze_at, unfreeze_at, Utc::now())
         .await
-        .map_err(|err| {
-            error!(target: "admin", underlying = %underlying,
-                %freeze_at,
-                %unfreeze_at,
-                error = %err,
-                "Failed to arm freeze window"
-            );
-            match err {
-                FreezeScheduleError::InvertedWindow { .. }
-                | FreezeScheduleError::ElapsedWindow { .. } => {
-                    Status::UnprocessableEntity
-                }
-                FreezeScheduleError::Push(_) => Status::InternalServerError,
+        .map_err(|err| match err {
+            FreezeScheduleError::UnknownUnderlying { .. } => {
+                debug!(target: "admin", underlying = %underlying,
+                    "Rejected freeze window for unlisted underlying"
+                );
+                Status::NotFound
+            }
+            // Expected client validation failures — not on-call events.
+            FreezeScheduleError::InvertedWindow { .. }
+            | FreezeScheduleError::WindowTooShort { .. }
+            | FreezeScheduleError::ElapsedWindow { .. } => {
+                debug!(target: "admin", underlying = %underlying,
+                    %freeze_at,
+                    %unfreeze_at,
+                    error = %err,
+                    "Rejected freeze window schedule"
+                );
+                Status::UnprocessableEntity
+            }
+            FreezeScheduleError::Push(_)
+            | FreezeScheduleError::View(_)
+            | FreezeScheduleError::Sqlx(_) => {
+                error!(target: "admin", underlying = %underlying,
+                    %freeze_at,
+                    %unfreeze_at,
+                    error = %err,
+                    "Failed to arm freeze window"
+                );
+                Status::InternalServerError
             }
         })?;
 
@@ -1980,7 +1998,7 @@ mod tests {
     use alloy::primitives::{Address, B256, Bloom, Bytes, U256, address, b256};
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
-    use chrono::Utc;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use event_sorcery::{Store, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
@@ -2002,6 +2020,8 @@ mod tests {
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
+    use crate::auth::FailedAuthRateLimiter;
+    use crate::mint::test_utils::{TestHarness, test_config};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::ReceiptVaultKey;
     use crate::receipt_inventory::{
@@ -2015,6 +2035,7 @@ mod tests {
         RedemptionServices, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
+    use crate::tokenized_asset::schedule::FreezeScheduler;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -5051,5 +5072,215 @@ mod tests {
         );
         // tokenization_request_id is preserved (it doesn't reset).
         assert_eq!(summary.tokenization_request_id, Some(tok_id));
+    }
+
+    fn freeze_schedule_rocket(
+        harness: &TestHarness,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(FreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ))
+            .mount("/", rocket::routes![super::schedule_freeze_window])
+    }
+
+    async fn post_freeze_schedule(
+        rocket: rocket::Rocket<rocket::Build>,
+        body: String,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+
+        let response = client
+            .post("/admin/freeze-schedules")
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(body)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    fn freeze_window_body(
+        underlying: &UnderlyingSymbol,
+        freeze_at: DateTime<Utc>,
+        unfreeze_at: DateTime<Utc>,
+    ) -> String {
+        format!(
+            r#"{{"underlying":"{underlying}","freeze_at":"{}","unfreeze_at":"{}"}}"#,
+            freeze_at.to_rfc3339(),
+            unfreeze_at.to_rfc3339(),
+        )
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn schedule_freeze_window_arms_window_for_listed_underlying() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let now = Utc::now();
+
+        let (status, response_body) = post_freeze_schedule(
+            freeze_schedule_rocket(&harness),
+            freeze_window_body(
+                &underlying,
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::hours(3),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(response_body.contains("Freeze window armed"));
+
+        let window_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key LIKE ?",
+        )
+        .bind(format!("%:{underlying}:%"))
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(window_jobs, 2, "one freeze and one unfreeze job");
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Freeze window armed", underlying.as_str()]
+        ));
+    }
+
+    // A symbol with no listing must 404 without arming anything: the
+    // Underlying commands succeed for any symbol, so accepting it would
+    // silently freeze nothing while reporting success.
+    #[traced_test]
+    #[tokio::test]
+    async fn schedule_freeze_window_rejects_unlisted_underlying() {
+        let harness = TestHarness::new().await;
+        let underlying = UnderlyingSymbol::new("MSFT").unwrap();
+        let now = Utc::now();
+
+        let (status, _) = post_freeze_schedule(
+            freeze_schedule_rocket(&harness),
+            freeze_window_body(
+                &underlying,
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::hours(3),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, Status::NotFound);
+
+        let window_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key LIKE ?",
+        )
+        .bind(format!("%:{underlying}:%"))
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            window_jobs, 0,
+            "an unlisted underlying must not enqueue schedule jobs"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["unlisted", underlying.as_str()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn schedule_freeze_window_rejects_inverted_window_over_http() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let now = Utc::now();
+
+        let (status, _) = post_freeze_schedule(
+            freeze_schedule_rocket(&harness),
+            freeze_window_body(
+                &underlying,
+                now + ChronoDuration::hours(3),
+                now + ChronoDuration::hours(1),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Rejected freeze window schedule", underlying.as_str()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn schedule_freeze_window_rejects_elapsed_window_over_http() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let now = Utc::now();
+
+        let (status, _) = post_freeze_schedule(
+            freeze_schedule_rocket(&harness),
+            freeze_window_body(
+                &underlying,
+                now - ChronoDuration::hours(3),
+                now - ChronoDuration::hours(1),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Rejected freeze window schedule", underlying.as_str()]
+        ));
+    }
+
+    // Re-posting the identical window must succeed and still leave exactly
+    // one freeze and one unfreeze job — the idempotent no-op the endpoint
+    // documents.
+    #[traced_test]
+    #[tokio::test]
+    async fn schedule_freeze_window_rearm_is_idempotent_over_http() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let now = Utc::now();
+        let body = freeze_window_body(
+            &underlying,
+            now + ChronoDuration::hours(1),
+            now + ChronoDuration::hours(3),
+        );
+
+        let (first_status, _) = post_freeze_schedule(
+            freeze_schedule_rocket(&harness),
+            body.clone(),
+        )
+        .await;
+        let (second_status, _) =
+            post_freeze_schedule(freeze_schedule_rocket(&harness), body).await;
+
+        assert_eq!(first_status, Status::Ok);
+        assert_eq!(second_status, Status::Ok);
+
+        let window_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key LIKE ?",
+        )
+        .bind(format!("%:{underlying}:%"))
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            window_jobs, 2,
+            "re-arming the same window must dedup to one freeze and one \
+             unfreeze job"
+        );
     }
 }
