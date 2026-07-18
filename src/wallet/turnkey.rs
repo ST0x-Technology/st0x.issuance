@@ -645,7 +645,7 @@ mod tests {
     use alloy::consensus::{Signed, TxEip1559, TxLegacy};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
-    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::node_bindings::AnvilInstance;
     use alloy::primitives::{Bytes, TxKind, U256, uint};
     use alloy::providers::ext::AnvilApi;
     use alloy::providers::{
@@ -656,7 +656,7 @@ mod tests {
     use httpmock::MockServer;
 
     use super::*;
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{logs_contain_at, test_anvil};
 
     /// Generate a fresh P-256 API key for testing.
     fn test_api_key() -> TurnkeyP256ApiKey {
@@ -1104,7 +1104,7 @@ mod tests {
                 }));
         });
 
-        let anvil = Anvil::new().spawn();
+        let anvil = test_anvil().spawn();
         let client = mock_client(&server);
 
         let wallet = TurnkeyWallet::from_client(
@@ -1340,7 +1340,7 @@ mod tests {
         org_id: String,
         address: Address,
     ) -> (TurnkeyWalletProvider, AnvilInstance) {
-        let anvil = Anvil::new().spawn();
+        let anvil = test_anvil().spawn();
 
         let wallet = TurnkeyWallet::new(
             &TurnkeyConfig {
