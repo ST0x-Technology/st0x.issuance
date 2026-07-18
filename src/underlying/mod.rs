@@ -251,7 +251,7 @@ mod tests {
 
     use super::{
         AssetStatus, Underlying, UnderlyingCommand, UnderlyingEvent,
-        UnderlyingSymbol, load_freeze_status,
+        UnderlyingSymbol, UnderlyingViewError, load_freeze_status,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -388,6 +388,41 @@ mod tests {
         let status = load_freeze_status(&pool, &aapl()).await.unwrap();
 
         assert_eq!(status, AssetStatus::Enabled);
+    }
+
+    // A row whose `$.Live` is null is a non-live lifecycle state (known but
+    // indeterminate), distinct from an absent row. Only reachable via external
+    // DB manipulation — the projection always writes a live `$.Live` payload.
+    #[tokio::test]
+    async fn test_load_freeze_status_errors_on_non_live_row() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        prepare_event_sourced_startup::<Underlying>(&pool).await.unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO underlying_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{\"Live\": null}')
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = load_freeze_status(&pool, &aapl()).await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                UnderlyingViewError::NonLiveRow { underlying }
+                    if underlying == aapl()
+            ),
+            "null $.Live must surface NonLiveRow, not default to Enabled"
+        );
     }
 
     #[tokio::test]

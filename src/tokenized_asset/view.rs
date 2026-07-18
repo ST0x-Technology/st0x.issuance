@@ -647,6 +647,7 @@ mod tests {
     // in `list_enabled_assets` and keeps resolving its vault — the freeze
     // invariant that lets in-flight redemptions of a frozen asset keep
     // detecting (see SPEC.md).
+    #[traced_test]
     #[tokio::test]
     async fn test_frozen_underlying_keeps_asset_listed() {
         let harness = TestHarness::new().await;
@@ -668,6 +669,11 @@ mod tests {
             )
             .await
             .expect("Failed to freeze underlying");
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Freezing underlying across all networks", "AAPL"]
+        ));
 
         assert_eq!(
             load_freeze_status(pool, &underlying).await.unwrap(),

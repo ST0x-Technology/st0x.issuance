@@ -65,7 +65,22 @@ Then apply the migration:
 DATABASE_URL=sqlite:/tmp/issuance-dry-run.db sqlx migrate run
 ```
 
-Validate rekey idempotency, the freeze-event split, and view rebuild:
+Validate rekey idempotency, the freeze-event split, and view rebuild.
+
+Capture the freeze-event count **before** running the migration (against the
+backup copy, prior to `sqlx migrate run`), then compare after:
+
+```sql
+-- Pre-migration: freeze events still live on TokenizedAsset streams.
+-- Record this count; it must equal the post-migration Underlying count below.
+SELECT COUNT(*) FROM events
+WHERE aggregate_type = 'TokenizedAsset'
+  AND event_type IN (
+    'TokenizedAssetEvent::Frozen', 'TokenizedAssetEvent::Unfrozen'
+  );
+```
+
+After `sqlx migrate run`:
 
 ```sql
 -- No underlying-only ids remain
@@ -84,8 +99,32 @@ WHERE aggregate_type = 'TokenizedAsset'
     'TokenizedAssetEvent::Frozen', 'TokenizedAssetEvent::Unfrozen'
   );
 
--- ...they moved to the Underlying aggregate, keyed by bare underlying,
--- resequenced 1..N
+-- ...they moved to the Underlying aggregate, keyed by bare underlying.
+-- Count must equal the pre-migration freeze-event count (no drops/dupes).
+SELECT COUNT(*) FROM events
+WHERE aggregate_type = 'Underlying'
+  AND event_type IN (
+    'UnderlyingEvent::Frozen', 'UnderlyingEvent::Unfrozen'
+  );
+
+-- Resequenced 1..N with no gaps per Underlying stream
+WITH ordered AS (
+  SELECT
+    aggregate_id,
+    sequence,
+    ROW_NUMBER() OVER (
+      PARTITION BY aggregate_id
+      ORDER BY sequence
+    ) AS expected_sequence
+  FROM events
+  WHERE aggregate_type = 'Underlying'
+)
+SELECT aggregate_id, sequence, expected_sequence
+FROM ordered
+WHERE sequence <> expected_sequence
+ORDER BY aggregate_id, sequence;
+
+-- Spot-check payload ordering
 SELECT aggregate_id, sequence, event_type FROM events
 WHERE aggregate_type = 'Underlying'
 ORDER BY aggregate_id, sequence;
