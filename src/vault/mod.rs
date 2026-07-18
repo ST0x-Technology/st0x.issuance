@@ -6,9 +6,9 @@ use alloy::eips::Decodable2718;
 #[cfg(test)]
 use alloy::eips::Encodable2718;
 use alloy::hex::decode;
-use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
 #[cfg(test)]
-use alloy::primitives::{Signature, TxKind};
+use alloy::primitives::TxKind;
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
 use alloy::providers::SendableTxErr;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 #[cfg(test)]
@@ -488,29 +488,6 @@ pub(crate) struct PreparedMintTx {
 }
 
 impl PreparedMintTx {
-    #[cfg(test)]
-    pub(crate) fn valid_for_test(nonce: u64, external_tx_id: String) -> Self {
-        let transaction = TxLegacy {
-            chain_id: Some(1),
-            nonce,
-            gas_price: 1,
-            gas_limit: 21_000,
-            to: TxKind::Call(Address::ZERO),
-            value: U256::ZERO,
-            input: Bytes::new(),
-        };
-        let signature = Signature::new(U256::from(1), U256::from(1), false);
-        let envelope = TxEnvelope::from(transaction.into_signed(signature));
-
-        Self {
-            tx: envelope.encoded_2718(),
-            hash: *envelope.tx_hash(),
-            nonce: envelope.nonce(),
-            signed_at: Utc::now(),
-            external_tx_id,
-        }
-    }
-
     /// Verifies that the redundant persisted identity fields describe the
     /// exact signed envelope bytes.
     pub(crate) fn validate(&self) -> Result<TxEnvelope, VaultError> {
