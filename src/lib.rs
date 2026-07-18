@@ -1616,11 +1616,13 @@ fn spawn_mint_recovery_worker(
 /// Spawns a drainer worker for one mint side-effect job type, mirroring
 /// [`spawn_mint_recovery_worker`]: a fresh worker id per registration
 /// (load-bearing for crash recovery) and an in-process restart loop on transient
-/// apalis/SQLite failures. A macro (not a generic fn) because apalis's
-/// `.build()` yields a deeply-nested worker type with no public alias, so the
-/// concrete job/context types must appear at the expansion site. Drainer-style:
-/// no apalis retry layer — a domain failure is recorded as a `MintingFailed`
-/// event that recovery retries.
+/// apalis/SQLite failures. No shutdown signal is wired, so a clean `Ok(())`
+/// exit is unexpected and restarts after the same backoff — breaking would
+/// permanently strand that job stage's queue. A macro (not a generic fn)
+/// because apalis's `.build()` yields a deeply-nested worker type with no
+/// public alias, so the concrete job/context types must appear at the
+/// expansion site. Drainer-style: no apalis retry layer — a domain failure is
+/// recorded as a `MintingFailed` event that recovery retries.
 macro_rules! spawn_drainer_worker {
     (
         ::<$ctx:ty, $job:ty>,
@@ -1649,13 +1651,21 @@ macro_rules! spawn_drainer_worker {
                 });
 
                 match monitor.run().await {
+                    // Unexpected without a shutdown signal; breaking here
+                    // would permanently strand every queued job for this stage.
                     Ok(()) => {
-                        info!(
+                        warn!(
                             target: "mint",
                             worker = worker_name,
-                            "Mint job worker stopped cleanly"
+                            backoff_secs =
+                                MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
+                            "Mint job worker monitor exited cleanly without a \
+                             shutdown signal; restarting"
                         );
-                        break;
+                        tokio::time::sleep(
+                            MINT_RECOVERY_WORKER_RESTART_BACKOFF,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         warn!(

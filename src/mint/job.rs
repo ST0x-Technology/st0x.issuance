@@ -635,10 +635,9 @@ mod tests {
     use cqrs_es::{AggregateError, DomainEvent};
     use event_sorcery::test_store;
     use std::any::type_name;
+    use std::collections::HashMap;
     use tracing::Level;
     use tracing_test::traced_test;
-
-    use std::collections::HashMap;
 
     use super::*;
     use crate::alpaca::mock::MockAlpacaService;

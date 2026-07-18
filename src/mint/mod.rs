@@ -1087,8 +1087,10 @@ impl Mint {
 
     /// Records a successful on-chain mint submission reported by a durable
     /// `SubmitMintJob`. Pure — emits `MintTxSubmitted` from the payload.
-    /// Idempotent: a no-op once the mint has advanced past `Minting`, so an
-    /// at-least-once job re-run cannot double-record the submission.
+    /// Accepts `Minting` and legacy `TxIntended` (pre-jobs prepare path the
+    /// submit job can still resume). Idempotent: a no-op once the mint has
+    /// advanced past those states, so an at-least-once job re-run cannot
+    /// double-record the submission.
     fn handle_record_tx_submitted(
         &self,
         issuer_request_id: IssuerMintRequestId,
@@ -1096,7 +1098,8 @@ impl Mint {
         tx_id: TxId,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
-            Self::Minting { issuer_request_id: expected_id, .. } => {
+            Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::TxIntended { issuer_request_id: expected_id, .. } => {
                 Self::validate_issuer_request_id(
                     expected_id,
                     &issuer_request_id,
@@ -1212,6 +1215,7 @@ impl Mint {
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::TxIntended { issuer_request_id: expected_id, .. }
             | Self::TxSubmitted { issuer_request_id: expected_id, .. } => {
                 Self::validate_issuer_request_id(
                     expected_id,
@@ -3158,6 +3162,41 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
+            MintEvent::MintTxSubmitted { tx_id, .. }
+                if tx_id == &TxId::Legacy("fb-1".to_string())
+        ));
+    }
+
+    /// `SubmitMintJob` can resume a legacy `TxIntended` mint; recording the
+    /// submission must not reject with `NotInMintingState`.
+    #[tokio::test]
+    async fn record_tx_submitted_from_tx_intended_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: Utc::now(),
+        });
+
+        let recorded = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events)
+            .when(MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
+            })
+            .await
+            .events();
+
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(
+            &recorded[0],
             MintEvent::MintTxSubmitted { tx_id, .. }
                 if tx_id == &TxId::Legacy("fb-1".to_string())
         ));
