@@ -84,7 +84,10 @@ async fn orchestrator_mint_burn_roundtrip()
         .get_receipt()
         .await?;
 
-    orchestrator
+    let pre_burn_pointer =
+        orchestrator.nextBurnReceiptId(evm.vault_address).call().await?;
+
+    let burn_receipt = orchestrator
         .burn(evm.vault_address, balance_after_mint, Bytes::new())
         .send()
         .await?
@@ -96,6 +99,48 @@ async fn orchestrator_mint_burn_roundtrip()
         balance_after_burn,
         U256::ZERO,
         "expected zero share balance after burn, got {balance_after_burn}"
+    );
+
+    // The RAI-1220 acceptance assertion, against a REAL `Burned` log (SPEC
+    // "Contract Summary"): `nextBurnReceiptIdAfter` is the half-open end of
+    // the consumed range — exclusive of the receipts this burn fully
+    // drained, and exactly the pointer `nextBurnReceiptId(token)` reports
+    // for the next burn to resume from.
+    let burned = burn_receipt
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| log.log_decode::<IST0xOrchestratorV1::Burned>().ok())
+        .expect("the burn must emit a Burned event");
+    let burned = burned.data();
+    assert_eq!(burned.token, evm.vault_address);
+    assert_eq!(burned.caller, evm.wallet_address);
+    assert_eq!(
+        burned.amount, balance_after_mint,
+        "Burned.amount is the authoritative burned quantity"
+    );
+    // Empirical semantics pinned against the real contract:
+    // `firstReceiptId` echoes the PRE-burn pointer (0 on a fresh
+    // orchestrator — the pointer's initial value, not the first receipt's
+    // id), and `nextBurnReceiptIdAfter` is the half-open end the pointer
+    // advanced to, exclusive of the receipts this burn fully drained.
+    assert_eq!(
+        burned.firstReceiptId, pre_burn_pointer,
+        "firstReceiptId must echo the pre-burn nextBurnReceiptId pointer"
+    );
+    // The mint above created this fresh vault's first receipt (id 1) and
+    // the burn fully drained it, so the pointer must have advanced past it.
+    assert_eq!(
+        burned.nextBurnReceiptIdAfter,
+        U256::from(2u8),
+        "a fully drained receipt 1 must advance the half-open end past it"
+    );
+    let post_burn_pointer =
+        orchestrator.nextBurnReceiptId(evm.vault_address).call().await?;
+    assert_eq!(
+        post_burn_pointer, burned.nextBurnReceiptIdAfter,
+        "nextBurnReceiptIdAfter must equal the post-burn \
+         nextBurnReceiptId(token) the next burn resumes from"
     );
 
     Ok(())

@@ -1042,7 +1042,9 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::MissingBlockNumber { .. }
         | VaultError::EventNotFound { .. }
         | VaultError::Reverted { .. }
+        | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }
+        | VaultError::BurnedEventMismatch { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
         | VaultError::PreparedMintSignerMismatch { .. }
@@ -1076,7 +1078,12 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         | VaultError::MissingBlockNumber { .. } => true,
         VaultError::EventNotFound { .. }
         | VaultError::Reverted { .. }
+        | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }
+        // Burn-confirm-only variant, unreachable on the mint paths; grouped
+        // with the definitive observations so nothing uncertain-retries an
+        // integrity anomaly.
+        | VaultError::BurnedEventMismatch { .. }
         | VaultError::BroadcastHashMismatch { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
