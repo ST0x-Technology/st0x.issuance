@@ -8,6 +8,7 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::Mock;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

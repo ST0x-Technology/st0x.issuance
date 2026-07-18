@@ -169,8 +169,9 @@ async fn process_journal_completion(
     // off the request path; each job records its outcome via an idempotent
     // command and enqueues the next. A domain failure flips the mint to
     // `MintingFailed`, which recovery retries on its own schedule.
-    let (underlying, network) = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(mint @ Mint::Minting { underlying, .. })) => {
+    let (underlying, network) = match mint_store.load(&issuer_request_id).await
+    {
+        Ok(Some(ref mint @ Mint::Minting { ref underlying, .. })) => {
             let Some(network) = mint.network() else {
                 error!(target: "mint", issuer_request_id = %issuer_request_id,
                     "Minting mint missing network — cannot enqueue submission"

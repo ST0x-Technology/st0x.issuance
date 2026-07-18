@@ -3294,7 +3294,7 @@ pub(crate) mod tests {
 
         mint.apply_event(MintEvent::MintTxSubmitted {
             issuer_request_id: issuer_request_id.clone(),
-            external_tx_id: MintExternalTxId::base(&issuer_request_id).into_string(),
+            external_tx_id: Mint::base_mint_external_tx_id(&issuer_request_id),
             tx_id: TxId::Legacy("fb-1".to_string()),
             submitted_at: now,
         });
