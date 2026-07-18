@@ -60,7 +60,6 @@ impl NetworkVaultServices {
         self.get(network).map(|entry| entry.chain_id)
     }
 
-    #[cfg(test)]
     pub(crate) fn with_single_vault(
         network: Network,
         chain_id: u64,

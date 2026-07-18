@@ -2230,7 +2230,6 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
@@ -2262,8 +2261,8 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, ReceiptInformation, SendableTxWithHash,
-        TxId, VaultError, VaultService,
+        BurnTxStatus, MultiBurnEntry, NetworkVaultServices, ReceiptInformation,
+        SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_WALLET: Address =
@@ -6351,8 +6350,11 @@ mod tests {
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let manager = BurnManager::new(
-            HashMap::from([(Network::Base, blockchain_service)]),
-            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
+            NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                blockchain_service,
+            ),
             harness.pool.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
@@ -6405,8 +6407,11 @@ mod tests {
         let recovery_blockchain: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let failing_manager = BurnManager::new(
-            HashMap::from([(Network::Base, recovery_blockchain)]),
-            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
+            NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                recovery_blockchain,
+            ),
             harness.pool.clone(),
             harness.store.clone(),
             settle_failing,
