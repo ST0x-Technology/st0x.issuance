@@ -559,6 +559,8 @@ pub(crate) async fn reconcile_recoverable_mints(
 enum AbandonReason {
     /// The mint could not be loaded after the maximum load-failure backoffs.
     FailedToLoadMint,
+    /// Receipt inventory remained unreadable after transient backoffs.
+    FailedToLoadReceipt,
     /// The aggregate's automatic-retry attempts ran out.
     AutomaticRetriesExhausted,
     /// The mint stayed in the same recoverable state across the maximum number
@@ -570,6 +572,7 @@ impl fmt::Display for AbandonReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             Self::FailedToLoadMint => "failed to load mint",
+            Self::FailedToLoadReceipt => "failed to load receipt inventory",
             Self::AutomaticRetriesExhausted => "automatic retries exhausted",
             Self::NoProgressBudgetExhausted => "no-progress budget exhausted",
         };
@@ -590,19 +593,56 @@ enum RecoveryConclusion {
     Abandoned { reason: AbandonReason },
 }
 
+async fn minting_failed_receipt_exists_with_backoff(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+    backoff: Duration,
+    failure_backoffs: &mut usize,
+) -> Result<Option<bool>, AbandonReason> {
+    match minting_failed_receipt_exists(ctx, mint, issuer_request_id).await {
+        Ok(exists) => {
+            *failure_backoffs = 0;
+            Ok(Some(exists))
+        }
+        Err(error) => {
+            *failure_backoffs += 1;
+            if *failure_backoffs > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS {
+                warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                    error = %error,
+                    "Failed to read receipt inventory after maximum backoffs"
+                );
+                return Err(AbandonReason::FailedToLoadReceipt);
+            }
+
+            debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                backoff_ms = backoff.as_millis(),
+                "Failed to read receipt inventory; backing off"
+            );
+            tokio::time::sleep(backoff).await;
+            Ok(None)
+        }
+    }
+}
+
 async fn recover_mint_until_automatic_budget_exhausted(
     ctx: &MintRecoveryContext,
     issuer_request_id: &IssuerMintRequestId,
     backoff: Duration,
     max_no_progress_polls: usize,
 ) -> RecoveryConclusion {
-    let mut failure_backoffs = 0;
+    let mut mint_load_failure_backoffs = 0;
+    let mut receipt_load_failure_backoffs = 0;
     let mut no_progress_polls = 0;
     let mut last_state: Option<&'static str> = None;
 
     loop {
         let mint = match ctx.mint_store.load(issuer_request_id).await {
-            Ok(Some(mint)) => mint,
+            Ok(Some(mint)) => {
+                mint_load_failure_backoffs = 0;
+                mint
+            }
             Ok(None) => {
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     "Mint not found for scheduled recovery"
@@ -612,8 +652,10 @@ async fn recover_mint_until_automatic_budget_exhausted(
             // A load failure is transient (e.g. a SQLite blip): back off and
             // retry rather than killing the durable job over a single read error.
             Err(error) => {
-                failure_backoffs += 1;
-                if failure_backoffs > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS {
+                mint_load_failure_backoffs += 1;
+                if mint_load_failure_backoffs
+                    > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS
+                {
                     warn!(target: "mint", issuer_request_id = %issuer_request_id,
                         error = %error,
                         max_failure_backoffs = MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS,
@@ -652,12 +694,26 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 return RecoveryConclusion::Resolved;
             }
             AutomaticRetryDecision::Exhausted => {
+                let receipt_exists =
+                    match minting_failed_receipt_exists_with_backoff(
+                        ctx,
+                        &mint,
+                        issuer_request_id,
+                        backoff,
+                        &mut receipt_load_failure_backoffs,
+                    )
+                    .await
+                    {
+                        Ok(Some(exists)) => exists,
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            return RecoveryConclusion::Abandoned { reason };
+                        }
+                    };
                 // A confirmed receipt outranks retry exhaustion: the mint
                 // succeeded on-chain after attempts ran out, so keep driving
                 // toward TokensMinted / callback instead of abandoning.
-                if minting_failed_receipt_exists(ctx, &mint, issuer_request_id)
-                    .await
-                {
+                if receipt_exists {
                     info!(target: "mint", issuer_request_id = %issuer_request_id,
                         "Automatic mint retries exhausted but on-chain receipt exists; continuing recovery"
                     );
@@ -693,15 +749,29 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 };
             }
             AutomaticRetryDecision::Wait(wait) => {
+                let receipt_exists =
+                    match minting_failed_receipt_exists_with_backoff(
+                        ctx,
+                        &mint,
+                        issuer_request_id,
+                        backoff,
+                        &mut receipt_load_failure_backoffs,
+                    )
+                    .await
+                    {
+                        Ok(Some(exists)) => exists,
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            return RecoveryConclusion::Abandoned { reason };
+                        }
+                    };
                 // The retry backoff only spaces out re-submissions. If a receipt
                 // already exists, the mint actually succeeded on-chain, so there
                 // is nothing to wait for — drive immediately to record the
                 // existing mint (the per-state job's receipt check turns this
                 // into a record, not a re-submission). Otherwise honour the
                 // backoff so a genuinely failed mint is not hammered.
-                if minting_failed_receipt_exists(ctx, &mint, issuer_request_id)
-                    .await
-                {
+                if receipt_exists {
                     no_progress_polls += 1;
                     if no_progress_polls > max_no_progress_polls {
                         warn!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -868,25 +938,23 @@ async fn minting_failed_receipt_exists(
     ctx: &MintRecoveryContext,
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
-) -> bool {
+) -> Result<bool, crate::receipt_inventory::ReceiptLookupError> {
     let Mint::MintingFailed { underlying, network, .. } = mint else {
-        return false;
+        return Ok(false);
     };
 
     let Ok(vault) = resolve_vault(ctx, underlying, *network).await else {
-        return false;
+        return Ok(false);
     };
 
-    matches!(
-        ctx.receipts
-            .find_by_issuer_request_id(
-                vault.chain_id,
-                &vault.address,
-                issuer_request_id,
-            )
-            .await,
-        Ok(Some(_))
-    )
+    ctx.receipts
+        .find_by_issuer_request_id(
+            vault.chain_id,
+            &vault.address,
+            issuer_request_id,
+        )
+        .await
+        .map(|receipt| receipt.is_some())
 }
 
 /// Enqueues a per-state job for a recovering mint, first freeing the mint's
@@ -1168,14 +1236,6 @@ mod tests {
                 started_at: now,
             },
         ]
-    }
-
-    fn journal_confirmed_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let mut events = minting_events(issuer_request_id);
-        events.pop();
-        events
     }
 
     fn tx_submitted_events(
@@ -1520,10 +1580,15 @@ mod tests {
         use alloy::primitives::{B256, U256};
         use async_trait::async_trait;
 
-        struct ReceiptExists;
+        enum ReceiptLookupBehavior {
+            Present,
+            Fails,
+        }
+
+        struct ReceiptLookupStub(ReceiptLookupBehavior);
 
         #[async_trait]
-        impl ReceiptService for ReceiptExists {
+        impl ReceiptService for ReceiptLookupStub {
             async fn register_minted_receipt(
                 &self,
                 _params: MintedReceiptParams,
@@ -1590,12 +1655,22 @@ mod tests {
                 _issuer_request_id: &IssuerMintRequestId,
             ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>
             {
-                Ok(Some(RecoveredReceipt {
-                    receipt_id: U256::from(1),
-                    tx_hash: B256::ZERO,
-                    shares: U256::from(100),
-                    block_number: 1,
-                }))
+                match self.0 {
+                    ReceiptLookupBehavior::Present => {
+                        Ok(Some(RecoveredReceipt {
+                            receipt_id: U256::from(1),
+                            tx_hash: B256::ZERO,
+                            shares: U256::from(100),
+                            block_number: 1,
+                        }))
+                    }
+                    ReceiptLookupBehavior::Fails => {
+                        Err(ReceiptLookupError::Inconsistent {
+                            issuer_request_id: _issuer_request_id.clone(),
+                            receipt_id: U256::from(1).into(),
+                        })
+                    }
+                }
             }
         }
 
@@ -1613,7 +1688,8 @@ mod tests {
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let mut ctx = fixture.context();
-        ctx.receipts = Arc::new(ReceiptExists);
+        ctx.receipts =
+            Arc::new(ReceiptLookupStub(ReceiptLookupBehavior::Present));
 
         let conclusion = recover_mint_until_automatic_budget_exhausted(
             &ctx,
@@ -1642,6 +1718,36 @@ mod tests {
             ) >= 1,
             "must log that recovery continues because a receipt exists"
         );
+
+        let lookup_failure_id = IssuerMintRequestId::random();
+        let mut lookup_failure_events = tx_submitted_events(&lookup_failure_id);
+        for _ in 0..5 {
+            lookup_failure_events.push(MintEvent::MintingFailed {
+                issuer_request_id: lookup_failure_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        fixture
+            .seed_mint_events(&lookup_failure_id, lookup_failure_events)
+            .await;
+        ctx.receipts =
+            Arc::new(ReceiptLookupStub(ReceiptLookupBehavior::Fails));
+
+        let lookup_failure = recover_mint_until_automatic_budget_exhausted(
+            &ctx,
+            &lookup_failure_id,
+            Duration::from_millis(1),
+            3,
+        )
+        .await;
+
+        assert!(matches!(
+            lookup_failure,
+            RecoveryConclusion::Abandoned {
+                reason: AbandonReason::FailedToLoadReceipt
+            }
+        ));
     }
 
     /// `MintRecoveryJob::perform` returns `Err(AbortError)` when recovery

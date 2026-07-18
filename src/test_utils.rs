@@ -10,13 +10,20 @@ use alloy::providers::{PendingTransactionError, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use event_sorcery::{Store, StoreBuilder};
 use rocket::routes;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
+};
+use std::env::temp_dir;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
+use uuid::Uuid;
 
 use crate::account::Account;
 use crate::alpaca::service::AlpacaConfig;
@@ -32,6 +39,8 @@ use crate::tokenized_asset::{
     AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
+use crate::vault::mock::MockVaultService;
+use crate::vault::{NetworkVaultServices, VaultService};
 use crate::wallet::SignerConfig;
 
 /// Builds Anvil with startup output enabled when stdout is piped by Alloy.
@@ -120,12 +129,28 @@ fn test_config() -> Result<Config, anyhow::Error> {
 /// - Rate limiter initialization fails
 pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>>
 {
-    // Create in-memory database
-    let pool =
-        SqlitePoolOptions::new().max_connections(5).connect(":memory:").await?;
+    // Both sqlx major versions must address the same file: private in-memory
+    // databases do not share the Jobs table used by the confirmation route.
+    let database_path =
+        temp_dir().join(format!("st0x-issuance-test-{}.db", Uuid::new_v4()));
+    let database_url = format!("sqlite:{}", database_path.display());
 
-    // Run migrations
+    let options = SqliteConnectOptions::from_str(&database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+
     sqlx::migrate!("./migrations").run(&pool).await?;
+
+    let apalis_options =
+        apalis_sqlite::SqliteConnectOptions::from_str(&database_url)?
+            .pragma("journal_mode", "WAL")
+            .busy_timeout(Duration::from_secs(5));
+    let apalis_pool = ApalisSqlitePool::connect_with(apalis_options).await?;
 
     // Setup Account store (event-sorcery)
     let (account_store, _account_projection) =
@@ -147,6 +172,13 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     seed_test_assets(&tokenized_asset_store).await?;
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
+    let vault: Arc<dyn VaultService> =
+        Arc::new(MockVaultService::new_success());
+    let vault_services = NetworkVaultServices::with_single_vault(
+        Network::Base,
+        ANVIL_CHAIN_ID,
+        vault,
+    );
 
     // Build rocket
     Ok(rocket::build()
@@ -156,6 +188,8 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         .manage(mint_store)
         .manage(rate_limiter)
         .manage(pool)
+        .manage(apalis_pool)
+        .manage(vault_services)
         .mount(
             "/",
             routes![

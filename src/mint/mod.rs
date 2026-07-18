@@ -23,9 +23,7 @@ pub use api::MintResponse;
 pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
-pub(crate) use view::{
-    MintView, find_all_recoverable_mints, find_by_issuer_request_id, find_stuck,
-};
+pub(crate) use view::{MintView, find_all_recoverable_mints, find_stuck};
 
 /// Returns whether another mint has a prepared transaction whose terminal
 /// submission outcome has not yet been persisted.
@@ -334,11 +332,18 @@ pub(crate) enum AutomaticRetryDecision {
     NotRecoverable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualRecoveryDecision {
+    Eligible,
+    AlreadyTerminal,
+    Unrecoverable,
+}
+
 impl Mint {
     pub(crate) const MAX_AUTOMATIC_MINT_RETRY_ATTEMPT: u32 = 4;
     const RETRY_EXTERNAL_TX_MARKER: &'static str = "-retry-";
 
-    const fn state_name(&self) -> &'static str {
+    pub(crate) const fn state_name(&self) -> &'static str {
         match self {
             Self::Initiated { .. } => "Initiated",
             Self::JournalConfirmed { .. } => "JournalConfirmed",
@@ -378,6 +383,13 @@ impl Mint {
             Self::TxSubmitted { external_tx_id, .. } => {
                 Some(external_tx_id.clone())
             }
+            _ => None,
+        }
+    }
+
+    pub(super) fn pending_prepared_tx(&self) -> Option<PreparedMintTx> {
+        match self.non_failed_predecessor() {
+            Self::TxIntended { prepared_tx, .. } => Some(prepared_tx.clone()),
             _ => None,
         }
     }
@@ -481,6 +493,46 @@ impl Mint {
             .map_or(AutomaticRetryDecision::Ready, AutomaticRetryDecision::Wait)
     }
 
+    pub(crate) fn manual_recovery_decision(&self) -> ManualRecoveryDecision {
+        match self {
+            Self::Completed { .. } | Self::Closed { .. } => {
+                ManualRecoveryDecision::AlreadyTerminal
+            }
+            Self::Initiated { .. } | Self::JournalRejected { .. } => {
+                ManualRecoveryDecision::Unrecoverable
+            }
+            Self::MintingFailed { .. }
+                if matches!(
+                    self.automatic_retry_decision(Utc::now()),
+                    AutomaticRetryDecision::Exhausted
+                ) =>
+            {
+                ManualRecoveryDecision::Unrecoverable
+            }
+            Self::JournalConfirmed { .. }
+            | Self::Minting { .. }
+            | Self::TxIntended { .. }
+            | Self::TxSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::MintingFailed { .. } => ManualRecoveryDecision::Eligible,
+        }
+    }
+
+    pub(crate) const fn network(&self) -> Option<Network> {
+        match self {
+            Self::Initiated { network, .. }
+            | Self::JournalConfirmed { network, .. }
+            | Self::JournalRejected { network, .. }
+            | Self::Minting { network, .. }
+            | Self::TxIntended { network, .. }
+            | Self::TxSubmitted { network, .. }
+            | Self::CallbackPending { network, .. }
+            | Self::MintingFailed { network, .. }
+            | Self::Completed { network, .. } => Some(*network),
+            Self::Closed { .. } => None,
+        }
+    }
+
     pub(crate) const fn tokenization_request_id(
         &self,
     ) -> Option<&TokenizationRequestId> {
@@ -496,21 +548,6 @@ impl Mint {
             | Self::Completed { tokenization_request_id, .. } => {
                 Some(tokenization_request_id)
             }
-            Self::Closed { .. } => None,
-        }
-    }
-
-    pub(crate) const fn network(&self) -> Option<Network> {
-        match self {
-            Self::Initiated { network, .. }
-            | Self::JournalConfirmed { network, .. }
-            | Self::JournalRejected { network, .. }
-            | Self::Minting { network, .. }
-            | Self::TxIntended { network, .. }
-            | Self::TxSubmitted { network, .. }
-            | Self::CallbackPending { network, .. }
-            | Self::MintingFailed { network, .. }
-            | Self::Completed { network, .. } => Some(*network),
             Self::Closed { .. } => None,
         }
     }
@@ -622,6 +659,33 @@ impl Mint {
                 }])
             }
             Self::TxSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInMintingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    fn handle_record_tx_intended(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        prepared_tx: PreparedMintTx,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+                Ok(vec![MintEvent::MintTxIntended {
+                    issuer_request_id,
+                    prepared_tx,
+                    intended_at: Utc::now(),
+                }])
+            }
+            Self::TxIntended { .. }
+            | Self::TxSubmitted { .. }
             | Self::CallbackPending { .. }
             | Self::Completed { .. } => Ok(vec![]),
             _ => Err(MintError::NotInMintingState {
@@ -781,6 +845,7 @@ impl Mint {
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::TxIntended { issuer_request_id: expected_id, .. }
             | Self::TxSubmitted { issuer_request_id: expected_id, .. }
             | Self::MintingFailed { issuer_request_id: expected_id, .. } => {
                 Self::validate_issuer_request_id(
@@ -1106,6 +1171,14 @@ impl Mint {
                     + 1,
                 Box::new(self.clone()),
             ),
+            Self::TxIntended { prepared_tx, .. } => (
+                Self::retry_attempt_from_external_tx_id(
+                    &prepared_tx.external_tx_id,
+                )
+                .unwrap_or(0)
+                    + 1,
+                Box::new(self.clone()),
+            ),
             Self::Minting { retry: Some(context), .. } => {
                 (context.attempts + 1, context.failed_from.clone())
             }
@@ -1113,6 +1186,19 @@ impl Mint {
         };
 
         let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
+        | Self::TxIntended {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -1435,7 +1521,8 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::RecordTxSubmitted { .. }
+            MintCommand::RecordTxIntended { .. }
+            | MintCommand::RecordTxSubmitted { .. }
             | MintCommand::RecordExistingMint { .. } => {
                 Err(MintError::NotInMintingState {
                     current_state: "Uninitialized".to_string(),
@@ -1502,6 +1589,10 @@ impl EventSourced for Mint {
             MintCommand::Deposit { issuer_request_id } => {
                 self.handle_deposit(issuer_request_id)
             }
+            MintCommand::RecordTxIntended {
+                issuer_request_id,
+                prepared_tx,
+            } => self.handle_record_tx_intended(issuer_request_id, prepared_tx),
             MintCommand::RecordTxSubmitted {
                 issuer_request_id,
                 external_tx_id,
@@ -1763,9 +1854,9 @@ pub(crate) mod tests {
     use uuid::{Uuid, uuid};
 
     use super::{
-        ClientId, IssuerMintRequestId, Mint, MintCommand, MintError, MintEvent,
-        MintExternalTxId, Network, Quantity, TokenSymbol,
-        TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, ManualRecoveryDecision, Mint,
+        MintCommand, MintError, MintEvent, MintExternalTxId, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -1877,6 +1968,21 @@ pub(crate) mod tests {
         events
     }
 
+    fn events_through_tx_intended(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_minting(issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: Utc::now(),
+        });
+        events
+    }
+
     fn events_through_completed(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
@@ -1886,6 +1992,71 @@ pub(crate) mod tests {
             completed_at: Utc::now(),
         });
         events
+    }
+
+    #[test]
+    fn manual_recovery_decision_rejects_nonrecoverable_states() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let minting = events_through_minting(&issuer_request_id);
+        let initiated =
+            replay::<Mint>(vec![minting[0].clone()]).unwrap().unwrap();
+        let journal_confirmed =
+            replay::<Mint>(minting[..2].to_vec()).unwrap().unwrap();
+        let completed =
+            replay::<Mint>(events_through_completed(&issuer_request_id))
+                .unwrap()
+                .unwrap();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+        let mut exhausted_events =
+            events_through_tx_submitted(&issuer_request_id);
+        for _ in 0..5 {
+            exhausted_events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        let exhausted = replay::<Mint>(exhausted_events).unwrap().unwrap();
+
+        assert_eq!(
+            initiated.manual_recovery_decision(),
+            ManualRecoveryDecision::Unrecoverable
+        );
+        assert_eq!(
+            journal_confirmed.manual_recovery_decision(),
+            ManualRecoveryDecision::Eligible
+        );
+        assert_eq!(
+            completed.manual_recovery_decision(),
+            ManualRecoveryDecision::AlreadyTerminal
+        );
+        assert_eq!(
+            exhausted.manual_recovery_decision(),
+            ManualRecoveryDecision::Unrecoverable
+        );
+    }
+
+    #[tokio::test]
+    async fn record_tx_intended_from_minting_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            1,
+            format!("mint-{issuer_request_id}"),
+        );
+
+        let events = TestHarness::<Mint>::with(())
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RecordTxIntended {
+                issuer_request_id,
+                prepared_tx,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [MintEvent::MintTxIntended { .. }]
+        ));
     }
 
     #[tokio::test]
@@ -1917,18 +2088,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn record_tx_submitted_from_tx_intended_emits_event() {
         let issuer_request_id = IssuerMintRequestId::random();
-        let mut events = events_through_minting(&issuer_request_id);
-        events.push(MintEvent::MintTxIntended {
-            issuer_request_id: issuer_request_id.clone(),
-            prepared_tx: PreparedMintTx::valid_for_test(
-                1,
-                format!("mint-{issuer_request_id}"),
-            ),
-            intended_at: Utc::now(),
-        });
 
         let recorded = TestHarness::<Mint>::with(())
-            .given(events)
+            .given(events_through_tx_intended(&issuer_request_id))
             .when(MintCommand::RecordTxSubmitted {
                 issuer_request_id: issuer_request_id.clone(),
                 external_tx_id: MintExternalTxId::from_string(
@@ -1944,6 +2106,51 @@ pub(crate) mod tests {
             &recorded[0],
             MintEvent::MintTxSubmitted { tx_id, .. }
                 if tx_id == &TxId::Legacy("fb-1".to_string())
+        ));
+    }
+
+    #[test]
+    fn minting_failed_from_tx_intended_replays_to_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut mint =
+            replay::<Mint>(events_through_tx_intended(&issuer_request_id))
+                .unwrap()
+                .unwrap();
+
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "legacy broadcast failed".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "a persisted failure must replay to MintingFailed, got {}",
+            mint.state_name()
+        );
+    }
+
+    #[tokio::test]
+    async fn record_existing_mint_from_tx_intended_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(())
+            .given(events_through_tx_intended(&issuer_request_id))
+            .when(MintCommand::RecordExistingMint {
+                issuer_request_id,
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                block_number: 1_234,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [MintEvent::ExistingMintRecovered { .. }]
         ));
     }
 
@@ -2126,6 +2333,42 @@ pub(crate) mod tests {
             matches!(failed_from.as_ref(), Mint::TxSubmitted { .. }),
             "the predecessor chain must survive a failed retry"
         );
+    }
+
+    #[test]
+    fn retry_failure_after_persisted_intent_keeps_escalating_attempts() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+        let mut mint = replay::<Mint>(minting_events_for_retry(
+            &issuer_request_id,
+            "mint-retry-seed".to_string(),
+            now - chrono::Duration::hours(2),
+        ))
+        .unwrap()
+        .unwrap();
+        mint.apply_event(MintEvent::MintRetryStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: None,
+            started_at: now,
+        });
+        mint.apply_event(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}-retry-1"),
+            ),
+            intended_at: now,
+        });
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "retry submission outcome unknown".to_string(),
+            failed_at: now,
+        });
+
+        let Mint::MintingFailed { attempts, .. } = mint else {
+            panic!("expected MintingFailed");
+        };
+        assert_eq!(attempts, 2);
     }
 
     #[tokio::test]

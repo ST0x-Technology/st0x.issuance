@@ -252,9 +252,11 @@ async fn process_journal_completion(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use event_sorcery::Store;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::confirm_journal;
@@ -263,9 +265,11 @@ mod tests {
         TestAccountAndAsset, TestHarness, network_vault_services, test_config,
     };
     use crate::mint::{
-        IssuerMintRequestId, MintCommand, MintView, Quantity,
-        TokenizationRequestId, view::find_by_issuer_request_id,
+        ClientId, IssuerMintRequestId, Mint, MintCommand, MintView, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        view::find_by_issuer_request_id,
     };
+    use crate::test_utils::setup_test_rocket;
 
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
@@ -479,11 +483,15 @@ mod tests {
     /// shared `Jobs` table.
     #[tokio::test]
     async fn confirm_enqueues_submit_job() {
-        let harness = TestHarness::new().await;
-        let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
-        } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let rocket = setup_test_rocket().await.expect("valid test Rocket");
+        let pool = rocket
+            .state::<sqlx::Pool<sqlx::Sqlite>>()
+            .expect("event-store pool is managed")
+            .clone();
+        let mint_store = rocket
+            .state::<Arc<Store<Mint>>>()
+            .expect("mint store is managed")
+            .clone();
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -496,10 +504,10 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     quantity: Quantity::new(Decimal::from(100)),
-                    underlying,
-                    token,
-                    network,
-                    client_id,
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    client_id: ClientId::new(),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -507,15 +515,6 @@ mod tests {
             )
             .await
             .expect("Failed to initiate mint");
-
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_store)
-            .manage(pool.clone())
-            .manage(apalis_pool)
-            .manage(network_vault_services(vault))
-            .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
             .await

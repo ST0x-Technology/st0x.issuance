@@ -299,7 +299,6 @@ pub async fn initialize_rocket(
     );
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
-    let vault_service_for_rocket = base.vault_service.clone();
     let configured_networks = chain_registry.configured_networks();
     let network_vault_services = chain_registry.network_vault_services();
 

@@ -5,7 +5,7 @@ use super::{
     ClientId, IssuerMintRequestId, MintExternalTxId, Network, Quantity,
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
-use crate::vault::TxId;
+use crate::vault::{PreparedMintTx, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MintCommand {
@@ -34,6 +34,13 @@ pub(crate) enum MintCommand {
     /// is performed by the durable `SubmitMintJob`.
     Deposit {
         issuer_request_id: IssuerMintRequestId,
+    },
+
+    /// Persists the exact signed transaction before the durable submit job
+    /// broadcasts it, so crash recovery can rebroadcast the same bytes.
+    RecordTxIntended {
+        issuer_request_id: IssuerMintRequestId,
+        prepared_tx: PreparedMintTx,
     },
 
     /// Records the outcome of a successful on-chain mint submission performed

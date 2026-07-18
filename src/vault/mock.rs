@@ -75,8 +75,6 @@ enum MockBehavior {
     /// where signed-tx preparation fails before the tx is stored in the event.
     #[cfg(test)]
     PrepareTxFails,
-    #[cfg(test)]
-    InvalidPreparedMint,
 }
 
 /// Configured outcome for `verify_burn_tx` in tests.
@@ -443,13 +441,6 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_invalid_prepared_mint() -> Self {
-        let mut service = Self::new_success();
-        service.behavior = MockBehavior::InvalidPreparedMint;
-        service
-    }
-
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_delay(mut self, delay_ms: u64) -> Self {
         self.mint_delay_ms = delay_ms;
@@ -760,19 +751,9 @@ impl VaultService for MockVaultService {
             receipt_info_bytes,
         });
 
-        #[cfg(test)]
-        let persisted_hash =
-            if matches!(self.behavior, MockBehavior::InvalidPreparedMint) {
-                B256::ZERO
-            } else {
-                tx_hash
-            };
-        #[cfg(not(test))]
-        let persisted_hash = tx_hash;
-
         Ok(PreparedMintTx {
             tx: envelope.encoded_2718(),
-            hash: persisted_hash,
+            hash: tx_hash,
             nonce: envelope.nonce(),
             signed_at: chrono::Utc::now(),
             external_tx_id: external_tx_id
@@ -844,10 +825,7 @@ impl VaultService for MockVaultService {
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::ConfirmPendingBlocked { .. }
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails
-            | MockBehavior::InvalidPreparedMint => {
-                Err(VaultError::InvalidReceipt)
-            }
+            | MockBehavior::PrepareTxFails => Err(VaultError::InvalidReceipt),
         }
     }
 
@@ -975,8 +953,7 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails
-            | MockBehavior::InvalidPreparedMint => {
+            | MockBehavior::PrepareTxFails => {
                 let result = self
                     .pending_burn_result
                     .lock()

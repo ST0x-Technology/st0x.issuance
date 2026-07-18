@@ -12,10 +12,10 @@
 //! schedule — and after recording it the job immediately enqueues the scheduled
 //! recovery job, so the first automatic retry starts right away instead of
 //! waiting for the periodic reconciler — while an infrastructure failure
-//! surfaces as a job error that apalis re-drives. Re-runs are safe —
-//! `submit_mint` derives a deterministic `external_tx_id` from the
-//! `issuer_request_id` (the signing backend dedups duplicate submissions), and
-//! every outcome command is a no-op once its event is recorded.
+//! surfaces as a job error that apalis re-drives. Re-runs are safe: the exact
+//! signed transaction is persisted before broadcast and reused until its
+//! submission resolves, while every outcome command is a no-op once its event
+//! is recorded.
 
 use alloy::primitives::Address;
 use apalis_sqlite::SqlitePool;
@@ -23,10 +23,12 @@ use event_sorcery::{SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::recovery::enqueue_scheduled_mint_recovery;
-use super::{IssuerMintRequestId, Mint, MintCommand};
+use super::{
+    IssuerMintRequestId, Mint, MintCommand, has_unresolved_mint_intent,
+};
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
@@ -51,6 +53,12 @@ pub(crate) enum MintJobError {
     Alpaca(#[from] AlpacaError),
     #[error(transparent)]
     ReceiptLookup(#[from] ReceiptLookupError),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(
+        "mint {issuer_request_id} is waiting for another persisted wallet intent"
+    )]
+    UnresolvedWalletIntent { issuer_request_id: IssuerMintRequestId },
 }
 
 /// Submits the on-chain mint to the signing backend, then hands off to
@@ -112,35 +120,7 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                 journal_confirmed_at,
                 ..
             } => {
-                // Defence against double-mint: if the on-chain mint already
-                // succeeded (a receipt exists for this mint), record it instead
-                // of re-submitting. Re-submission would mint again where the
-                // signer does not dedup on the external_tx_id.
-                if let Some(receipt) = ctx
-                    .receipts
-                    .find_by_issuer_request_id(
-                        self.chain_id,
-                        &self.vault,
-                        &self.issuer_request_id,
-                    )
-                    .await?
-                {
-                    ctx.mint_store
-                        .send(
-                            &self.issuer_request_id,
-                            MintCommand::RecordExistingMint {
-                                issuer_request_id: self
-                                    .issuer_request_id
-                                    .clone(),
-                                tx_hash: receipt.tx_hash,
-                                receipt_id: receipt.receipt_id,
-                                shares_minted: receipt.shares,
-                                block_number: receipt.block_number,
-                            },
-                        )
-                        .await?;
-
-                    self.enqueue_callback(ctx).await?;
+                if self.record_existing_receipt(ctx).await? {
                     return Ok(());
                 }
 
@@ -193,27 +173,55 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     .map(super::MintExternalTxId::into_string);
 
                 let wallet_guard = vault.lock_wallet().await;
-                let prepared = match vault
-                    .prepare_mint_tx(
-                        self.vault,
-                        assets,
-                        ctx.bot,
-                        *wallet,
-                        receipt_info,
-                        external_tx_id,
-                    )
-                    .await
+                if has_unresolved_mint_intent(
+                    &ctx.pool,
+                    Some(&self.issuer_request_id),
+                )
+                .await?
                 {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        drop(wallet_guard);
-                        self.record_submission_failure(ctx, error).await?;
-                        return Ok(());
-                    }
+                    return Err(MintJobError::UnresolvedWalletIntent {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                    });
+                }
+                let prepared = if let Some(prepared) =
+                    mint.pending_prepared_tx()
+                {
+                    prepared
+                } else {
+                    let prepared = match vault
+                        .prepare_mint_tx(
+                            self.vault,
+                            assets,
+                            ctx.bot,
+                            *wallet,
+                            receipt_info,
+                            external_tx_id,
+                        )
+                        .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            drop(wallet_guard);
+                            self.record_submission_failure(ctx, error).await?;
+                            return Ok(());
+                        }
+                    };
+
+                    ctx.mint_store
+                        .send(
+                            &self.issuer_request_id,
+                            MintCommand::RecordTxIntended {
+                                issuer_request_id: self
+                                    .issuer_request_id
+                                    .clone(),
+                                prepared_tx: prepared.clone(),
+                            },
+                        )
+                        .await?;
+                    prepared
                 };
 
                 let submitted = vault.submit_mint(&prepared).await;
-                drop(wallet_guard);
 
                 match submitted {
                     Ok(submitted) => {
@@ -240,15 +248,30 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                         self.record_submission_failure(ctx, error).await?;
                     }
                 }
+                drop(wallet_guard);
             }
             // Crash recovery for a prepare-then-submit job that persisted
             // intent via the inline PrepareMint path before the job rewrite.
             Mint::TxIntended { prepared_tx, network, .. } => {
+                if self.record_existing_receipt(ctx).await? {
+                    return Ok(());
+                }
                 let Some(vault) =
                     self.resolve_vault_service(ctx, *network).await?
                 else {
                     return Ok(());
                 };
+                let wallet_guard = vault.lock_wallet().await;
+                if has_unresolved_mint_intent(
+                    &ctx.pool,
+                    Some(&self.issuer_request_id),
+                )
+                .await?
+                {
+                    return Err(MintJobError::UnresolvedWalletIntent {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                    });
+                }
 
                 match vault.submit_mint(prepared_tx).await {
                     Ok(submitted) => {
@@ -275,6 +298,7 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                         self.record_submission_failure(ctx, error).await?;
                     }
                 }
+                drop(wallet_guard);
             }
             // A re-run after the submission was already recorded: the
             // confirm job may not have been enqueued before a crash, so
@@ -298,6 +322,45 @@ impl Job<SubmitMintContext> for SubmitMintJob {
 }
 
 impl SubmitMintJob {
+    async fn record_existing_receipt(
+        &self,
+        ctx: &SubmitMintContext,
+    ) -> Result<bool, MintJobError> {
+        let Some(receipt) = ctx
+            .receipts
+            .find_by_issuer_request_id(
+                self.chain_id,
+                &self.vault,
+                &self.issuer_request_id,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        info!(
+            target: "mint",
+            issuer_request_id = %self.issuer_request_id,
+            tx_hash = %receipt.tx_hash,
+            block_number = receipt.block_number,
+            "Found existing receipt, recording recovery"
+        );
+        ctx.mint_store
+            .send(
+                &self.issuer_request_id,
+                MintCommand::RecordExistingMint {
+                    issuer_request_id: self.issuer_request_id.clone(),
+                    tx_hash: receipt.tx_hash,
+                    receipt_id: receipt.receipt_id,
+                    shares_minted: receipt.shares,
+                    block_number: receipt.block_number,
+                },
+            )
+            .await?;
+        self.enqueue_callback(ctx).await?;
+        Ok(true)
+    }
+
     /// Resolves the signing backend for `network`. An unconfigured network is
     /// deterministic for this deploy, so it is recorded as `MintingFailed`
     /// instead of surfacing as a job error apalis would re-drive forever.
@@ -686,6 +749,7 @@ async fn kick_mint_recovery(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, U256};
     use async_trait::async_trait;
     use cqrs_es::{AggregateError, DomainEvent};
     use event_sorcery::test_store;
@@ -801,6 +865,21 @@ mod tests {
         {
             *event_network = network;
         }
+        events
+    }
+
+    fn events_through_tx_intended(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_minting(issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: crate::vault::PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: chrono::Utc::now(),
+        });
         events
     }
 
@@ -1025,6 +1104,201 @@ mod tests {
             Level::WARN,
             &[test, "Mint submission failed"]
         ));
+    }
+
+    #[tokio::test]
+    async fn submit_mint_job_waits_for_another_persisted_wallet_intent() {
+        let harness = TestHarness::new().await;
+        let pending_id = IssuerMintRequestId::random();
+        let mut pending_events = events_through_minting(&pending_id);
+        pending_events.push(MintEvent::MintTxIntended {
+            issuer_request_id: pending_id.clone(),
+            prepared_tx: crate::vault::PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{pending_id}"),
+            ),
+            intended_at: chrono::Utc::now(),
+        });
+        seed_mint_events(&harness.pool, &pending_id, pending_events).await;
+
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_minting(&issuer_request_id),
+        )
+        .await;
+        let vault = Arc::new(MockVaultService::new_success());
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id,
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .expect_err("another unresolved signed transaction must defer minting");
+
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "the blocked job must not prepare another signed transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_mint_job_persists_signed_intent_before_resolution() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_minting(&issuer_request_id),
+        )
+        .await;
+        let ctx =
+            submit_ctx(&harness, Arc::new(MockVaultService::new_success()));
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let intent_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'Mint' AND aggregate_id = ? AND event_type = 'MintEvent::MintTxIntended'",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(intent_count, 1);
+    }
+
+    #[tokio::test]
+    async fn submit_mint_job_retry_reuses_persisted_signed_intent() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: crate::vault::PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: chrono::Utc::now(),
+        });
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "submission outcome unknown".to_string(),
+            failed_at: chrono::Utc::now(),
+        });
+        events.push(MintEvent::MintRetryStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: None,
+            started_at: chrono::Utc::now(),
+        });
+        seed_mint_events(&harness.pool, &issuer_request_id, events).await;
+        let vault = Arc::new(MockVaultService::new_success());
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "recovery must rebroadcast the persisted bytes, not prepare a new transaction"
+        );
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::TxSubmitted { .. }));
+    }
+
+    #[tokio::test]
+    async fn tx_intended_submission_acquires_wallet_lock() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+        let vault = Arc::new(MockVaultService::new_success());
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id,
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(vault.get_wallet_lock_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tx_intended_with_existing_receipt_records_without_resubmitting() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+        let receipts = cqrs_receipts(&harness.pool);
+        let receipt_info = ReceiptInformation::new(
+            super::super::TokenizationRequestId::new("tok-123"),
+            issuer_request_id.clone(),
+            super::super::UnderlyingSymbol::new("AAPL").unwrap(),
+            crate::Quantity::new(rust_decimal::Decimal::from(100)),
+            chrono::Utc::now(),
+            None,
+        );
+        receipts
+            .register_minted_receipt(MintedReceiptParams {
+                chain_id: ANVIL_CHAIN_ID,
+                vault: VAULT,
+                receipt_id: ReceiptId::from(U256::from(7)),
+                shares: Shares::new(U256::from(100)),
+                block_number: 1_234,
+                tx_hash: B256::ZERO,
+                receipt_info_bytes: receipt_info.encode(None).unwrap(),
+                receipt_info,
+            })
+            .await
+            .unwrap();
+        let vault = Arc::new(MockVaultService::new_success());
+        let mut ctx = submit_ctx(&harness, vault.clone());
+        ctx.receipts = receipts;
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::CallbackPending { .. }));
+        assert_eq!(vault.get_call_count(), 0);
     }
 
     /// A re-run of the submit job after the submission was already recorded

@@ -191,6 +191,9 @@ initial request through journal confirmation to on-chain minting and callback.
   `MintingStarted`. Intent is persisted before the network call so that a crash
   during submission leaves the aggregate in a recoverable `Minting` state rather
   than `JournalConfirmed` (which would lose track of the submission)
+- `RecordTxIntended { issuer_request_id, prepared_tx }` - Persist the exact
+  signed transaction prepared by `SubmitMintJob` before broadcast. Pure,
+  requires `Minting`, emits `MintTxIntended`
 - `RecordTxSubmitted { issuer_request_id, external_tx_id, signer_tx_id }` -
   Records a successful on-chain submission performed by `SubmitMintJob`. Pure,
   requires `Minting`, emits `MintTxSubmitted`
@@ -214,16 +217,18 @@ initial request through journal confirmation to on-chain minting and callback.
   (terminal)
 
 The external mint side effects run in **durable apalis jobs**, not in the
-command handlers — closing the crash window between a signer submission and
-the event commit (ADR-0001). The handlers above are pure: each job performs one
+command handlers — closing the crash window between a signer submission and the
+event commit (ADR-0001). The handlers above are pure: each job performs one
 external call and reports the outcome via the matching `Record…` command. The
-job chain is `SubmitMintJob` (calls `vault.submit_mint`) -> `ConfirmMintJob`
-(polls `vault.confirm_mint`, registers the receipt) -> `SendCallbackJob` (calls
+job chain is `SubmitMintJob` (prepares the transaction, persists
+`MintTxIntended`, then calls `vault.submit_mint`) -> `ConfirmMintJob` (polls
+`vault.confirm_mint`, registers the receipt) -> `SendCallbackJob` (calls
 Alpaca); `process_journal_completion` resolves the vault and enqueues the first
 job. `SubmitMintJob` uses the configured network's Turnkey-backed vault service
-to prepare and submit the signed transaction. It also preserves compatibility
-with a legacy `MintIntended` state by rebroadcasting the exact persisted
-transaction bytes instead of preparing a replacement.
+to prepare and submit the signed transaction. A retry with an unresolved
+`MintIntended` predecessor rebroadcasts those exact persisted bytes instead of
+preparing a replacement, and other mint jobs wait while that wallet intent is
+unresolved.
 
 **Events:**
 
@@ -260,19 +265,19 @@ dual-format reader or restore the pre-cutover backup.
 
 **Command -> Event Mappings:**
 
-| Command                     | Events                  | Notes                                  |
-| --------------------------- | ----------------------- | -------------------------------------- |
-| `Initiate`                  | `Initiated`             | Mint request created                   |
-| `ConfirmJournal`            | `JournalConfirmed`      | Journal confirmed                      |
-| `RejectJournal`             | `JournalRejected`       | Terminal failure                       |
-| `Deposit`                   | `MintingStarted`        | Records intent (no network call)       |
-| `RecordTxSubmitted`         | `MintTxSubmitted`       | `SubmitMintJob` outcome                |
-| `RecordTokensMinted`        | `TokensMinted`          | `ConfirmMintJob` outcome               |
-| `RecordCallbackSent`        | `MintCompleted`         | `SendCallbackJob` outcome              |
-| `RecordMintFailed`          | `MintingFailed`         | Job-reported side-effect failure       |
-| `RecordExistingMint`        | `ExistingMintRecovered` | Double-mint guard (receipt exists)     |
-| `RetryMint`                 | `MintRetryStarted`      | `MintingFailed` -> `Minting` for retry |
-| `CloseMint`                 | `MintClosed`            | Admin-close (terminal)                 |
+| Command              | Events                  | Notes                                  |
+| -------------------- | ----------------------- | -------------------------------------- |
+| `Initiate`           | `Initiated`             | Mint request created                   |
+| `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                      |
+| `RejectJournal`      | `JournalRejected`       | Terminal failure                       |
+| `Deposit`            | `MintingStarted`        | Records intent (no network call)       |
+| `RecordTxSubmitted`  | `MintTxSubmitted`       | `SubmitMintJob` outcome                |
+| `RecordTokensMinted` | `TokensMinted`          | `ConfirmMintJob` outcome               |
+| `RecordCallbackSent` | `MintCompleted`         | `SendCallbackJob` outcome              |
+| `RecordMintFailed`   | `MintingFailed`         | Job-reported side-effect failure       |
+| `RecordExistingMint` | `ExistingMintRecovered` | Double-mint guard (receipt exists)     |
+| `RetryMint`          | `MintRetryStarted`      | `MintingFailed` -> `Minting` for retry |
+| `CloseMint`          | `MintClosed`            | Admin-close (terminal)                 |
 
 `Deposit` emits only `MintingStarted` (intent). The actual submission is handled
 by `SubmitMintJob`, whose outcome command emits either `MintTxSubmitted`
@@ -289,23 +294,23 @@ or recovering work.
 **Recovery.** A durable `MintRecoveryJob` re-drives a stuck or failed mint. Its
 budget loop (driven by `automatic_retry_decision`) enqueues the per-state job
 for the mint's current state — `SubmitMintJob` from `Minting`, `ConfirmMintJob`
-from `TxSubmitted`, `SendCallbackJob` from `CallbackPending` — or issues
-the pure transition that precedes it (`Deposit` from `JournalConfirmed`,
-`RetryMint` from `MintingFailed`). The startup re-scan, the periodic reconciler,
-the receipt monitor (on ITN-receipt discovery), and the admin reprocess endpoint
-all route through the same enqueue path.
+from `TxSubmitted`, `SendCallbackJob` from `CallbackPending` — or issues the
+pure transition that precedes it (`Deposit` from `JournalConfirmed`, `RetryMint`
+from `MintingFailed`). The startup re-scan, the periodic reconciler, the receipt
+monitor (on ITN-receipt discovery), and the admin reprocess endpoint all route
+through the same enqueue path.
 
 Re-submission is double-mint-safe: before submitting, `SubmitMintJob` checks the
 receipt inventory and, if the mint already succeeded on-chain, sends
 `RecordExistingMint` (emitting `ExistingMintRecovered`) instead of submitting
-again; the deterministic `external_tx_id` (`mint-{issuer_request_id}`) lets
-a deduplicating signing backend drop repeats. The retry-delay/exhaustion
-schedule is driven by a `MintingFailed` attempt counter (retries due after 1m,
-10m, 30m, 1h, then exhausted). A discovered receipt bypasses the backoff so a
-mint that actually succeeded is recorded immediately rather than waiting out
-the retry window. A pre-existing `MintIntended` state is recovered by submitting
-its persisted signed transaction, preserving the Turnkey migration's
-rebroadcast behavior.
+again; the deterministic `external_tx_id` (`mint-{issuer_request_id}`) lets a
+deduplicating signing backend drop repeats. The retry-delay/exhaustion schedule
+is driven by a `MintingFailed` attempt counter (retries due after 1m, 10m, 30m,
+1h, then exhausted). A discovered receipt bypasses the backoff so a mint that
+actually succeeded is recorded immediately rather than waiting out the retry
+window. A pre-existing `MintIntended` state is recovered by submitting its
+persisted signed transaction, preserving the Turnkey migration's rebroadcast
+behavior.
 
 ### Redemption Aggregate
 
