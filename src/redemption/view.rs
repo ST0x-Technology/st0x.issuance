@@ -8,7 +8,9 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::{IssuerRedemptionRequestId, default_redemption_network};
+use crate::config::VaultMode;
 use crate::mint::{Quantity, TokenizationRequestId};
+use crate::redemption::event::BurnFailureClassification;
 use crate::redemption::{Redemption, RedemptionEvent, TokensBurnedData};
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::TxId;
@@ -34,6 +36,10 @@ pub(crate) enum RedemptionView {
         /// staleness gate reflect the latest entry rather than the
         /// original detection.
         detected_entered_at: DateTime<Utc>,
+        /// Mode anchor captured on `Detected` (see the aggregate's
+        /// `RedemptionMetadata::burn_mode`).
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     AlpacaCalled {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -50,6 +56,8 @@ pub(crate) enum RedemptionView {
         block_number: u64,
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     Burning {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -73,6 +81,8 @@ pub(crate) enum RedemptionView {
         /// triage and the staleness gate reflect the latest entry rather than
         /// the original journal completion.
         burning_entered_at: DateTime<Utc>,
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     Completed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -110,6 +120,12 @@ pub(crate) enum RedemptionView {
         /// Planned burns at the time of failure.
         #[serde(default)]
         planned_burns: Vec<super::BurnRecord>,
+        #[serde(default)]
+        burn_mode: VaultMode,
+        /// Typed failure classification; keys retry-exclusion and admin
+        /// grouping.
+        #[serde(default)]
+        classification: BurnFailureClassification,
     },
     Closed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -153,6 +169,7 @@ impl RedemptionView {
             tx_hash,
             block_number,
             detected_at,
+            burn_mode,
             ..
         } = self
         else {
@@ -173,6 +190,7 @@ impl RedemptionView {
             block_number,
             detected_at,
             called_at,
+            burn_mode,
         }
     }
 
@@ -194,6 +212,7 @@ impl RedemptionView {
             block_number,
             detected_at,
             called_at,
+            burn_mode,
             ..
         } = self
         else {
@@ -216,6 +235,7 @@ impl RedemptionView {
             called_at,
             alpaca_journal_completed_at,
             burning_entered_at: alpaca_journal_completed_at,
+            burn_mode,
         }
     }
 
@@ -225,6 +245,7 @@ impl RedemptionView {
         failed_at: DateTime<Utc>,
         tx_id: Option<&TxId>,
         planned_burns: &[super::BurnRecord],
+        classification: &BurnFailureClassification,
     ) -> Self {
         let Self::Burning {
             issuer_request_id,
@@ -242,6 +263,7 @@ impl RedemptionView {
             called_at,
             alpaca_journal_completed_at,
             burning_entered_at: _,
+            burn_mode,
         } = self
         else {
             return self;
@@ -266,6 +288,8 @@ impl RedemptionView {
             failed_at,
             tx_id: tx_id.cloned(),
             planned_burns: planned_burns.to_vec(),
+            burn_mode,
+            classification: classification.clone(),
         }
     }
 }
@@ -283,6 +307,7 @@ impl RedemptionView {
                 tx_hash,
                 block_number,
                 detected_at,
+                burn_mode,
             } => Self::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
@@ -294,6 +319,7 @@ impl RedemptionView {
                 block_number: *block_number,
                 detected_at: *detected_at,
                 detected_entered_at: *detected_at,
+                burn_mode: *burn_mode,
             },
             RedemptionEvent::Reprocessed {
                 issuer_request_id,
@@ -306,6 +332,7 @@ impl RedemptionView {
                 block_number,
                 detected_at,
                 reprocessed_at,
+                burn_mode,
                 ..
             } => Self::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -318,6 +345,7 @@ impl RedemptionView {
                 block_number: *block_number,
                 detected_at: *detected_at,
                 detected_entered_at: *reprocessed_at,
+                burn_mode: *burn_mode,
             },
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id,
@@ -352,12 +380,14 @@ impl RedemptionView {
                 failed_at,
                 tx_id,
                 planned_burns,
+                classification,
                 ..
             } => self.update_burning_failed(
                 error,
                 *failed_at,
                 tx_id.as_ref(),
                 planned_burns,
+                classification,
             ),
 
             RedemptionEvent::AlpacaJournalCompleted {
@@ -383,6 +413,7 @@ impl RedemptionView {
                 called_at,
                 alpaca_journal_completed_at,
                 resumed_at,
+                burn_mode,
                 ..
             } => Self::Burning {
                 issuer_request_id: issuer_request_id.clone(),
@@ -400,6 +431,7 @@ impl RedemptionView {
                 called_at: *called_at,
                 alpaca_journal_completed_at: *alpaca_journal_completed_at,
                 burning_entered_at: *resumed_at,
+                burn_mode: *burn_mode,
             },
             RedemptionEvent::TokensBurned(TokensBurnedData {
                 issuer_request_id,
@@ -770,10 +802,11 @@ mod tests {
         RedemptionView, RedemptionViewReactor, find_alpaca_called,
         find_burn_failed, find_burning, find_detected, find_stuck,
     };
+    use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::{
-        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionEvent,
-        TokensBurnedData,
+        BurnFailureClassification, BurnRecord, IssuerRedemptionRequestId,
+        Redemption, RedemptionEvent, TokensBurnedData,
     };
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::TxId;
@@ -885,6 +918,7 @@ mod tests {
             self.emit(
                 id,
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: id.clone(),
                     underlying: UnderlyingSymbol::new(underlying).unwrap(),
                     token: TokenSymbol::new(format!("t{underlying}")),
@@ -978,6 +1012,7 @@ mod tests {
             self.emit(
                 id,
                 RedemptionEvent::BurningFailed {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: id.clone(),
                     error: error.to_string(),
                     failed_at: Utc::now(),
@@ -1033,6 +1068,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -1057,7 +1093,8 @@ mod tests {
             block_number: view_block_number,
             detected_at: view_detected_at,
             detected_entered_at: view_detected_entered_at,
-            ..
+            burn_mode: view_burn_mode,
+            network: view_network,
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Detected view");
@@ -1071,6 +1108,8 @@ mod tests {
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_detected_at, detected_at);
+        assert_eq!(view_burn_mode, VaultMode::VaultDirect);
+        assert_eq!(view_network, Network::Base);
         // On first Detection, detected_entered_at mirrors detected_at — the
         // view has not yet been reprocessed.
         assert_eq!(view_detected_entered_at, detected_at);
@@ -1099,6 +1138,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -1140,11 +1180,15 @@ mod tests {
             block_number: view_block_number,
             detected_at: view_detected_at,
             called_at: view_called_at,
-            ..
+            burn_mode: view_burn_mode,
+            network: view_network,
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected AlpacaCalled view");
         };
+
+        assert_eq!(view_burn_mode, VaultMode::VaultDirect);
+        assert_eq!(view_network, Network::Base);
 
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_tok_id, tokenization_request_id);
@@ -1191,6 +1235,7 @@ mod tests {
                     tx_hash,
                     block_number: 54321,
                     detected_at,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -1252,6 +1297,7 @@ mod tests {
                     tx_hash,
                     block_number: 99999,
                     detected_at,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -1325,6 +1371,7 @@ mod tests {
                     tx_hash,
                     block_number: 88888,
                     detected_at,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -1364,6 +1411,7 @@ mod tests {
                     failed_at,
                     tx_id: None,
                     planned_burns: vec![],
+                    classification: BurnFailureClassification::Unclassified,
                 },
             )
             .await
@@ -1403,6 +1451,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -1457,11 +1506,15 @@ mod tests {
             called_at: view_called_at,
             alpaca_journal_completed_at: view_alpaca_journal_completed_at,
             burning_entered_at: view_burning_entered_at,
-            ..
+            burn_mode: view_burn_mode,
+            network: view_network,
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burning view");
         };
+
+        assert_eq!(view_burn_mode, VaultMode::VaultDirect);
+        assert_eq!(view_network, Network::Base);
 
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_tok_id, tokenization_request_id);
@@ -1508,6 +1561,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -1571,6 +1625,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -1929,6 +1984,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -1977,6 +2033,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::BurningFailed {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: error.clone(),
                     failed_at,
@@ -2091,6 +2148,7 @@ mod tests {
         let quantity = Quantity::new(Decimal::from(100));
 
         let detected_event = RedemptionEvent::Detected {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
@@ -2334,6 +2392,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -2373,6 +2432,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::Reprocessed {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
@@ -2437,6 +2497,7 @@ mod tests {
             .receive::<Redemption>(
                 issuer_request_id.clone(),
                 RedemptionEvent::BurnResumed {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
@@ -2473,11 +2534,15 @@ mod tests {
             called_at: view_called_at,
             alpaca_journal_completed_at: view_journal_completed_at,
             burning_entered_at: view_burning_entered_at,
-            ..
+            burn_mode: view_burn_mode,
+            network: view_network,
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burning view after BurnResumed");
         };
+
+        assert_eq!(view_burn_mode, VaultMode::VaultDirect);
+        assert_eq!(view_network, Network::Base);
 
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_tok_id, tokenization_request_id);

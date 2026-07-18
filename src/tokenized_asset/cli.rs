@@ -1969,7 +1969,9 @@ mod tests {
 
     use super::*;
     use crate::Quantity;
-    use crate::redemption::{BurnRecord, RedemptionEvent};
+    use crate::redemption::{
+        BurnFailureClassification, BurnRecord, RedemptionEvent,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -2596,6 +2598,7 @@ mod tests {
                 ),
                 block_number: 30_000_000,
                 detected_at: Utc::now(),
+                burn_mode: crate::VaultMode::VaultDirect,
             },
             RedemptionEvent::BurningFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -2606,6 +2609,7 @@ mod tests {
                     receipt_id: U256::from(3),
                     shares_burned: U256::from(40_000_000_000_000_000_u64),
                 }],
+                classification: BurnFailureClassification::Unclassified,
             },
         ];
         for (index, event) in events.iter().enumerate() {

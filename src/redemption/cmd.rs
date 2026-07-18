@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::Quantity;
+use crate::config::VaultMode;
 use crate::mint::TokenizationRequestId;
+use crate::redemption::event::BurnFailureClassification;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{MultiBurnEntry, TxId};
 
@@ -18,6 +20,12 @@ pub(crate) enum RedemptionCommand {
         quantity: Quantity,
         tx_hash: B256,
         block_number: u64,
+        /// The asset's `VaultMode` resolved from config at detection time.
+        /// Persisted on `Detected` to anchor mode derivation for the whole
+        /// redemption lifecycle. Deliberately no `#[serde(default)]`:
+        /// commands are not persisted, so a default here would only mask a
+        /// caller that forgot to resolve the mode.
+        burn_mode: VaultMode,
     },
     RecordAlpacaCall {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -68,6 +76,9 @@ pub(crate) enum RedemptionCommand {
         tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         planned_burns: Vec<super::BurnRecord>,
+        /// Typed failure classification persisted on `BurningFailed`.
+        /// Deliberately no `#[serde(default)]` — see `Detect::burn_mode`.
+        classification: BurnFailureClassification,
     },
     /// Resets a failed redemption back to Detected state for reprocessing.
     /// Only valid from `Failed` state — post-Alpaca states have dedicated

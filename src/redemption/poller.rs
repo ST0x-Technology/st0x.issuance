@@ -21,6 +21,7 @@ use super::{
     },
 };
 use crate::bindings;
+use crate::config::VaultModeConfig;
 use crate::poll_checkpoint::{
     self, CheckpointError, TRANSFER_POLL, advance_transfer_poll,
     load_transfer_poll,
@@ -89,6 +90,7 @@ pub(crate) struct TransferPoller<P> {
     redeem_call_manager: Arc<RedeemCallManager>,
     journal_manager: Arc<JournalManager>,
     burn_manager: Arc<BurnManager>,
+    vault_mode_config: VaultModeConfig,
 }
 
 /// Configuration for constructing a [`TransferPoller`].
@@ -102,6 +104,7 @@ pub(crate) struct TransferPollerConfig<P> {
     pub(crate) redeem_call_manager: Arc<RedeemCallManager>,
     pub(crate) journal_manager: Arc<JournalManager>,
     pub(crate) burn_manager: Arc<BurnManager>,
+    pub(crate) vault_mode_config: VaultModeConfig,
 }
 
 impl<P> TransferPoller<P> {
@@ -116,6 +119,7 @@ impl<P> TransferPoller<P> {
             redeem_call_manager: config.redeem_call_manager,
             journal_manager: config.journal_manager,
             burn_manager: config.burn_manager,
+            vault_mode_config: config.vault_mode_config,
         }
     }
 }
@@ -453,6 +457,7 @@ where
             assets,
             &self.store,
             &self.pool,
+            &self.vault_mode_config,
         )
         .await
         {
@@ -617,6 +622,7 @@ mod tests {
 
     use super::{TransferPollError, watch_redemption_flow};
     use crate::alpaca::mock::MockAlpacaService;
+    use crate::config::VaultModeConfig;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
     };
@@ -723,6 +729,7 @@ mod tests {
             redeem_call_manager,
             journal_manager,
             burn_manager,
+            vault_mode_config: VaultModeConfig::default(),
         });
 
         TestPollerSetup { poller, pool }

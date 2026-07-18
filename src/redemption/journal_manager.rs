@@ -605,6 +605,7 @@ mod tests {
     use crate::alpaca::{
         AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
     };
+    use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionViewReactor;
@@ -662,6 +663,7 @@ mod tests {
             .send(
                 issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
@@ -1874,6 +1876,7 @@ mod tests {
 
         let quantity = Quantity::new(dec!(100));
         let view = RedemptionView::AlpacaCalled {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
