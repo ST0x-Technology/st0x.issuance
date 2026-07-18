@@ -654,7 +654,10 @@ stateDiagram-v2
 ### TokenizedAsset Aggregate
 
 The `TokenizedAsset` aggregate manages which assets are supported for
-tokenization. The aggregate id is the `UnderlyingSymbol`.
+tokenization. The aggregate id is the `UnderlyingSymbol` today; the multichain
+cutover rekeys it to `{underlying}:{network}` (`AssetKey`) so the same
+underlying can be listed per network — see the [Multi-chain](#multi-chain)
+section for the target identity model and the migration/rollback story.
 
 **Aggregate State:**
 
@@ -705,12 +708,11 @@ error (separate from `AssetNotAvailable`), so the rejection is observable and
 not conflated with de-listing. A frozen asset stays in `list_enabled_assets()`,
 so in-flight redemption detection (`src/redemption/`) keeps working — issuance
 reacts to on-chain transfers and has no "reject redemption" point. Preventing
-_new_ redemptions of a frozen asset is the liquidity rebalance guard's job
-(RAI-1038), which reads the per-asset status endpoint (see "Tokenized Assets
-Data Endpoint"). This issuance-side freeze plus the liquidity guard form the
-single dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze
-is involved here (that is separate, heavier supply-control work and out of
-scope).
+_new_ redemptions of a frozen asset is the liquidity rebalance guard's job,
+which reads the per-asset status endpoint (see "Tokenized Assets Data
+Endpoint"). This issuance-side freeze plus the liquidity guard form the single
+dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze is
+involved here (that is separate, heavier supply-control work and out of scope).
 
 The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
 in M1 and automatically by the dividend scheduler in M3 — the same command path
@@ -728,8 +730,15 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 Each subcommand opens the same event store, prints the resolved asset and its
 current status, requires confirmation before a mutating action, and dispatches
 the CQRS command through the `Store` (never writing the `events` table
-directly); freeze/unfreeze are idempotent. Per RAI-586 the trigger is a local
+directly); freeze/unfreeze are idempotent. The trigger is deliberately a local
 action on the issuer host, not a remotely pushable endpoint.
+
+From the multichain cutover (see the [Multi-chain](#multi-chain) section) every
+subcommand is network-aware: it takes a required `--network <NETWORK>` flag
+(wire value) and resolves the asset by `{underlying}:{network}` —
+underlying-only lookups are no longer possible once the aggregate is rekeyed,
+and there is deliberately no default network so an operator can never freeze the
+wrong chain's listing by omission.
 
 ## Services
 
@@ -1089,31 +1098,42 @@ Alpaca needs to query which assets we support:
 **Our Response:**
 
 ```json
-[
-  {
-    "underlying_symbol": "AAPL",
-    "token_symbol": "AAPL0x",
-    "network": "base"
-  },
-  {
-    "underlying_symbol": "TSLA",
-    "token_symbol": "TSLA0x",
-    "network": "base"
-  }
-]
+{
+  "tokens": [
+    {
+      "underlying": "AAPL",
+      "token": "tAAPL",
+      "networks": ["base"]
+    },
+    {
+      "underlying": "TSLA",
+      "token": "tTSLA",
+      "networks": ["base"]
+    }
+  ]
+}
 ```
 
 **Data Structure:**
 
 ```rust
-struct TokenizedAsset {
-    #[serde(rename = "underlying_symbol")]
+struct TokenizedAssetsListResponse {
+    tokens: Vec<TokenizedAssetResponse>,
+}
+
+struct TokenizedAssetResponse {
     underlying: UnderlyingSymbol,
-    #[serde(rename = "token_symbol")]
     token: TokenSymbol,
-    network: Network,
+    networks: Vec<Network>,
 }
 ```
+
+With multichain registration (see the [Multi-chain](#multi-chain) section)
+responses **merge rows** when the same `(underlying, token)` is registered on
+multiple chains (union of `networks[]`) -- a breaking semantic change for
+clients that relied on one row per network -- and `tokens` are sorted by
+`(underlying, token)`, each `networks[]` by `Network` wire value for
+deterministic ordering.
 
 #### Adding Tokenized Assets
 
@@ -1144,9 +1164,15 @@ struct TokenizedAsset {
 **Endpoint:** `GET /tokenized-assets/<underlying>/status`
 
 Internal service-to-service endpoint (internal auth) consumed by the liquidity
-rebalance guard (RAI-1038) to skip frozen assets before starting a rebalancing
-flow. Returns the asset's `status` (`enabled` or `frozen`), or `404` if the
-asset is unknown.
+rebalance guard to skip frozen assets before starting a rebalancing flow.
+Returns the asset's `status` (`enabled` or `frozen`), or `404` if the asset is
+unknown.
+
+From the multichain cutover (see the [Multi-chain](#multi-chain) section) this
+endpoint and its sibling detail lookup `GET /tokenized-assets/{underlying}`
+(same internal auth, returning the full asset record instead of just the status)
+require a `?network=` query parameter and return `422` when it is missing; the
+liquidity freeze guard fail-closes on 422.
 
 **Response:**
 
@@ -1167,6 +1193,8 @@ asset is unknown.
 - `200`: asset found — returns its `status` (`"enabled"` or `"frozen"`)
 - `401`: missing or invalid internal API key
 - `404`: asset unknown
+- `422`: missing `?network=` (from the multichain cutover -- see the Multi-chain
+  section). Consumers must treat this as fail-closed, never as `"enabled"`
 - `500`: database or view-deserialization failure — the status is
   **indeterminate**. A consumer must NOT treat any non-`404` failure as
   `"enabled"`; treat `500` as "unknown, retry" rather than proceeding.
@@ -1956,7 +1984,7 @@ We run an HTTP server that implements these endpoints.
    address for AP
 4. **`POST /tokenized-assets`** - Add a new tokenized asset
 5. **`GET /tokenized-assets/<underlying>/status`** - Per-asset listing + freeze
-   status, consumed by the liquidity rebalance guard (RAI-1038)
+   status, consumed by the liquidity rebalance guard
 
 ### Endpoints We Call
 
@@ -2488,3 +2516,98 @@ detail including:
 - Separation between minting and burning keys if needed
 
 This is a critical security consideration that requires careful planning.
+
+### Multi-chain
+
+**MVP scope:** Full multichain operation of the issuance service -- mints,
+redemptions, burns, token listing, receipt inventory, and transfer polling
+routed by aggregate `network`. Contract deployment on new chains is prerequisite
+work delivered via `st0x.deploy`; issuance registers deployed vaults and routes
+all side effects through `ChainRegistry`. Base-only config stays identical until
+each multichain PR merges.
+
+**Token listing:** Alpaca ITN `GET /tokenized-assets` keeps its JSON shape — a
+`tokens` array whose rows each carry a per-token `networks` array — but **row
+cardinality changes**: when the same `(underlying, token)` is registered on
+multiple chains, responses merge into one row whose `networks` is the union
+(single-chain deployments emit one row per registered network). `tokens` are
+sorted by `(underlying, token)` ascending; `networks[]` within each row are
+sorted by network wire string. Add-asset registers vaults per `network`.
+
+**Redemption + burn:** Detect, Alpaca orchestration, aggregate
+`BurnTokens`/`ConfirmBurn`, and BurnManager recovery all sign on the aggregate's
+`network` runtime -- not Base by default.
+
+**Architecture:** One issuance process. `ChainRegistry` maps each `Network` to a
+`ChainRuntime` — the per-network bundle of everything needed for on-chain side
+effects on that chain:
+
+- HTTP JSON-RPC provider (Alloy)
+- `VaultService` (Turnkey or local signer, bound to that chain's `chain_id`)
+- `backfill_start_block` for receipt backfill
+- Subgraph URL for receipt indexing
+
+Constructed once at startup from config; immutable for the process lifetime.
+Alpaca calls a single issuer URL; payload `network` selects the runtime.
+
+**ChainRegistry:** Legacy env vars (`RPC_URL`, `CHAIN_ID`, `SUBGRAPH_URL`,
+`BACKFILL_START_BLOCK`) map to one `base` registry entry. Behaviour identical to
+single-chain production. The flat vars are transitional compatibility, not a
+supported long-term configuration: the target shape is one
+`CHAIN_<NETWORK>_RPC_URL` / `CHAIN_<NETWORK>_CHAIN_ID` /
+`CHAIN_<NETWORK>_SUBGRAPH_URL` / `CHAIN_<NETWORK>_BACKFILL_START_BLOCK` block
+per configured network, with `.env.example` as the authoritative record of that
+shape. Parsing those variables into `Config::chains` is its own change; until it
+lands, the flat legacy vars remain the only live config path. Checkpoints are
+keyed per network: transfer polling under `transfer_poll:{network}` and receipt
+backfill under `receipt_backfill:<network>:<vault_address_lowercase>`, with the
+pre-multichain rows (`transfer_poll`, `receipt_backfill:<vault_lowercase>`)
+readable as Base-only fallbacks. Once staging and production migrate, the
+flat-var mapping and those legacy checkpoint fallbacks are deleted.
+
+**Asset identity (breaking):** `TokenizedAsset` aggregate id becomes the
+`AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`). The internal asset
+endpoints (the `InternalAuth`-guarded `GET /tokenized-assets/{underlying}`
+detail lookup and its `GET /tokenized-assets/{underlying}/status` freeze-status
+companion, consumed by `st0x-issuance-client`) require `?network=` (422 if
+missing). This is a **lockstep break** with `st0x-issuance-client` and the
+liquidity freeze guard -- no dual-read or optional-default transition. Alpaca
+ITN list (`GET /tokenized-assets`) keeps `{ tokens, networks[] }`; see token
+listing above for merge semantics.
+
+**Cutover:** Lockstep deploy -- issuance, `st0x-issuance-client`, and the
+liquidity freeze guard must ship in the same deploy window. No dual-read or
+versioned transition; callers without `?network=` get **422** immediately after
+cutover. Liquidity freeze guard **fail-closes** on 422 (rebalancing stops) if it
+calls issuance without `?network=` after cutover.
+
+**Rollback:** Roll back all three deployables together. If issuance rolls back
+alone (with the pre-deployment database restore applied) while liquidity still
+sends `?network=`, freeze/status calls succeed -- the old server ignores the
+unknown query parameter. Without the restore, reverted code looks assets up by
+the old `{underlying}` keys, every lookup against the rekeyed store returns
+**404**, and consumers read 404 as "asset unknown" rather than a fail-closed
+error -- a code-only rollback silently un-gates frozen assets. If liquidity
+rolls back alone while issuance requires `?network=`, freeze guard gets 422 and
+rebalancing **fail-closes** until liquidity is restored or issuance is rolled
+back. Do not leave a mixed-version window in production. The same cutover
+applies the aggregate-store rekey: a code rollback after the rekey has run must
+be accompanied by a database restore from the pre-deployment backup. The
+backup/restore procedure is the
+`docs/runbooks/tokenized-asset-aggregate-rekey.md` runbook, which ships with the
+rekey change itself.
+
+**Invariants:**
+
+1. Every on-chain side effect uses the aggregate's persisted `network` runtime.
+2. `registry.get(network)` miss -> typed failure; never fall back to Base.
+3. Startup fails if a live asset's `network` has no chain config entry.
+
+**Alternatives considered:**
+
+| Alternative                                               | Rejected because                                                                                        |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| One process per chain                                     | Duplicate SQLite/event store; Alpaca expects one issuer URL                                             |
+| Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
+| Shared `VaultService` with runtime chain_id switch        | Signing backends bind `chain_id` at construction; a runtime switch is error-prone                       |
+| Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |
