@@ -43,7 +43,7 @@ type Storage<Task> = SqliteStorage<Task, JsonCodec<CompactType>, SqliteFetcher>;
 /// Cleanup queries that scope a `DELETE` to one job type must derive it the same
 /// way, so they match exactly the rows apalis actually wrote.
 pub(crate) fn job_type<Task>() -> &'static str {
-    std::any::type_name::<Task>()
+    type_name::<Task>()
 }
 
 /// Handler-facing durable job queue backed by apalis `SqliteStorage`.

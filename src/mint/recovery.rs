@@ -432,6 +432,39 @@ pub(crate) async fn vacuum_terminal_mint_side_effect_jobs(
     Ok(())
 }
 
+/// Flips submit/confirm/callback jobs left `Running` by a dead process back to
+/// `Pending`, clearing their lock columns. Mirrors
+/// [`reset_orphaned_recovery_jobs`] for the per-state side-effect chain so a
+/// crash mid-job does not strand recovery behind apalis's orphan timeout
+/// (re-enqueue would otherwise dedupe against the orphaned `Running` row).
+pub(crate) async fn reset_orphaned_mint_side_effect_jobs(
+    pool: &Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    for side_effect_job_type in [
+        job_type::<SubmitMintJob>(),
+        job_type::<ConfirmMintJob>(),
+        job_type::<SendCallbackJob>(),
+    ] {
+        sqlx::query(
+            "
+            UPDATE Jobs
+            SET
+                status = 'Pending',
+                lock_at = NULL,
+                lock_by = NULL
+            WHERE
+                job_type = ?
+                AND status = 'Running'
+            ",
+        )
+        .bind(side_effect_job_type)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Deletes `Workers` rows for the mint-recovery worker type that no job
 /// references via `Jobs.lock_by`, so the table stays bounded across restarts.
 ///
@@ -619,6 +652,39 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 return RecoveryConclusion::Resolved;
             }
             AutomaticRetryDecision::Exhausted => {
+                // A confirmed receipt outranks retry exhaustion: the mint
+                // succeeded on-chain after attempts ran out, so keep driving
+                // toward TokensMinted / callback instead of abandoning.
+                if minting_failed_receipt_exists(ctx, &mint, issuer_request_id)
+                    .await
+                {
+                    info!(target: "mint", issuer_request_id = %issuer_request_id,
+                        "Automatic mint retries exhausted but on-chain receipt exists; continuing recovery"
+                    );
+                    no_progress_polls += 1;
+                    if no_progress_polls > max_no_progress_polls {
+                        warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                            max_no_progress_polls,
+                            "Scheduled mint recovery stopped after maximum polls without progress"
+                        );
+                        return RecoveryConclusion::Abandoned {
+                            reason: AbandonReason::NoProgressBudgetExhausted,
+                        };
+                    }
+
+                    if let Err(error) =
+                        drive_one_step(ctx, &mint, issuer_request_id).await
+                    {
+                        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                            error = %error,
+                            "Scheduled recovery step failed after exhausted retries with receipt; backing off"
+                        );
+                    }
+
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     "Automatic mint retries exhausted"
                 );
@@ -1436,6 +1502,145 @@ mod tests {
                 &[test, "Mint not found for scheduled recovery"]
             ) >= 1,
             "an absent mint must log the not-found path"
+        );
+    }
+
+    /// Exhausted automatic retries must not abandon a mint that already has an
+    /// on-chain receipt — recovery should keep driving toward TokensMinted /
+    /// callback instead of returning `AutomaticRetriesExhausted`.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_retries_with_existing_receipt_keep_driving() {
+        use crate::receipt_inventory::{
+            BurnPlan, BurnTrackingError, MintedReceiptParams,
+            ReceiptLookupError, ReceiptRegistrationError, ReceiptService,
+            RecoveredReceipt, Shares,
+        };
+        use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
+        use alloy::primitives::{B256, U256};
+        use async_trait::async_trait;
+
+        struct ReceiptExists;
+
+        #[async_trait]
+        impl ReceiptService for ReceiptExists {
+            async fn register_minted_receipt(
+                &self,
+                _params: MintedReceiptParams,
+            ) -> Result<(), ReceiptRegistrationError> {
+                Ok(())
+            }
+
+            async fn for_burn(
+                &self,
+                _chain_id: u64,
+                _vault: Address,
+                _redemption_issuer_request_id: &IssuerRedemptionRequestId,
+                _shares_to_burn: Shares,
+                _dust: Shares,
+            ) -> Result<BurnPlan, BurnTrackingError> {
+                Ok(BurnPlan {
+                    allocations: vec![],
+                    total_burn: Shares::ZERO,
+                    dust: Shares::ZERO,
+                })
+            }
+
+            async fn reserve_burn(
+                &self,
+                _chain_id: u64,
+                _vault: Address,
+                _redemption_issuer_request_id: IssuerRedemptionRequestId,
+                _burns: Vec<BurnRecord>,
+            ) -> Result<(), ReceiptRegistrationError> {
+                Ok(())
+            }
+
+            async fn release_burn(
+                &self,
+                _chain_id: u64,
+                _vault: Address,
+                _redemption_issuer_request_id: IssuerRedemptionRequestId,
+            ) -> Result<(), ReceiptRegistrationError> {
+                Ok(())
+            }
+
+            async fn settle_burn(
+                &self,
+                _chain_id: u64,
+                _vault: Address,
+                _redemption_issuer_request_id: IssuerRedemptionRequestId,
+            ) -> Result<(), ReceiptRegistrationError> {
+                Ok(())
+            }
+
+            async fn reserved_redemptions(
+                &self,
+                _chain_id: u64,
+                _vault: Address,
+            ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
+            {
+                Ok(vec![])
+            }
+
+            async fn find_by_issuer_request_id(
+                &self,
+                _chain_id: u64,
+                _vault: &Address,
+                _issuer_request_id: &IssuerMintRequestId,
+            ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>
+            {
+                Ok(Some(RecoveredReceipt {
+                    receipt_id: U256::from(1),
+                    tx_hash: B256::ZERO,
+                    shares: U256::from(100),
+                    block_number: 1,
+                }))
+            }
+        }
+
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+        let mut events = tx_submitted_events(&issuer_request_id);
+        for _ in 0..5 {
+            events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mut ctx = fixture.context();
+        ctx.receipts = Arc::new(ReceiptExists);
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &ctx,
+            &issuer_request_id,
+            Duration::from_millis(1),
+            3,
+        )
+        .await;
+
+        assert!(
+            !matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::AutomaticRetriesExhausted
+                }
+            ),
+            "an exhausted mint with a confirmed receipt must not be abandoned \
+             for retry exhaustion"
+        );
+
+        let test = "exhausted_retries_with_existing_receipt_keep_driving";
+        assert!(
+            log_count_at!(
+                Level::INFO,
+                &[test, "on-chain receipt exists; continuing recovery"]
+            ) >= 1,
+            "must log that recovery continues because a receipt exists"
         );
     }
 

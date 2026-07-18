@@ -37,8 +37,8 @@ use crate::mint::{
         MintRecoveryContext, MintRecoveryHandler, MintRecoveryJob,
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
         prune_unreferenced_recovery_workers, reconcile_recoverable_mints,
-        reset_orphaned_recovery_jobs, vacuum_terminal_mint_side_effect_jobs,
-        vacuum_terminal_recovery_jobs,
+        reset_orphaned_mint_side_effect_jobs, reset_orphaned_recovery_jobs,
+        vacuum_terminal_mint_side_effect_jobs, vacuum_terminal_recovery_jobs,
     },
 };
 use crate::receipt_inventory::backfill::{
@@ -735,6 +735,14 @@ async fn run_mint_recovery(
     if let Err(error) = reset_orphaned_recovery_jobs(pool).await {
         warn!(target: "mint", error = %error,
             "Failed to reset orphaned mint-recovery jobs"
+        );
+    }
+
+    // Same for the submit/confirm/callback chain: a crash leaves `Running`
+    // rows that would otherwise block re-enqueue until apalis's orphan timeout.
+    if let Err(error) = reset_orphaned_mint_side_effect_jobs(pool).await {
+        warn!(target: "mint", error = %error,
+            "Failed to reset orphaned mint side-effect jobs"
         );
     }
 
