@@ -78,7 +78,6 @@ impl MockAlpacaService {
         self
     }
 
-
     /// Returns the number of times `send_mint_callback()` was called.
     #[cfg(test)]
     pub(crate) fn get_call_count(&self) -> usize {
