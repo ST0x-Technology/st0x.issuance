@@ -115,7 +115,10 @@ pub async fn wait_for_mock_hits(
     expected: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(5);
+    // Must comfortably exceed the transfer poller's 5s POLL_INTERVAL: a
+    // transfer landing just after a poll pass is only detected on the next
+    // tick, so a 5s wait races the poller by construction.
+    let timeout = tokio::time::Duration::from_secs(15);
     let poll_interval = tokio::time::Duration::from_millis(50);
 
     loop {
@@ -241,7 +244,9 @@ pub async fn seed_tokenized_asset_with(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(
             json!({
                 "underlying": underlying,
@@ -423,14 +428,18 @@ pub async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(json!({"email": "user@example.com"}).to_string())
         .dispatch()
         .await;
 
     assert_eq!(register_response.status(), rocket::http::Status::Ok);
-    let _: RegisterAccountResponse =
-        register_response.into_json().await.unwrap();
+    let _: RegisterAccountResponse = register_response
+        .into_json()
+        .await
+        .expect("register response must contain valid JSON");
 
     let link_response = client
         .post("/accounts/connect")
@@ -439,7 +448,9 @@ pub async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(
             json!({"email": "user@example.com", "account": "USER123"})
                 .to_string(),
@@ -448,8 +459,10 @@ pub async fn setup_account(
         .await;
 
     assert_eq!(link_response.status(), rocket::http::Status::Ok);
-    let link_body: AccountLinkResponse =
-        link_response.into_json().await.unwrap();
+    let link_body: AccountLinkResponse = link_response
+        .into_json()
+        .await
+        .expect("link response must contain valid JSON");
 
     let whitelist_response = client
         .post(format!("/accounts/{}/wallets", link_body.client_id))
@@ -458,7 +471,9 @@ pub async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
@@ -574,15 +589,21 @@ pub fn create_config_with_db(
 
 /// Builds a [`Config`] wired to two Anvil chains: Base and Ethereum, both
 /// entries in `Config::chains`. Both chains share the mock subgraph.
+/// `eth_vault_address` is passed explicitly rather than read from `eth_evm`:
+/// both Anvil chains deploy from the same key and nonce, so
+/// `eth_evm.vault_address` equals `base_evm.vault_address`, and twin
+/// addresses would make cross-chain routing assertions vacuous. Multichain
+/// tests deploy an additional vault on the Ethereum chain and use its address.
 pub fn create_multichain_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     base_evm: &LocalEvm,
     eth_evm: &LocalEvm,
+    eth_vault_address: Address,
 ) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
     let vault_schemas = HashMap::from([
         (base_evm.vault_address, TEST_OA_SCHEMA_HASH),
-        (eth_evm.vault_address, TEST_OA_SCHEMA_HASH),
+        (eth_vault_address, TEST_OA_SCHEMA_HASH),
     ]);
     let mock_subgraph = setup_mock_subgraph(&vault_schemas);
     let subgraph_url =
@@ -695,7 +716,9 @@ pub async fn perform_mint_and_confirm_with(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(
             json!({
                 "tokenization_request_id": tokenization_request_id,
@@ -712,7 +735,10 @@ pub async fn perform_mint_and_confirm_with(
         .await;
 
     assert_eq!(mint_response.status(), rocket::http::Status::Ok);
-    let mint_body: MintResponse = mint_response.into_json().await.unwrap();
+    let mint_body: MintResponse = mint_response
+        .into_json()
+        .await
+        .expect("mint response must contain valid JSON");
     let issuer_request_id = mint_body.issuer_request_id.to_string();
 
     let confirm_response = client
@@ -722,7 +748,9 @@ pub async fn perform_mint_and_confirm_with(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .remote("127.0.0.1:8000".parse().unwrap())
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
         .body(
             json!({
                 "tokenization_request_id": tokenization_request_id,

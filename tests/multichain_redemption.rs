@@ -23,6 +23,16 @@ async fn test_multichain_redemption_routes_by_network()
     let base_evm = LocalEvm::new().await?;
     let eth_evm = LocalEvm::with_chain_id(ETHEREUM_TEST_CHAIN_ID).await?;
 
+    // Both Anvils deploy from the same key and nonce, so the default vault
+    // addresses collide across chains. Receipt inventory is keyed by
+    // `{chain_id}:{vault}`, so colliding addresses would not merge streams —
+    // but twin addresses would make the routing assertions vacuous. Deploy a
+    // distinct vault on the Ethereum chain so a wrong-chain call cannot
+    // masquerade as the right one.
+    let (eth_vault_address, eth_authorizer_address) =
+        eth_evm.deploy_additional_vault().await?;
+    assert_ne!(eth_vault_address, base_evm.vault_address);
+
     let mock_alpaca = MockServer::start();
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
@@ -51,7 +61,7 @@ async fn test_multichain_redemption_routes_by_network()
     .await?;
     harness::preseed_tokenized_asset_into_pool_with_network(
         &pool,
-        eth_evm.vault_address,
+        eth_vault_address,
         "TSLA",
         "tTSLA",
         Network::Ethereum,
@@ -64,6 +74,7 @@ async fn test_multichain_redemption_routes_by_network()
         &mock_alpaca,
         &base_evm,
         &eth_evm,
+        eth_vault_address,
     )?;
 
     let rocket = initialize_rocket(config).await?;
@@ -77,7 +88,14 @@ async fn test_multichain_redemption_routes_by_network()
     let bot_wallet = base_evm.wallet_address;
 
     harness::setup_roles(&base_evm, user_wallet, bot_wallet).await?;
-    harness::setup_roles(&eth_evm, user_wallet, bot_wallet).await?;
+    harness::setup_roles_on_vault(
+        &eth_evm,
+        eth_authorizer_address,
+        eth_vault_address,
+        user_wallet,
+        bot_wallet,
+    )
+    .await?;
 
     let link_body = harness::setup_account(&client, user_wallet).await;
 
@@ -103,7 +121,7 @@ async fn test_multichain_redemption_routes_by_network()
         .connect(&eth_evm.endpoint)
         .await?;
     let eth_vault = OffchainAssetReceiptVaultInstance::new(
-        eth_evm.vault_address,
+        eth_vault_address,
         &eth_provider,
     );
 

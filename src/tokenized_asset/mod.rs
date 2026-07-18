@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub(crate) use api::{
     add_tokenized_asset, get_tokenized_asset, get_tokenized_asset_status,
@@ -54,6 +55,44 @@ impl From<AssetStatus> for TokenizedAssetStatus {
             AssetStatus::Frozen => Self::Frozen,
         }
     }
+}
+
+/// Two enabled assets on different networks share one vault address.
+///
+/// Receipt inventory is keyed by `(chain_id, vault)`, so the streams no longer
+/// merge, but a shared address across networks is still a misconfiguration:
+/// transfer matching, admin tooling, and operator mental models assume a vault
+/// address identifies one deployment. Reject at boot and at add time.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "vault address {vault} is configured on both {first} and {second}; \
+     one address cannot serve two networks"
+)]
+pub(crate) struct CrossNetworkVaultCollision {
+    pub(crate) vault: Address,
+    pub(crate) first: Network,
+    pub(crate) second: Network,
+}
+
+/// Rejects enabled-asset sets where the same vault address appears on more
+/// than one network.
+pub(crate) fn validate_no_cross_network_vault_collisions(
+    assets: &[TokenizedAssetView],
+) -> Result<(), CrossNetworkVaultCollision> {
+    let mut vault_networks: HashMap<Address, Network> = HashMap::new();
+
+    assets.iter().try_for_each(|asset| {
+        match vault_networks.insert(asset.vault, asset.network) {
+            Some(first) if first != asset.network => {
+                Err(CrossNetworkVaultCollision {
+                    vault: asset.vault,
+                    first,
+                    second: asset.network,
+                })
+            }
+            _ => Ok(()),
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,10 +306,62 @@ mod tests {
 
     use super::{
         AssetStatus, Network, TokenSymbol, TokenizedAsset,
-        TokenizedAssetCommand, TokenizedAssetEvent, UnderlyingSymbol,
+        TokenizedAssetCommand, TokenizedAssetEvent, TokenizedAssetView,
+        UnderlyingSymbol, validate_no_cross_network_vault_collisions,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
+
+    fn enabled_asset(
+        underlying: &str,
+        network: Network,
+        vault: Address,
+    ) -> TokenizedAssetView {
+        TokenizedAssetView {
+            underlying: UnderlyingSymbol::new(underlying).unwrap(),
+            token: TokenSymbol::new(format!("t{underlying}")),
+            network,
+            vault,
+            status: AssetStatus::Enabled,
+            added_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn cross_network_vault_address_collision_is_rejected() {
+        let shared = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let assets = vec![
+            enabled_asset("AAPL", Network::Base, shared),
+            enabled_asset("MSFT", Network::Ethereum, shared),
+        ];
+
+        let error =
+            validate_no_cross_network_vault_collisions(&assets).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("base"), "missing first network: {message}");
+        assert!(
+            message.contains("ethereum"),
+            "missing second network: {message}"
+        );
+    }
+
+    #[test]
+    fn distinct_vault_addresses_across_networks_pass_validation() {
+        let assets = vec![
+            enabled_asset(
+                "AAPL",
+                Network::Base,
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
+            enabled_asset(
+                "AAPL",
+                Network::Ethereum,
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ),
+        ];
+
+        assert!(validate_no_cross_network_vault_collisions(&assets).is_ok());
+    }
 
     #[traced_test]
     #[tokio::test]

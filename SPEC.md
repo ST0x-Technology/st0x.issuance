@@ -896,8 +896,12 @@ left for on-chain settlement or manual intervention.
 The per-vault receipt backfill cursor (previously `BackfillCheckpoint` events on
 this aggregate) is not domain state — it is a single mutable counter with no
 audit value, so it is persisted in the `poll_checkpoints` SQL table under the
-key `receipt_backfill:<vault_address_lowercase>`. See the polling checkpoints
-persistence section below.
+key `receipt_backfill:<network>:<vault_address_lowercase>`. Each
+`(network,
+vault)` pair keeps an independent cursor because block numbers are
+chain-specific. For Base only, `load_receipt_backfill` falls back to the legacy
+vault-only key `receipt_backfill:<vault_address_lowercase>` seeded from
+pre-multichain `BackfillCheckpoint` events.
 
 ## Core Functionality
 
@@ -1656,19 +1660,23 @@ any redemption transfers that occurred while the service was down. This ensures
 no redemptions are silently missed due to downtime.
 
 The configured `backfill_start_block` is only the first-run seed; after a
-successful range, the service persists a single `transfer_poll` row in the
+successful range, the service persists a per-(network, vault)
+`transfer_poll:{network}:{vault_address_lowercase}` row in the
 `poll_checkpoints` SQL table and the next startup resumes at
-`last_processed_block + 1`. The checkpoint advances only after the requested
-range succeeds, and writes are monotonic so a shorter later range cannot move
-progress backward. Idempotency is still guaranteed by the
-`IssuerRedemptionRequestId` derived from each transaction hash — the Redemption
-aggregate rejects duplicate detections.
+`last_processed_block + 1`. For Base only, `load_transfer_poll` falls back to
+the legacy global key `transfer_poll` when the per-vault row does not exist yet.
+The checkpoint advances only after the requested range succeeds, and writes are
+monotonic so a shorter later range cannot move progress backward. Idempotency is
+still guaranteed by the `IssuerRedemptionRequestId` derived from each
+transaction hash — the Redemption aggregate rejects duplicate detections.
 
-This mirrors the receipt backfill pattern, where per-vault checkpoints are
-tracked under the keys `receipt_backfill:<vault_lowercase>` in the same
-`poll_checkpoints` table. Both checkpoints are intentionally not event-sourced:
-they are single mutable values whose history has no audit worth keeping, and
-modeling them as aggregates was the root cause of the 2026-05-19 OOM (RAI-617).
+This mirrors the receipt backfill pattern, where per-(network, vault)
+checkpoints are tracked under `receipt_backfill:<network>:<vault_lowercase>` in
+the same `poll_checkpoints` table, with the legacy
+`receipt_backfill:<vault_lowercase>` fallback for Base. Both checkpoints are
+intentionally not event-sourced: they are single mutable values whose history
+has no audit worth keeping, and modeling them as aggregates was the root cause
+of the 2026-05-19 OOM (RAI-617).
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
@@ -2567,11 +2575,12 @@ supported long-term configuration: the target shape is one
 per configured network, with `.env.example` as the authoritative record of that
 shape. Parsing those variables into `Config::chains` is its own change; until it
 lands, the flat legacy vars remain the only live config path. Checkpoints are
-keyed per network: transfer polling under `transfer_poll:{network}` and receipt
-backfill under `receipt_backfill:<network>:<vault_address_lowercase>`, with the
-pre-multichain rows (`transfer_poll`, `receipt_backfill:<vault_lowercase>`)
-readable as Base-only fallbacks. Once staging and production migrate, the
-flat-var mapping and those legacy checkpoint fallbacks are deleted.
+keyed per `(network, vault)`: transfer polling under
+`transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
+`receipt_backfill:<network>:<vault_address_lowercase>`, with the pre-multichain
+rows (`transfer_poll`, `receipt_backfill:<vault_lowercase>`) readable as
+Base-only fallbacks. Once staging and production migrate, the flat-var mapping
+and those legacy checkpoint fallbacks are deleted.
 
 **Asset identity (breaking):** `TokenizedAsset` aggregate id becomes the
 `AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`). The internal asset
