@@ -171,7 +171,7 @@ pub(crate) async fn add_tokenized_asset(
     let command = TokenizedAssetCommand::Add {
         underlying: request.underlying.clone(),
         token: request.token.clone(),
-        network: request.network.clone(),
+        network: request.network,
         vault: request.vault,
     };
 

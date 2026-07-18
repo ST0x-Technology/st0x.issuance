@@ -168,7 +168,7 @@ mod tests {
         let asset_cmd = TokenizedAssetCommand::Add {
             underlying: underlying.clone(),
             token: token.clone(),
-            network: network.clone(),
+            network,
             vault,
         };
         tokenized_asset_store
@@ -574,7 +574,7 @@ mod tests {
         let asset_cmd = TokenizedAssetCommand::Add {
             underlying: underlying.clone(),
             token: token.clone(),
-            network: network.clone(),
+            network,
             vault,
         };
         tokenized_asset_store
@@ -925,7 +925,7 @@ mod tests {
             quantity: Quantity::new(Decimal::from(100)),
             underlying: underlying.clone(),
             token: token.clone(),
-            network: network.clone(),
+            network,
             client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };

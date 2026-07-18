@@ -11,7 +11,7 @@
 //! - **Batch size**: 512 spans per batch
 //! - **Queue size**: 2048 spans maximum
 //! - **Export interval**: 3 seconds
-//! - **Protocol**: gRPC via OTLP
+//! - **Protocol**: OTLP/HTTP (protobuf)
 //!
 //! ## Blocking HTTP Client Requirement
 //!
@@ -60,30 +60,55 @@
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::ExporterBuildError;
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{
+    ExporterBuildError, Protocol, SpanExporter, WithExportConfig,
+    WithHttpConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{
     BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::Level;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct HyperDxConfig {
-    pub(crate) api_key: String,
+    pub(crate) api_key: HyperDxApiKey,
     pub(crate) service_name: String,
-    pub(crate) log_level: tracing::Level,
+    pub(crate) log_level: Level,
+}
+
+/// HyperDX ingestion API key.
+///
+/// `Debug` renders `<redacted>` (matching the `AlpacaConfig` marker) so the
+/// key cannot leak through debug-formatting of any struct that holds it —
+/// redaction travels with the value instead of relying on each container's
+/// hand-written `Debug` impl.
+#[derive(Clone)]
+pub struct HyperDxApiKey(String);
+
+impl HyperDxApiKey {
+    pub(crate) const fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for HyperDxApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl HyperDxConfig {
     pub fn setup_telemetry(&self) -> Result<TelemetryGuard, TelemetryError> {
         let headers = HashMap::from([(
             "authorization".to_string(),
-            self.api_key.clone(),
+            self.api_key.0.clone(),
         )]);
 
         let http_client = std::thread::spawn(|| {
@@ -96,12 +121,17 @@ impl HyperDxConfig {
         .map_err(|_| TelemetryError::ThreadSpawn)?
         .map_err(TelemetryError::HttpClient)?;
 
-        let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        // HyperDX ingests OTLP over HTTP at in-otel.hyperdx.io, with the API
+        // key passed bare (no Bearer prefix) in the `authorization` header
+        // (https://www.hyperdx.io/docs/install/opentelemetry). `/v1/traces` is
+        // the standard OTLP/HTTP traces path; the exporter is built
+        // `.with_http()`, so the wire format is OTLP/HTTP protobuf.
+        let otlp_exporter = SpanExporter::builder()
             .with_http()
             .with_http_client(http_client)
             .with_endpoint("https://in-otel.hyperdx.io/v1/traces")
             .with_headers(headers)
-            .with_protocol(opentelemetry_otlp::Protocol::Grpc)
+            .with_protocol(Protocol::HttpBinary)
             .build()?;
 
         let batch_exporter = BatchSpanProcessor::builder(otlp_exporter)
@@ -208,3 +238,30 @@ impl Drop for TelemetryGuard {
 /// auto-instrumentation, this distinction is somewhat artificial but
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    use super::{HyperDxApiKey, HyperDxConfig};
+
+    #[test]
+    fn hyperdx_config_debug_redacts_api_key() {
+        let config = HyperDxConfig {
+            api_key: HyperDxApiKey::new("super-secret-hyperdx-key".to_string()),
+            service_name: "issuer".to_string(),
+            log_level: Level::INFO,
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(
+            !rendered.contains("super-secret-hyperdx-key"),
+            "Debug output must not leak the HyperDX API key: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output should redact the api_key: {rendered}"
+        );
+    }
+}

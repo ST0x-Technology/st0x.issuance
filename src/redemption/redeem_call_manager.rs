@@ -450,7 +450,7 @@ mod tests {
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),
-                        network: network.clone(),
+                        network: *network,
                         vault: address!(
                             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         ),

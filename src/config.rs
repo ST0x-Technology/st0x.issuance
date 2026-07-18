@@ -1,29 +1,17 @@
-use alloy::providers::fillers::BlobGasFiller;
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::transports::{RpcError, TransportErrorKind};
+use alloy::providers::Provider;
 use clap::{Args, Parser};
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{Level, info};
+use tracing::Level;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
-use crate::telemetry::HyperDxConfig;
-use crate::vault::rain_meta::OaSchemaCache;
-use crate::vault::{VaultService, service::RealBlockchainService};
-use crate::wallet::{
-    SignerConfig, SignerConfigError, SignerEnv, SignerResolveError,
-    local::resolve_local_signer, turnkey::resolve_turnkey_signer,
+use crate::chain::{
+    ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
 };
-
-pub(crate) struct BlockchainSetup<HttpP> {
-    pub(crate) vault_service: Arc<dyn VaultService>,
-    /// HTTP provider — used for all non-subscription RPC calls (backfill,
-    /// reconciliation, vault service balance checks, etc.). Receipt monitors
-    /// and redemption detectors create their own WSS connections.
-    pub(crate) http_provider: HttpP,
-}
+use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
+use crate::tokenized_asset::Network;
+use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
 
 /// Default chain ID (Base mainnet)
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
@@ -68,56 +56,27 @@ impl Config {
         env.into_config()
     }
 
-    /// Creates the HTTP provider and vault service.
-    ///
-    /// Initializes an HTTP provider for non-subscription RPC calls (backfill,
-    /// reconciliation, vault service) and builds the appropriate VaultService
-    /// (local signer or Turnkey). Receipt monitors and redemption detectors
-    /// create their own WSS connections independently.
-    pub(crate) async fn create_blockchain_setup(
+    /// Builds a [`ChainRegistry`] from legacy single-chain env vars, producing
+    /// a registry with a single `base` entry.
+    pub(crate) async fn create_chain_registry(
         &self,
-    ) -> Result<BlockchainSetup<impl Provider + Clone + use<>>, ConfigError>
-    {
-        let http_url = wss_to_http(&self.rpc_url)?;
-        let http_provider = ProviderBuilder::new().connect_http(http_url);
+    ) -> Result<ChainRegistry<impl Provider + Clone + use<>>, ConfigError> {
+        build_chain_registry(
+            vec![self.legacy_base_chain_config()],
+            &self.signer,
+        )
+        .await
+        .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
+    }
 
-        let rpc_chain_id = http_provider.get_chain_id().await?;
-        if rpc_chain_id != self.chain_id {
-            return Err(ConfigError::ChainIdMismatch {
-                configured: self.chain_id,
-                from_rpc: rpc_chain_id,
-            });
+    fn legacy_base_chain_config(&self) -> ChainConfig {
+        ChainConfig {
+            network: Network::Base,
+            chain_id: self.chain_id,
+            rpc_url: self.rpc_url.clone(),
+            subgraph_url: self.subgraph_url.clone(),
+            backfill_start_block: self.backfill_start_block,
         }
-
-        let oa_schema_cache =
-            Arc::new(OaSchemaCache::new(self.subgraph_url.clone())?);
-
-        let vault_service: Arc<dyn VaultService> = {
-            let resolved = match &self.signer {
-                SignerConfig::Local(key) => {
-                    resolve_local_signer(key, self.chain_id)?
-                }
-                SignerConfig::Turnkey(env) => {
-                    resolve_turnkey_signer(env, self.chain_id)?
-                }
-            };
-            info!(signer_kind = ?resolved.kind, "Signer backend resolved");
-            let signing_provider = ProviderBuilder::new()
-                .disable_recommended_fillers()
-                .with_gas_estimation()
-                .filler(BlobGasFiller)
-                .with_simple_nonce_management()
-                .with_chain_id(self.chain_id)
-                .wallet(resolved.wallet)
-                .connect_http(wss_to_http(&self.rpc_url)?);
-
-            Arc::new(RealBlockchainService::new(
-                signing_provider,
-                oa_schema_cache,
-            ))
-        };
-
-        Ok(BlockchainSetup { vault_service, http_provider })
     }
 }
 
@@ -295,7 +254,7 @@ struct HyperDxEnv {
 impl HyperDxEnv {
     fn into_config(self, log_level: Level) -> Option<HyperDxConfig> {
         self.hyperdx_api_key.map(|api_key| HyperDxConfig {
-            api_key,
+            api_key: HyperDxApiKey::new(api_key),
             service_name: self.hyperdx_service_name,
             log_level,
         })
@@ -306,39 +265,32 @@ impl HyperDxEnv {
 pub enum ConfigError {
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
-    #[error("Failed to resolve signer: {0}")]
-    SignerResolve(#[from] SignerResolveError),
-    #[error("RPC error")]
-    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
     #[error("SUBGRAPH_URL must use http or https scheme, got: {0}")]
     InvalidSubgraphScheme(String),
-    #[error(
-        "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
-    )]
-    ChainIdMismatch { configured: u64, from_rpc: u64 },
-    #[error("Cannot derive HTTP URL from RPC URL: {0}")]
-    InvalidRpcScheme(String),
+    #[error("chain registry initialization failed: {0}")]
+    ChainRegistry(#[source] Box<ChainRegistryError>),
 }
 
+/// RPC URL uses a scheme that cannot be mapped to HTTP.
+#[derive(Debug, thiserror::Error)]
+#[error("Cannot derive HTTP URL from RPC URL: {0}")]
+pub struct InvalidRpcScheme(String);
+
 /// Derives an HTTP URL from a WebSocket URL by replacing the scheme.
-///
-/// `wss://` → `https://`, `ws://` → `http://`. Leaves HTTP URLs unchanged.
-fn wss_to_http(url: &Url) -> Result<Url, ConfigError> {
+pub(crate) fn wss_to_http(url: &Url) -> Result<Url, InvalidRpcScheme> {
     let new_scheme = match url.scheme() {
         "wss" => "https",
         "ws" => "http",
         "http" | "https" => return Ok(url.clone()),
-        other => return Err(ConfigError::InvalidRpcScheme(other.to_string())),
+        other => return Err(InvalidRpcScheme(other.to_string())),
     };
 
     let mut http_url = url.clone();
-    http_url.set_scheme(new_scheme).map_err(|()| {
-        ConfigError::InvalidRpcScheme(url.scheme().to_string())
-    })?;
+    http_url
+        .set_scheme(new_scheme)
+        .map_err(|()| InvalidRpcScheme(url.scheme().to_string()))?;
 
     Ok(http_url)
 }
