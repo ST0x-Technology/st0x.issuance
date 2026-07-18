@@ -758,15 +758,11 @@ mod tests {
     ) -> SubmitMintContext {
         SubmitMintContext {
             mint_store: harness.mint_store.clone(),
-<<<<<<< HEAD
             vaults: NetworkVaultServices::with_single_vault(
                 Network::Base,
                 ANVIL_CHAIN_ID,
                 vault,
             ),
-=======
-            vault,
->>>>>>> 15a77f85 (refactor: remove the superseded inline mint recovery commands)
             receipts: cqrs_receipts(&harness.pool),
             bot: BOT,
             confirm_queue: JobQueue::new(&harness.apalis_pool),

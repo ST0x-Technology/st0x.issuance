@@ -359,13 +359,8 @@ pub async fn initialize_rocket(
         .map(|config| (config.chain_id, config.vault))
         .collect();
 
-    run_recovery_with_timeout(
-        &pool,
-        &apalis_pool,
-        &managers,
-        &receipt_vaults,
-    )
-    .await;
+    run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
+        .await;
 
     // Drain MintRecoveryJobs in the background: the worker runs the per-mint
     // recovery budget loop for each enqueued job. Spawned only AFTER the
@@ -419,7 +414,10 @@ pub async fn initialize_rocket(
             bot_wallet,
             backfill_start_block: runtime.backfill_start_block,
             receipt_poll_interval: config.receipt_poll_interval,
-            handler: MintRecoveryHandler::new(pool.clone(), apalis_pool.clone()),
+            handler: MintRecoveryHandler::new(
+                pool.clone(),
+                apalis_pool.clone(),
+            ),
         });
     }
 

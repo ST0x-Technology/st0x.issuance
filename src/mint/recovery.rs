@@ -19,12 +19,8 @@ use super::{
 };
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, find_vault,
-};
-use crate::vault::{
-    NetworkVaultServices, TxId, UnconfiguredNetworkError,
-};
+use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
+use crate::vault::{NetworkVaultServices, TxId, UnconfiguredNetworkError};
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
 /// failed mint by enqueuing the appropriate per-state job.
@@ -922,14 +918,16 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::mint::api::test_utils::{TestAccountAndAsset, TestHarness};
+    use crate::mint::api::test_utils::{
+        TestAccountAndAsset, TestHarness, network_vault_services,
+    };
     use crate::mint::tests::VAULT;
     use crate::mint::{
         ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at};
+    use crate::test_utils::log_count_at;
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
 
     /// Builds a real event-sorcery [`Store<Mint>`] over a file-backed SQLite
@@ -943,6 +941,7 @@ mod tests {
         receipt_store: Arc<Store<ReceiptInventory>>,
         pool: Pool<Sqlite>,
         apalis_pool: SqlitePool,
+        vault_services: NetworkVaultServices,
     }
 
     impl MintRecoveryFixture {
@@ -971,14 +970,15 @@ mod tests {
                 (),
             ));
 
-            let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+            let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
+                harness;
 
             Self {
                 mint_store,
                 receipt_store,
                 pool,
                 apalis_pool,
-                vault_services,
+                vault_services: network_vault_services(vault),
             }
         }
 

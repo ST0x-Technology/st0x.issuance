@@ -1772,7 +1772,7 @@ pub(crate) mod tests {
     use crate::tokenized_asset::{
         AssetKey, TokenizedAsset, TokenizedAssetCommand,
     };
-    use crate::vault::TxId;
+    use crate::vault::{PreparedMintTx, TxId};
 
     pub(super) const VAULT: Address =
         address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -1927,7 +1927,7 @@ pub(crate) mod tests {
             intended_at: Utc::now(),
         });
 
-        let recorded = TestHarness::<Mint>::with(test_mint_services().await)
+        let recorded = TestHarness::<Mint>::with(())
             .given(events)
             .when(MintCommand::RecordTxSubmitted {
                 issuer_request_id: issuer_request_id.clone(),
