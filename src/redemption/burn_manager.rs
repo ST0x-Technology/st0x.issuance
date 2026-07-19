@@ -16,6 +16,7 @@ use super::{
     RedemptionEvent, next_burn_retry_external_tx_id_from_history,
 };
 use crate::burn_excess::has_unresolved_excess_burn_intent;
+use crate::config::VaultMode;
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
@@ -29,8 +30,8 @@ use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MultiBurnEntry, NetworkVaultServices,
-    SendableTxWithHash, TxId, UnconfiguredNetworkError, VaultError,
-    VaultService,
+    OrchestratorBurnReadiness, SendableTxWithHash, TxId,
+    UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 pub(crate) const MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS: u32 = 5;
@@ -1335,8 +1336,24 @@ impl BurnManager {
             dust_shares = %dust_shares,
             wallet = %metadata.wallet,
             vault = %vault,
+            burn_mode = ?metadata.burn_mode,
             "Starting on-chain burning process with dust handling"
         );
+
+        if let VaultMode::Orchestrator { address: orchestrator } =
+            metadata.burn_mode
+        {
+            return self
+                .execute_orchestrator_burn(
+                    issuer_request_id,
+                    metadata.network,
+                    orchestrator,
+                    vault,
+                    burn_shares,
+                    external_tx_id.clone(),
+                )
+                .await;
+        }
 
         // A retry plans against availability that EXCLUDES this redemption's own
         // prior reservation (see `for_burn`), and `reserve_burn` atomically
@@ -1354,12 +1371,115 @@ impl BurnManager {
             )
             .await?;
 
+        let execution = BurnExecutionPlan::vault_direct(
+            metadata.network,
+            vault,
+            &plan,
+            self.bot_wallet,
+            external_tx_id.clone(),
+        );
         self.execute_burn_and_record_result(
             issuer_request_id,
             metadata.network,
-            vault,
-            plan,
-            external_tx_id.clone(),
+            execution,
+        )
+        .await
+    }
+
+    /// Runs the orchestrator-mode pre-submit gates, then drives the shared
+    /// intend→submit→confirm pipeline with no receipt plan. Skips the entire
+    /// receipt reserve/settle/release lifecycle — the orchestrator custodies
+    /// receipts and walks them on-chain.
+    async fn execute_orchestrator_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
+        orchestrator: Address,
+        token: Address,
+        amount: U256,
+        external_tx_id: Option<BurnExternalTxId>,
+    ) -> Result<(), BurnManagerError> {
+        match self
+            .vaults
+            .service(network)?
+            .check_orchestrator_burn_readiness(
+                orchestrator,
+                token,
+                self.bot_wallet,
+                amount,
+            )
+            .await?
+        {
+            OrchestratorBurnReadiness::Ready => {}
+            OrchestratorBurnReadiness::AllowanceInsufficient {
+                required,
+                current,
+            } => {
+                // Deterministic until ops grants the approval — never
+                // auto-retried, and the burn is never submitted.
+                error!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    token = %token,
+                    orchestrator = %orchestrator,
+                    required = %required,
+                    current = %current,
+                    "Orchestrator burn allowance insufficient; ops must \
+                     approve the orchestrator before this redemption can \
+                     resume"
+                );
+                let error_msg = format!(
+                    "Orchestrator allowance insufficient: required \
+                     {required}, current {current}"
+                );
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::RecordBurnFailure {
+                            classification:
+                                BurnFailureClassification::AllowanceInsufficient,
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: error_msg.clone(),
+                            tx_id: None,
+                            planned_burns: vec![],
+                        },
+                    )
+                    .await?;
+                return Err(BurnManagerError::Redemption(
+                    RedemptionError::Vault {
+                        message: error_msg,
+                        release_reservation: false,
+                        tx_id: None,
+                        classification:
+                            BurnFailureClassification::AllowanceInsufficient,
+                    },
+                ));
+            }
+            OrchestratorBurnReadiness::VaultLogicMismatch => {
+                // Orchestrator-wide halt: no submission, no event, and no
+                // retry counter advances. The redemption stays in `Burning`
+                // and the next recovery pass re-checks health.
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    token = %token,
+                    orchestrator = %orchestrator,
+                    "Orchestrator halted (vault logic mismatch); deferring \
+                     burn without recording failure"
+                );
+                return Ok(());
+            }
+        }
+
+        let execution = BurnExecutionPlan::orchestrator(
+            network,
+            token,
+            amount,
+            self.bot_wallet,
+            external_tx_id,
+        );
+        self.execute_burn_and_record_result(
+            issuer_request_id,
+            network,
+            execution,
         )
         .await
     }
@@ -1635,12 +1755,8 @@ impl BurnManager {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         network: Network,
-        vault: Address,
-        plan: BurnPlan,
-        external_tx_id: Option<BurnExternalTxId>,
+        execution: BurnExecutionPlan,
     ) -> Result<(), BurnManagerError> {
-        let execution =
-            BurnExecutionPlan::new(network, vault, &plan, external_tx_id);
         // Bounded to the 30 seconds SPEC promises: a live burn defers to
         // recovery rather than occupying the flow indefinitely behind an
         // intent that is not resolving.
@@ -1722,6 +1838,11 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         execution: &BurnExecutionPlan,
     ) -> Result<(), BurnManagerError> {
+        // Orchestrator burns have no bot-side inventory to reserve against.
+        if execution.is_orchestrator() {
+            return Ok(());
+        }
+
         let result = self
             .reserve_with_conflict_retry(
                 execution.network,
@@ -1765,12 +1886,7 @@ impl BurnManager {
                 issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault: execution.vault,
-                        burns: execution.burns.clone(),
-                        dust_shares: execution.dust_shares,
-                        owner: self.bot_wallet,
-                    },
+                    params: execution.params.clone(),
                     external_tx_id: execution.external_tx_id.clone(),
                 },
             )
@@ -1790,14 +1906,18 @@ impl BurnManager {
                     error = %message,
                     "Preparing signed burn tx failed"
                 );
+
                 // Always release because nothing was submitted on-chain.
                 let chain_id = self.chain_id_for(execution.network)?;
-                self.release_reserved_burn(
-                    chain_id,
-                    execution.vault,
-                    issuer_request_id,
-                )
-                .await;
+                if !execution.is_orchestrator() {
+                    self.release_reserved_burn(
+                        chain_id,
+                        execution.vault,
+                        issuer_request_id,
+                    )
+                    .await;
+                }
+
                 self.store
                     .send(
                         issuer_request_id,
@@ -1876,12 +1996,7 @@ impl BurnManager {
                 issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault: execution.vault,
-                        burns: execution.burns.clone(),
-                        dust_shares: execution.dust_shares,
-                        owner: self.bot_wallet,
-                    },
+                    params: execution.params.clone(),
                     external_tx_id: execution.external_tx_id.clone(),
                 },
             )
@@ -1907,7 +2022,7 @@ impl BurnManager {
                     tx_id = ?tx_id,
                     "Burn submission failed"
                 );
-                if release_reservation {
+                if release_reservation && !execution.is_orchestrator() {
                     self.release_before_terminal_failure(
                         execution.network,
                         execution.vault,
@@ -1995,15 +2110,19 @@ impl BurnManager {
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "Burn confirmed successfully"
                 );
+
                 // The burn landed on-chain: consume the reservation so the
                 // mirror balance drops to match.
                 let chain_id = self.chain_id_for(execution.network)?;
-                self.settle_reserved_burn(
-                    chain_id,
-                    execution.vault,
-                    issuer_request_id,
-                )
-                .await;
+                if !execution.is_orchestrator() {
+                    self.settle_reserved_burn(
+                        chain_id,
+                        execution.vault,
+                        issuer_request_id,
+                    )
+                    .await;
+                }
+
                 Ok(())
             }
             Err(AggregateError::UserError(LifecycleError::Apply(
@@ -2016,18 +2135,41 @@ impl BurnManager {
             ))) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %message,
+                    classification = ?classification,
                     "Burn confirmation failed"
                 );
                 if release_reservation {
-                    let exact_recovery = self
-                        .reserve_replacement_after_revert(issuer_request_id)
+                    // Typed classifications are never auto-retried
+                    // (InsufficientReceipts / AllowanceInsufficient need
+                    // manual action; the logic-mismatch halt must not consume
+                    // the retry budget), so no recovery action is reserved
+                    // for them. Decided BEFORE the release below so a reserve
+                    // error keeps the receipt reservation intact, matching
+                    // the pre-orchestrator ordering.
+                    let exact_recovery = if classification
+                        == BurnFailureClassification::Unclassified
+                    {
+                        self.reserve_replacement_after_revert(issuer_request_id)
+                            .await?
+                    } else {
+                        error!(target: "redemption",
+                            issuer_request_id = %issuer_request_id,
+                            token = %execution.vault,
+                            classification = ?classification,
+                            error = %message,
+                            "Orchestrator burn failed with a non-retryable \
+                             classification; manual intervention required"
+                        );
+                        None
+                    };
+                    if !execution.is_orchestrator() {
+                        self.release_before_terminal_failure(
+                            execution.network,
+                            execution.vault,
+                            issuer_request_id,
+                        )
                         .await?;
-                    self.release_before_terminal_failure(
-                        execution.network,
-                        execution.vault,
-                        issuer_request_id,
-                    )
-                    .await?;
+                    }
                     self.store
                         .send(
                             issuer_request_id,
@@ -2197,17 +2339,18 @@ impl BurnManager {
 struct BurnExecutionPlan {
     network: Network,
     vault: Address,
-    burns: Vec<MultiBurnEntry>,
+    params: BurnParams,
     planned_burns: Vec<BurnRecord>,
     dust_shares: U256,
     external_tx_id: Option<BurnExternalTxId>,
 }
 
 impl BurnExecutionPlan {
-    fn new(
+    fn vault_direct(
         network: Network,
         vault: Address,
         plan: &BurnPlan,
+        owner: Address,
         external_tx_id: Option<BurnExternalTxId>,
     ) -> Self {
         let burns: Vec<MultiBurnEntry> = plan
@@ -2230,15 +2373,46 @@ impl BurnExecutionPlan {
                 shares_burned: entry.burn_shares,
             })
             .collect();
+        let dust_shares = plan.dust.inner();
 
         Self {
             network,
             vault,
-            burns,
+            params: BurnParams::VaultDirect {
+                vault,
+                burns,
+                dust_shares,
+                owner,
+            },
             planned_burns,
-            dust_shares: plan.dust.inner(),
+            dust_shares,
             external_tx_id,
         }
+    }
+
+    /// Orchestrator-mode execution: no receipt plan and no dust entry — the
+    /// orchestrator walks receipts on-chain and dust stays in the bot wallet.
+    const fn orchestrator(
+        network: Network,
+        token: Address,
+        amount: U256,
+        owner: Address,
+        external_tx_id: Option<BurnExternalTxId>,
+    ) -> Self {
+        Self {
+            network,
+            vault: token,
+            params: BurnParams::Orchestrator { token, amount, owner },
+            planned_burns: vec![],
+            dust_shares: U256::ZERO,
+            external_tx_id,
+        }
+    }
+
+    /// Whether this execution runs through the orchestrator, in which case
+    /// the receipt-inventory reserve/settle/release lifecycle does not apply.
+    const fn is_orchestrator(&self) -> bool {
+        matches!(self.params, BurnParams::Orchestrator { .. })
     }
 }
 
@@ -2279,9 +2453,13 @@ pub(crate) const fn extract_tx_hash(error: &VaultError) -> Option<B256> {
 
 /// Whether a failed burn confirmation definitively consumed no receipts, so its
 /// inventory reservation must be released. Ambiguous pending tx statuses
-/// keep the reservation (the transaction may still land on-chain).
+/// keep the reservation (the transaction may still land on-chain). A decoded
+/// orchestrator revert is definitive like a plain revert.
 pub(crate) const fn should_release_reserved_burn(error: &VaultError) -> bool {
-    matches!(error, VaultError::Reverted { .. })
+    matches!(
+        error,
+        VaultError::Reverted { .. } | VaultError::OrchestratorReverted { .. }
+    )
 }
 
 pub(crate) const fn is_pending_burn_confirmation(error: &VaultError) -> bool {
@@ -2346,6 +2524,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tracing_test::traced_test;
 
@@ -2370,7 +2549,7 @@ mod tests {
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
-        IssuerRedemptionRequestId, RedemptionError,
+        IssuerRedemptionRequestId, RedemptionError, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
@@ -2379,8 +2558,9 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, NetworkVaultServices, ReceiptInformation,
-        SendableTxWithHash, TxId, VaultError, VaultService,
+        BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
+        OrchestratorBurnReadiness, OrchestratorRevertReason,
+        ReceiptInformation, SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_WALLET: Address =
@@ -2770,6 +2950,437 @@ mod tests {
             )
             .await
             .expect("persisted burn intent should succeed");
+    }
+
+    /// Counts every receipt-service call while delegating to the real
+    /// service, so orchestrator-mode tests can prove the receipt lifecycle
+    /// is never touched.
+    struct RecordingReceiptService {
+        inner: Arc<dyn ReceiptService>,
+        calls: AtomicUsize,
+    }
+
+    impl RecordingReceiptService {
+        fn new(inner: Arc<dyn ReceiptService>) -> Self {
+            Self { inner, calls: AtomicUsize::new(0) }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn record(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReceiptService for RecordingReceiptService {
+        async fn register_minted_receipt(
+            &self,
+            params: MintedReceiptParams,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.record();
+            self.inner.register_minted_receipt(params).await
+        }
+
+        async fn for_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: &IssuerRedemptionRequestId,
+            shares_to_burn: Shares,
+            dust: Shares,
+        ) -> Result<BurnPlan, BurnTrackingError> {
+            self.record();
+            self.inner
+                .for_burn(
+                    chain_id,
+                    vault,
+                    redemption_issuer_request_id,
+                    shares_to_burn,
+                    dust,
+                )
+                .await
+        }
+
+        async fn reserve_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+            burns: Vec<BurnRecord>,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.record();
+            self.inner
+                .reserve_burn(
+                    chain_id,
+                    vault,
+                    redemption_issuer_request_id,
+                    burns,
+                )
+                .await
+        }
+
+        async fn release_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.record();
+            self.inner
+                .release_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
+        }
+
+        async fn settle_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.record();
+            self.inner
+                .settle_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
+        }
+
+        async fn reserved_redemptions(
+            &self,
+            chain_id: u64,
+            vault: Address,
+        ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
+        {
+            self.record();
+            self.inner.reserved_redemptions(chain_id, vault).await
+        }
+
+        async fn find_by_issuer_request_id(
+            &self,
+            chain_id: u64,
+            vault: &Address,
+            issuer_request_id: &IssuerMintRequestId,
+        ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
+            self.record();
+            self.inner
+                .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
+                .await
+        }
+    }
+
+    fn test_orchestrator_address() -> Address {
+        address!("0x00000000000000000000000000000000000000aa")
+    }
+
+    /// Mirrors `create_test_redemption_in_burning_state` with the redemption
+    /// anchored to orchestrator mode at detection.
+    async fn create_orchestrator_redemption_in_burning_state(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Redemption {
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Detect {
+                    burn_mode: VaultMode::Orchestrator {
+                        address: test_orchestrator_address(),
+                    },
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    tx_hash: b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                    block_number: 12345,
+                    network: Network::Base,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-orch-456",
+                    ),
+                    alpaca_quantity: Quantity::new(Decimal::from(100)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        load_aggregate(store, issuer_request_id).await
+    }
+
+    struct OrchestratorTestSetup {
+        harness: TestHarness,
+        vault_mock: Arc<MockVaultService>,
+        recording: Arc<RecordingReceiptService>,
+        manager: BurnManager,
+        issuer_request_id: IssuerRedemptionRequestId,
+        aggregate: Redemption,
+        vault: Address,
+    }
+
+    async fn setup_orchestrator_burning(
+        vault_mock: Arc<MockVaultService>,
+    ) -> OrchestratorTestSetup {
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, vault).await;
+
+        let recording = Arc::new(RecordingReceiptService::new(
+            harness.receipt_service.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            recording.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let aggregate = create_orchestrator_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+
+        OrchestratorTestSetup {
+            harness,
+            vault_mock,
+            recording,
+            manager,
+            issuer_request_id,
+            aggregate,
+            vault,
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_burn_happy_path_skips_receipt_lifecycle() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success(),
+        ))
+        .await;
+
+        setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("orchestrator burn should complete");
+
+        let aggregate =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await;
+        assert!(
+            matches!(aggregate, Redemption::Completed { .. }),
+            "expected Completed, got {aggregate:?}"
+        );
+
+        assert_eq!(
+            setup.recording.call_count(),
+            0,
+            "the receipt reserve/settle/release lifecycle must never run in \
+             orchestrator mode"
+        );
+        assert_eq!(setup.vault_mock.orchestrator_readiness_call_count(), 1);
+        assert_eq!(setup.vault_mock.orchestrator_submit_call_count(), 1);
+
+        let params = setup
+            .vault_mock
+            .last_orchestrator_burn_params()
+            .expect("orchestrator submit must record its params");
+        assert_eq!(params.orchestrator, test_orchestrator_address());
+        assert_eq!(params.token, setup.vault);
+        assert_eq!(params.amount, uint!(100_000000000000000000_U256));
+        assert_eq!(params.owner, TEST_WALLET);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Starting on-chain burning process", "Orchestrator"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Burn confirmed successfully"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_allowance_gate_records_classified_failure() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_readiness(
+                OrchestratorBurnReadiness::AllowanceInsufficient {
+                    required: uint!(100_000000000000000000_U256),
+                    current: U256::ZERO,
+                },
+            ),
+        ))
+        .await;
+
+        let result = setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await;
+        assert!(result.is_err(), "allowance gate must fail the burn");
+
+        assert_eq!(
+            setup.vault_mock.orchestrator_submit_call_count(),
+            0,
+            "the burn must never be submitted without an approval"
+        );
+
+        let failed = find_burn_failed(&setup.harness.pool)
+            .await
+            .expect("burn-failed query should succeed");
+        let (_, view) = failed
+            .iter()
+            .find(|(id, _)| *id == setup.issuer_request_id)
+            .expect("redemption must be in BurnFailed view state");
+        assert!(
+            matches!(
+                view,
+                RedemptionView::BurnFailed {
+                    classification:
+                        BurnFailureClassification::AllowanceInsufficient,
+                    ..
+                }
+            ),
+            "expected AllowanceInsufficient classification, got {view:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &[
+                "Orchestrator burn allowance insufficient",
+                "required",
+                "current",
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_gate_defers_without_event() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_readiness(
+                OrchestratorBurnReadiness::VaultLogicMismatch,
+            ),
+        ))
+        .await;
+
+        setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("health-gate deferral is not an error");
+
+        let aggregate =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await;
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "a halted orchestrator must leave the redemption in Burning \
+             (no event), got {aggregate:?}"
+        );
+        assert_eq!(setup.vault_mock.orchestrator_submit_call_count(), 0);
+
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Orchestrator halted", "deferring"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_insufficient_receipts_revert_classifies_failure() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_confirm_revert(
+                OrchestratorRevertReason::InsufficientReceipts {
+                    token: address!(
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    ),
+                    shortfall: uint!(250_U256),
+                },
+            ),
+        ))
+        .await;
+
+        let result = setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await;
+        assert!(result.is_err(), "revert must surface as an error");
+
+        let failed = find_burn_failed(&setup.harness.pool)
+            .await
+            .expect("burn-failed query should succeed");
+        let (_, view) = failed
+            .iter()
+            .find(|(id, _)| *id == setup.issuer_request_id)
+            .expect("redemption must be in BurnFailed view state");
+        assert!(
+            matches!(
+                view,
+                RedemptionView::BurnFailed {
+                    classification:
+                        BurnFailureClassification::InsufficientReceipts {
+                            shortfall,
+                        },
+                    ..
+                } if *shortfall == uint!(250_U256)
+            ),
+            "expected InsufficientReceipts classification, got {view:?}"
+        );
+
+        // Non-retryable classifications must not consume the automatic
+        // recovery budget.
+        let recovery_events = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::BurnRecoveryAttempted'
+            ",
+        )
+        .bind(setup.issuer_request_id.to_string())
+        .fetch_one(&setup.harness.pool)
+        .await
+        .expect("recovery-event count should query");
+        assert_eq!(
+            recovery_events, 0,
+            "a classified revert must not reserve a recovery action"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["non-retryable classification", "InsufficientReceipts"]
+        ));
     }
 
     #[tokio::test]

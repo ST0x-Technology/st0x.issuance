@@ -219,7 +219,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// The default implementation fails closed for implementations without
     /// orchestrator support (mirroring
     /// [`VaultService::prepare_replacement_burn_tx`]).
-    #[allow(dead_code)]
     async fn check_orchestrator_burn_readiness(
         &self,
         _orchestrator: Address,
