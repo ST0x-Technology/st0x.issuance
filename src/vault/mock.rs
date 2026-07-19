@@ -546,6 +546,13 @@ impl MockVaultService {
         self.burn_classification_call_count.store(0, Ordering::Relaxed);
         self.burn_preparation_call_count.store(0, Ordering::Relaxed);
         self.replacement_preparation_call_count.store(0, Ordering::Relaxed);
+        *self.orchestrator.readiness.lock().unwrap() = None;
+        *self.orchestrator.confirm_revert.lock().unwrap() = None;
+        *self.orchestrator.last_params.lock().unwrap() = None;
+        self.orchestrator.preparation_call_count.store(0, Ordering::Relaxed);
+        self.orchestrator.submit_call_count.store(0, Ordering::Relaxed);
+        self.orchestrator.readiness_call_count.store(0, Ordering::Relaxed);
+        *self.orchestrator.pending_result.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -703,6 +710,32 @@ impl MockVaultService {
     ) -> Self {
         *self.orchestrator.confirm_revert.lock().unwrap() = Some(reason);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_readiness(
+        self,
+        readiness: OrchestratorBurnReadiness,
+    ) -> Self {
+        *self.orchestrator.readiness.lock().unwrap() = Some(readiness);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_orchestrator_burn_params(
+        &self,
+    ) -> Option<OrchestratorBurnParams> {
+        self.orchestrator.last_params.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestrator_submit_call_count(&self) -> usize {
+        self.orchestrator.submit_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestrator_readiness_call_count(&self) -> usize {
+        self.orchestrator.readiness_call_count.load(Ordering::Relaxed)
     }
 }
 
