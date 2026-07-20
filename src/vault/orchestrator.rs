@@ -64,9 +64,11 @@ pub(crate) struct OrchestratorBurnResult {
 
 /// Outcome of the pre-submit orchestrator burn gates (SPEC "Failure States").
 ///
-/// Evaluated allowance-first, then `vaultLogicIsExpected()`: an allowance
-/// shortfall is an actionable ops failure and must be reported even while the
-/// orchestrator is halted.
+/// Evaluated allowance-first, then `vaultLogicIsExpected()`, then a burn
+/// simulation: an allowance shortfall is an actionable ops failure and must
+/// be reported even while the orchestrator is halted, and a deterministic
+/// `InsufficientReceipts` revert must be classified without ever submitting
+/// (gas estimation would reject the transaction at signing anyway).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OrchestratorBurnReadiness {
     Ready,
@@ -79,6 +81,13 @@ pub(crate) enum OrchestratorBurnReadiness {
     /// `vaultLogicIsExpected()` returned `false` — the orchestrator is halted
     /// pending upgrade; defer without recording any failure.
     VaultLogicMismatch,
+    /// The burn simulation reverted with
+    /// `InsufficientReceipts(token, shortfall)` — the orchestrator's receipt
+    /// walk cannot cover the amount. Token-global anomaly; never submitted
+    /// and never auto-retried.
+    InsufficientReceipts {
+        shortfall: U256,
+    },
 }
 
 /// Typed revert reason decoded from a mined-but-reverted orchestrator burn.
