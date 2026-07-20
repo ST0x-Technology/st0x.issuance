@@ -1364,13 +1364,14 @@ impl VaultService for MockVaultService {
         _tx_id: &TxId,
     ) -> Result<OrchestratorBurnResult, VaultError> {
         #[cfg(test)]
-        let reason_opt = *self.orchestrator.confirm_revert.lock().unwrap();
-        #[cfg(test)]
-        if let Some(reason) = reason_opt {
-            return Err(VaultError::OrchestratorReverted {
-                tx_hash: MOCK_BURN_TX_HASH,
-                reason,
-            });
+        {
+            let reason_opt = *self.orchestrator.confirm_revert.lock().unwrap();
+            if let Some(reason) = reason_opt {
+                return Err(VaultError::OrchestratorReverted {
+                    tx_hash: MOCK_BURN_TX_HASH,
+                    reason,
+                });
+            }
         }
 
         match &self.behavior {

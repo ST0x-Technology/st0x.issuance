@@ -614,44 +614,6 @@ authorization has not yet arrived is `mint_mode: Orchestrator` with no
 `mint_authorization` — it is not, and must never be read as, a vault-direct
 mint.
 
-**Orchestrator mode** introduces no new commands: `Deposit`, `SubmitMint`,
-`ConfirmMint`, and `Recover` are reused unchanged, with the handler branching on
-`VaultMode` internally to submit `orchestrator.mint()` calldata instead of the
-vault multicall and to emit the orchestrator-mode events above. An
-orchestrator-mode mint creates no bot-held receipt for the receipt monitor to
-discover (the orchestrator custodies it — see "Orchestrator Migration" ->
-"Dual-Mode Operation and Cutover"), so `RecoverFromReceipt` does not apply;
-`Recover`'s existing-mint check instead queries the orchestrator's `Minted` log
-by `(wallet, nonce)`, emitting `OrchestratorMintRecovered` only when the log's
-`token`/`amount` also exactly match this mint's own request facts (see "Nonce"
-below for the full-match rule and its manual-failure fallback). See
-"Orchestrator Migration" for the mint flow, failure states
-(`BadRecipientSignature`, `RecipientCallbackRejected`, `VaultAmountMismatch`,
-`VaultLogicMismatch`/`ReceiptLogicMismatch`), and the full event reuse/new
-rationale.
-
-Mirroring the mode-scoping rule given for Redemption below, a mint's mode does
-not follow later `VaultMode` flips of its asset: `Recover`, `SubmitMint`, and
-`ConfirmMint` determine which mode to use for a given mint from that mint's own
-event history — the `mint_mode` field persisted on its `Initiated` event,
-resolved from configuration at initiate time — never re-resolved from the
-asset's currently-configured `VaultMode`. This ensures a mint `Initiated` while
-its asset was in `vault_direct` mode is still recovered as a vault-direct mint
-even after that asset's configured `vault_mode` is later flipped to
-orchestrator, exactly as Redemption's persisted `burn_mode` (captured on
-`RedemptionDetected`) prevents the analogous mismatch on the Redemption side.
-
-The mode anchor is deliberately **not** the presence of `mint_authorization`.
-`Initiated` is written synchronously on Alpaca's `POST /inkind/issuance`, before
-the liquidity bot delivers the authorization on the internal mint-authorization
-call, and events are immutable — an already-persisted `Initiated` can never grow
-an authorization field. Mode (known from config at initiate time) and
-authorization (arriving later, on `MintAuthorizationReceived`) are therefore
-orthogonal facts on two separate events. An orchestrator-mode mint whose
-authorization has not yet arrived is `mint_mode: Orchestrator` with no
-`mint_authorization` — it is not, and must never be read as, a vault-direct
-mint.
-
 ### Redemption Aggregate
 
 The `Redemption` aggregate manages the redemption lifecycle, from detecting an
@@ -868,13 +830,18 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `Reprocessed` - Redemption reset to `Detected` state for reprocessing. Carries
   the original `RedemptionMetadata`, the previous state name, and a timestamp.
   Used for audit trail — shows when and from what state a manual reprocess was
-  triggered.
+  triggered. Gains the same additive `#[serde(default)]` `burn_mode` field as
+  `RedemptionDetected`, preserving the mode anchor across a reset (the event
+  flattens metadata, so without it a reprocessed orchestrator redemption would
+  silently replay as vault-direct).
 - `BurnResumed` - Redemption resumed directly to `Burning` state from `Failed`.
   Carries the original `RedemptionMetadata`, `tokenization_request_id`,
   `alpaca_quantity`, `dust_quantity`, `called_at` (from the original
   `AlpacaCalled` event), `alpaca_journal_completed_at`, optional retry
   `external_tx_id`, and `resumed_at` timestamp. Used for post-Alpaca recovery
-  where the journal already completed.
+  where the journal already completed. Gains the same additive
+  `#[serde(default)]` `burn_mode` field as `RedemptionDetected`, preserving the
+  mode anchor across a resume.
 - `OrchestratorBurnSubmitted` (orchestrator mode only) - Burn transaction
   submitted to the signing backend. Carries
   `{issuer_request_id,
@@ -933,7 +900,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 | `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery                                                     |
 | `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption                                                           |
 | `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a burn verified against this redemption's persisted `burn_mode`              |
-| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | No per-receipt plan to reserve first                                                           |
+| `IntendBurn` (orchestrator mode)         | `BurnIntended`                     | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                  |
+| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | Broadcasts the persisted bytes; no per-receipt plan to reserve first                           |
 | `ConfirmBurn` (orchestrator mode)        | `OrchestratorTokensBurned`         | New success event; carries the consumed pointer range and `dust_retained`                      |
 | `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`        | Recovery via the orchestrator's `Burned` log; carries `dust_retained` for success-event parity |
 
@@ -985,32 +953,34 @@ exhausted persisted intent cannot be re-armed through the admin recover
 endpoint: the operator must force-complete a verified landed burn or close only
 after off-chain reconciliation. At every point there is at most one transaction
 hash that can still land for a redemption. **Orchestrator mode** introduces no
-new command names: `BurnTokens`, `ConfirmBurn`, `RecordBurnFailure`, and
-`RecordExistingBurn` are reused, with the handler branching on `VaultMode`
-internally to call `submit_orchestrator_burn` / `confirm_orchestrator_burn` (see
-"VaultService" below) instead of the vault multicall, and to emit the
-orchestrator-mode events above. This differs from the Mint side, where the pure
-`Record*` commands already carry backend-agnostic, job-supplied payloads, so
-"reused unchanged" holds exactly — on the Redemption side, `BurnTokens`'s
-`vault`/`burns`/ `dust_shares`/`owner` fields and
-`RecordExistingBurn`/`RecordBurnFailure`'s `planned_burns` field mirror the
-vault-direct `MultiBurnParams` shape, and orchestrator mode has no per-receipt
-plan to populate them from: `BurnManager` skips `plan_burn` and the entire
+new command names: `IntendBurn`, `BurnTokens`, `ConfirmBurn`,
+`RecordBurnFailure`, and `RecordExistingBurn` are reused, with the handler
+branching on `VaultMode` internally to call the orchestrator-mode `VaultService`
+methods (see "VaultService" below) instead of the vault multicall, and to emit
+the orchestrator-mode events above. The persist-before-broadcast discipline is
+identical to vault-direct: `IntendBurn` builds and signs the
+`orchestrator.burn()` transaction via `prepare_orchestrator_burn_tx` and
+persists it in the existing `BurnIntended` event with `planned_burns: vec![]`
+(there is no per-receipt plan; the field is already tolerant of an empty list),
+then `BurnTokens` broadcasts those exact bytes via `submit_orchestrator_burn`
+and emits `OrchestratorBurnSubmitted`. The whole `(hash, nonce)`
+classify/rebroadcast/replace recovery machinery above therefore applies to
+orchestrator burns unchanged. `IntendBurn`/`BurnTokens` carry a mode-specific
+`BurnParams` enum (`VaultDirect { vault, burns, dust_shares, owner }` |
+`Orchestrator { token, amount, owner }`), and the handler rejects params whose
+mode does not match the redemption's persisted `burn_mode` anchor
+(`BurnModeMismatch`) — commands are not persisted and may change shape freely
+per AGENTS.md. `BurnManager` skips `plan_burn` and the entire
 reserve/settle/release reservation lifecycle — the orchestrator custodies
 receipts directly, so there is no bot-side inventory to reserve against — and
-derives the burn amount from redemption state to call
-`submit_orchestrator_burn(token, amount, burn_info,
-external_tx_id)` directly
-rather than constructing a `MultiBurnParams`. Because commands (unlike events)
-are not persisted and may change freely per AGENTS.md, RAI-1220/1221 may adjust
-`BurnTokens`'s field shape for orchestrator mode (e.g. mode-specific fields, or
-unused vault-direct fields) as needed during implementation without touching any
-event schema. `RecordBurnFailure`'s existing `planned_burns` field carries
-`vec![]` for an orchestrator-mode failure (already `#[serde(default)]`-tolerant
-of that), and its `classification` field (see "Failure States") carries
-`InsufficientReceipts { shortfall }` or `AllowanceInsufficient` as appropriate.
-`BurnTokens`, `ConfirmBurn`, and `ResumeBurn` all derive which mode to use for a
-given redemption from its own persisted `burn_mode` (captured on
+derives the burn amount from redemption state (`alpaca_quantity` in share-wei;
+dust stays in the bot wallet). `RecordBurnFailure`'s existing `planned_burns`
+field carries `vec![]` for an orchestrator-mode failure (already
+`#[serde(default)]`-tolerant of that), and its `classification` field (see
+"Failure States") carries `InsufficientReceipts { shortfall }` or
+`AllowanceInsufficient` as appropriate. `IntendBurn`, `BurnTokens`,
+`ConfirmBurn`, and `ResumeBurn` all derive which mode to use for a given
+redemption from its own persisted `burn_mode` (captured on
 `RedemptionDetected`), never re-resolved from the asset's currently-configured
 `VaultMode` — see `ForceCompleteBurn` below for why this matters across a
 cutover.
@@ -2078,16 +2048,23 @@ sequenceDiagram
         alt halted (VaultLogicMismatch / ReceiptLogicMismatch)
             Note right of Us: No submission, no event,<br/>WARN log, retry later
         else healthy
-            Us->>Orchestrator: burn(token, amount, burnInfo)
-            alt reverts (InsufficientReceipts)
-                Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified, not auto-retried)
-            else reverts (VaultLogicMismatch / ReceiptLogicMismatch - post-hoc race)
-                Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified,<br/>not auto-retried; re-driven via ResumeBurn once healthy)
-            else succeeds
-                Orchestrator->>Orchestrator: transferFrom(bot, orchestrator, amount);<br/>consume receipts in order; advance nextBurnReceiptId
-                Orchestrator->>Us: Burned(token, amount, burn_range)
-                Note right of Us: BurnTokens/ConfirmBurn command<br/>Event: OrchestratorTokensBurned<br/>(dust_retained recorded, not returned)
-                Us->>AP: Redemption completed ✓
+            Us->>Orchestrator: eth_call simulation of burn(token, amount, burnInfo)
+            alt simulation reverts (InsufficientReceipts)
+                Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified,<br/>never signed or submitted, not auto-retried)
+            else simulation passes
+                Note right of Us: IntendBurn command — sign the exact<br/>burn(token, amount, burnInfo) transaction<br/>Event: BurnIntended (persisted bytes,<br/>empty receipt plan)
+                Us->>Orchestrator: broadcast the persisted bytes
+                Note right of Us: BurnTokens command<br/>Event: OrchestratorBurnSubmitted
+                alt reverts (InsufficientReceipts - pool drained after simulation)
+                    Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified, not auto-retried)
+                else reverts (VaultLogicMismatch / ReceiptLogicMismatch - post-hoc race)
+                    Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified,<br/>not auto-retried; re-driven via ResumeBurn once healthy)
+                else succeeds
+                    Orchestrator->>Orchestrator: transferFrom(bot, orchestrator, amount);<br/>consume receipts in order; advance nextBurnReceiptId
+                    Orchestrator->>Us: Burned(token, amount, burn_range)
+                    Note right of Us: ConfirmBurn command<br/>Event: OrchestratorTokensBurned<br/>(dust_retained recorded, not returned)
+                    Us->>AP: Redemption completed ✓
+                end
             end
         end
     end
@@ -2119,6 +2096,12 @@ emergency withdrawal or an external receipt transfer drained the pool, or the
 asset was switched to orchestrator mode before its receipt migration completed)
 — it fails every redemption of that token, not just the one that triggered the
 revert.
+
+A deterministic shortfall is normally caught by the **pre-submit burn
+simulation** in `check_orchestrator_burn_readiness` (see "VaultService"), so the
+burn is never signed or submitted; the classified `BurningFailed` below is
+recorded either way. The post-submit revert decode remains for the race where
+the pool is drained between the simulation and the mined transaction.
 
 - Recorded via the existing `RecordBurnFailure` command, producing
   `BurningFailed` with
@@ -2189,7 +2172,10 @@ recovery on any other chain.
   returns `false`, the bot does not submit — there is no transaction to record,
   so no `MintingFailed`/`BurningFailed` event is produced, the `attempts`
   counter and its bounded 1m/10m/30m/1h exhaustion schedule do not advance, and
-  the bot logs at WARN. Recovery is deferred the same way it already is for each
+  the bot logs at WARN. A `VaultLogicMismatch`/`ReceiptLogicMismatch` revert
+  from the burn readiness simulation (see "VaultService") folds into this same
+  halt outcome — the health flag can flip between the explicit check and the
+  simulation. Recovery is deferred the same way it already is for each
   aggregate: for mint, the existing background scheduled-recovery task re-checks
   health before its next attempt; for burn (which has no automatic retry loop —
   see "InsufficientReceipts" above), the next startup or manual admin recovery
@@ -2393,11 +2379,40 @@ bodies are never logged or embedded in decode errors.
   / `confirm_orchestrator_mint(tx_id)
   -> OrchestratorMintResult` -
   submits/confirms `ST0xOrchestrator.mint()`
-- `submit_orchestrator_burn(token, amount, burn_info, external_tx_id) ->
+- `check_orchestrator_burn_readiness(orchestrator, token, owner, amount) ->
+  OrchestratorBurnReadiness` -
+  the pre-submit gates, evaluated in order: the ERC-20
+  `allowance(owner, orchestrator) >= amount` check
+  (`AllowanceInsufficient { required, current }`), the `vaultLogicIsExpected()`
+  health check (`VaultLogicMismatch`), then an `eth_call` simulation of the burn
+  so a deterministic `InsufficientReceipts(token, shortfall)` revert is
+  classified (`InsufficientReceipts { shortfall }`) before anything is signed.
+  The simulation is the required classification mechanism in its own right, not
+  a shortcut around gas estimation: `eth_estimateGas` is a separate RPC step in
+  `prepare_orchestrator_burn_tx`'s fill pipeline (not part of signing), its
+  failure on a reverting burn surfaces only as an unclassified preparation
+  error, and a transaction prepared with a supplied gas limit would skip
+  estimation entirely and sign a doomed burn — a preparation failure must
+  therefore never be treated as a substitute for the typed readiness outcomes
+  above. Deterministic reverts _outside_ the classified set (another
+  orchestrator error, or a foreign revert from the vault's `transferFrom` path)
+  are the deliberate exception: the simulation reports `Ready` and lets
+  preparation replay the revert, recording the failure as `Unclassified` under
+  the bounded preparation-retry budget instead of deferring the redemption
+  forever without an operator-visible `BurnFailed` state
+- `prepare_orchestrator_burn_tx(OrchestratorBurnParams) ->
+  SendableTxWithHash` -
+  builds and signs the exact `ST0xOrchestrator.burn(token, amount, burnInfo)`
+  transaction (empty `burnInfo`, `dust_shares: 0` — dust is retained, never
+  returned on-chain) for persistence in `BurnIntended` before any broadcast
+- `submit_orchestrator_burn(OrchestratorBurnParams, SendableTxWithHash) ->
   SubmittedTx`
   / `confirm_orchestrator_burn(tx_id) ->
-  OrchestratorBurnResult` -
-  submits/confirms `ST0xOrchestrator.burn()`
+  OrchestratorBurnResult` - broadcasts
+  the exact persisted bytes / confirms by parsing the orchestrator's `Burned`
+  event; a mined-but-reverted burn replays the transaction as an `eth_call`
+  pinned at its mined block - 1 to decode the typed revert reason
+  (`VaultError::OrchestratorReverted`)
 
 Both method families live on the same trait rather than a second trait:
 splitting them would force the mode-independent methods above to be duplicated
