@@ -12,6 +12,7 @@ use alloy::providers::{
 };
 use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::sol_types::SolInterface;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use super::{
     VaultService, WalletNonceGuard, classify_checked_receipt,
     verify_burn_in_receipt,
 };
+use crate::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Errors;
 use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
 use crate::redemption::BurnExternalTxId;
 
@@ -99,8 +101,6 @@ impl RealBlockchainService {
         tx_hash: alloy::primitives::B256,
         block_number: u64,
     ) -> OrchestratorRevertReason {
-        use alloy::sol_types::SolInterface;
-
         let Ok(Some(transaction)) =
             self.provider.get_transaction_by_hash(tx_hash).await
         else {
@@ -125,14 +125,9 @@ impl RealBlockchainService {
         error
             .as_error_resp()
             .and_then(ErrorPayload::as_revert_data)
-            .and_then(|data| {
-                IST0xOrchestratorV1::IST0xOrchestratorV1Errors::abi_decode(
-                    &data,
-                )
-                .ok()
-            })
+            .and_then(|data| IST0xOrchestratorV1Errors::abi_decode(&data).ok())
             .map_or(OrchestratorRevertReason::Unknown, |decoded| {
-                use IST0xOrchestratorV1::IST0xOrchestratorV1Errors::{
+                use IST0xOrchestratorV1Errors::{
                     InsufficientReceipts, ReceiptLogicMismatch,
                     VaultLogicMismatch,
                 };
@@ -837,7 +832,46 @@ impl VaultService for RealBlockchainService {
             return Ok(OrchestratorBurnReadiness::VaultLogicMismatch);
         }
 
-        Ok(OrchestratorBurnReadiness::Ready)
+        // Simulate the burn so a deterministic revert is classified before
+        // any signing: gas estimation would reject the transaction anyway,
+        // surfacing only an unclassified preparation failure.
+        let Err(error) = orchestrator_contract
+            .burn(token, amount, Bytes::new())
+            .from(owner)
+            .call()
+            .await
+        else {
+            return Ok(OrchestratorBurnReadiness::Ready);
+        };
+
+        // No revert data means the simulation itself failed (transport/RPC),
+        // not that the burn reverted — propagate so the reconciler retries
+        // the gate on its next pass.
+        let Some(revert_data) = error.as_revert_data() else {
+            return Err(error.into());
+        };
+
+        match IST0xOrchestratorV1Errors::abi_decode(&revert_data).ok() {
+            Some(IST0xOrchestratorV1Errors::InsufficientReceipts(revert)) => {
+                Ok(OrchestratorBurnReadiness::InsufficientReceipts {
+                    shortfall: revert.shortfall,
+                })
+            }
+            Some(
+                IST0xOrchestratorV1Errors::VaultLogicMismatch(_)
+                | IST0xOrchestratorV1Errors::ReceiptLogicMismatch(_),
+            ) => Ok(OrchestratorBurnReadiness::VaultLogicMismatch),
+            // A deterministic revert outside the classified set (another
+            // orchestrator error, or a foreign revert from the vault's
+            // transferFrom path): report Ready and let preparation fail
+            // instead. Its gas estimation replays the same revert before
+            // anything is signed, recording the failure as `Unclassified`
+            // under the bounded preparation-retry budget — the
+            // pre-simulation behavior. Erroring here would defer the
+            // redemption forever without ever parking it in an
+            // operator-visible BurnFailed state.
+            Some(_) | None => Ok(OrchestratorBurnReadiness::Ready),
+        }
     }
 
     async fn prepare_orchestrator_burn_tx(
@@ -985,19 +1019,25 @@ mod tests {
     use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::{
         Block, FeeHistory, Transaction as RpcTransaction, TransactionReceipt,
         TransactionRequest,
     };
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::{SolCall, SolError};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
 
-    use super::{RealBlockchainService, RealBlockchainServiceProvider};
-    use crate::bindings::OffchainAssetReceiptVault;
+    use super::{
+        OrchestratorBurnParams, OrchestratorBurnReadiness,
+        OrchestratorRevertReason, RealBlockchainService,
+        RealBlockchainServiceProvider,
+    };
+    use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
@@ -2609,10 +2649,8 @@ mod tests {
         address!("0x00000000000000000000000000000000000000aa")
     }
 
-    fn test_orchestrator_burn_params(
-        owner: Address,
-    ) -> super::OrchestratorBurnParams {
-        super::OrchestratorBurnParams {
+    fn test_orchestrator_burn_params(owner: Address) -> OrchestratorBurnParams {
+        OrchestratorBurnParams {
             orchestrator: test_orchestrator_address(),
             token: test_vault_address(),
             amount: U256::from(1_000_000u64),
@@ -2653,7 +2691,7 @@ mod tests {
         succeeded: bool,
         emitter: Address,
     ) -> TransactionReceipt {
-        let burned_event = crate::bindings::IST0xOrchestratorV1::Burned {
+        let burned_event = IST0xOrchestratorV1::Burned {
             caller,
             token: test_vault_address(),
             amount,
@@ -2748,8 +2786,6 @@ mod tests {
 
     #[tokio::test]
     async fn orchestrator_burn_prepare_submit_confirm_round_trip() {
-        use alloy::sol_types::SolCall;
-
         let asserter = Asserter::new();
         setup_asserter_for_fill(&asserter, 7);
         let signer = PrivateKeySigner::random();
@@ -2773,13 +2809,12 @@ mod tests {
             .expect("prepared orchestrator burn must decode");
         assert_eq!(*envelope.tx_hash(), prepared.hash);
         assert_eq!(envelope.to(), Some(test_orchestrator_address()));
-        let expected_calldata =
-            crate::bindings::IST0xOrchestratorV1::burnCall {
-                token: params.token,
-                amount: params.amount,
-                burnInfo: Bytes::new(),
-            }
-            .abi_encode();
+        let expected_calldata = IST0xOrchestratorV1::burnCall {
+            token: params.token,
+            amount: params.amount,
+            burnInfo: Bytes::new(),
+        }
+        .abi_encode();
         assert_eq!(
             envelope.input().as_ref(),
             expected_calldata.as_slice(),
@@ -2855,31 +2890,27 @@ mod tests {
     /// `eth_call` at its mined block and decodes the typed revert reason.
     #[tokio::test]
     async fn confirm_orchestrator_burn_decodes_typed_revert_reasons() {
-        use alloy::rpc::json_rpc::ErrorPayload;
-        use alloy::sol_types::SolError;
-
-        let shortfall_error =
-            crate::bindings::IST0xOrchestratorV1::InsufficientReceipts {
-                token: test_vault_address(),
-                shortfall: U256::from(250u64),
-            };
+        let shortfall_error = IST0xOrchestratorV1::InsufficientReceipts {
+            token: test_vault_address(),
+            shortfall: U256::from(250u64),
+        };
         let cases = [
             (
                 Bytes::from(shortfall_error.abi_encode()),
-                super::OrchestratorRevertReason::InsufficientReceipts {
+                OrchestratorRevertReason::InsufficientReceipts {
                     token: test_vault_address(),
                     shortfall: U256::from(250u64),
                 },
             ),
             (
                 Bytes::from(
-                    crate::bindings::IST0xOrchestratorV1::VaultLogicMismatch {
+                    IST0xOrchestratorV1::VaultLogicMismatch {
                         expected: test_receiver(),
                         actual: test_vault_address(),
                     }
                     .abi_encode(),
                 ),
-                super::OrchestratorRevertReason::VaultLogicMismatch,
+                OrchestratorRevertReason::VaultLogicMismatch,
             ),
             (
                 Bytes::from(
@@ -2893,7 +2924,7 @@ mod tests {
             ),
             (
                 Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
-                super::OrchestratorRevertReason::Unknown,
+                OrchestratorRevertReason::Unknown,
             ),
         ];
 
@@ -2968,7 +2999,7 @@ mod tests {
             .expect("readiness check should succeed");
         assert_eq!(
             readiness,
-            super::OrchestratorBurnReadiness::AllowanceInsufficient {
+            OrchestratorBurnReadiness::AllowanceInsufficient {
                 required: amount,
                 current: U256::from(999u64),
             }
@@ -2988,15 +3019,13 @@ mod tests {
             )
             .await
             .expect("readiness check should succeed");
-        assert_eq!(
-            readiness,
-            super::OrchestratorBurnReadiness::VaultLogicMismatch
-        );
+        assert_eq!(readiness, OrchestratorBurnReadiness::VaultLogicMismatch);
 
-        // Sufficient allowance and healthy orchestrator.
+        // Sufficient allowance, healthy orchestrator, burn simulation passes.
         let asserter = Asserter::new();
         asserter.push_success(&format!("0x{}", "f".repeat(64)));
         asserter.push_success(&format!("0x{:064x}", 1u64));
+        asserter.push_success(&"0x"); // burn simulation (empty return)
         let service = create_service_with_asserter(asserter);
         let readiness = service
             .check_orchestrator_burn_readiness(
@@ -3007,6 +3036,100 @@ mod tests {
             )
             .await
             .expect("readiness check should succeed");
-        assert_eq!(readiness, super::OrchestratorBurnReadiness::Ready);
+        assert_eq!(readiness, OrchestratorBurnReadiness::Ready);
+
+        // Simulation reverting with InsufficientReceipts classifies the
+        // shortfall before anything is signed.
+        {
+            let revert_data = Bytes::from(
+                IST0xOrchestratorV1::InsufficientReceipts {
+                    token: test_vault_address(),
+                    shortfall: U256::from(123u64),
+                }
+                .abi_encode(),
+            );
+            let asserter = Asserter::new();
+            asserter.push_success(&format!("0x{}", "f".repeat(64)));
+            asserter.push_success(&format!("0x{:064x}", 1u64));
+            asserter.push_failure(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(
+                    serde_json::value::to_raw_value(&format!("{revert_data}"))
+                        .expect("revert data must serialize"),
+                ),
+            });
+            let service = create_service_with_asserter(asserter);
+            let readiness = service
+                .check_orchestrator_burn_readiness(
+                    test_orchestrator_address(),
+                    test_vault_address(),
+                    owner,
+                    amount,
+                )
+                .await
+                .expect("readiness check should succeed");
+            assert_eq!(
+                readiness,
+                OrchestratorBurnReadiness::InsufficientReceipts {
+                    shortfall: U256::from(123u64),
+                }
+            );
+        }
+
+        // A deterministic revert with undecodable data must fall through to
+        // Ready — preparation replays the same revert and records it as
+        // Unclassified — rather than erroring, which would defer the
+        // redemption forever.
+        {
+            let asserter = Asserter::new();
+            asserter.push_success(&format!("0x{}", "f".repeat(64)));
+            asserter.push_success(&format!("0x{:064x}", 1u64));
+            asserter.push_failure(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(
+                    serde_json::value::to_raw_value("0xdeadbeef")
+                        .expect("revert data must serialize"),
+                ),
+            });
+            let service = create_service_with_asserter(asserter);
+            let readiness = service
+                .check_orchestrator_burn_readiness(
+                    test_orchestrator_address(),
+                    test_vault_address(),
+                    owner,
+                    amount,
+                )
+                .await
+                .expect("an undecodable revert must not error the gate");
+            assert_eq!(readiness, OrchestratorBurnReadiness::Ready);
+        }
+
+        // A simulation that fails without revert data is a transport fault,
+        // not a burn revert: it must propagate so the reconciler retries.
+        {
+            let asserter = Asserter::new();
+            asserter.push_success(&format!("0x{}", "f".repeat(64)));
+            asserter.push_success(&format!("0x{:064x}", 1u64));
+            asserter.push_failure(ErrorPayload {
+                code: -32603,
+                message: "internal error".into(),
+                data: None,
+            });
+            let service = create_service_with_asserter(asserter);
+            assert!(
+                service
+                    .check_orchestrator_burn_readiness(
+                        test_orchestrator_address(),
+                        test_vault_address(),
+                        owner,
+                        amount,
+                    )
+                    .await
+                    .is_err(),
+                "a transport failure must not be classified as a readiness outcome"
+            );
+        }
     }
 }
