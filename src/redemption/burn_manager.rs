@@ -1564,6 +1564,50 @@ impl BurnManager {
                 );
                 return Ok(());
             }
+            OrchestratorBurnReadiness::InsufficientReceipts { shortfall } => {
+                // Token-global anomaly: the orchestrator's receipt walk
+                // cannot cover this burn for ANY redemption of this token.
+                // Never submitted, never auto-retried — recovery is a manual
+                // EMERGENCY_ROLE action followed by admin ResumeBurn.
+                error!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    token = %token,
+                    orchestrator = %orchestrator,
+                    shortfall = %shortfall,
+                    "Orchestrator receipts insufficient to cover burn; \
+                     manual EMERGENCY_ROLE recovery required"
+                );
+                let error_msg = format!(
+                    "Orchestrator receipts insufficient: shortfall \
+                     {shortfall}"
+                );
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::RecordBurnFailure {
+                            classification:
+                                BurnFailureClassification::InsufficientReceipts {
+                                    shortfall,
+                                },
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: error_msg.clone(),
+                            tx_id: None,
+                            planned_burns: vec![],
+                        },
+                    )
+                    .await?;
+                return Err(BurnManagerError::Redemption(
+                    RedemptionError::Vault {
+                        message: error_msg,
+                        release_reservation: false,
+                        tx_id: None,
+                        classification:
+                            BurnFailureClassification::InsufficientReceipts {
+                                shortfall,
+                            },
+                    },
+                ));
+            }
         }
 
         let execution = BurnExecutionPlan::orchestrator(
@@ -3347,6 +3391,62 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::WARN,
             &["Orchestrator halted", "deferring"]
+        ));
+    }
+
+    /// The pre-submit shortfall gate (burn simulation reverting with
+    /// `InsufficientReceipts`) records a classified failure without ever
+    /// signing or submitting.
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_shortfall_gate_records_classified_failure() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_readiness(
+                OrchestratorBurnReadiness::InsufficientReceipts {
+                    shortfall: uint!(250_U256),
+                },
+            ),
+        ))
+        .await;
+
+        let result = setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await;
+        assert!(result.is_err(), "the shortfall gate must fail the burn");
+        assert_eq!(
+            setup.vault_mock.orchestrator_submit_call_count(),
+            0,
+            "a shortfall burn must never be submitted"
+        );
+
+        let failed = find_burn_failed(&setup.harness.pool)
+            .await
+            .expect("burn-failed query should succeed");
+        let (_, view) = failed
+            .iter()
+            .find(|(id, _)| *id == setup.issuer_request_id)
+            .expect("redemption must be in BurnFailed view state");
+        assert!(
+            matches!(
+                view,
+                RedemptionView::BurnFailed {
+                    classification:
+                        BurnFailureClassification::InsufficientReceipts {
+                            shortfall,
+                        },
+                    ..
+                } if *shortfall == uint!(250_U256)
+            ),
+            "expected InsufficientReceipts classification, got {view:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &[
+                "Orchestrator receipts insufficient",
+                "manual EMERGENCY_ROLE recovery required",
+            ]
         ));
     }
 
