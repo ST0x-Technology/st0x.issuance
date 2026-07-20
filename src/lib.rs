@@ -967,7 +967,7 @@ async fn run_redemption_recovery(
 /// **cancelled** — not left running — so no concurrent side effects can
 /// race with incoming HTTP requests. Stuck aggregates that weren't recovered
 /// in time require manual intervention via `/admin/recover` or `/admin/close`.
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Runs mint and redemption recovery with a timeout, then starts the HTTP
 /// server. Recovery that completes within [`RECOVERY_TIMEOUT`] runs to

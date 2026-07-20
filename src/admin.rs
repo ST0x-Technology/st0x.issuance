@@ -941,6 +941,12 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 /// shares) before the redemption is moved to `Completed`, recording the proving
 /// tx hash for audit. Ambiguous cases with no verifiable on-chain burn are
 /// rejected (`422`) — use `/admin/close/redemption` for those.
+///
+/// When the redemption persisted a burn tx (it reached `BurnIntended`), the
+/// proving hash is checked against that persisted identity. When it did not —
+/// the recovery timeout orphaned it in bare `Burning` before any burn event was
+/// written — the proving tx is bound to the redemption by amount: it must burn
+/// exactly the shares owed and return exactly the dust, else `422`.
 #[utoipa::path(
     post,
     path = "/admin/force-complete/redemption/{issuer_request_id}",
@@ -1096,7 +1102,10 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
             | VaultError::Reverted { .. },
         )
         | BurnManagerError::InvalidAggregateState { .. }
-        | BurnManagerError::Cqrs(AggregateError::UserError(_)) => {
+        | BurnManagerError::Cqrs(AggregateError::UserError(_))
+        | BurnManagerError::Redemption(_)
+        | BurnManagerError::ForceCompleteBurnAmountMismatch { .. }
+        | BurnManagerError::ForceCompleteDustMismatch { .. } => {
             Status::UnprocessableEntity
         }
         BurnManagerError::Vault(_) => Status::BadGateway,
@@ -4517,6 +4526,17 @@ mod tests {
         assert_eq!(
             map_burn_manager_error(&super::BurnManagerError::SharesOverflow),
             Status::InternalServerError
+        );
+        // A proving tx that burns the wrong amount is an unverifiable
+        // operator-supplied input, not an upstream failure.
+        assert_eq!(
+            map_burn_manager_error(
+                &super::BurnManagerError::ForceCompleteBurnAmountMismatch {
+                    expected: alloy::primitives::U256::from(2u8),
+                    found: alloy::primitives::U256::from(1u8),
+                }
+            ),
+            Status::UnprocessableEntity
         );
     }
 

@@ -584,8 +584,8 @@ on-chain transfer through calling Alpaca to burning tokens.
   landed. Emits `RedemptionClosed`.
 - `ForceCompleteBurn { issuer_request_id, burn_tx_hash, block_number, reason,
   acknowledged_unresolved_burn_tx_hash }` -
-  Admin-terminalize a redemption stuck in `BurnIntended`/`BurnSubmitted` whose
-  persisted exact burn transaction **already landed on-chain** but was never
+  Admin-terminalize a redemption stuck in `Burning`/`BurnIntended`/`BurnSubmitted`
+  whose burn **already landed on-chain** but was never
   recorded (e.g. the bot crashed between the burn and `TokensBurned`). The admin
   layer verifies the operator-supplied `burn_tx_hash` on-chain first — the
   receipt must have succeeded and contain a real burn
@@ -614,8 +614,15 @@ on-chain transfer through calling Alpaca to burning tokens.
   burn on the redemption's vault whose per-receipt withdrawals match the burn
   plan persisted by the latest `BurningFailed` event exactly, with the owner
   recovered from the transaction's own signature, and refuses a hash any other
-  redemption's history already mentions. Pre-intent states with no persisted
-  burn plan at all are **not** force-completed; ops use `CloseRedemption` after
+  redemption's history already mentions. When the redemption never persisted a
+  burn transaction and has no burn plan either — the recovery timeout orphaned
+  it in bare `Burning` before any burn event was written — there is no persisted
+  identity to anchor against; the proving tx is instead bound to the redemption
+  **by amount**: it must burn exactly the shares owed (`alpaca_quantity`) and
+  return exactly the dust (`dust_quantity`), else it is rejected (`422`). No
+  acknowledgement is accepted when nothing was persisted, as there is nothing to
+  acknowledge. Truly ambiguous states with no verifiable on-chain burn are still
+  **not** force-completed; ops use `CloseRedemption` after
   off-chain reconciliation instead.
 
 **Events:**
@@ -2446,6 +2453,7 @@ stateDiagram-v2
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn
     Burning --> Failed: RecordBurnFailure / MarkFailed
+    Burning --> Completed: ForceCompleteBurn (admin, verified on-chain by amount)
     Burning --> Closed: CloseRedemption (admin)
     BurnIntended --> BurnSubmitted: BurnTokens (BurnTxSubmitted)
     BurnIntended --> Completed: ConfirmBurn (TokensBurned, crash recovery)

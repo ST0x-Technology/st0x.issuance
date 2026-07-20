@@ -294,25 +294,65 @@ impl BurnManager {
                 }
             })?;
 
-        let persisted_burn_tx = redemption.persisted_burn_tx()?;
-        persisted_burn_tx.validate_for_owner(self.bot_wallet)?;
-        let acknowledged_unresolved_burn_tx_hash = redemption
-            .validate_force_complete_burn_hash(
+        let (underlying, network, alpaca_quantity, dust_quantity) =
+            match &redemption {
+                Redemption::Burning {
+                    metadata,
+                    alpaca_quantity,
+                    dust_quantity,
+                    ..
+                }
+                | Redemption::BurnIntended {
+                    metadata,
+                    alpaca_quantity,
+                    dust_quantity,
+                    ..
+                }
+                | Redemption::BurnSubmitted {
+                    metadata,
+                    alpaca_quantity,
+                    dust_quantity,
+                    ..
+                } => (
+                    metadata.underlying.clone(),
+                    metadata.network,
+                    alpaca_quantity.clone(),
+                    dust_quantity.clone(),
+                ),
+                other => {
+                    return Err(BurnManagerError::InvalidAggregateState {
+                        current_state: aggregate_state_name(other).to_string(),
+                    });
+                }
+            };
+
+        // A redemption that reached `BurnIntended` persisted its signed burn
+        // tx; that persisted identity anchors force-complete via the owner
+        // check and hash/acknowledgement guard. A redemption the recovery
+        // timeout orphaned in bare `Burning` never persisted one, so there is
+        // nothing to anchor against — the on-chain proof is bound to this
+        // redemption by amount instead (see below).
+        let persisted_burn_tx = redemption
+            .persisted_unresolved_burn_tx()
+            .filter(|sendable_tx| !sendable_tx.tx.is_empty());
+        let persisted_burn_hash = persisted_burn_tx.map(|tx| tx.hash);
+        let acknowledged_unresolved_burn_tx_hash = if let Some(sendable_tx) =
+            persisted_burn_tx
+        {
+            sendable_tx.validate_for_owner(self.bot_wallet)?;
+            redemption.validate_force_complete_burn_hash(
                 burn_tx_hash,
                 acknowledged_unresolved_burn_tx_hash,
-            )?;
-
-        let (underlying, network) = match &redemption {
-            Redemption::Burning { metadata, .. }
-            | Redemption::BurnIntended { metadata, .. }
-            | Redemption::BurnSubmitted { metadata, .. } => {
-                (metadata.underlying.clone(), metadata.network)
-            }
-            other => {
-                return Err(BurnManagerError::InvalidAggregateState {
-                    current_state: aggregate_state_name(other).to_string(),
-                });
-            }
+            )?
+        } else if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
+            return Err(
+                RedemptionError::UnexpectedUnresolvedBurnAcknowledgement {
+                    provided,
+                }
+                .into(),
+            );
+        } else {
+            None
         };
 
         let vault =
@@ -325,9 +365,39 @@ impl BurnManager {
             .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
             .await?;
 
+        // Without a persisted burn tx, the on-chain proof is the only anchor to
+        // THIS redemption. Bind it by amount: the proving tx must burn exactly
+        // the shares this redemption owes and return exactly its dust.
+        if persisted_burn_hash.is_none() {
+            let expected_burn = alpaca_quantity.to_u256_with_18_decimals()?;
+            if verification.shares_burned != expected_burn {
+                return Err(
+                    BurnManagerError::ForceCompleteBurnAmountMismatch {
+                        expected: expected_burn,
+                        found: verification.shares_burned,
+                    },
+                );
+            }
+
+            let expected_dust = dust_quantity.to_u256_with_18_decimals()?;
+            let returned_dust = verification
+                .share_transfers
+                .iter()
+                .try_fold(U256::ZERO, |total, transfer| {
+                    total.checked_add(transfer.shares)
+                })
+                .ok_or(BurnManagerError::SharesOverflow)?;
+            if returned_dust != expected_dust {
+                return Err(BurnManagerError::ForceCompleteDustMismatch {
+                    expected: expected_dust,
+                    found: returned_dust,
+                });
+            }
+        }
+
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_tx_hash = ?burn_tx_hash,
-            persisted_burn_tx_hash = ?persisted_burn_tx.hash,
+            persisted_burn_tx_hash = ?persisted_burn_hash,
             acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
             block_number = verification.block_number,
             shares_burned = %verification.shares_burned,
@@ -2289,6 +2359,16 @@ pub(crate) enum BurnManagerError {
          {issuer_request_id}; deferred to recovery"
     )]
     WalletIntentWaitExhausted { issuer_request_id: IssuerRedemptionRequestId },
+    #[error(
+        "Force-complete burn amount mismatch: redemption owes {expected} shares, \
+         proving tx burned {found}"
+    )]
+    ForceCompleteBurnAmountMismatch { expected: U256, found: U256 },
+    #[error(
+        "Force-complete dust mismatch: redemption returns {expected} dust shares, \
+         proving tx transferred {found}"
+    )]
+    ForceCompleteDustMismatch { expected: U256, found: U256 },
 }
 
 #[cfg(test)]
@@ -3006,13 +3086,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_force_complete_burn_rejects_burning_without_persisted_hash() {
+    async fn test_force_complete_burn_without_persisted_tx_rejects_amount_mismatch()
+     {
+        // The seeded redemption owes 100e18 shares. With no persisted tx to
+        // anchor against, a proving tx that burned a different amount must be
+        // rejected — the amount is the only binding to this redemption.
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let vault_mock = Arc::new(
             MockVaultService::new_success()
                 .with_verified_burn(45_989_009, uint!(17_U256)),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new_for_tests(
             vault_mock,
             pool.clone(),
@@ -3036,13 +3122,88 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(BurnManagerError::Redemption(
-                RedemptionError::PersistedBurnHashUnavailable
-            ))
+            Err(BurnManagerError::ForceCompleteBurnAmountMismatch {
+                expected,
+                found,
+            }) if expected == uint!(100_000000000000000000_U256)
+                && found == uint!(17_U256)
         ));
         assert!(matches!(
             load_aggregate(store, &issuer_request_id).await,
             Redemption::Burning { .. }
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_force_complete_burn_without_persisted_tx_records_matching_burn()
+     {
+        // The recovery-timeout case: the burn landed on-chain but no burn event
+        // was ever persisted. A proving tx burning exactly the owed shares
+        // terminalizes the redemption and settles its reservation.
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let expected_shares = uint!(100_000000000000000000_U256);
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burn(45_989_009, expected_shares),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock,
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        // Seed a held reservation so the test fails if force-complete stops
+        // settling inventory after terminalizing the aggregate.
+        harness.discover_receipt(vault, uint!(42_U256), expected_shares).await;
+        receipt_service
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: uint!(42_U256),
+                    shares_burned: expected_shares,
+                }],
+            )
+            .await
+            .expect("seeding reservation should succeed");
+
+        let verification = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                B256::random(),
+                "burn landed on-chain, never recorded".to_string(),
+                None,
+            )
+            .await
+            .expect("force-complete should succeed");
+
+        assert_eq!(verification.shares_burned, expected_shares);
+        assert!(matches!(
+            load_aggregate(store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert!(
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "force-complete must leave no dangling reservation"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Force-completing stuck Burning redemption", "verified on-chain"]
         ));
     }
 
