@@ -67,8 +67,9 @@ pub(crate) struct OrchestratorBurnResult {
 /// Evaluated allowance-first, then `vaultLogicIsExpected()`, then a burn
 /// simulation: an allowance shortfall is an actionable ops failure and must
 /// be reported even while the orchestrator is halted, and a deterministic
-/// `InsufficientReceipts` revert must be classified without ever submitting
-/// (gas estimation would reject the transaction at signing anyway).
+/// `InsufficientReceipts` revert must be classified here, before anything is
+/// signed — without the simulation, the revert would only surface as an
+/// unclassified failure of gas estimation during transaction preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OrchestratorBurnReadiness {
     Ready,
