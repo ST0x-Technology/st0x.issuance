@@ -8,12 +8,15 @@
 pub mod alpaca_mocks;
 
 use alloy::hex;
-use alloy::primitives::{Address, U256};
+use alloy::network::EthereumWallet;
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller,
     SimpleNonceManager,
 };
 use alloy::providers::{Identity, ProviderBuilder};
+use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use httpmock::Mock;
 use httpmock::prelude::*;
@@ -25,6 +28,7 @@ use std::net::SocketAddr;
 use url::Url;
 
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
+use st0x_issuance::bindings::IST0xOrchestratorV1;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
@@ -108,6 +112,59 @@ pub async fn wait_for_mock_hit(
     mock: &Mock<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_mock_hits(mock, 1).await
+}
+
+/// Polls the event store until the mint's terminal `MintCompleted` event is
+/// COMMITTED. A callback-mock hit alone is not terminality: the mock counts
+/// the request on arrival, while the service still has to process the
+/// response and persist `RecordCallbackSent -> MintCompleted` — a window a
+/// fast test can win locally and lose on a loaded CI runner. Anything that
+/// gates on the mint being terminal (service shutdown before a custody
+/// migration's quiescence check, restarts asserting no recovery work) must
+/// wait on this, not on the mock.
+pub async fn wait_for_mint_completed(
+    db_url: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await?;
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(15);
+    let poll_interval = tokio::time::Duration::from_millis(50);
+
+    loop {
+        let count = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Mint'
+              AND aggregate_id = ?
+              AND event_type = 'MintEvent::MintCompleted'
+            ",
+        )
+        .bind(issuer_request_id)
+        .fetch_one(&pool)
+        .await?;
+
+        if count >= 1 {
+            pool.close().await;
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            pool.close().await;
+            return Err(format!(
+                "Timeout waiting for MintCompleted on {issuer_request_id} \
+                 after {}s",
+                timeout.as_secs()
+            )
+            .into());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 pub async fn wait_for_mock_hits(
@@ -632,6 +689,86 @@ pub fn create_multichain_config_with_db(
     ];
 
     Ok((base_config, mock_subgraph))
+}
+
+/// Same as [`create_config_with_db`] but with a per-asset `VaultModeConfig`
+/// (orchestrator-mode overrides) instead of the all-vault-direct default.
+pub fn create_config_with_vault_modes(
+    db_path: &str,
+    mock_alpaca: &MockServer,
+    evm: &LocalEvm,
+    vault_mode_config: VaultModeConfig,
+) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
+    let (mut config, mock_subgraph) =
+        create_config_with_db(db_path, mock_alpaca, evm)?;
+    config.vault_mode_config = vault_mode_config;
+    Ok((config, mock_subgraph))
+}
+
+/// Mints `amount` share-wei of the primary vault's token to
+/// `recipient_signer`'s address through `orchestrator.mint()`, creating one
+/// orchestrator-custodied receipt per call. The recipient authorizes the mint
+/// by signing the orchestrator's EIP-712 digest; the bot wallet (deployer,
+/// `MINT_ROLE`) submits it.
+pub async fn orchestrator_mint_to(
+    evm: &LocalEvm,
+    orchestrator_address: Address,
+    recipient_signer: &PrivateKeySigner,
+    amount: U256,
+    nonce_seed: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
+    let provider = create_provider()
+        .wallet(EthereumWallet::from(bot_signer))
+        .connect(&evm.endpoint)
+        .await?;
+    let orchestrator =
+        IST0xOrchestratorV1::new(orchestrator_address, &provider);
+
+    let recipient = recipient_signer.address();
+    let nonce = B256::with_last_byte(nonce_seed);
+    let digest = orchestrator
+        .mintAuthDigest(evm.vault_address, recipient, amount, nonce)
+        .call()
+        .await?;
+    let signature = recipient_signer.sign_hash_sync(&digest)?;
+    let auth = IST0xOrchestratorV1::MintAuthV1 {
+        nonce,
+        signature: Bytes::from(signature.as_bytes().to_vec()),
+    };
+
+    orchestrator
+        .mint(evm.vault_address, recipient, amount, auth, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    Ok(())
+}
+
+/// The one-time unlimited ERC-20 approval ops issues at token onboarding so
+/// the orchestrator can pull the bot wallet's shares via `transferFrom`.
+pub async fn approve_orchestrator(
+    evm: &LocalEvm,
+    orchestrator_address: Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
+    let provider = create_provider()
+        .wallet(EthereumWallet::from(bot_signer))
+        .connect(&evm.endpoint)
+        .await?;
+    let vault =
+        OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider);
+
+    vault
+        .approve(orchestrator_address, U256::MAX)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    Ok(())
 }
 
 pub async fn setup_roles(

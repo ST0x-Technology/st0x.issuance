@@ -166,9 +166,10 @@ async fn mint_before_cutover(
     user_signer: &PrivateKeySigner,
     user_wallet: Address,
     mint_callback_mock: &Mock<'_>,
+    db_url: &str,
 ) -> Result<PreCutoverMint, Box<dyn std::error::Error>> {
     let account = harness::setup_account(client, user_wallet).await;
-    harness::perform_mint_and_confirm(
+    let issuer_request_id = harness::perform_mint_and_confirm(
         client,
         user_wallet,
         &account.client_id.to_string(),
@@ -188,6 +189,10 @@ async fn mint_before_cutover(
     let minted_shares =
         harness::wait_for_shares(&user_vault, user_wallet).await?;
     harness::wait_for_mock_hits(mint_callback_mock, 1).await?;
+    // The migration's quiescence gate counts non-terminal mints, so the
+    // service must not shut down until the terminal event is COMMITTED —
+    // the mock hit above only proves the callback request arrived.
+    harness::wait_for_mint_completed(db_url, &issuer_request_id).await?;
 
     Ok(PreCutoverMint {
         client_id: account.client_id.to_string(),
@@ -200,8 +205,9 @@ async fn mint_after_cutover(
     user_wallet: Address,
     client_id: &str,
     mint_callback_mock: &Mock<'_>,
+    db_url: &str,
 ) -> Result<U256, Box<dyn std::error::Error>> {
-    harness::perform_mint_and_confirm(
+    let issuer_request_id = harness::perform_mint_and_confirm(
         client,
         user_wallet,
         client_id,
@@ -210,6 +216,10 @@ async fn mint_after_cutover(
     )
     .await?;
     harness::wait_for_mock_hits(mint_callback_mock, 2).await?;
+    // Same terminality wait as `mint_before_cutover`: the rehearsal
+    // reverses the migration after the canaries, and its quiescence gate
+    // must find this mint terminal, not racing its final event write.
+    harness::wait_for_mint_completed(db_url, &issuer_request_id).await?;
 
     Ok(U256::from(25) * U256::from(10).pow(U256::from(18)))
 }
@@ -224,6 +234,7 @@ struct PostCutoverCanaries<'context, 'server> {
     mint_callback_mock: &'context Mock<'server>,
     redeem_mock: &'context Mock<'server>,
     poll_mock: &'context Mock<'server>,
+    db_url: &'context str,
 }
 
 impl PostCutoverCanaries<'_, '_> {
@@ -262,6 +273,7 @@ impl PostCutoverCanaries<'_, '_> {
             self.user_wallet,
             &self.pre_cutover_mint.client_id,
             self.mint_callback_mock,
+            self.db_url,
         )
         .await?;
         assert_eq!(
@@ -465,6 +477,7 @@ async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
         &user_signer,
         user_wallet,
         &mint_callback_mock,
+        &databases.fireblocks_url,
     )
     .await?;
 
@@ -547,6 +560,7 @@ async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
         mint_callback_mock: &mint_callback_mock,
         redeem_mock: &redeem_mock,
         poll_mock: &poll_mock,
+        db_url: &databases.turnkey_url,
     }
     .run()
     .await?;
@@ -835,6 +849,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
         &user_signer,
         user_wallet,
         &mint_callback_mock,
+        &databases.fireblocks_url,
     )
     .await?;
     fireblocks_client.terminate().await;
@@ -873,6 +888,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
         mint_callback_mock: &mint_callback_mock,
         redeem_mock: &redeem_mock,
         poll_mock: &poll_mock,
+        db_url: &databases.turnkey_url,
     }
     .run()
     .await?;
@@ -1044,6 +1060,7 @@ async fn test_cutover_without_receipt_transfer_cannot_burn_historical_shares()
         &user_signer,
         user_wallet,
         &mint_callback_mock,
+        &databases.fireblocks_url,
     )
     .await?;
     let (receipt_id, receipt_shares, _receipt_information) =
