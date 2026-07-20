@@ -217,14 +217,24 @@ endpoints.
 1. AP sends tokens to our redemption wallet → we detect transfer
 2. We call Alpaca's redeem endpoint
 3. We poll for journal completion
-4. We prepare and persist the exact signed vault burn multicall
+4. We prepare and persist the exact signed burn transaction
 5. We broadcast that transaction and confirm the on-chain burn
 
+Each redemption anchors its burn mode at detection from the per-asset
+`vault_mode` config (see SPEC.md "Orchestrator Migration"): vault-direct assets
+burn via the vault multicall against bot-held receipts; orchestrator assets burn
+via a single `ST0xOrchestrator.burn()` (the orchestrator walks its own receipts
+on-chain, with no receipt planning or reservation on our side).
+
 If the process stops after persisting or broadcasting a burn, startup and
-periodic recovery classify the persisted hash before acting. Recovery confirms
-a mined burn, re-broadcasts the same bytes while it can still land, and only
-signs a fresh-nonce replacement after the previous transaction is provably
-dead.
+periodic recovery classify the persisted hash before acting. Recovery confirms a
+mined burn, re-broadcasts the same bytes while it can still land, and only signs
+a fresh-nonce replacement after the previous transaction is provably dead. This
+automatic recovery only reconciles the outcome of already-signed transactions —
+burns that failed with a deterministic classification (`InsufficientReceipts`,
+`AllowanceInsufficient`) are never auto-retried; an operator fixes the
+underlying cause and re-drives them via the admin recovery endpoint
+(`ResumeBurn`).
 
 Receipt and redemption transfer backfills use durable per-vault checkpoints.
 Periodic receipt backfill keeps receipt checkpoints current during long uptime,
@@ -235,16 +245,20 @@ instead of rescanning the full configured historical range.
 
 ## Configuration
 
-Configuration is managed through environment variables. See `.env.example` for
-all available options.
+Configuration comes from two non-overlapping sources:
 
-Key configuration areas:
+- **Environment variables** (see `.env.example`) — everything except vault
+  modes: HTTP server settings, Alpaca API credentials, blockchain RPC endpoints,
+  signing backend, database connection, and operational parameters (gas limits,
+  poll intervals, etc.).
+- **The optional TOML config file** (path via the `--config` flag or the
+  `CONFIG` environment variable; see `config.example.toml`) — the only source of
+  per-asset vault modes: the `[orchestrator]` section and per-asset `vault_mode`
+  overrides. No environment variable sets vault modes. When the file is absent
+  (or has no orchestrator entries), every asset runs vault-direct.
 
-- HTTP server settings
-- Alpaca API credentials
-- Blockchain RPC endpoints
-- Database connection
-- Operational parameters (gas limits, poll intervals, etc.)
+Because the sources are disjoint there is no precedence between them; each
+setting has exactly one home.
 
 ## Testing Strategy
 

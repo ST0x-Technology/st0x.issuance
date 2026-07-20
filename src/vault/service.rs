@@ -833,8 +833,11 @@ impl VaultService for RealBlockchainService {
         }
 
         // Simulate the burn so a deterministic revert is classified before
-        // any signing: gas estimation would reject the transaction anyway,
-        // surfacing only an unclassified preparation failure.
+        // anything is signed. This simulation is the classification
+        // mechanism: gas estimation is a separate RPC step in the prepare
+        // fill pipeline whose failure on a reverting burn surfaces only as
+        // an unclassified preparation error, and a supplied gas limit would
+        // skip estimation and sign a doomed transaction.
         let Err(error) = orchestrator_contract
             .burn(token, amount, Bytes::new())
             .from(owner)
