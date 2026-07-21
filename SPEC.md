@@ -1610,18 +1610,42 @@ with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
 the schedule mechanism both the manual admin endpoint and the automated
 corporate-actions sourcing feed.
 
-**Corporate-actions sourcing.** A periodic sync (every 6 hours) lists upcoming
-dividend announcements from Alpaca's Corporate Actions Announcements API
-(`GET /v1/corporate_actions/announcements`, filtered to `ca_types=dividend` /
-`date_type=ex_date`, 89-day horizon) and arms one freeze window per supported
-asset per ex-date through the same scheduler. The window is the full UTC ex-date
-day — freeze at ex-date 00:00 UTC, unfreeze at 00:00 UTC the next day — which
-brackets the US/Eastern trading session on both sides. Announcements for symbols
-we do not tokenize, announcements whose ex-date is not yet set, and windows that
-already elapsed are skipped; a failed pass is retried at the next interval, and
-because re-arming the same window is an idempotent no-op the sync needs no state
-of its own. The issuer CLI owns an independent operator hold and cannot release
-a corporate-action window's hold.
+**Corporate-actions sourcing.** Issuance consumes Alpaca's corporate-actions SSE
+stream as an authenticated, durable mutation source. The accepted contract is
+exactly US-region `cash_dividend_corporateaction_event` and
+`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
+`delete`; any other discriminator, region, malformed identity, or invalid date
+is a typed poison boundary and cannot advance the cursor. Each action's stable
+Alpaca ID owns one source hold and one current schedule revision, so updates
+replace that action's prior window and deletes release only that action's hold.
+An operator hold or another action on the same underlying is never affected.
+
+The window is the full UTC ex-date day — freeze at ex-date 00:00 UTC and
+unfreeze at 00:00 UTC the next day — which brackets the US/Eastern trading
+session on both sides. An immediate idempotent alignment job reconciles a new
+revision against the current time and underlying before its boundary jobs run.
+The projection transaction persists the mutation, action revision, pending
+alignment marker, and replay cursor together. Apalis jobs and aggregate hold
+events are recoverable second-phase effects; startup aligns every pending
+revision before reconnecting.
+
+Event IDs are canonical uppercase ULIDs ordered by their encoded value. An exact
+replay is a duplicate; an unseen lower ID is a cursor regression. Before a
+poison or regression stops the feed, issuance persists its event ID and typed
+reason, and startup refuses to reconnect while that blocked boundary remains.
+The first install requests history with `since=1970-01-01T00:00:00Z`. Subsequent
+connections use inclusive `since_id=<committed-event-id>` replay, and the first
+data frame must echo that cursor. A rejected anchor or non-echoing first frame
+is a replay gap: no later or live event is accepted.
+
+Repairing a replay-retention gap is an explicit fail-closed operation, never a
+cursor reset. While minting remains gated, the repair buffers a newly connected
+live stream durably, exhausts a paginated current-action GET snapshot for the
+accepted US dividend types, rebuilds source-owned schedules and holds, applies
+the buffered mutations in order, and atomically establishes the resulting
+cursor. Normal consumption resumes only after pending alignment completes;
+incomplete pagination, buffer overflow, disconnect, or an invalid row aborts
+repair.
 
 **Operator lifecycle notifications.** The V1 corporate-actions workflow sends
 operator notifications to the same Telegram chat, topic, and bot used by the
