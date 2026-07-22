@@ -931,9 +931,11 @@ fn ambiguous_prior_burn_status(
 }
 
 /// Logs each recovery outcome at a severity matching what actually happened and
-/// returns the operator-facing message. Only `SkippedManualIntervention` leaves
-/// the redemption unresolved, so it alone warns; the other outcomes describe
-/// their distinct resolutions without ever claiming a burn that didn't run.
+/// returns the operator-facing message. `SkippedManualIntervention` and
+/// `DeferredUnderfunded` leave the redemption unresolved, so they warn — with
+/// distinct messages, because their resolutions differ (manual force-complete/
+/// close vs. funding the wallet); the other outcomes describe their distinct
+/// resolutions without ever claiming a burn that didn't run.
 fn report_recovery_outcome(
     outcome: RecoveryOutcome,
     aggregate_id: &str,
@@ -957,6 +959,15 @@ fn report_recovery_outcome(
             );
             "Recovered to Burning but burn skipped: on-chain balance \
              insufficient, manual intervention required"
+        }
+        RecoveryOutcome::DeferredUnderfunded => {
+            warn!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
+                "Recovered redemption to Burning but the orchestrator burn \
+                 is deferred: wallet balance below the burn amount"
+            );
+            "Recovered to Burning but burn deferred: wallet balance below \
+             the burn amount; recovery retries automatically once the \
+             wallet is funded"
         }
         RecoveryOutcome::AlreadyAdvanced => {
             info!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
