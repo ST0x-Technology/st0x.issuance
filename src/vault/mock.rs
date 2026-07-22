@@ -25,6 +25,7 @@ use super::{
 #[cfg(test)]
 use super::{OrchestratorRevertReason, VerifiedBurn, VerifiedShareTransfer};
 use crate::redemption::BurnExternalTxId;
+use crate::vault::orchestrator::BurnProofKind;
 use crate::vault::{SendableTxWithHash, TxId};
 
 #[cfg(test)]
@@ -225,6 +226,8 @@ pub(crate) struct MockVaultService {
     /// Optional forced `submit_mint` error (e.g. uncertain broadcast).
     #[cfg(test)]
     submit_mint_error: Arc<Mutex<Option<VaultError>>>,
+    #[cfg(test)]
+    last_burn_proof_kind: Arc<Mutex<Option<BurnProofKind>>>,
 }
 
 impl MockVaultService {
@@ -281,6 +284,8 @@ impl MockVaultService {
             confirm_mint_outcomes: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             submit_mint_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            last_burn_proof_kind: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -469,6 +474,7 @@ impl MockVaultService {
         self.orchestrator.submit_call_count.store(0, Ordering::Relaxed);
         self.orchestrator.readiness_call_count.store(0, Ordering::Relaxed);
         *self.orchestrator.pending_result.lock().unwrap() = None;
+        *self.last_burn_proof_kind.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -727,6 +733,11 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn orchestrator_readiness_call_count(&self) -> usize {
         self.orchestrator.readiness_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_last_burn_proof_kind(&self) -> Option<BurnProofKind> {
+        *self.last_burn_proof_kind.lock().unwrap()
     }
 }
 
@@ -1121,11 +1132,13 @@ impl VaultService for MockVaultService {
         _vault: Address,
         _owner: Address,
         tx_hash: B256,
+        expected_proof: BurnProofKind,
     ) -> Result<BurnVerification, VaultError> {
         #[cfg(test)]
         {
             use MockVerifyBurn::{NotABurn, Reverted, Verified};
 
+            *self.last_burn_proof_kind.lock().unwrap() = Some(expected_proof);
             self.verify_burn_call_count.fetch_add(1, Ordering::Relaxed);
             let outcome = self.verify_burn.lock().unwrap().clone();
             match outcome {
@@ -1447,6 +1460,7 @@ mod tests {
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::redemption::IssuerRedemptionRequestId;
+    use crate::vault::orchestrator::BurnProofKind;
     use crate::vault::{
         BurnRequestOrigin, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
         SendableTxWithHash, VaultError, VaultService,
@@ -1724,9 +1738,14 @@ mod tests {
         mock.prepare_replacement_burn_tx(params.owner, &sendable_tx)
             .await
             .unwrap();
-        mock.verify_burn_tx(test_vault(), test_receiver(), B256::ZERO)
-            .await
-            .unwrap();
+        mock.verify_burn_tx(
+            test_vault(),
+            test_receiver(),
+            B256::ZERO,
+            BurnProofKind::VaultDirect,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(mock.get_multi_burn_call_count(), 2);
         assert!(mock.get_last_multi_burn_params().is_some());
@@ -1735,6 +1754,10 @@ mod tests {
         assert_eq!(mock.burn_classification_call_count(), 1);
         assert_eq!(mock.burn_preparation_call_count(), 1);
         assert_eq!(mock.replacement_preparation_call_count(), 1);
+        assert_eq!(
+            mock.get_last_burn_proof_kind(),
+            Some(BurnProofKind::VaultDirect)
+        );
 
         mock.reset();
 
@@ -1745,9 +1768,33 @@ mod tests {
         assert_eq!(mock.burn_classification_call_count(), 0);
         assert_eq!(mock.burn_preparation_call_count(), 0);
         assert_eq!(mock.replacement_preparation_call_count(), 0);
+        assert!(mock.get_last_burn_proof_kind().is_none());
         assert_eq!(
             mock.prepare_burn_tx(&test_multi_burn_params()).await.unwrap(),
             SendableTxWithHash::default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_burn_tx_records_last_proof_kind() {
+        let mock = MockVaultService::new_success();
+        let orchestrator =
+            address!("0xcccccccccccccccccccccccccccccccccccccccc");
+
+        assert!(mock.get_last_burn_proof_kind().is_none());
+
+        mock.verify_burn_tx(
+            test_vault(),
+            test_receiver(),
+            B256::ZERO,
+            BurnProofKind::Orchestrator { address: orchestrator },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.get_last_burn_proof_kind(),
+            Some(BurnProofKind::Orchestrator { address: orchestrator })
         );
     }
 
