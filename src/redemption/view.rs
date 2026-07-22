@@ -295,6 +295,7 @@ impl RedemptionView {
 }
 
 impl RedemptionView {
+    #[allow(clippy::too_many_lines)]
     fn apply(self, event: &RedemptionEvent) -> Self {
         match event {
             RedemptionEvent::Detected {
@@ -453,6 +454,13 @@ impl RedemptionView {
                 completed_at: *burned_at,
             },
             RedemptionEvent::ExistingBurnRecovered {
+                issuer_request_id,
+                tx_hash,
+                block_number,
+                recovered_at,
+                ..
+            }
+            | RedemptionEvent::OrchestratorBurnRecovered {
                 issuer_request_id,
                 tx_hash,
                 block_number,

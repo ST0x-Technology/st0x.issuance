@@ -18,6 +18,7 @@ use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
 use crate::auth::InternalAuth;
+use crate::config::VaultMode;
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
     MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
@@ -32,9 +33,9 @@ use crate::redemption::burn_manager::{
     RecoveryOutcome,
 };
 use crate::redemption::{
-    BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, RedemptionCommand,
-    RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
-    find_stuck as find_stuck_redemptions,
+    BurnExternalTxId, BurnRecord, ExistingBurnProof, IssuerRedemptionRequestId,
+    RedemptionCommand, RedemptionError, RedemptionEvent, RedemptionMetadata,
+    RedemptionView, find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
@@ -585,10 +586,10 @@ async fn recover_post_alpaca(
         store,
         vault_service,
         &aggregate_id,
-        &issuer_request_id,
-        &metadata.detected_tx_hash,
+        &metadata,
         burning_failed.as_ref(),
         burn_retry_external_tx_id,
+        &alpaca_data.dust_quantity,
     )
     .await?
     {
@@ -667,16 +668,21 @@ enum PriorBurnDisposition {
 /// Inspects the prior tx (if any) from a previous `BurningFailed` event to
 /// decide whether the on-chain burn already succeeded (record it), conclusively
 /// reverted (resume with a fresh replacement `externalTxId`), or remains
-/// ambiguous (require manual intervention).
+/// ambiguous (require manual intervention). The confirmation is mode-scoped on
+/// the redemption's persisted `burn_mode`: vault-direct confirms via a receipt
+/// lookup, orchestrator via the orchestrator's `Burned` event.
 async fn inspect_prior_burn(
     store: &Store<Redemption>,
     vault_service: &Arc<dyn VaultService>,
     aggregate_id: &str,
-    issuer_request_id: &IssuerRedemptionRequestId,
-    detected_tx_hash: &B256,
+    metadata: &RedemptionMetadata,
     burning_failed: Option<&BurningFailedData>,
     burn_retry_external_tx_id: Option<BurnExternalTxId>,
+    dust_quantity: &Quantity,
 ) -> Result<PriorBurnDisposition, Status> {
+    let issuer_request_id = &metadata.issuer_request_id;
+    let detected_tx_hash = &metadata.detected_tx_hash;
+
     let Some(bf_data) = burning_failed else {
         return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
     };
@@ -684,98 +690,200 @@ async fn inspect_prior_burn(
         return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
     };
 
-    match vault_service.check_tx(tx_id).await {
-        Ok(receipt) => {
-            let Some(block_number) = receipt.block_number() else {
-                error!(target: "admin", aggregate_id = %aggregate_id,
+    match metadata.burn_mode {
+        VaultMode::VaultDirect => match vault_service.check_tx(tx_id).await {
+            Ok(receipt) => {
+                let Some(block_number) = receipt.block_number() else {
+                    error!(target: "admin", aggregate_id = %aggregate_id,
+                        tx_hash = ?tx_id,
+                        "Completed burn transaction receipt is missing block number"
+                    );
+                    return Err(Status::InternalServerError);
+                };
+
+                if bf_data.planned_burns.is_empty() {
+                    warn!(target: "admin", aggregate_id = %aggregate_id,
+                        tx_hash = ?tx_id,
+                        "BurningFailed event has no planned_burns — \
+                         burn records will be empty. Manual receipt inventory \
+                         reconciliation may be needed after recovery."
+                    );
+                }
+
+                info!(target: "admin", aggregate_id = %aggregate_id,
                     tx_hash = ?tx_id,
-                    "Completed burn transaction receipt is missing block number"
+                    "Transaction already completed on-chain, recording existing burn"
                 );
-                return Err(Status::InternalServerError);
-            };
 
-            if bf_data.planned_burns.is_empty() {
-                warn!(target: "admin", aggregate_id = %aggregate_id,
-                    tx_hash = ?tx_id,
-                    "BurningFailed event has no planned_burns — \
-                     burn records will be empty. Manual receipt inventory \
-                     reconciliation may be needed after recovery."
-                );
-            }
-
-            info!(target: "admin", aggregate_id = %aggregate_id,
-                tx_hash = ?tx_id,
-                "Transaction already completed on-chain, recording existing burn"
-            );
-
-            store
-                .send(
+                record_existing_burn(
+                    store,
+                    aggregate_id,
                     issuer_request_id,
-                    RedemptionCommand::RecordExistingBurn {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tx_id: tx_id.clone(),
-                        tx_hash: receipt.transaction_hash(),
-                        planned_burns: bf_data.planned_burns.clone(),
-                        block_number,
+                    tx_id,
+                    receipt.transaction_hash(),
+                    ExistingBurnProof::VaultDirect {
+                        burns: bf_data.planned_burns.clone(),
                     },
+                    block_number,
                 )
                 .await
-                .map_err(|err| {
-                    error!(target: "admin", aggregate_id = %aggregate_id,
-                        error = %err,
-                        "Failed to record existing burn"
+            }
+            Err(VaultError::Reverted { .. }) => Ok(resume_after_reverted_burn(
+                aggregate_id,
+                detected_tx_hash,
+                tx_id,
+                burn_retry_external_tx_id,
+            )),
+            Err(error) => Err(ambiguous_prior_burn_status(
+                aggregate_id,
+                issuer_request_id,
+                tx_id,
+                &error,
+            )),
+        },
+        VaultMode::Orchestrator { .. } => {
+            match vault_service.confirm_orchestrator_burn(tx_id).await {
+                Ok(result) => {
+                    let dust_retained = dust_quantity
+                        .to_u256_with_18_decimals()
+                        .map_err(|err| {
+                            error!(target: "admin", aggregate_id = %aggregate_id,
+                                error = %err,
+                                "Failed to convert dust quantity for orchestrator recovery"
+                            );
+                            Status::InternalServerError
+                        })?;
+
+                    info!(target: "admin", aggregate_id = %aggregate_id,
+                        tx_hash = %result.tx_hash,
+                        "Orchestrator burn already completed on-chain, recording existing burn"
                     );
-                    map_redemption_error(&err)
-                })?;
 
-            Ok(PriorBurnDisposition::AlreadyRecorded(ReprocessResponse {
-                aggregate_type: AggregateKind::Redemption,
-                aggregate_id: aggregate_id.to_string(),
-                previous_state: "Failed".to_string(),
-                message: "Existing on-chain burn recorded via tx lookup"
-                    .to_string(),
-            }))
+                    record_existing_burn(
+                        store,
+                        aggregate_id,
+                        issuer_request_id,
+                        tx_id,
+                        result.tx_hash,
+                        ExistingBurnProof::Orchestrator {
+                            shares_burned: result.shares_burned,
+                            burn_range: result.burn_range,
+                            dust_retained,
+                        },
+                        result.block_number,
+                    )
+                    .await
+                }
+                Err(
+                    VaultError::OrchestratorReverted { .. }
+                    | VaultError::Reverted { .. },
+                ) => Ok(resume_after_reverted_burn(
+                    aggregate_id,
+                    detected_tx_hash,
+                    tx_id,
+                    burn_retry_external_tx_id,
+                )),
+                Err(error) => Err(ambiguous_prior_burn_status(
+                    aggregate_id,
+                    issuer_request_id,
+                    tx_id,
+                    &error,
+                )),
+            }
         }
-        Err(VaultError::Reverted { .. }) => {
-            // The terminally failed tx permanently reserves its externalTxId,
-            // so the replacement burn must never reuse the base id. When event
-            // history has no recorded retry id, fall back to retry-1 — mirror
-            // of the startup recovery path in BurnManager.
-            let retry_external_tx_id =
-                burn_retry_external_tx_id.or_else(|| {
-                    Some(Redemption::retry_burn_external_tx_id_typed(
-                        detected_tx_hash,
-                        1,
-                    ))
-                });
+    }
+}
 
-            info!(target: "admin", aggregate_id = %aggregate_id,
-                tx_hash = %tx_id,
-                retry_external_tx_id = ?retry_external_tx_id,
-                "Transaction reverted onchain, proceeding with ResumeBurn"
-            );
-
-            Ok(PriorBurnDisposition::ResumeWith(retry_external_tx_id))
-        }
-        Err(VaultError::MissingBlockNumber { tx_hash }) => {
-            // A successful receipt without inclusion proof is a data-integrity
-            // failure, not an ambiguous prior-burn outcome — operators must
-            // investigate the RPC/receipt, not treat it as a 422 resume block.
+/// Sends `RecordExistingBurn` for a prior burn confirmed on-chain and returns
+/// the `AlreadyRecorded` disposition. Shared by both modes; the proof variant
+/// is already mode-specific.
+async fn record_existing_burn(
+    store: &Store<Redemption>,
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    tx_id: &TxId,
+    tx_hash: B256,
+    proof: ExistingBurnProof,
+    block_number: u64,
+) -> Result<PriorBurnDisposition, Status> {
+    store
+        .send(
+            issuer_request_id,
+            RedemptionCommand::RecordExistingBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id: tx_id.clone(),
+                tx_hash,
+                proof,
+                block_number,
+            },
+        )
+        .await
+        .map_err(|err| {
             error!(target: "admin", aggregate_id = %aggregate_id,
-                %tx_hash,
-                "Completed burn transaction receipt is missing block number"
+                error = %err,
+                "Failed to record existing burn"
             );
-            Err(Status::InternalServerError)
-        }
-        Err(error) => {
-            warn!(target: "admin", aggregate_id = %aggregate_id,
-                issuer_request_id = %issuer_request_id,
-                %tx_id,
-                error = %error,
-                "Prior burn outcome is ambiguous; manual intervention required"
-            );
-            Err(Status::UnprocessableEntity)
-        }
+            map_redemption_error(&err)
+        })?;
+
+    Ok(PriorBurnDisposition::AlreadyRecorded(ReprocessResponse {
+        aggregate_type: AggregateKind::Redemption,
+        aggregate_id: aggregate_id.to_string(),
+        previous_state: "Failed".to_string(),
+        message: "Existing on-chain burn recorded via tx lookup".to_string(),
+    }))
+}
+
+/// Resolves a conclusively reverted prior burn to a `ResumeWith` disposition
+/// carrying a fresh replacement `externalTxId`. The terminally failed tx
+/// permanently reserves its `externalTxId`, so the replacement burn must never
+/// reuse the base id; when event history has no recorded retry id, fall back to
+/// retry-1 — mirror of the startup recovery path in `BurnManager`.
+fn resume_after_reverted_burn(
+    aggregate_id: &str,
+    detected_tx_hash: &B256,
+    tx_id: &TxId,
+    burn_retry_external_tx_id: Option<BurnExternalTxId>,
+) -> PriorBurnDisposition {
+    let retry_external_tx_id = burn_retry_external_tx_id.or_else(|| {
+        Some(Redemption::retry_burn_external_tx_id_typed(detected_tx_hash, 1))
+    });
+
+    info!(target: "admin", aggregate_id = %aggregate_id,
+        tx_hash = %tx_id,
+        retry_external_tx_id = ?retry_external_tx_id,
+        "Transaction reverted onchain, proceeding with ResumeBurn"
+    );
+
+    PriorBurnDisposition::ResumeWith(retry_external_tx_id)
+}
+
+/// Maps a non-revert confirmation error to the operator-facing status: a
+/// missing block number is an internal fault, anything else is an ambiguous
+/// outcome needing manual intervention. Shared by both modes.
+fn ambiguous_prior_burn_status(
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    tx_id: &TxId,
+    error: &VaultError,
+) -> Status {
+    if let VaultError::MissingBlockNumber { tx_hash } = error {
+        // A successful receipt without inclusion proof is a data-integrity
+        // failure, not an ambiguous prior-burn outcome — operators must
+        // investigate the RPC/receipt, not treat it as a 422 resume block.
+        error!(target: "admin", aggregate_id = %aggregate_id,
+            %tx_hash,
+            "Completed burn transaction receipt is missing block number"
+        );
+        Status::InternalServerError
+    } else {
+        warn!(target: "admin", aggregate_id = %aggregate_id,
+            issuer_request_id = %issuer_request_id,
+            %tx_id,
+            error = %error,
+            "Prior burn outcome is ambiguous; manual intervention required"
+        );
+        Status::UnprocessableEntity
     }
 }
 
@@ -2057,7 +2165,9 @@ mod tests {
     use alloy::consensus::{
         Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
     };
-    use alloy::primitives::{Address, B256, Bloom, Bytes, U256, address, b256};
+    use alloy::primitives::{
+        Address, B256, Bloom, Bytes, U256, address, b256, uint,
+    };
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -3613,6 +3723,250 @@ mod tests {
         assert!(logs_contain_at!(
             Level::INFO,
             &[&aggregate_id, "recording existing burn"]
+        ));
+    }
+
+    /// Drives an orchestrator-mode redemption to `BurnFailed` with the given
+    /// submitted transaction id, mirroring `setup_burn_failure` but on the
+    /// orchestrator burn path.
+    async fn setup_orchestrator_burn_failure(
+        store: &Store<Redemption>,
+        tx_id: TxId,
+    ) -> (RedemptionMetadata, AlpacaCalledData) {
+        let metadata = RedemptionMetadata {
+            burn_mode: VaultMode::Orchestrator {
+                address: address!("0x00000000000000000000000000000000000000aa"),
+            },
+            ..test_metadata()
+        };
+        // 10⁻⁹ tokens of dust, retained in the bot wallet, so the recorded
+        // `dust_retained` proves the 18-decimal conversion.
+        let alpaca_data = AlpacaCalledData {
+            dust_quantity: Quantity::new(Decimal::new(1, 9)),
+            ..test_alpaca_data()
+        };
+        let token = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let external_tx_id =
+            Some(BurnExternalTxId::base(&metadata.detected_tx_hash));
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    burn_mode: metadata.burn_mode,
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    network: Network::Base,
+                },
+            )
+            .await
+            .expect("Detect failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token,
+                        amount: U256::from(100),
+                        owner: Address::ZERO,
+                    },
+                    external_tx_id: external_tx_id.clone(),
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token,
+                        amount: U256::from(100),
+                        owner: Address::ZERO,
+                    },
+                    external_tx_id,
+                },
+            )
+            .await
+            .expect("BurnTokens failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    error: "orchestrator burn terminally failed".to_string(),
+                    tx_id: Some(tx_id),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
+
+        (metadata, alpaca_data)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_records_orchestrator_burn_when_already_landed() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) =
+            setup_orchestrator_burn_failure(&store, tx_id).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(body.contains("Existing on-chain burn recorded"));
+        assert_eq!(burn_recovery.calls(), 0);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(redemption, Redemption::Completed { .. }));
+        // `fetch_one` fails on zero rows, so this doubles as the
+        // exactly-one-recovery-event existence check.
+        let payload: String = sqlx::query_scalar(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::OrchestratorBurnRecovered'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let event: RedemptionEvent = serde_json::from_str(&payload).unwrap();
+        let RedemptionEvent::OrchestratorBurnRecovered {
+            dust_retained, ..
+        } = event
+        else {
+            panic!("expected OrchestratorBurnRecovered event");
+        };
+        // The redemption's own persisted 10⁻⁹-token dust in 18-decimal
+        // share-wei — recorded from state, not from the on-chain result.
+        assert_eq!(dust_retained, uint!(1_000_000_000_U256));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "recording existing burn"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_resumes_orchestrator_burn_when_reverted() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) =
+            setup_orchestrator_burn_failure(&store, tx_id).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success().with_orchestrator_confirm_revert(
+                crate::vault::OrchestratorRevertReason::Unknown,
+            ),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            burn_recovery.calls(),
+            1,
+            "a reverted prior burn must resume and re-drive the burn"
+        );
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        let Redemption::Burning { external_tx_id, .. } = redemption else {
+            panic!("expected Burning state, got {redemption:?}");
+        };
+        // The reverted transaction permanently reserves the base externalTxId,
+        // so the resume must carry the retry-1 fallback (mirrors the
+        // vault-direct counterpart assertion).
+        assert_eq!(
+            external_tx_id,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &metadata.detected_tx_hash,
+                1,
+            )),
+            "a reverted orchestrator burn must not reuse the base externalTxId"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "reverted onchain, proceeding with ResumeBurn"]
         ));
     }
 
