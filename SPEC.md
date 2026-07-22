@@ -710,9 +710,9 @@ token symbol) stays on `TokenizedAsset`.
 
 **Aggregate State:**
 
-- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty set
-  of typed, independently owned `FreezeHoldId`s. Mints are rejected across all
-  networks while any hold remains, but listings stay supported and in-flight
+- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty
+  set of typed, independently owned `FreezeHoldId`s. Mints are rejected across
+  all networks while any hold remains, but listings stay supported and in-flight
   redemptions still complete.
 
 A stream originates on the first legacy `Frozen` or new `FreezeHoldAcquired`
@@ -925,22 +925,35 @@ scheduler itself so every schedule source inherits it); an inverted or
 sub-second window is rejected with 422 (apalis schedules at second granularity,
 so a sub-second window has no defined execution order); a fully elapsed window
 is rejected rather than flapping the asset; a `freeze_at` already in the past
-with `unfreeze_at` still ahead (window in progress) freezes immediately. This
-is the schedule mechanism both the manual admin endpoint and the automated
-corporate-actions sourcing feed.
+with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
+the manual/operator schedule mechanism; the automated corporate-actions feed
+uses the same underlying freeze-hold commands through its own action-keyed
+alignment jobs.
 
-**Corporate-actions sourcing.** A periodic sync (every 6 hours) lists upcoming
-dividend announcements from Alpaca's Corporate Actions Announcements API
-(`GET /v1/corporate_actions/announcements`, filtered to `ca_types=dividend` /
-`date_type=ex_date`, 89-day horizon) and arms one freeze window per supported
-asset per ex-date through the same scheduler. The window is the full UTC ex-date
-day — freeze at ex-date 00:00 UTC, unfreeze at 00:00 UTC the next day — which
-brackets the US/Eastern trading session on both sides. Announcements for symbols
-we do not tokenize, announcements whose ex-date is not yet set, and windows that
-already elapsed are skipped; a failed pass is retried at the next interval, and
-because re-arming the same window is an idempotent no-op the sync needs no state
-of its own. The issuer CLI owns an independent operator hold and cannot release
-a corporate-action window's hold.
+**Corporate-actions sourcing.** A long-lived Alpaca Market Data SSE stream
+(`GET /v1beta1/events/corporate-actions`, filtered to cash- and stock-dividend
+event types with `region=us`) delivers `insert`, `update`, and `delete`
+mutations. Issuance persists every accepted event ID, projects the latest
+revision per Alpaca corporate-action ID, and reconnects with replay from the
+stored cursor. Replay is inclusive, so duplicate event IDs are no-ops; a cursor
+regression or invalid stored cursor fails closed instead of silently advancing.
+The window is the full UTC ex-date day — freeze at ex-date 00:00 UTC, unfreeze
+at 00:00 UTC the next day — which brackets the US/Eastern trading session on
+both sides.
+
+Each projected revision enqueues durable `AlignCorporateActionFreeze` jobs keyed
+by action ID and event ID. Insert/update alignment acquires exactly the
+Alpaca-owned hold derived from that action ID when the current revision is
+inside its active window, releases the same hold from any superseded underlying,
+and never touches the independent operator hold. A delete revision, an elapsed
+revision, or a revision whose current underlying is not listed schedules
+release-only alignment so any previous action-owned hold is removed without
+arming a new unsupported freeze. At startup, `Running` transition and alignment
+jobs reset to `Pending`; `Killed` or exhausted alignment jobs are re-armed from
+attempt zero because the projected revision is still unreconciled operationally;
+`Done` alignment jobs and terminal transition jobs are vacuumed, with dead
+transitions logged before removal. The issuer CLI owns an independent operator
+hold and cannot release a corporate-action action hold.
 
 **Operator lifecycle notifications.** The V1 corporate-actions workflow sends
 operator notifications to the same Telegram chat, topic, and bot used by the

@@ -39,7 +39,7 @@ alloy = { version = "1.0.41", features = [
 ] }
 rust_decimal = { version = "1.39.0", features = ["serde"] }
 tokio = { workspace = true, features = ["time"] }
-reqwest = { workspace = true, features = ["blocking", "gzip"] }
+reqwest = { workspace = true, features = ["blocking", "gzip", "stream"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-opentelemetry = "0.31.0"
 opentelemetry = "0.30.0"

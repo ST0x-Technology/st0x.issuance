@@ -47,6 +47,18 @@ pub type TestProviderBuilder = ProviderBuilder<
     >,
 >;
 
+fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
+    mock_alpaca.mock(|when, then| {
+        when.method(GET).path("/v1beta1/events/corporate-actions");
+        then.status(200).header("content-type", "text/event-stream").body("");
+    });
+
+    format!(
+        "{}/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us",
+        mock_alpaca.base_url()
+    )
+}
+
 pub async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
     wallet: Address,
@@ -574,6 +586,8 @@ pub fn create_config_with_db(
                 api_secret: "test-secret".to_string(),
                 connect_timeout_secs: 10,
                 request_timeout_secs: 30,
+                corporate_actions_stream_url:
+                    setup_corporate_actions_stream_mock(mock_alpaca),
             },
             subgraph_url: subgraph_url.clone(),
             chains: vec![ChainConfig {

@@ -509,8 +509,13 @@ pub async fn initialize_rocket_with_notifications(
 
     spawn_freeze_schedule_worker(
         apalis_pool.clone(),
-        underlying_store,
+        underlying_store.clone(),
         lifecycle_notifier.clone(),
+    );
+    spawn_corporate_action_freeze_worker(
+        apalis_pool.clone(),
+        underlying_store,
+        pool.clone(),
     );
     spawn_lifecycle_notification_worker(
         apalis_pool.clone(),
@@ -522,13 +527,15 @@ pub async fn initialize_rocket_with_notifications(
         pool.clone(),
     );
 
-    tokenized_asset::corporate_actions::spawn_corporate_actions_sync(
-        tokenized_asset::corporate_actions::CorporateActionsSync::new(
-            alpaca_service.clone(),
-            freeze_scheduler.clone(),
+    let corporate_action_feed =
+        tokenized_asset::corporate_action_feed::CorporateActionFeed::new(
+            &config.alpaca,
             pool.clone(),
+            &apalis_pool,
             lifecycle_notifier.clone(),
-        ),
+        )?;
+    tokenized_asset::corporate_action_feed::spawn_corporate_action_feed(
+        corporate_action_feed,
     );
 
     Ok(build_rocket(RocketState {
@@ -1876,6 +1883,24 @@ fn spawn_lifecycle_notification_worker(
         Arc::new(notifications::LifecycleNotificationJobCtx { notifier }),
         "lifecycle-notification-worker",
         target: "notifications",
+    );
+}
+
+fn spawn_corporate_action_freeze_worker(
+    apalis_pool: ApalisSqlitePool,
+    underlying_store: Arc<Store<Underlying>>,
+    pool: Pool<Sqlite>,
+) {
+    spawn_drainer_worker!(
+        ::<tokenized_asset::schedule::CorporateActionFreezeCtx,
+            tokenized_asset::schedule::AlignCorporateActionFreeze>,
+        apalis_pool,
+        Arc::new(tokenized_asset::schedule::CorporateActionFreezeCtx {
+            underlying_store,
+            pool,
+        }),
+        "corporate-action-freeze-worker",
+        target: "asset",
     );
 }
 

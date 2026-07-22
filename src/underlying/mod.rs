@@ -17,6 +17,8 @@ use std::collections::BTreeSet;
 use st0x_issuance_dto::TokenizedAssetStatus;
 pub use st0x_issuance_dto::UnderlyingSymbol;
 
+use crate::tokenized_asset::CorporateActionId;
+
 /// Whether an underlying accepts new mints, on any network.
 ///
 /// `Frozen` gates *only* new minting — every listing of a frozen underlying
@@ -77,7 +79,7 @@ impl FreezeWindow {
 
 /// Stable identity of one independent requirement to keep an underlying frozen.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
 pub(crate) struct FreezeHoldId(FreezeHoldSource);
 
@@ -90,22 +92,30 @@ impl FreezeHoldId {
         Self(FreezeHoldSource::CorporateAction(window))
     }
 
-    pub(crate) fn is_expired_at(self, now: DateTime<Utc>) -> bool {
-        match self.0 {
-            FreezeHoldSource::Operator => false,
+    pub(crate) const fn alpaca_corporate_action(
+        action_id: CorporateActionId,
+    ) -> Self {
+        Self(FreezeHoldSource::AlpacaCorporateAction(action_id))
+    }
+
+    pub(crate) fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        match &self.0 {
             FreezeHoldSource::CorporateAction(window) => {
                 window.unfreeze_at() <= now
             }
+            FreezeHoldSource::Operator
+            | FreezeHoldSource::AlpacaCorporateAction(_) => false,
         }
     }
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
 enum FreezeHoldSource {
     Operator,
     CorporateAction(FreezeWindow),
+    AlpacaCorporateAction(CorporateActionId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -324,7 +334,9 @@ impl EventSourced for Underlying {
             }),
             UnderlyingEvent::FreezeHoldAcquired { hold_id, .. } => Some(Self {
                 freeze_state: FreezeState::Frozen {
-                    active_freeze_holds: ActiveFreezeHolds::one(*hold_id),
+                    active_freeze_holds: ActiveFreezeHolds::one(
+                        hold_id.clone(),
+                    ),
                 },
             }),
             // `Unfreeze` on a stream-less underlying is a no-op (already
@@ -355,7 +367,7 @@ impl EventSourced for Underlying {
                 Ok(Some(Self {
                     freeze_state: entity
                         .freeze_state
-                        .acquire(*hold_id)
+                        .acquire(hold_id.clone())
                         .unwrap_or_else(|| entity.freeze_state.clone()),
                 }))
             }
@@ -731,21 +743,21 @@ mod tests {
         let underlying = TestHarness::<Underlying>::with(())
             .given(vec![
                 UnderlyingEvent::FreezeHoldAcquired {
-                    hold_id: first_hold,
+                    hold_id: first_hold.clone(),
                     acquired_at: now + ChronoDuration::hours(1),
                 },
                 UnderlyingEvent::FreezeHoldAcquired {
-                    hold_id: second_hold,
+                    hold_id: second_hold.clone(),
                     acquired_at: now + ChronoDuration::hours(2),
                 },
                 UnderlyingEvent::FreezeHoldReleased {
-                    hold_id: first_hold,
+                    hold_id: first_hold.clone(),
                     released_at: now + ChronoDuration::hours(3),
                 },
             ])
             .when(UnderlyingCommand::ReleaseFreezeHold {
                 underlying: aapl(),
-                hold_id: second_hold,
+                hold_id: second_hold.clone(),
                 released_at: now + ChronoDuration::hours(4),
             })
             .await
@@ -771,7 +783,7 @@ mod tests {
                 acquired_at: now,
             },
             UnderlyingEvent::FreezeHoldAcquired {
-                hold_id: scheduled_hold,
+                hold_id: scheduled_hold.clone(),
                 acquired_at: now,
             },
             UnderlyingEvent::FreezeHoldReleased {
