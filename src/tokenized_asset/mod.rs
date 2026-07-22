@@ -1,7 +1,7 @@
 pub(crate) mod api;
 pub(crate) mod cli;
 mod cmd;
-pub(crate) mod corporate_actions;
+pub(crate) mod corporate_action_feed;
 mod event;
 pub(crate) mod schedule;
 pub(crate) mod view;
@@ -12,12 +12,16 @@ use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 pub(crate) use api::{
     add_tokenized_asset, get_tokenized_asset, get_tokenized_asset_status,
     list_tokenized_assets,
 };
 pub(crate) use cmd::TokenizedAssetCommand;
+pub(crate) use corporate_action_feed::{
+    CorporateActionFeed, spawn_corporate_action_feed,
+};
 pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::TokenizedAssetView;
 
@@ -27,6 +31,90 @@ pub(crate) use view::TokenizedAssetView;
 pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
+
+/// Stable Alpaca identity of one corporate action across insert, update, and
+/// delete mutations.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub(crate) struct CorporateActionId(String);
+
+impl CorporateActionId {
+    const MAX_LEN: usize = 128;
+
+    pub(crate) fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty() && value.len() <= Self::MAX_LEN)
+            .then_some(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CorporateActionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            serde::de::Error::custom("invalid corporate-action id")
+        })
+    }
+}
+
+impl fmt::Display for CorporateActionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Monotonic ULID identifying one Alpaca corporate-action stream event.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub(crate) struct CorporateActionEventId(String);
+
+impl CorporateActionEventId {
+    pub(crate) fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        let valid = value.len() == 26
+            && value.bytes().enumerate().all(|(index, byte)| {
+                let allowed = matches!(
+                    byte,
+                    b'0'..=b'9'
+                        | b'A'..=b'H'
+                        | b'J' | b'K' | b'M' | b'N'
+                        | b'P'..=b'T'
+                        | b'V'..=b'Z'
+                );
+                allowed && (index != 0 || byte <= b'7')
+            });
+        valid.then_some(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CorporateActionEventId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            serde::de::Error::custom("invalid corporate-action event id")
+        })
+    }
+}
+
+impl fmt::Display for CorporateActionEventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// Two enabled assets on different networks share one vault address.
 ///
@@ -216,8 +304,9 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetEvent, TokenizedAssetView, UnderlyingSymbol,
+        CorporateActionEventId, CorporateActionId, Network, TokenSymbol,
+        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
+        TokenizedAssetView, UnderlyingSymbol,
         validate_no_cross_network_vault_collisions,
     };
     use crate::prepare_event_sourced_startup;
@@ -235,6 +324,64 @@ mod tests {
             vault,
             added_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn corporate_action_identity_bounds_untrusted_stream_input() {
+        assert!(CorporateActionId::new("ca-1").is_some());
+        assert!(CorporateActionId::new("").is_none());
+        assert!(CorporateActionId::new("x".repeat(129)).is_none());
+    }
+
+    #[test]
+    fn corporate_action_event_identity_requires_a_canonical_ulid() {
+        assert!(
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").is_some()
+        );
+        assert!(
+            CorporateActionEventId::new("81J9RPMV5TKB8WX3M4F1KZ7QH2").is_none()
+        );
+        assert!(
+            CorporateActionEventId::new("01j9rpmv5tkb8wx3m4f1kz7qh2").is_none()
+        );
+        assert!(
+            CorporateActionEventId::new("01L9RPMV5TKB8WX3M4F1KZ7QH2").is_none()
+        );
+    }
+
+    #[test]
+    fn corporate_action_identity_deserialization_uses_validation() {
+        let id: CorporateActionId = serde_json::from_str(r#""ca-1""#).unwrap();
+        assert_eq!(id.as_str(), "ca-1");
+
+        assert!(serde_json::from_str::<CorporateActionId>(r#""""#).is_err());
+        assert!(
+            serde_json::from_str::<CorporateActionId>(&format!(
+                "\"{}\"",
+                "x".repeat(129)
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn corporate_action_event_identity_deserialization_uses_validation() {
+        let event_id: CorporateActionEventId =
+            serde_json::from_str(r#""01J9RPMV5TKB8WX3M4F1KZ7QH2""#).unwrap();
+        assert_eq!(event_id.as_str(), "01J9RPMV5TKB8WX3M4F1KZ7QH2");
+
+        assert!(
+            serde_json::from_str::<CorporateActionEventId>(
+                r#""81J9RPMV5TKB8WX3M4F1KZ7QH2""#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<CorporateActionEventId>(
+                r#""01j9rpmv5tkb8wx3m4f1kz7qh2""#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -64,8 +64,9 @@ use crate::redemption::{
     view::{RedemptionViewReactor, rebuild_redemption_view},
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
-    validate_no_cross_network_vault_collisions, view::list_enabled_assets,
+    CorporateActionFeed, TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
+    spawn_corporate_action_feed, validate_no_cross_network_vault_collisions,
+    view::list_enabled_assets,
 };
 use crate::underlying::Underlying;
 use crate::vault::NetworkVaultServices;
@@ -370,6 +371,14 @@ pub async fn initialize_rocket(
     run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
         .await;
 
+    let corporate_action_feed = prepare_corporate_action_feed(
+        &config,
+        pool.clone(),
+        &apalis_pool,
+        lifecycle_notifier.clone(),
+    )
+    .await?;
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut background_task_handles = Vec::new();
 
@@ -440,7 +449,7 @@ pub async fn initialize_rocket(
         }
     }
 
-    maintain_background_job_tables(&pool).await;
+    maintain_background_job_tables(&pool, &apalis_pool).await;
 
     background_task_handles.push(spawn_terminal_unfreeze_recovery(
         pool.clone(),
@@ -449,8 +458,14 @@ pub async fn initialize_rocket(
     background_task_handles.push(spawn_freeze_schedule_worker(
         apalis_pool.clone(),
         pool.clone(),
-        underlying_store,
+        underlying_store.clone(),
         lifecycle_notifier.clone(),
+        shutdown_rx.clone(),
+    ));
+    background_task_handles.push(spawn_corporate_action_freeze_worker(
+        apalis_pool.clone(),
+        underlying_store,
+        pool.clone(),
         shutdown_rx.clone(),
     ));
     background_task_handles.push(spawn_lifecycle_notification_worker(
@@ -464,18 +479,11 @@ pub async fn initialize_rocket(
         pool.clone(),
     );
 
-    background_task_handles.push(
-        tokenized_asset::corporate_actions::spawn_corporate_actions_sync(
-            tokenized_asset::corporate_actions::CorporateActionsSync {
-                alpaca: alpaca_service.clone(),
-                scheduler: freeze_scheduler.clone(),
-                notification_queue: JobQueue::new(&apalis_pool),
-                pool: pool.clone(),
-                notifier: lifecycle_notifier.clone(),
-            },
-            shutdown_rx.clone(),
-        ),
-    );
+    background_task_handles.push(spawn_corporate_action_feed(
+        corporate_action_feed,
+        shutdown_rx.clone(),
+        shutdown_tx.clone(),
+    ));
 
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
@@ -498,6 +506,23 @@ pub async fn initialize_rocket(
             handles: background_task_handles,
         },
     }))
+}
+
+async fn prepare_corporate_action_feed(
+    config: &Config,
+    pool: Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+) -> Result<CorporateActionFeed, anyhow::Error> {
+    let mut feed = CorporateActionFeed::new(
+        &config.alpaca,
+        config.environment,
+        pool,
+        apalis_pool,
+        lifecycle_notifier,
+    )?;
+    feed.establish_development_baseline().await?;
+    Ok(feed)
 }
 
 struct EventSourcedStores {
@@ -537,13 +562,19 @@ async fn setup_event_sourced_stores(
     })
 }
 
-async fn maintain_background_job_tables(pool: &Pool<Sqlite>) {
-    // Non-fatal, mirroring the mint jobs: without the reset a transition
-    // crashed mid-run waits for apalis's orphan re-enqueue timeout, and
-    // without the vacuum terminal rows accumulate and hold idempotency keys.
+/// Job-table recovery is non-fatal, mirroring mint-job recovery. Resetting
+/// avoids apalis's orphan timeout after a crash; vacuuming bounds terminal rows
+/// and releases concluded idempotency keys.
+async fn maintain_background_job_tables(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+) {
     if let Err(error) =
-        tokenized_asset::schedule::reset_orphaned_freeze_schedule_jobs(pool)
-            .await
+        tokenized_asset::schedule::reset_orphaned_freeze_schedule_jobs_and_notify(
+            pool,
+            apalis_pool,
+        )
+        .await
     {
         warn!(target: "asset", error = %error,
             "Failed to reset orphaned freeze-schedule jobs"
@@ -594,6 +625,8 @@ struct RocketState {
 }
 
 struct BackgroundTasks {
+    /// Stops spawned loops on shutdown and lets a poisoned source request a
+    /// graceful whole-service shutdown.
     shutdown: tokio::sync::watch::Sender<bool>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -682,8 +715,29 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;
 
+    let mut service_shutdown = state.background_tasks.shutdown.subscribe();
     let background_tasks = state.background_tasks;
     let rocket = rocket::custom(figment)
+        .attach(rocket::fairing::AdHoc::on_liftoff(
+            "fail closed on poisoned corporate-action source",
+            move |rocket| {
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(async move {
+                        let already_requested =
+                            *service_shutdown.borrow_and_update();
+                        if !already_requested
+                            && service_shutdown.changed().await.is_err()
+                        {
+                            return;
+                        }
+                        if *service_shutdown.borrow() {
+                            shutdown.notify();
+                        }
+                    });
+                })
+            },
+        ))
         .attach(rocket::fairing::AdHoc::on_shutdown(
             "stop background tasks",
             |_| {
@@ -2103,6 +2157,28 @@ fn spawn_lifecycle_notification_worker(
         shutdown,
         "lifecycle-notification-worker",
         target: "notifications",
+    )
+}
+
+fn spawn_corporate_action_freeze_worker(
+    apalis_pool: ApalisSqlitePool,
+    underlying_store: Arc<Store<Underlying>>,
+    pool: Pool<Sqlite>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    spawn_drainer_worker!(
+        ::<tokenized_asset::schedule::CorporateActionFreezeCtx,
+            tokenized_asset::schedule::AlignCorporateActionFreeze>,
+        apalis_pool,
+        Arc::new(tokenized_asset::schedule::CorporateActionFreezeCtx {
+            underlying_store,
+            pool,
+            #[cfg(test)]
+            revision_read_test_hook: None,
+        }),
+        shutdown,
+        "corporate-action-freeze-worker",
+        target: "asset",
     )
 }
 
