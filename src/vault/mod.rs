@@ -241,6 +241,27 @@ pub(crate) trait VaultService: Send + Sync {
     ) -> Result<OrchestratorBurnResult, VaultError> {
         Err(VaultError::InvalidReceipt)
     }
+
+    /// Reads the orchestrator's `vaultLogicIsExpected()` health flag. A `false`
+    /// result means the orchestrator is halted pending upgrade — the operator
+    /// health surface reports this distinctly from a stuck transaction.
+    async fn vault_logic_is_expected(
+        &self,
+        _orchestrator: Address,
+    ) -> Result<bool, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Reads the orchestrator's `nextBurnReceiptId(token)` — the receipt id its
+    /// on-chain walk will consume next for `token`. Surfaced per
+    /// orchestrator-mode asset on the operator health surface.
+    async fn next_burn_receipt_id(
+        &self,
+        _orchestrator: Address,
+        _token: Address,
+    ) -> Result<U256, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
 }
 
 pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;

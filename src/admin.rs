@@ -1,5 +1,5 @@
 use alloy::network::ReceiptResponse;
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,7 +18,7 @@ use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
 use crate::auth::InternalAuth;
-use crate::config::VaultMode;
+use crate::config::{Config, VaultMode};
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
     MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
@@ -36,6 +36,7 @@ use crate::redemption::{
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
+use crate::tokenized_asset::view::list_enabled_assets;
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnVerification, NetworkVaultServices, TxId, VaultError, VaultService,
@@ -1460,6 +1461,197 @@ pub(crate) async fn list_stuck(
     Ok(Json(StuckResponse { stuck }))
 }
 
+/// Per-asset resolved burn path, from the asset's live `VaultMode` config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssetVaultMode {
+    VaultDirect,
+    Orchestrator,
+}
+
+/// Outcome of the orchestrator's `vaultLogicIsExpected()` read. `Unexpected`
+/// means the orchestrator is halted pending upgrade — visibly distinct from a
+/// stuck transaction in `/admin/stuck`. A failed RPC read is reported as
+/// `Unavailable` rather than coerced into a healthy or halted flag, and it
+/// degrades only this row so the rest of the health surface stays visible
+/// during an RPC outage.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub(crate) enum VaultLogicStatus {
+    Expected,
+    Unexpected,
+    Unavailable { error: String },
+}
+
+/// One orchestrator contract's health, from `vaultLogicIsExpected()`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct OrchestratorHealth {
+    network: Network,
+    #[schema(value_type = String)]
+    address: Address,
+    vault_logic: VaultLogicStatus,
+}
+
+/// Outcome of the orchestrator's `nextBurnReceiptId(token)` read for one
+/// asset. A failed RPC read is reported as `Unavailable` for this row alone
+/// instead of failing the whole response.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub(crate) enum NextBurnReceiptIdStatus {
+    Available { value: String },
+    Unavailable { error: String },
+}
+
+/// One enabled asset's resolved burn path. Orchestrator-mode rows also carry
+/// the orchestrator address and its `nextBurnReceiptId`; those fields are
+/// absent on vault-direct rows.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct AssetVaultModeStatus {
+    underlying: UnderlyingSymbol,
+    network: Network,
+    #[schema(value_type = String)]
+    vault: Address,
+    vault_mode: AssetVaultMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    orchestrator: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_burn_receipt_id: Option<NextBurnReceiptIdStatus>,
+}
+
+/// Operator health surface for the orchestrator migration: per-orchestrator
+/// `vaultLogicIsExpected()` health and each enabled asset's resolved
+/// (live-config) burn path.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct OrchestratorHealthResponse {
+    orchestrators: Vec<OrchestratorHealth>,
+    assets: Vec<AssetVaultModeStatus>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/orchestrator-health",
+    tag = "admin",
+    responses(
+        (status = 200,
+            description = "Per-orchestrator health and per-asset resolved vault mode; \
+                failed on-chain reads degrade the affected rows to `unavailable`",
+            body = OrchestratorHealthResponse),
+        (status = 500, description = "Failed to list enabled assets")
+    ),
+    security(("internal_api_key" = []))
+)]
+#[tracing::instrument(skip(_auth, pool, config, vault_services))]
+#[get("/admin/orchestrator-health")]
+pub(crate) async fn orchestrator_health(
+    _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<OrchestratorHealthResponse>, Status> {
+    let enabled_assets =
+        list_enabled_assets(pool.inner()).await.map_err(|err| {
+            error!(target: "admin", error = %err,
+                "Failed to list enabled assets for orchestrator health"
+            );
+            Status::InternalServerError
+        })?;
+
+    let mut assets = Vec::with_capacity(enabled_assets.len());
+    // Distinct per-network orchestrators, so a shared orchestrator is health-
+    // checked once per network regardless of how many assets point at it. The
+    // same address on two networks is two different contracts, so the key
+    // includes the network.
+    let mut orchestrators_seen: Vec<(Network, Address)> = Vec::new();
+
+    for asset in &enabled_assets {
+        match config.vault_mode_for(&asset.underlying) {
+            VaultMode::VaultDirect => {
+                assets.push(AssetVaultModeStatus {
+                    underlying: asset.underlying.clone(),
+                    network: asset.network,
+                    vault: asset.vault,
+                    vault_mode: AssetVaultMode::VaultDirect,
+                    orchestrator: None,
+                    next_burn_receipt_id: None,
+                });
+            }
+            VaultMode::Orchestrator { address } => {
+                let key = (asset.network, address);
+                if !orchestrators_seen.contains(&key) {
+                    orchestrators_seen.push(key);
+                }
+
+                let service = vault_services
+                    .service(asset.network)
+                    .map_err(|err| {
+                        error!(target: "admin", network = %asset.network,
+                            error = %err,
+                            "No vault service for orchestrator-mode asset's network"
+                        );
+                        Status::InternalServerError
+                    })?;
+                let next_burn_receipt_id = match service
+                    .next_burn_receipt_id(address, asset.vault)
+                    .await
+                {
+                    Ok(next) => NextBurnReceiptIdStatus::Available {
+                        value: next.to_string(),
+                    },
+                    Err(err) => {
+                        warn!(target: "admin", orchestrator = %address,
+                            vault = %asset.vault, error = %err,
+                            "Failed to read nextBurnReceiptId"
+                        );
+                        NextBurnReceiptIdStatus::Unavailable {
+                            error: err.to_string(),
+                        }
+                    }
+                };
+
+                assets.push(AssetVaultModeStatus {
+                    underlying: asset.underlying.clone(),
+                    network: asset.network,
+                    vault: asset.vault,
+                    vault_mode: AssetVaultMode::Orchestrator,
+                    orchestrator: Some(address),
+                    next_burn_receipt_id: Some(next_burn_receipt_id),
+                });
+            }
+        }
+    }
+
+    let mut orchestrators = Vec::with_capacity(orchestrators_seen.len());
+    for (network, address) in orchestrators_seen {
+        let service = vault_services.service(network).map_err(|err| {
+            error!(target: "admin", %network, error = %err,
+                "No vault service for orchestrator network"
+            );
+            Status::InternalServerError
+        })?;
+        // An RPC failure must never masquerade as a healthy or halted
+        // orchestrator, so report it as an explicit `Unavailable` row while
+        // the rest of the health surface stays visible.
+        let vault_logic = match service.vault_logic_is_expected(address).await {
+            Ok(true) => VaultLogicStatus::Expected,
+            Ok(false) => VaultLogicStatus::Unexpected,
+            Err(err) => {
+                warn!(target: "admin", orchestrator = %address, error = %err,
+                    "Failed to read vaultLogicIsExpected"
+                );
+                VaultLogicStatus::Unavailable { error: err.to_string() }
+            }
+        };
+        orchestrators.push(OrchestratorHealth {
+            network,
+            address,
+            vault_logic,
+        });
+    }
+
+    Ok(Json(OrchestratorHealthResponse { orchestrators, assets }))
+}
+
 /// Classification of a non-terminal view used to decide whether it counts as
 /// stuck right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1769,9 +1961,17 @@ fn redemption_history_summary_from_events(
                 summary.tokenization_request_id = Some(tokenization_request_id);
             }
             RedemptionEvent::BurnTxSubmitted { tx_id, .. }
+            | RedemptionEvent::OrchestratorBurnSubmitted { tx_id, .. }
             | RedemptionEvent::ExistingBurnRecovered { tx_id, .. }
             | RedemptionEvent::BurningFailed { tx_id: Some(tx_id), .. } => {
                 summary.tx_id = Some(tx_id);
+            }
+            // A defaulted/empty `sendable_tx` (mock-prepared histories) would
+            // otherwise surface `TxId::Hash(B256::ZERO)` as a fabricated hash.
+            RedemptionEvent::BurnIntended { sendable_tx, .. }
+                if !sendable_tx.tx.is_empty() =>
+            {
+                summary.tx_id = Some(TxId::Hash(sendable_tx.hash));
             }
             _ => {}
         }
@@ -2115,10 +2315,17 @@ mod tests {
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
+    use url::Url;
+
+    use crate::alpaca::service::AlpacaConfig;
+    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
+    use crate::config::{Config, Environment, LogLevel};
+    use crate::wallet::SignerConfig;
 
     use super::{
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
@@ -2127,14 +2334,12 @@ mod tests {
         AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
         recover_post_alpaca,
     };
-    use crate::VaultModeConfig;
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
-    use crate::auth::FailedAuthRateLimiter;
-    use crate::config::VaultMode;
+    use crate::config::{VaultMode, VaultModeConfig};
     use crate::mint::test_utils::{TestHarness, test_config};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::ReceiptVaultKey;
@@ -2150,7 +2355,10 @@ mod tests {
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
     use crate::tokenized_asset::schedule::FreezeScheduler;
-    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::view::TokenizedAssetView;
+    use crate::tokenized_asset::{
+        AssetKey, Network, TokenSymbol, UnderlyingSymbol,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         MultiBurnEntry, NetworkVaultServices, SendableTxWithHash, TxId,
@@ -3162,13 +3370,6 @@ mod tests {
         Arc<Store<Redemption>>,
         sqlx::Pool<sqlx::Sqlite>,
     ) {
-        use crate::alpaca::service::AlpacaConfig;
-        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, Environment, LogLevel};
-        use crate::wallet::SignerConfig;
-        use alloy::primitives::B256;
-        use url::Url;
-
         let config = Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
@@ -3470,13 +3671,6 @@ mod tests {
         vault_service: Arc<dyn VaultService>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
-        use crate::alpaca::service::AlpacaConfig;
-        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, Environment, LogLevel};
-        use crate::wallet::SignerConfig;
-        use alloy::primitives::B256;
-        use url::Url;
-
         let config = Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
@@ -4633,13 +4827,6 @@ mod tests {
         pool: sqlx::Pool<sqlx::Sqlite>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
-        use crate::alpaca::service::AlpacaConfig;
-        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, Environment, LogLevel};
-        use crate::wallet::SignerConfig;
-        use alloy::primitives::B256;
-        use url::Url;
-
         let config = Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
@@ -5676,5 +5863,415 @@ mod tests {
             "re-arming the same window must dedup to one freeze and one \
              unfreeze job"
         );
+    }
+
+    #[test]
+    fn redemption_history_summary_exposes_persisted_burn_intent_hash() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let sendable_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let summary = super::redemption_history_summary_from_events([
+            RedemptionEvent::BurnIntended {
+                issuer_request_id: IssuerRedemptionRequestId::random(),
+                sendable_tx: sendable_tx.clone(),
+                planned_burns: vec![],
+            },
+        ]);
+
+        assert_eq!(summary.tx_id, Some(TxId::Hash(sendable_tx.hash)));
+    }
+
+    fn admin_test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
+            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+            signer: SignerConfig::Local(B256::ZERO),
+            backfill_start_block: 0,
+            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            auth: test_auth_config().unwrap(),
+            log_level: LogLevel::Debug,
+            environment: Environment::Development,
+            hyperdx: None,
+            alpaca: AlpacaConfig::test_default(),
+            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            chains: Vec::new(),
+            vault_mode_config: crate::config::VaultModeConfig::default(),
+        }
+    }
+
+    fn health_config(vault_mode_config: VaultModeConfig) -> Config {
+        Config { vault_mode_config, ..admin_test_config() }
+    }
+
+    async fn seed_enabled_asset(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        underlying: &str,
+        vault: Address,
+    ) {
+        let view = TokenizedAssetView {
+            underlying: UnderlyingSymbol::new(underlying).unwrap(),
+            token: TokenSymbol::new(format!("t{underlying}")),
+            network: Network::Base,
+            vault,
+            added_at: Utc::now(),
+        };
+        let view_id = AssetKey {
+            underlying: view.underlying.clone(),
+            network: view.network,
+        }
+        .to_string();
+        let payload = serde_json::json!({ "Live": view }).to_string();
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+        )
+        .bind(view_id)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("seeding enabled asset should succeed");
+    }
+
+    fn orchestrator_health_rocket(
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        config: Config,
+        vault_service: Arc<dyn VaultService>,
+    ) -> rocket::Rocket<rocket::Build> {
+        // Seeded assets live on `Network::Base`, so the health endpoint
+        // resolves the service from a single-network registry.
+        let vault_services = super::NetworkVaultServices::with_single_vault(
+            Network::Base,
+            ANVIL_CHAIN_ID,
+            vault_service,
+        );
+        rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .manage(vault_services)
+            .mount("/", rocket::routes![super::orchestrator_health])
+    }
+
+    async fn dispatch_orchestrator_health(
+        rocket: rocket::Rocket<rocket::Build>,
+        with_key: bool,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let mut request = client
+            .get("/admin/orchestrator-health")
+            .remote("127.0.0.1:8000".parse().unwrap());
+        if with_key {
+            request = request.header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ));
+        }
+        let response = request.dispatch().await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_reports_mixed_assets() {
+        let pool = setup_pool().await;
+        let orchestrator =
+            address!("0x00000000000000000000000000000000000000aa");
+        let aapl_vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tsla_vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        seed_enabled_asset(&pool, "AAPL", aapl_vault).await;
+        seed_enabled_asset(&pool, "TSLA", tsla_vault).await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orchestrator },
+            )]),
+            VaultMode::VaultDirect,
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_vault_logic_expected(true)
+                .with_next_burn_receipt_id(U256::from(4u64)),
+        );
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let expected_addr = serde_json::to_value(orchestrator).unwrap();
+
+        let orchestrators = json["orchestrators"].as_array().unwrap();
+        assert_eq!(orchestrators.len(), 1);
+        assert_eq!(orchestrators[0]["address"], expected_addr);
+        assert_eq!(orchestrators[0]["vault_logic"]["status"], "expected");
+
+        let assets = json["assets"].as_array().unwrap();
+        let aapl =
+            assets.iter().find(|asset| asset["underlying"] == "AAPL").unwrap();
+        assert_eq!(aapl["vault_mode"], "orchestrator");
+        assert_eq!(aapl["orchestrator"], expected_addr);
+        assert_eq!(aapl["next_burn_receipt_id"]["status"], "available");
+        assert_eq!(aapl["next_burn_receipt_id"]["value"], "4");
+
+        let tsla =
+            assets.iter().find(|asset| asset["underlying"] == "TSLA").unwrap();
+        assert_eq!(tsla["vault_mode"], "vault_direct");
+        assert!(
+            tsla.get("orchestrator").is_none(),
+            "vault-direct rows omit the orchestrator field"
+        );
+        assert!(
+            tsla.get("next_burn_receipt_id").is_none(),
+            "vault-direct rows omit next_burn_receipt_id"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_reports_halted_orchestrator() {
+        let pool = setup_pool().await;
+        let orchestrator =
+            address!("0x00000000000000000000000000000000000000aa");
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orchestrator },
+            )]),
+            VaultMode::VaultDirect,
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success().with_vault_logic_expected(false),
+        );
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["orchestrators"][0]["vault_logic"]["status"], "unexpected",
+            "a halted orchestrator must report vault_logic status=unexpected"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_dedupes_shared_orchestrator() {
+        let pool = setup_pool().await;
+        let orchestrator =
+            address!("0x00000000000000000000000000000000000000aa");
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+        seed_enabled_asset(
+            &pool,
+            "TSLA",
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
+        .await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::new(),
+            VaultMode::Orchestrator { address: orchestrator },
+        );
+        let mock = Arc::new(MockVaultService::new_success());
+        let vault_service: Arc<dyn VaultService> = mock.clone();
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["orchestrators"].as_array().unwrap().len(),
+            1,
+            "a shared orchestrator must appear once"
+        );
+        assert_eq!(json["assets"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            mock.vault_logic_call_count(),
+            1,
+            "a shared orchestrator must be health-checked once"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_rpc_error_degrades_health_row() {
+        let pool = setup_pool().await;
+        let orchestrator =
+            address!("0x00000000000000000000000000000000000000aa");
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orchestrator },
+            )]),
+            VaultMode::VaultDirect,
+        );
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_vault_logic_error());
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let vault_logic = &json["orchestrators"][0]["vault_logic"];
+        assert_eq!(
+            vault_logic["status"], "unavailable",
+            "a failed health read must be reported, not fabricated"
+        );
+        assert!(
+            !vault_logic["error"].as_str().unwrap().is_empty(),
+            "the unavailable row must carry the read error"
+        );
+        assert_eq!(
+            json["assets"][0]["next_burn_receipt_id"]["status"], "available",
+            "the asset row must stay visible when only the health read fails"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Failed to read vaultLogicIsExpected"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_receipt_id_error_degrades_asset_row() {
+        let pool = setup_pool().await;
+        let orchestrator =
+            address!("0x00000000000000000000000000000000000000aa");
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orchestrator },
+            )]),
+            VaultMode::VaultDirect,
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success().with_next_burn_receipt_id_error(),
+        );
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let receipt_id = &json["assets"][0]["next_burn_receipt_id"];
+        assert_eq!(
+            receipt_id["status"], "unavailable",
+            "a failed nextBurnReceiptId read must degrade only its own row"
+        );
+        assert!(
+            !receipt_id["error"].as_str().unwrap().is_empty(),
+            "the unavailable row must carry the read error"
+        );
+        assert_eq!(
+            json["orchestrators"][0]["vault_logic"]["status"], "expected",
+            "orchestrator health must stay visible when only the receipt-id \
+             read fails"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Failed to read nextBurnReceiptId"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_empty_when_all_vault_direct() {
+        let pool = setup_pool().await;
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(VaultModeConfig::default()),
+            vault_service,
+        );
+
+        let (status, body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(status, Status::Ok);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["orchestrators"].as_array().unwrap().is_empty());
+        assert_eq!(json["assets"][0]["vault_mode"], "vault_direct");
+    }
+
+    #[tokio::test]
+    async fn orchestrator_health_requires_auth() {
+        let pool = setup_pool().await;
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(VaultModeConfig::default()),
+            vault_service,
+        );
+
+        let (status, _body) = dispatch_orchestrator_health(rocket, false).await;
+
+        assert_eq!(status, Status::Unauthorized);
     }
 }
