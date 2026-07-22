@@ -2624,29 +2624,24 @@ effects on that chain:
 Constructed once at startup from config; immutable for the process lifetime.
 Alpaca calls a single issuer URL; payload `network` selects the runtime.
 
-**ChainRegistry:** Legacy env vars (`RPC_URL`, `SUBGRAPH_URL`, `CHAIN_ID`,
-`BACKFILL_START_BLOCK`) map to one `base` registry entry. Behaviour identical to
-single-chain production. In deployment, `RPC_URL` and `SUBGRAPH_URL` live in the
-encrypted secret (`.env.secrets.example`); `CHAIN_ID` and `BACKFILL_START_BLOCK`
-are not set in the systemd unit and fall back to clap defaults (`8453`,
-`41704326`). The flat vars are transitional compatibility, not a supported
-long-term configuration: the canonical multichain target shape is `[[chains]]`
-TOML blocks documented in `.env.secrets.example`, with equivalent
-`CHAIN_<NETWORK>_RPC_URL` / `CHAIN_<NETWORK>_CHAIN_ID` /
-`CHAIN_<NETWORK>_SUBGRAPH_URL` / `CHAIN_<NETWORK>_BACKFILL_START_BLOCK` env-var
-encoding planned for local dev (`.env.example` when added). The encrypted secret
-is a systemd `EnvironmentFile` and can only carry `KEY=VALUE` lines, so the file
-that carries the `[[chains]]` TOML in production is decided by the
-config-parsing change itself. Parsing either shape into `Config::chains` is its
-own change; until it lands, the flat legacy vars remain the only live config
-path. Checkpoints are keyed per `(network, vault)`: transfer polling under
+**ChainRegistry:** Each configured network uses one complete environment group:
+`CHAIN_<NETWORK>_RPC_URL`, `CHAIN_<NETWORK>_CHAIN_ID`,
+`CHAIN_<NETWORK>_SUBGRAPH_URL`, and `CHAIN_<NETWORK>_BACKFILL_START_BLOCK`.
+Supplying any field requires all four, so partial chain configuration fails at
+startup. An absent additional-network group keeps that chain disabled.
+`CHAIN_BASE_*` overrides the legacy flat Base values; when it is absent,
+`RPC_URL`, `SUBGRAPH_URL`, `CHAIN_ID`, and `BACKFILL_START_BLOCK` continue to
+produce the single Base entry unchanged. This lets one deployed artifact start
+Base-only and later activate another chain through a config update and restart.
+
+Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
 `receipt_backfill:<network>:<vault_address_lowercase>`. The pre-multichain
 `transfer_poll` row is migrated once by
 `TransferPoller::seed_per_vault_checkpoints` (then deleted); receipt backfill
 still reads `receipt_backfill:<vault_lowercase>` as a Base-only load-time
-fallback. Once staging and production migrate, the flat-var mapping and that
-receipt-backfill legacy fallback are deleted.
+fallback. Once staging and production use `CHAIN_BASE_*`, the flat-var mapping
+and receipt-backfill legacy fallback can be removed in a separate cutover.
 
 **Asset identity (breaking):** `TokenizedAsset` aggregate id becomes the
 `AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`), and freeze status

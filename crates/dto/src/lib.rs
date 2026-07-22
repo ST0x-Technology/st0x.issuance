@@ -142,6 +142,21 @@ impl Network {
             Self::Ethereum => "ethereum",
         }
     }
+
+    /// The canonical chain id this network denotes.
+    ///
+    /// Exists so configuration can reject a network label bound to a chain it
+    /// does not name. Without it, `CHAIN_BASE_CHAIN_ID` pointed at a testnet
+    /// yields a running `Network::Base` runtime on the wrong chain — and since
+    /// the receipt inventory is keyed by chain id, that silently orphans every
+    /// receipt aggregate the network already had.
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        match self {
+            Self::Base => 8453,
+            Self::Ethereum => 1,
+        }
+    }
 }
 
 impl std::fmt::Display for Network {

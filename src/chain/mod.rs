@@ -1,8 +1,8 @@
 //! Per-chain RPC, vault service, and backfill configuration.
 //!
 //! `ChainRegistry` maps each configured `Network` to the runtime bundle needed
-//! for on-chain side effects, built once at startup — currently a single Base
-//! entry wired from legacy env vars.
+//! for on-chain side effects, built once at startup from complete per-network
+//! configuration groups.
 
 use alloy::providers::fillers::BlobGasFiller;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -33,7 +33,7 @@ use crate::wallet::{
 const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
 
 /// Per-chain RPC, vault, and subgraph settings for [`ChainRegistry`].
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ChainConfig {
     pub network: Network,
     pub chain_id: u64,
