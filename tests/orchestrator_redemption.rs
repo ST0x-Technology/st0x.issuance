@@ -58,11 +58,15 @@ async fn bot_provider(
         .await?)
 }
 
-/// Fetches the current `GET /admin/stuck` entries, failing loudly on an
-/// endpoint error so a broken endpoint can never read as "nothing stuck".
-async fn fetch_stuck_entries(client: &Client) -> Vec<serde_json::Value> {
+/// Dispatches an authenticated admin `GET`, failing loudly on a non-OK
+/// status or a non-JSON body so a broken endpoint can never read as a
+/// healthy/empty response.
+async fn authenticated_get_json(
+    client: &Client,
+    path: &str,
+) -> serde_json::Value {
     let response = client
-        .get("/admin/stuck")
+        .get(path)
         .header(rocket::http::Header::new(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
@@ -73,12 +77,18 @@ async fn fetch_stuck_entries(client: &Client) -> Vec<serde_json::Value> {
     assert_eq!(
         response.status(),
         rocket::http::Status::Ok,
-        "/admin/stuck must respond OK"
+        "{path} must respond OK"
     );
-    let body: serde_json::Value = response
+    response
         .into_json()
         .await
-        .expect("/admin/stuck must return a JSON body");
+        .unwrap_or_else(|| panic!("{path} must return a JSON body"))
+}
+
+/// Fetches the current `GET /admin/stuck` entries, failing loudly on an
+/// endpoint error so a broken endpoint can never read as "nothing stuck".
+async fn fetch_stuck_entries(client: &Client) -> Vec<serde_json::Value> {
+    let body = authenticated_get_json(client, "/admin/stuck").await;
 
     body["stuck"]
         .as_array()
@@ -151,6 +161,81 @@ async fn wait_for_recovery_to_resolve(
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Fetches `GET /admin/orchestrator-health`, failing loudly on a non-OK
+/// status so a broken endpoint can never read as "healthy".
+async fn fetch_orchestrator_health(client: &Client) -> serde_json::Value {
+    authenticated_get_json(client, "/admin/orchestrator-health").await
+}
+
+/// Seeded history for a control redemption: a classified `BurnFailed`
+/// (`AllowanceInsufficient`) the reconciler provably never resolves — typed
+/// classifications are never auto-retried. Its persistent `/admin/stuck`
+/// entry proves the seeds replay and the stuck surfacing works, so a target
+/// redemption's absence in the same snapshot is positive evidence of
+/// recovery (see `wait_for_recovery_to_resolve`).
+fn classified_control_events(
+    control_id: &str,
+    control_tx_hash: B256,
+    orchestrator_address: Address,
+    user_wallet: Address,
+    old: &str,
+) -> [(&'static str, serde_json::Value); 4] {
+    [
+        (
+            "RedemptionEvent::Detected",
+            json!({
+                "Detected": {
+                    "issuer_request_id": control_id,
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "wallet": user_wallet,
+                    "quantity": "5",
+                    "tx_hash": control_tx_hash,
+                    "block_number": 1,
+                    "detected_at": old,
+                    "burn_mode": {
+                        "Orchestrator": { "address": orchestrator_address }
+                    }
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::AlpacaCalled",
+            json!({
+                "AlpacaCalled": {
+                    "issuer_request_id": control_id,
+                    "tokenization_request_id": "tok-recovery-control",
+                    "alpaca_quantity": "5",
+                    "dust_quantity": "0",
+                    "called_at": old
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::AlpacaJournalCompleted",
+            json!({
+                "AlpacaJournalCompleted": {
+                    "issuer_request_id": control_id,
+                    "alpaca_journal_completed_at": old
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::BurningFailed",
+            json!({
+                "BurningFailed": {
+                    "issuer_request_id": control_id,
+                    "error": "allowance missing (control fixture)",
+                    "failed_at": old,
+                    "tx_id": null,
+                    "planned_burns": [],
+                    "classification": "AllowanceInsufficient"
+                }
+            }),
+        ),
+    ]
 }
 
 /// A burn spanning multiple orchestrator-custodied receipts: three separate
@@ -414,67 +499,15 @@ async fn orchestrator_recovery_confirms_landed_burn_without_resubmitting()
     let user_wallet =
         PrivateKeySigner::from_bytes(&USER_PRIVATE_KEY)?.address();
 
-    // Control redemption: a classified BurnFailed the reconciler provably
-    // never resolves. Its persistent /admin/stuck entry is the evidence that
-    // the seeds replay and the stuck surfacing works, so the target's absence
-    // below can only mean recovery resolved it (see
-    // `wait_for_recovery_to_resolve`).
     let control_tx_hash = B256::random();
     let control_id = format!("{control_tx_hash:#x}");
-    let control_events = [
-        (
-            "RedemptionEvent::Detected",
-            json!({
-                "Detected": {
-                    "issuer_request_id": control_id,
-                    "underlying": "AAPL",
-                    "token": "tAAPL",
-                    "wallet": user_wallet,
-                    "quantity": "5",
-                    "tx_hash": control_tx_hash,
-                    "block_number": 1,
-                    "detected_at": old,
-                    "burn_mode": {
-                        "Orchestrator": { "address": orchestrator_address }
-                    }
-                }
-            }),
-        ),
-        (
-            "RedemptionEvent::AlpacaCalled",
-            json!({
-                "AlpacaCalled": {
-                    "issuer_request_id": control_id,
-                    "tokenization_request_id": "tok-recovery-control",
-                    "alpaca_quantity": "5",
-                    "dust_quantity": "0",
-                    "called_at": old
-                }
-            }),
-        ),
-        (
-            "RedemptionEvent::AlpacaJournalCompleted",
-            json!({
-                "AlpacaJournalCompleted": {
-                    "issuer_request_id": control_id,
-                    "alpaca_journal_completed_at": old
-                }
-            }),
-        ),
-        (
-            "RedemptionEvent::BurningFailed",
-            json!({
-                "BurningFailed": {
-                    "issuer_request_id": control_id,
-                    "error": "allowance missing (control fixture)",
-                    "failed_at": old,
-                    "tx_id": null,
-                    "planned_burns": [],
-                    "classification": "AllowanceInsufficient"
-                }
-            }),
-        ),
-    ];
+    let control_events = classified_control_events(
+        &control_id,
+        control_tx_hash,
+        orchestrator_address,
+        user_wallet,
+        old,
+    );
 
     let events = [
         (
@@ -591,6 +624,233 @@ async fn orchestrator_recovery_confirms_landed_burn_without_resubmitting()
             .call()
             .await?,
         U256::ZERO
+    );
+
+    Ok(())
+}
+
+/// Kill-and-restart recovery of an in-flight orchestrator burn: a redemption
+/// whose orchestrator burn was submitted and landed on-chain but crashed as
+/// `BurnFailed` with the tx id retained and never confirmed. On restart,
+/// startup recovery takes the Step-4 orchestrator confirm path — recording the
+/// existing burn without resubmitting — so the redemption completes and drains
+/// from `/admin/stuck`, exactly one `Burned` log exists, and
+/// `/admin/orchestrator-health` reports the live orchestrator healthy with an
+/// advanced `nextBurnReceiptId`.
+#[tokio::test]
+async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+    let orchestrator_address = evm.deploy_orchestrator().await?;
+
+    // The burn that "landed before the crash": mint 10 to the bot, then burn
+    // it through the orchestrator directly, capturing the real tx hash and
+    // consuming the single receipt (id 1).
+    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
+    harness::approve_orchestrator(&evm, orchestrator_address).await?;
+    harness::orchestrator_mint_to(
+        &evm,
+        orchestrator_address,
+        &bot_signer,
+        tokens(10),
+        1,
+    )
+    .await?;
+    let provider = bot_provider(&evm).await?;
+    let orchestrator =
+        IST0xOrchestratorV1Instance::new(orchestrator_address, &provider);
+    let burn_receipt = orchestrator
+        .burn(evm.vault_address, tokens(10), Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let burn_tx_hash = burn_receipt.transaction_hash;
+
+    // Seed the crashed redemption's history (events table only, per the e2e
+    // setup exception): anchored to orchestrator mode, failed with the real
+    // burn's tx id retained but never confirmed — the exact in-flight state
+    // the Step-4 orchestrator recovery must resolve. Timestamps predate
+    // STUCK_THRESHOLD, though a `BurnFailed` is operator-visible regardless.
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("orchestrator_burn_failed_recovery.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let detected_tx_hash = B256::random();
+    let issuer_request_id = format!("{detected_tx_hash:#x}");
+    let old = "2020-01-01T00:00:00Z";
+    let user_wallet =
+        PrivateKeySigner::from_bytes(&USER_PRIVATE_KEY)?.address();
+
+    let control_tx_hash = B256::random();
+    let control_id = format!("{control_tx_hash:#x}");
+    let control_events = classified_control_events(
+        &control_id,
+        control_tx_hash,
+        orchestrator_address,
+        user_wallet,
+        old,
+    );
+
+    let events = [
+        (
+            "RedemptionEvent::Detected",
+            json!({
+                "Detected": {
+                    "issuer_request_id": issuer_request_id,
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "wallet": user_wallet,
+                    "quantity": "10",
+                    "tx_hash": detected_tx_hash,
+                    "block_number": 1,
+                    "detected_at": old,
+                    "burn_mode": {
+                        "Orchestrator": { "address": orchestrator_address }
+                    }
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::AlpacaCalled",
+            json!({
+                "AlpacaCalled": {
+                    "issuer_request_id": issuer_request_id,
+                    "tokenization_request_id": "tok-burn-failed-1",
+                    "alpaca_quantity": "10",
+                    "dust_quantity": "0",
+                    "called_at": old
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::AlpacaJournalCompleted",
+            json!({
+                "AlpacaJournalCompleted": {
+                    "issuer_request_id": issuer_request_id,
+                    "alpaca_journal_completed_at": old
+                }
+            }),
+        ),
+        (
+            "RedemptionEvent::BurningFailed",
+            json!({
+                "BurningFailed": {
+                    "issuer_request_id": issuer_request_id,
+                    "error": "orchestrator burn confirmation lost before crash",
+                    "failed_at": old,
+                    "tx_id": { "hash": burn_tx_hash },
+                    "planned_burns": [],
+                    "classification": "Unclassified"
+                }
+            }),
+        ),
+    ];
+
+    let pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+    for (aggregate_id, aggregate_events) in
+        [(&issuer_request_id, &events), (&control_id, &control_events)]
+    {
+        for (sequence, (event_type, payload)) in
+            (1i64..).zip(aggregate_events.iter())
+        {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+                ",
+            )
+            .bind(aggregate_id)
+            .bind(sequence)
+            .bind(event_type)
+            .bind(payload.to_string())
+            .execute(&pool)
+            .await?;
+        }
+    }
+    pool.close().await;
+
+    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+        &db_url,
+        &mock_alpaca,
+        &evm,
+        orchestrator_vault_modes("AAPL", orchestrator_address),
+    )?;
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    // Startup recovery confirms the landed burn: the redemption leaves the
+    // recoverable states and no longer surfaces in /admin/stuck — while the
+    // unresolvable control still does, proving the absence is recovery's
+    // doing rather than a seed that never replayed.
+    wait_for_recovery_to_resolve(&client, &issuer_request_id, &control_id)
+        .await?;
+
+    let burned_logs =
+        orchestrator.Burned_filter().from_block(0).query().await?;
+    assert_eq!(
+        burned_logs.len(),
+        1,
+        "recovery must confirm the landed burn, never submit a second one"
+    );
+    assert_eq!(
+        OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider)
+            .balanceOf(bot_wallet)
+            .call()
+            .await?,
+        U256::ZERO
+    );
+
+    // The operator health surface reads the live orchestrator: healthy, with
+    // the per-token burn pointer advanced past the single consumed receipt.
+    let health = fetch_orchestrator_health(&client).await;
+    let expected_addr = serde_json::to_value(orchestrator_address)?;
+    let orchestrators = health["orchestrators"].as_array().unwrap();
+    assert_eq!(orchestrators.len(), 1);
+    assert_eq!(
+        orchestrators[0]["vault_logic"]["status"], "expected",
+        "the deployed orchestrator must report healthy"
+    );
+    let aapl = health["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|asset| asset["underlying"] == "AAPL")
+        .unwrap();
+    assert_eq!(aapl["vault_mode"], "orchestrator");
+    assert_eq!(
+        aapl["orchestrator"], expected_addr,
+        "asset must report the orchestrator address it burns through"
+    );
+    assert_eq!(
+        aapl["next_burn_receipt_id"]["status"], "available",
+        "a live orchestrator's receipt pointer must be readable"
+    );
+    assert_eq!(
+        aapl["next_burn_receipt_id"]["value"], "2",
+        "nextBurnReceiptId must have advanced past the consumed receipt"
     );
 
     Ok(())
