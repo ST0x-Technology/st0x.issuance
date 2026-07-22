@@ -318,6 +318,9 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url:
+                harness::setup_corporate_actions_stream_mock(&mock_alpaca),
         },
         subgraph_url: subgraph_url.clone(),
         chains: vec![ChainConfig {

@@ -1607,18 +1607,20 @@ sub-second window is rejected with 422 (apalis schedules at second granularity,
 so a sub-second window has no defined execution order); a fully elapsed window
 is rejected rather than flapping the asset; a `freeze_at` already in the past
 with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
-the schedule mechanism both the manual admin endpoint and the automated
-corporate-actions sourcing feed.
+the manual/operator schedule mechanism; the automated corporate-actions feed
+uses the same underlying freeze-hold commands through its own action-keyed
+alignment jobs.
 
-**Corporate-actions sourcing.** Issuance consumes Alpaca's corporate-actions SSE
-stream as an authenticated, durable mutation source. The accepted contract is
-exactly US-region `cash_dividend_corporateaction_event` and
-`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
-`delete`; any other discriminator, region, malformed identity, or invalid date
-is a typed poison boundary and cannot advance the cursor. Each action's stable
-Alpaca ID owns one source hold and one current schedule revision, so updates
-replace that action's prior window and deletes release only that action's hold.
-An operator hold or another action on the same underlying is never affected.
+**Corporate-actions sourcing.** Issuance consumes Alpaca's authenticated Market
+Data SSE stream (`GET /v1beta1/events/corporate-actions`) as a durable mutation
+source. The accepted contract is exactly US-region
+`cash_dividend_corporateaction_event` and `stock_dividend_corporateaction_event`
+frames with `insert`, `update`, or `delete`; any other discriminator, region,
+malformed identity, or invalid date is a typed poison boundary and cannot
+advance the cursor. Each action's stable Alpaca ID owns one source hold and one
+current schedule revision, so updates replace that action's prior window and
+deletes release only that action's hold. An operator hold or another action on
+the same underlying is never affected.
 
 The window is the full UTC ex-date day — freeze at ex-date 00:00 UTC and
 unfreeze at 00:00 UTC the next day — which brackets the US/Eastern trading
@@ -1629,14 +1631,30 @@ alignment marker, and replay cursor together. Apalis jobs and aggregate hold
 events are recoverable second-phase effects; startup aligns every pending
 revision before reconnecting.
 
+Each projected revision enqueues durable `AlignCorporateActionFreeze` jobs keyed
+by action ID and event ID. Projection commits and the alignment job's
+expected-event check plus action-owned hold effects share one process-wide
+revision guard; the single-writer issuer therefore cannot commit a newer
+revision between the check and those effects. Insert/update alignment acquires
+exactly that Alpaca-owned hold when the current revision is inside its active
+window and releases the same hold from any superseded underlying. A delete,
+elapsed window, or unlisted current underlying schedules release-only alignment.
+At startup, `Running` transition and alignment jobs reset to `Pending`; `Killed`
+or exhausted alignment jobs are re-armed because the projection remains pending,
+and each terminal alignment key enqueues one deduplicated sync-failure lifecycle
+notification. `Done` alignment jobs and terminal transition jobs are vacuumed
+after dead transitions are logged.
+
 Event IDs are canonical uppercase ULIDs ordered by their encoded value. An exact
 replay is a duplicate; an unseen lower ID is a cursor regression. Before a
-poison or regression stops the feed, issuance persists its event ID and typed
-reason, and startup refuses to reconnect while that blocked boundary remains.
-The first install requests history with `since=1970-01-01T00:00:00Z`. Subsequent
-connections use inclusive `since_id=<committed-event-id>` replay, and the first
-data frame must echo that cursor. A rejected anchor or non-echoing first frame
-is a replay gap: no later or live event is accepted.
+poison or regression stops the feed, issuance persists its typed reason and any
+valid event ID the frame exposes; identity-malformed poison persists an
+identity-free boundary. Startup refuses to reconnect while that boundary
+remains. The first install requests history with `since=1970-01-01T00:00:00Z`.
+Subsequent connections use inclusive `since_id=<committed-event-id>` replay, and
+the first data frame must echo that cursor. A rejected anchor refuses the
+connection and accepts no traffic; a successful response with a non-echoing
+first frame persists a replay gap, and no later or live event is accepted.
 
 Repairing a replay-retention gap is an explicit fail-closed operation, never a
 cursor reset. While minting remains gated, the repair buffers a newly connected

@@ -20,12 +20,15 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use cqrs_es::AggregateError;
 use event_sorcery::{EventSourced, LifecycleError, Store};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
+use sqlx::{AssertSqlSafe, Pool, Sqlite};
 use std::sync::Arc;
+#[cfg(test)]
+use tokio::sync::Barrier;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{error, warn};
 
-use super::UnderlyingSymbol;
 use super::view::{TokenizedAssetViewError, underlying_has_listing};
+use super::{CorporateActionEventId, CorporateActionId, UnderlyingSymbol};
 use crate::jobs::{Job, JobQueue, QueuePushError, ScheduledTask, job_type};
 use crate::notifications::{
     FreezeTransitionKind, LifecycleNotification, LifecycleNotifier,
@@ -114,7 +117,320 @@ pub(crate) struct FreezeScheduleCtx {
         Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
-/// Error surfaced by a freeze-transition job.
+/// Durable alignment of one Alpaca-owned hold to its latest projected
+/// corporate-action revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AlignCorporateActionFreeze {
+    pub(crate) action_id: CorporateActionId,
+    pub(crate) expected_event_id: CorporateActionEventId,
+}
+
+#[cfg(test)]
+pub(crate) struct RevisionReadTestHook {
+    pub(crate) observed: Arc<Barrier>,
+    pub(crate) release: Arc<Barrier>,
+}
+
+static CORPORATE_ACTION_REVISION_GUARD: Mutex<()> = Mutex::const_new(());
+
+/// Serializes projection commits with the action-owned hold effects authorized
+/// by their expected revision. The issuer is a single-writer service, so one
+/// process-wide guard closes this boundary without a distributed lease.
+pub(crate) async fn acquire_corporate_action_revision_guard()
+-> MutexGuard<'static, ()> {
+    CORPORATE_ACTION_REVISION_GUARD.lock().await
+}
+
+const CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS: u32 = 10;
+
+/// Rows apalis will never run again. Recovery, logging, notification, and
+/// cleanup share this predicate so a terminal job cannot fall between paths.
+const DEAD_JOB_PREDICATE: &str = "
+    status = 'Killed'
+    OR (status = 'Failed' AND max_attempts <= attempts)
+";
+
+pub(crate) struct CorporateActionFreezeCtx {
+    pub(crate) underlying_store: Arc<Store<Underlying>>,
+    pub(crate) pool: Pool<Sqlite>,
+    #[cfg(test)]
+    pub(crate) revision_read_test_hook: Option<RevisionReadTestHook>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CorporateActionFreezeScheduler {
+    queue: JobQueue<AlignCorporateActionFreeze>,
+    notification_queue: JobQueue<SendLifecycleNotification>,
+    pool: Pool<Sqlite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorporateActionScheduleState {
+    Active,
+    Deleted,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CorporateActionScheduleError {
+    #[error("underlying {underlying} has no listing on any network")]
+    UnknownUnderlying { underlying: UnderlyingSymbol },
+    #[error(transparent)]
+    Push(#[from] QueuePushError),
+    #[error(transparent)]
+    View(#[from] TokenizedAssetViewError),
+    #[error("corporate-action ex-date {0} has no following day")]
+    InvalidExDate(NaiveDate),
+}
+
+impl CorporateActionFreezeScheduler {
+    pub(crate) fn new(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        pool: Pool<Sqlite>,
+    ) -> Self {
+        Self {
+            queue: JobQueue::new(apalis_pool),
+            notification_queue: JobQueue::new(apalis_pool),
+            pool,
+        }
+    }
+
+    pub(crate) async fn schedule_revision(
+        &mut self,
+        action_id: &CorporateActionId,
+        event_id: &CorporateActionEventId,
+        underlying: &UnderlyingSymbol,
+        ex_date: NaiveDate,
+        state: CorporateActionScheduleState,
+        now: DateTime<Utc>,
+    ) -> Result<(), CorporateActionScheduleError> {
+        if state == CorporateActionScheduleState::Active
+            && !underlying_has_listing(&self.pool, underlying).await?
+        {
+            return Err(CorporateActionScheduleError::UnknownUnderlying {
+                underlying: underlying.clone(),
+            });
+        }
+
+        let key_prefix = format!("corporate-action:{action_id}:{event_id}");
+        let immediate = ScheduledTask {
+            task: AlignCorporateActionFreeze {
+                action_id: action_id.clone(),
+                expected_event_id: event_id.clone(),
+            },
+            idempotency_key: format!("{key_prefix}:immediate"),
+            run_after: std::time::Duration::ZERO,
+            max_attempts: Some(CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS),
+        };
+        if state == CorporateActionScheduleState::Deleted {
+            self.queue.push_scheduled_batch([immediate]).await?;
+            return Ok(());
+        }
+
+        // The feed is restricted to the US market. UTC midnight begins before
+        // the US/Eastern session opens and the following UTC midnight ends
+        // after it closes, so this window contains the full ex-date session.
+        let freeze_at = ex_date
+            .and_hms_opt(0, 0, 0)
+            .map(|value| DateTime::<Utc>::from_naive_utc_and_offset(value, Utc))
+            .ok_or(CorporateActionScheduleError::InvalidExDate(ex_date))?;
+        let unfreeze_at = ex_date
+            .succ_opt()
+            .and_then(|value| value.and_hms_opt(0, 0, 0))
+            .map(|value| DateTime::<Utc>::from_naive_utc_and_offset(value, Utc))
+            .ok_or(CorporateActionScheduleError::InvalidExDate(ex_date))?;
+        let freeze_delay =
+            (freeze_at - now).to_std().unwrap_or(std::time::Duration::ZERO);
+        let unfreeze_delay =
+            (unfreeze_at - now).to_std().unwrap_or(std::time::Duration::ZERO);
+        if unfreeze_at <= now {
+            self.queue.push_scheduled_batch([immediate]).await?;
+            return Ok(());
+        }
+
+        self.queue
+            .push_scheduled_batch([
+                immediate,
+                ScheduledTask {
+                    task: AlignCorporateActionFreeze {
+                        action_id: action_id.clone(),
+                        expected_event_id: event_id.clone(),
+                    },
+                    idempotency_key: format!("{key_prefix}:freeze"),
+                    run_after: freeze_delay,
+                    max_attempts: Some(CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS),
+                },
+                ScheduledTask {
+                    task: AlignCorporateActionFreeze {
+                        action_id: action_id.clone(),
+                        expected_event_id: event_id.clone(),
+                    },
+                    idempotency_key: format!("{key_prefix}:unfreeze"),
+                    run_after: unfreeze_delay,
+                    max_attempts: Some(CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS),
+                },
+            ])
+            .await?;
+
+        self.notification_queue
+            .push_with_idempotency_key(
+                SendLifecycleNotification {
+                    notification:
+                        LifecycleNotification::CorporateActionScheduled {
+                            underlying: underlying.clone(),
+                            ex_date,
+                            freeze_at,
+                            unfreeze_at,
+                        },
+                },
+                format!(
+                    "notify:corporate-action:{underlying}:{ex_date}:{}:{}",
+                    freeze_at.timestamp(),
+                    unfreeze_at.timestamp()
+                ),
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CorporateActionFreezeError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    View(#[from] TokenizedAssetViewError),
+    #[error("invalid stored corporate-action underlying {0}")]
+    InvalidUnderlying(String),
+    #[error("invalid stored corporate-action ex-date {0}")]
+    InvalidExDate(String),
+    #[error(transparent)]
+    Aggregate(#[from] Box<AggregateError<LifecycleError<Underlying>>>),
+}
+
+impl Job<CorporateActionFreezeCtx> for AlignCorporateActionFreeze {
+    type Output = ();
+    type Error = CorporateActionFreezeError;
+
+    async fn perform(
+        &self,
+        ctx: &CorporateActionFreezeCtx,
+    ) -> Result<Self::Output, Self::Error> {
+        let _revision_guard = acquire_corporate_action_revision_guard().await;
+        let Some((event_id, underlying, ex_date, deleted)) =
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "
+                SELECT event_id, underlying, ex_date, deleted
+                FROM corporate_action_schedule
+                WHERE action_id = ?
+                ",
+            )
+            .bind(self.action_id.as_str())
+            .fetch_optional(&ctx.pool)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        if event_id != self.expected_event_id.as_str() {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &ctx.revision_read_test_hook {
+            hook.observed.wait().await;
+            hook.release.wait().await;
+        }
+
+        let underlying_symbol =
+            UnderlyingSymbol::new(&underlying).map_err(|_| {
+                CorporateActionFreezeError::InvalidUnderlying(
+                    underlying.clone(),
+                )
+            })?;
+        let ex_date =
+            NaiveDate::parse_from_str(&ex_date, "%Y-%m-%d").map_err(|_| {
+                CorporateActionFreezeError::InvalidExDate(ex_date.clone())
+            })?;
+        let freeze_at = ex_date
+            .and_hms_opt(0, 0, 0)
+            .map(|value| DateTime::<Utc>::from_naive_utc_and_offset(value, Utc))
+            .ok_or_else(|| {
+                CorporateActionFreezeError::InvalidExDate(ex_date.to_string())
+            })?;
+        let unfreeze_at = ex_date
+            .succ_opt()
+            .and_then(|value| value.and_hms_opt(0, 0, 0))
+            .map(|value| DateTime::<Utc>::from_naive_utc_and_offset(value, Utc))
+            .ok_or_else(|| {
+                CorporateActionFreezeError::InvalidExDate(ex_date.to_string())
+            })?;
+        let now = Utc::now();
+        let hold_id =
+            FreezeHoldId::alpaca_corporate_action(self.action_id.clone());
+        let should_hold = deleted == 0
+            && underlying_has_listing(&ctx.pool, &underlying_symbol).await?
+            && now >= freeze_at
+            && now < unfreeze_at;
+        let observed_underlyings: Vec<String> = sqlx::query_scalar(
+            "
+            SELECT DISTINCT underlying
+            FROM corporate_action_mutations
+            WHERE action_id = ? AND underlying IS NOT NULL
+            ",
+        )
+        .bind(self.action_id.as_str())
+        .fetch_all(&ctx.pool)
+        .await?;
+
+        if should_hold {
+            ctx.underlying_store
+                .send(
+                    &underlying_symbol,
+                    UnderlyingCommand::AcquireFreezeHold {
+                        underlying: underlying_symbol.clone(),
+                        hold_id: hold_id.clone(),
+                        acquired_at: now,
+                    },
+                )
+                .await
+                .map_err(|source| {
+                    CorporateActionFreezeError::Aggregate(Box::new(source))
+                })?;
+        }
+
+        for observed_underlying in observed_underlyings {
+            let observed_underlying =
+                UnderlyingSymbol::new(&observed_underlying).map_err(|_| {
+                    CorporateActionFreezeError::InvalidUnderlying(
+                        observed_underlying.clone(),
+                    )
+                })?;
+            if should_hold && observed_underlying == underlying_symbol {
+                continue;
+            }
+            ctx.underlying_store
+                .send(
+                    &observed_underlying,
+                    UnderlyingCommand::ReleaseFreezeHold {
+                        underlying: observed_underlying.clone(),
+                        hold_id: hold_id.clone(),
+                        released_at: now,
+                    },
+                )
+                .await
+                .map_err(|source| {
+                    CorporateActionFreezeError::Aggregate(Box::new(source))
+                })?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Error surfaced by a freeze-transition job. Command dispatch is the only
+/// fallible step; `Freeze`/`Unfreeze` on an already-transitioned asset is a
+/// no-op, not an error.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FreezeTransitionError {
     #[error(
@@ -233,13 +549,13 @@ impl Job<FreezeScheduleCtx> for ApplyFreezeTransition {
         let command = match self.transition {
             FreezeTransition::Freeze => UnderlyingCommand::AcquireFreezeHold {
                 underlying: self.underlying.clone(),
-                hold_id: self.hold_id,
+                hold_id: self.hold_id.clone(),
                 acquired_at: transitioned_at,
             },
             FreezeTransition::Unfreeze => {
                 UnderlyingCommand::ReleaseFreezeHold {
                     underlying: self.underlying.clone(),
-                    hold_id: self.hold_id,
+                    hold_id: self.hold_id.clone(),
                     released_at: transitioned_at,
                 }
             }
@@ -339,7 +655,6 @@ pub(crate) enum FreezeScheduleError {
 #[derive(Clone)]
 pub(crate) struct FreezeScheduler {
     queue: JobQueue<ApplyFreezeTransition>,
-    notification_queue: JobQueue<SendLifecycleNotification>,
     /// Event-store pool for the terminal-row release; both pools address the
     /// same SQLite file (see `crate::jobs`).
     pool: Pool<Sqlite>,
@@ -350,11 +665,7 @@ impl FreezeScheduler {
         apalis_pool: &apalis_sqlite::SqlitePool,
         pool: Pool<Sqlite>,
     ) -> Self {
-        Self {
-            queue: JobQueue::new(apalis_pool),
-            notification_queue: JobQueue::new(apalis_pool),
-            pool,
-        }
+        Self { queue: JobQueue::new(apalis_pool), pool }
     }
 
     /// Arms one freeze window for `underlying`: acquire its hold at `freeze_at`
@@ -437,12 +748,13 @@ impl FreezeScheduler {
                 ScheduledTask {
                     task: ApplyFreezeTransition {
                         underlying: underlying.clone(),
-                        hold_id,
+                        hold_id: hold_id.clone(),
                         transition: FreezeTransition::Freeze,
                         scheduled_for: freeze_at,
                     },
                     idempotency_key: freeze_key,
                     run_after: freeze_delay,
+                    max_attempts: None,
                 },
                 ScheduledTask {
                     task: ApplyFreezeTransition {
@@ -453,37 +765,9 @@ impl FreezeScheduler {
                     },
                     idempotency_key: unfreeze_key,
                     run_after: unfreeze_delay,
+                    max_attempts: None,
                 },
             ])
-            .await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn notify_corporate_action_scheduled(
-        &mut self,
-        underlying: &UnderlyingSymbol,
-        ex_date: NaiveDate,
-        freeze_at: DateTime<Utc>,
-        unfreeze_at: DateTime<Utc>,
-    ) -> Result<(), FreezeScheduleError> {
-        self.notification_queue
-            .push_with_idempotency_key(
-                SendLifecycleNotification {
-                    notification:
-                        LifecycleNotification::CorporateActionScheduled {
-                            underlying: underlying.clone(),
-                            ex_date,
-                            freeze_at,
-                            unfreeze_at,
-                        },
-                },
-                format!(
-                    "notify:corporate-action:{underlying}:{ex_date}:{}:{}",
-                    freeze_at.timestamp(),
-                    unfreeze_at.timestamp()
-                ),
-            )
             .await?;
 
         Ok(())
@@ -505,22 +789,23 @@ impl FreezeScheduler {
         for idempotency_key in idempotency_keys {
             log_dead_freeze_jobs(&self.pool, Some(idempotency_key)).await?;
 
-            sqlx::query(
+            let query = format!(
                 "
                 DELETE FROM Jobs
                 WHERE
                     job_type = ?
                     AND idempotency_key = ?
                     AND (
-                        status IN ('Done', 'Killed')
-                        OR (status = 'Failed' AND max_attempts <= attempts)
+                        status = 'Done'
+                        OR ({DEAD_JOB_PREDICATE})
                     )
-                ",
-            )
-            .bind(job_type::<ApplyFreezeTransition>())
-            .bind(idempotency_key)
-            .execute(&self.pool)
-            .await?;
+                "
+            );
+            sqlx::query(AssertSqlSafe(query))
+                .bind(job_type::<ApplyFreezeTransition>())
+                .bind(idempotency_key)
+                .execute(&self.pool)
+                .await?;
         }
 
         Ok(())
@@ -537,43 +822,37 @@ async fn log_dead_freeze_jobs(
     pool: &Pool<Sqlite>,
     idempotency_key: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    let dead_jobs: Vec<String> = match idempotency_key {
-        Some(idempotency_key) => {
-            sqlx::query_scalar(
-                "
-                SELECT idempotency_key
-                FROM Jobs
-                WHERE
-                    job_type = ?
-                    AND idempotency_key = ?
-                    AND (
-                        status = 'Killed'
-                        OR (status = 'Failed' AND max_attempts <= attempts)
-                    )
-                ",
-            )
+    let dead_jobs: Vec<String> = if let Some(idempotency_key) = idempotency_key
+    {
+        let query = format!(
+            "
+            SELECT idempotency_key
+            FROM Jobs
+            WHERE
+                job_type = ?
+                AND idempotency_key = ?
+                AND ({DEAD_JOB_PREDICATE})
+            "
+        );
+        sqlx::query_scalar(AssertSqlSafe(query))
             .bind(job_type::<ApplyFreezeTransition>())
             .bind(idempotency_key)
             .fetch_all(pool)
             .await?
-        }
-        None => {
-            sqlx::query_scalar(
-                "
-                SELECT idempotency_key
-                FROM Jobs
-                WHERE
-                    job_type = ?
-                    AND (
-                        status = 'Killed'
-                        OR (status = 'Failed' AND max_attempts <= attempts)
-                    )
-                ",
-            )
+    } else {
+        let query = format!(
+            "
+            SELECT idempotency_key
+            FROM Jobs
+            WHERE
+                job_type = ?
+                AND ({DEAD_JOB_PREDICATE})
+            "
+        );
+        sqlx::query_scalar(AssertSqlSafe(query))
             .bind(job_type::<ApplyFreezeTransition>())
             .fetch_all(pool)
             .await?
-        }
     };
 
     if !dead_jobs.is_empty() {
@@ -586,16 +865,28 @@ async fn log_dead_freeze_jobs(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FreezeScheduleRecoveryError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Push(#[from] QueuePushError),
+}
+
 /// Flips freeze-schedule jobs left `Running` by a dead process back to
-/// `Pending`, clearing their lock columns (`lock_at`, `lock_by`).
+/// `Pending`, clearing their lock columns (`lock_at`, `lock_by`). Dead
+/// corporate-action alignment jobs (`Killed` or exhausted `Failed`) are also
+/// re-armed from attempt zero: their commands are idempotent, and leaving one
+/// terminal would strand the latest projected freeze state permanently because
+/// the projection has already marked that revision reconciled.
 ///
 /// At startup no worker from this process is running yet, so any `Running`
 /// row is an orphan from the previous process; without this reset a
 /// crashed-mid-run transition waits for apalis's orphan re-enqueue timeout
 /// (default ~300s) — a long delay next to an ex-date deadline. Scoped to the
-/// [`ApplyFreezeTransition`] job type so `Running` rows of other apalis job
-/// types sharing the `Jobs` table are left for their own recovery. Runs on
-/// the event-store pool because both pools address the same SQLite file.
+/// two freeze-schedule job types so `Running` rows of other apalis job
+/// types sharing the `Jobs` table are left for their own recovery. Runs on the
+/// event-store pool because both pools address the same SQLite file.
 pub(crate) async fn reset_orphaned_freeze_schedule_jobs(
     pool: &Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
@@ -607,59 +898,163 @@ pub(crate) async fn reset_orphaned_freeze_schedule_jobs(
             lock_at = NULL,
             lock_by = NULL
         WHERE
-            job_type = ?
+            job_type IN (?, ?)
             AND status = 'Running'
         ",
     )
     .bind(job_type::<ApplyFreezeTransition>())
+    .bind(job_type::<AlignCorporateActionFreeze>())
     .execute(pool)
     .await?;
+
+    let dead_alignment_query = format!(
+        "
+        SELECT idempotency_key
+        FROM Jobs
+        WHERE
+            job_type = ?
+            AND ({DEAD_JOB_PREDICATE})
+        "
+    );
+    let dead_alignments: Vec<String> =
+        sqlx::query_scalar(AssertSqlSafe(dead_alignment_query))
+            .bind(job_type::<AlignCorporateActionFreeze>())
+            .fetch_all(pool)
+            .await?;
+    if !dead_alignments.is_empty() {
+        error!(target: "asset", jobs = ?dead_alignments,
+            "Re-arming dead corporate-action freeze alignments"
+        );
+    }
+
+    let rearm_query = format!(
+        "
+        UPDATE Jobs
+        SET
+            status = 'Pending',
+            attempts = 0,
+            lock_at = NULL,
+            lock_by = NULL,
+            done_at = NULL,
+            last_result = NULL
+        WHERE
+            job_type = ?
+            AND ({DEAD_JOB_PREDICATE})
+        "
+    );
+    sqlx::query(AssertSqlSafe(rearm_query))
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
 
-/// Deletes terminal apalis rows for [`ApplyFreezeTransition`] jobs, mirroring
+/// Re-arms orphaned and terminal schedule jobs and durably alerts once per
+/// alignment key that exhausted its bounded retry budget. The alert key stays
+/// stable across later restarts, so a permanently malformed revision cannot
+/// page on every boot.
+pub(crate) async fn reset_orphaned_freeze_schedule_jobs_and_notify(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Result<(), FreezeScheduleRecoveryError> {
+    let dead_alignment_query = format!(
+        "
+        SELECT idempotency_key
+        FROM Jobs
+        WHERE
+            job_type = ?
+            AND ({DEAD_JOB_PREDICATE})
+        "
+    );
+    let dead_alignments: Vec<String> =
+        sqlx::query_scalar(AssertSqlSafe(dead_alignment_query))
+            .bind(job_type::<AlignCorporateActionFreeze>())
+            .fetch_all(pool)
+            .await?;
+
+    let mut notification_queue =
+        JobQueue::<SendLifecycleNotification>::new(apalis_pool);
+    for idempotency_key in dead_alignments {
+        notification_queue
+            .push_with_idempotency_key(
+                SendLifecycleNotification {
+                    notification:
+                        LifecycleNotification::CorporateActionsSyncFailed,
+                },
+                format!(
+                    "notify:corporate-action-alignment-dead:{idempotency_key}"
+                ),
+            )
+            .await?;
+    }
+
+    // Enqueue every durable alert before clearing the terminal evidence. If a
+    // queue write fails, the dead alignment remains discoverable on restart;
+    // already-enqueued alerts deduplicate by their stable key.
+    reset_orphaned_freeze_schedule_jobs(pool).await?;
+
+    Ok(())
+}
+
+/// Deletes terminal apalis rows for concluded freeze-schedule work, mirroring
 /// the mint stack's terminal-job vacuums: it bounds the `Jobs` table across
-/// restarts and frees idempotency keys held by concluded windows. Only
-/// terminal rows are removed, so orphaned `Pending`/`Running` jobs apalis
-/// will re-pick are left untouched. Rows that died without applying (killed
-/// or out of retries) are surfaced at ERROR before deletion — the row is the
-/// only record that the transition was ever armed. Runs on the event-store
-/// pool because both pools address the same SQLite file.
+/// restarts and frees idempotency keys held by concluded windows. Terminal
+/// [`ApplyFreezeTransition`] rows are removed after logging rows that died
+/// without applying. Done [`AlignCorporateActionFreeze`] rows are removed too;
+/// dead alignment rows are re-armed by the startup call to
+/// [`reset_orphaned_freeze_schedule_jobs`] instead of vacuumed because the
+/// latest projected freeze state still needs to be applied. Only terminal rows
+/// are removed, so orphaned `Pending`/`Running`
+/// jobs apalis will re-pick are left untouched. Runs on the event-store pool
+/// because both pools address the same SQLite file.
 pub(crate) async fn vacuum_terminal_freeze_schedule_jobs(
     pool: &Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
     log_dead_freeze_jobs(pool, None).await?;
 
-    sqlx::query(
+    let delete_query = format!(
         "
         DELETE FROM Jobs
         WHERE
             job_type = ?
             AND (
-                status IN ('Done', 'Killed')
-                OR (status = 'Failed' AND max_attempts <= attempts)
+                status = 'Done'
+                OR ({DEAD_JOB_PREDICATE})
             )
-        ",
-    )
-    .bind(job_type::<ApplyFreezeTransition>())
-    .execute(pool)
-    .await?;
+        "
+    );
+    sqlx::query(AssertSqlSafe(delete_query))
+        .bind(job_type::<ApplyFreezeTransition>())
+        .execute(pool)
+        .await?;
+
+    sqlx::query("DELETE FROM Jobs WHERE job_type = ? AND status = 'Done'")
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use chrono::{Duration as ChronoDuration, Utc};
     use event_sorcery::StoreBuilder;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::{
-        ApplyFreezeTransition, FreezeScheduleCtx, FreezeScheduleError,
-        FreezeScheduler, FreezeTransition, reset_orphaned_freeze_schedule_jobs,
+        AlignCorporateActionFreeze, ApplyFreezeTransition,
+        CorporateActionFreezeCtx, CorporateActionFreezeScheduler,
+        CorporateActionScheduleState, FreezeScheduleCtx, FreezeScheduleError,
+        FreezeScheduler, FreezeTransition, RevisionReadTestHook,
+        reset_orphaned_freeze_schedule_jobs,
+        reset_orphaned_freeze_schedule_jobs_and_notify,
         vacuum_terminal_freeze_schedule_jobs,
     };
     use crate::jobs::{Job, job_type};
@@ -669,7 +1064,14 @@ mod tests {
         LifecycleNotification, SendLifecycleNotification,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::UnderlyingSymbol;
+    use crate::tokenized_asset::corporate_action_feed::{
+        CorporateActionMutation, CorporateActionMutationKind,
+        DividendCorporateAction, apply_mutation,
+    };
+    use crate::tokenized_asset::{
+        AssetKey, CorporateActionEventId, CorporateActionId, Network,
+        TokenSymbol, TokenizedAssetCommand, UnderlyingSymbol,
+    };
     use crate::underlying::{
         AssetStatus, FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
         load_freeze_status,
@@ -686,6 +1088,480 @@ mod tests {
         FreezeHoldId::corporate_action(
             FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
         )
+    }
+
+    fn corporate_action(
+        event_id: &str,
+        kind: CorporateActionMutationKind,
+        action_id: &str,
+        underlying: &UnderlyingSymbol,
+        ex_date: chrono::NaiveDate,
+    ) -> CorporateActionMutation {
+        CorporateActionMutation {
+            event_id: CorporateActionEventId::new(event_id).unwrap(),
+            kind,
+            action: DividendCorporateAction {
+                id: CorporateActionId::new(action_id).unwrap(),
+                underlying: underlying.clone(),
+                ex_date,
+            },
+        }
+    }
+
+    async fn corporate_action_context(
+        harness: &TestHarness,
+    ) -> CorporateActionFreezeCtx {
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(harness.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        CorporateActionFreezeCtx {
+            underlying_store,
+            pool: harness.pool.clone(),
+            revision_read_test_hook: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn corporate_action_revision_schedules_immediate_and_boundary_jobs() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mut scheduler = CorporateActionFreezeScheduler::new(
+            &harness.apalis_pool,
+            harness.pool.clone(),
+        );
+        let now = Utc::now();
+        let ex_date = now.date_naive() + ChronoDuration::days(1);
+
+        scheduler
+            .schedule_revision(
+                &CorporateActionId::new("ca-1").unwrap(),
+                &CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2")
+                    .unwrap(),
+                &underlying,
+                ex_date,
+                CorporateActionScheduleState::Active,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let (jobs, min_attempts): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(max_attempts) FROM Jobs WHERE job_type = ?",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(jobs, 3);
+        assert_eq!(
+            min_attempts,
+            i64::from(super::CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS)
+        );
+        let run_at: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT idempotency_key, run_at FROM Jobs WHERE job_type = ? ORDER BY idempotency_key",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+        let freeze_at = ex_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let unfreeze_at =
+            ex_date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        assert!(run_at.iter().any(|(key, scheduled_at)| {
+            key.ends_with(":immediate") && *scheduled_at <= now.timestamp() + 1
+        }));
+        assert!(run_at.iter().any(|(key, scheduled_at)| {
+            key.ends_with(":freeze") && *scheduled_at == freeze_at.timestamp()
+        }));
+        assert!(run_at.iter().any(|(key, scheduled_at)| {
+            key.ends_with(":unfreeze")
+                && *scheduled_at == unfreeze_at.timestamp()
+        }));
+
+        scheduler
+            .schedule_revision(
+                &CorporateActionId::new("ca-1").unwrap(),
+                &CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2")
+                    .unwrap(),
+                &underlying,
+                ex_date,
+                CorporateActionScheduleState::Active,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let notification_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            notification_jobs, 1,
+            "re-scheduling the same revision must dedup to one \
+             corporate-action-scheduled notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_corporate_action_revision_schedules_only_alignment() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mut scheduler = CorporateActionFreezeScheduler::new(
+            &harness.apalis_pool,
+            harness.pool.clone(),
+        );
+        let now = Utc::now();
+
+        scheduler
+            .schedule_revision(
+                &CorporateActionId::new("ca-elapsed").unwrap(),
+                &CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2")
+                    .unwrap(),
+                &underlying,
+                now.date_naive() - ChronoDuration::days(2),
+                CorporateActionScheduleState::Active,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<AlignCorporateActionFreeze>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, 1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn corporate_action_alignment_acquires_the_action_owned_hold() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mutation = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &mutation).await.unwrap();
+
+        AlignCorporateActionFreeze {
+            action_id: mutation.action.id,
+            expected_event_id: mutation.event_id,
+        }
+        .perform(&corporate_action_context(&harness).await)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&harness.pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Acquiring underlying freeze hold", underlying.as_str()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn corporate_action_update_releases_the_superseded_active_window() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let ctx = corporate_action_context(&harness).await;
+        let insert = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &insert).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: insert.action.id.clone(),
+            expected_event_id: insert.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let update = corporate_action(
+            "01J9RVB6Y4ZK8M3N7QD2WX1RFP",
+            CorporateActionMutationKind::Update,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive() + ChronoDuration::days(1),
+        );
+        apply_mutation(&harness.pool, &update).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: update.action.id,
+            expected_event_id: update.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&harness.pool, &underlying).await.unwrap(),
+            AssetStatus::Enabled
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Releasing underlying freeze hold", underlying.as_str()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn corporate_action_update_moves_its_hold_to_the_revised_underlying()
+    {
+        let harness = TestHarness::new().await;
+        let aapl = harness.setup_account_and_asset().await.underlying;
+        let msft = UnderlyingSymbol::new("MSFT").unwrap();
+        harness
+            .asset_store
+            .send(
+                &AssetKey::new(msft.clone(), Network::Base),
+                TokenizedAssetCommand::Add {
+                    underlying: msft.clone(),
+                    token: TokenSymbol::new("tMSFT"),
+                    network: Network::Base,
+                    vault: address!(
+                        "0x2234567890abcdef1234567890abcdef12345678"
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = corporate_action_context(&harness).await;
+        let insert = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &aapl,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &insert).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: insert.action.id,
+            expected_event_id: insert.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+        let update = corporate_action(
+            "01J9RVB6Y4ZK8M3N7QD2WX1RFP",
+            CorporateActionMutationKind::Update,
+            "ca-1",
+            &msft,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &update).await.unwrap();
+
+        AlignCorporateActionFreeze {
+            action_id: update.action.id,
+            expected_event_id: update.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&harness.pool, &aapl).await.unwrap(),
+            AssetStatus::Enabled
+        );
+        assert_eq!(
+            load_freeze_status(&harness.pool, &msft).await.unwrap(),
+            AssetStatus::Frozen
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Acquiring underlying freeze hold", msft.as_str()]
+        ));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Releasing underlying freeze hold", aapl.as_str()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn revision_update_waits_for_inflight_action_alignment() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let insert = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &insert).await.unwrap();
+
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(harness.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let ctx = Arc::new(CorporateActionFreezeCtx {
+            underlying_store,
+            pool: harness.pool.clone(),
+            revision_read_test_hook: Some(RevisionReadTestHook {
+                observed: observed.clone(),
+                release: release.clone(),
+            }),
+        });
+        let alignment = AlignCorporateActionFreeze {
+            action_id: insert.action.id.clone(),
+            expected_event_id: insert.event_id,
+        };
+        let alignment_ctx = ctx.clone();
+        let alignment_task =
+            tokio::spawn(
+                async move { alignment.perform(&alignment_ctx).await },
+            );
+        observed.wait().await;
+
+        let update = corporate_action(
+            "01J9RVB6Y4ZK8M3N7QD2WX1RFP",
+            CorporateActionMutationKind::Update,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive() + ChronoDuration::days(1),
+        );
+        let update_pool = harness.pool.clone();
+        let mut update_task =
+            tokio::spawn(
+                async move { apply_mutation(&update_pool, &update).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut update_task)
+                .await
+                .is_err(),
+            "a newer revision must not commit between the old revision check and its hold effects"
+        );
+
+        release.wait().await;
+        alignment_task.await.unwrap().unwrap();
+        update_task.await.unwrap().unwrap();
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn stale_corporate_action_alignment_is_a_noop() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let ctx = corporate_action_context(&harness).await;
+        let insert = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &insert).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: insert.action.id.clone(),
+            expected_event_id: insert.event_id.clone(),
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+        let update = corporate_action(
+            "01J9RVB6Y4ZK8M3N7QD2WX1RFP",
+            CorporateActionMutationKind::Update,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive() + ChronoDuration::days(1),
+        );
+        apply_mutation(&harness.pool, &update).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: update.action.id,
+            expected_event_id: update.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        AlignCorporateActionFreeze {
+            action_id: insert.action.id,
+            expected_event_id: insert.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&harness.pool, &underlying).await.unwrap(),
+            AssetStatus::Enabled
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Releasing underlying freeze hold", underlying.as_str()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn corporate_action_delete_preserves_the_operator_hold() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let ctx = corporate_action_context(&harness).await;
+        ctx.underlying_store
+            .send(
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
+            )
+            .await
+            .unwrap();
+        let insert = corporate_action(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &insert).await.unwrap();
+        AlignCorporateActionFreeze {
+            action_id: insert.action.id.clone(),
+            expected_event_id: insert.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+        let deletion = corporate_action(
+            "01J9RVB6Y4ZK8M3N7QD2WX1RFP",
+            CorporateActionMutationKind::Delete,
+            "ca-1",
+            &underlying,
+            Utc::now().date_naive(),
+        );
+        apply_mutation(&harness.pool, &deletion).await.unwrap();
+
+        AlignCorporateActionFreeze {
+            action_id: deletion.action.id,
+            expected_event_id: deletion.event_id,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&harness.pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Releasing underlying freeze hold", underlying.as_str()]
+        ));
     }
 
     // A window owns one stable hold: acquiring it freezes the asset, releasing
@@ -715,7 +1591,7 @@ mod tests {
 
         let freeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
-            hold_id,
+            hold_id: hold_id.clone(),
             transition: FreezeTransition::Freeze,
             scheduled_for: freeze_at,
         };
@@ -863,13 +1739,13 @@ mod tests {
 
         let first_freeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
-            hold_id: first_hold,
+            hold_id: first_hold.clone(),
             transition: FreezeTransition::Freeze,
             scheduled_for: now + ChronoDuration::hours(1),
         };
         let second_freeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
-            hold_id: second_hold,
+            hold_id: second_hold.clone(),
             transition: FreezeTransition::Freeze,
             scheduled_for: now + ChronoDuration::hours(2),
         };
@@ -977,7 +1853,7 @@ mod tests {
 
         ApplyFreezeTransition {
             underlying: underlying.clone(),
-            hold_id,
+            hold_id: hold_id.clone(),
             transition: FreezeTransition::Freeze,
             scheduled_for: freeze_at,
         }
@@ -1167,24 +2043,6 @@ mod tests {
             .await
             .unwrap();
         scheduler
-            .notify_corporate_action_scheduled(
-                &underlying,
-                freeze_at.date_naive(),
-                freeze_at,
-                unfreeze_at,
-            )
-            .await
-            .unwrap();
-        scheduler
-            .notify_corporate_action_scheduled(
-                &underlying,
-                freeze_at.date_naive(),
-                freeze_at,
-                unfreeze_at,
-            )
-            .await
-            .unwrap();
-        scheduler
             .schedule_window(&underlying, freeze_at, unfreeze_at, now)
             .await
             .unwrap();
@@ -1200,14 +2058,6 @@ mod tests {
             "re-arming the same window must dedup to one freeze and one \
              unfreeze job"
         );
-
-        let notification_jobs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-                .bind(job_type::<SendLifecycleNotification>())
-                .fetch_one(&harness.pool)
-                .await
-                .unwrap();
-        assert_eq!(notification_jobs, 1);
     }
 
     // A window whose job died terminally (e.g. exhausted retries after an
@@ -1314,6 +2164,178 @@ mod tests {
         .unwrap();
         assert_eq!(remaining_keys.len(), 1);
         assert!(remaining_keys[0].starts_with("unfreeze:"));
+    }
+
+    #[tokio::test]
+    async fn startup_reset_and_vacuum_cover_corporate_action_alignments() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mut scheduler = CorporateActionFreezeScheduler::new(
+            &harness.apalis_pool,
+            harness.pool.clone(),
+        );
+        let now = Utc::now();
+        scheduler
+            .schedule_revision(
+                &CorporateActionId::new("ca-1").unwrap(),
+                &CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2")
+                    .unwrap(),
+                &underlying,
+                now.date_naive() + ChronoDuration::days(1),
+                CorporateActionScheduleState::Active,
+                now,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES ('dead-corporate-action-worker', ?, 'SqliteStorage')",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Running', lock_at = strftime('%s', 'now'), lock_by = 'dead-corporate-action-worker' WHERE job_type = ?",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        reset_orphaned_freeze_schedule_jobs(&harness.pool).await.unwrap();
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending' AND lock_at IS NULL AND lock_by IS NULL",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 3);
+
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        reset_orphaned_freeze_schedule_jobs_and_notify(
+            &harness.pool,
+            &harness.apalis_pool,
+        )
+        .await
+        .unwrap();
+        let rearmed_failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending' AND attempts = 0",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(rearmed_failed, 3);
+        let alignment_alerts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(alignment_alerts, 4);
+
+        sqlx::query("UPDATE Jobs SET status = 'Killed' WHERE job_type = ?")
+            .bind(job_type::<AlignCorporateActionFreeze>())
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        reset_orphaned_freeze_schedule_jobs_and_notify(
+            &harness.pool,
+            &harness.apalis_pool,
+        )
+        .await
+        .unwrap();
+        let rearmed_killed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending' AND attempts = 0",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(rearmed_killed, 3);
+        let deduplicated_alignment_alerts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(deduplicated_alignment_alerts, 4);
+
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(job_type::<AlignCorporateActionFreeze>())
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        vacuum_terminal_freeze_schedule_jobs(&harness.pool).await.unwrap();
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<AlignCorporateActionFreeze>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_preserves_dead_alignment_until_alert_is_durable()
+    {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mut scheduler = CorporateActionFreezeScheduler::new(
+            &harness.apalis_pool,
+            harness.pool.clone(),
+        );
+        let now = Utc::now();
+        scheduler
+            .schedule_revision(
+                &CorporateActionId::new("ca-alert-failure").unwrap(),
+                &CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2")
+                    .unwrap(),
+                &underlying,
+                now.date_naive() + ChronoDuration::days(1),
+                CorporateActionScheduleState::Active,
+                now,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        harness.apalis_pool.close().await;
+
+        assert!(
+            reset_orphaned_freeze_schedule_jobs_and_notify(
+                &harness.pool,
+                &harness.apalis_pool,
+            )
+            .await
+            .is_err(),
+            "startup must fail when the durable alert cannot be enqueued"
+        );
+        let still_dead: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Failed' AND attempts = max_attempts",
+        )
+        .bind(job_type::<AlignCorporateActionFreeze>())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            still_dead, 3,
+            "terminal evidence must remain available for the next restart"
+        );
     }
 
     // Two windows in the same UTC second must not share an idempotency key:

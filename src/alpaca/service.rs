@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
-use chrono::NaiveDate;
 use clap::Args;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+pub(crate) const DEFAULT_CORPORATE_ACTIONS_STREAM_URL: &str = "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us";
+
 use super::{
-    AlpacaError, AlpacaService, DividendAnnouncement, MintCallbackRequest,
-    RedeemRequest, RedeemResponse, TokenizationRequest,
+    AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
+    RedeemResponse, TokenizationRequest,
     itn::{self, REDEEM_CALLBACK_OPENAPI_REFERENCE},
 };
 use crate::mint::TokenizationRequestId;
@@ -59,6 +60,22 @@ pub struct AlpacaConfig {
         help = "Alpaca API request timeout in seconds"
     )]
     pub request_timeout_secs: u64,
+
+    #[arg(
+        long = "alpaca-corporate-actions-read-timeout-secs",
+        env = "ALPACA_CORPORATE_ACTIONS_READ_TIMEOUT_SECS",
+        default_value = "90",
+        help = "Idle-read timeout for the Alpaca corporate-actions SSE stream"
+    )]
+    pub corporate_actions_read_timeout_secs: u64,
+
+    #[arg(
+        long = "alpaca-corporate-actions-stream-url",
+        env = "ALPACA_CORPORATE_ACTIONS_STREAM_URL",
+        default_value = DEFAULT_CORPORATE_ACTIONS_STREAM_URL,
+        help = "Alpaca corporate-actions SSE stream URL"
+    )]
+    pub corporate_actions_stream_url: String,
 }
 
 impl std::fmt::Debug for AlpacaConfig {
@@ -70,6 +87,14 @@ impl std::fmt::Debug for AlpacaConfig {
             .field("api_secret", &"<redacted>")
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field(
+                "corporate_actions_read_timeout_secs",
+                &self.corporate_actions_read_timeout_secs,
+            )
+            .field(
+                "corporate_actions_stream_url",
+                &self.corporate_actions_stream_url,
+            )
             .finish()
     }
 }
@@ -97,6 +122,9 @@ impl AlpacaConfig {
             api_secret: "test".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: DEFAULT_CORPORATE_ACTIONS_STREAM_URL
+                .to_string(),
         }
     }
 }
@@ -366,77 +394,6 @@ impl AlpacaService for RealAlpacaService {
         })
         .await
     }
-
-    async fn list_dividend_announcements(
-        &self,
-        since: NaiveDate,
-        until: NaiveDate,
-    ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-        let url = format!(
-            "{}/v1/corporate_actions/announcements",
-            self.base_url.trim_end_matches('/'),
-        );
-
-        debug!(target: "alpaca", %url, method = "GET", %since, %until, "Listing Alpaca dividend announcements");
-
-        (|| async {
-            let response = self
-                .client
-                .get(&url)
-                .query(&[
-                    ("ca_types", "dividend"),
-                    ("date_type", "ex_date"),
-                    ("since", &since.to_string()),
-                    ("until", &until.to_string()),
-                ])
-                .basic_auth(&self.api_key, Some(&self.api_secret))
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret)
-                .send()
-                .await?;
-
-            let status = response.status();
-
-            match status {
-                reqwest::StatusCode::OK => {
-                    let body = response.text().await?;
-                    serde_json::from_str(&body).map_err(|e| {
-                        tracing::error!(
-                            target: "alpaca",
-                            %body,
-                            error = %e,
-                            "Failed to parse Alpaca announcements response"
-                        );
-                        AlpacaError::Parse { body, source: e }
-                    })
-                }
-                reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Auth(body))
-                }
-                status => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
-                }
-            }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_max_times(self.max_retries)
-                .with_jitter(),
-        )
-        .when(|e: &AlpacaError| e.is_retryable())
-        .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::debug!(
-                target: "alpaca",
-                error = %err,
-                retry_after = ?dur,
-                "Alpaca announcements API call failed; retrying"
-            );
-        })
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -446,8 +403,8 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        AlpacaError, AlpacaService, DividendAnnouncement, MintCallbackRequest,
-        NaiveDate, RealAlpacaService, RedeemRequest, TokenizationRequest,
+        AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
+        RedeemRequest, TokenizationRequest,
     };
     use crate::alpaca::{
         RedeemRequestStatus, TokenizationRequestType,
@@ -1755,124 +1712,5 @@ mod tests {
             ),
             "expected DEBUG retry log from the notify callback"
         );
-    }
-
-    // The announcements fetch sends the dividend/ex-date filters and the
-    // requested range, and deserializes the documented wire shape — including
-    // announcements whose ex_date is not set yet.
-    #[tokio::test]
-    async fn test_list_dividend_announcements_success() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/corporate_actions/announcements")
-                .query_param("ca_types", "dividend")
-                .query_param("date_type", "ex_date")
-                .query_param("since", "2026-07-13")
-                .query_param("until", "2026-10-10")
-                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "test-key")
-                .header("APCA-API-SECRET-KEY", "test-secret");
-            then.status(200).json_body(serde_json::json!([
-                {
-                    "id": "3fa6553a-4211-4018-85b9-d34d4d744c06",
-                    "corporate_action_id": "037833100_AD21",
-                    "ca_type": "Dividend",
-                    "ca_sub_type": "cash",
-                    "initiating_symbol": "AAPL",
-                    "initiating_original_cusip": "037833100",
-                    "target_symbol": "AAPL",
-                    "target_original_cusip": "037833100",
-                    "declaration_date": "2026-07-10",
-                    "ex_date": "2026-08-14",
-                    "record_date": "2026-08-15",
-                    "payable_date": "2026-08-18",
-                    "cash": "0.26",
-                    "old_rate": "1",
-                    "new_rate": "1"
-                },
-                {
-                    "id": "8c6f7c3e-92c8-4e39-b8b7-d1f2f2f0d9aa",
-                    "corporate_action_id": "594918104_AD09",
-                    "ca_type": "Dividend",
-                    "ca_sub_type": "cash",
-                    "initiating_symbol": "MSFT",
-                    "initiating_original_cusip": "594918104",
-                    "target_symbol": "MSFT",
-                    "target_original_cusip": "594918104",
-                    "declaration_date": "2026-07-11",
-                    "ex_date": null,
-                    "record_date": null,
-                    "payable_date": null,
-                    "cash": "0.83",
-                    "old_rate": "1",
-                    "new_rate": "1"
-                }
-            ]));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let since = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
-        let until = NaiveDate::from_ymd_opt(2026, 10, 10).unwrap();
-        let announcements =
-            service.list_dividend_announcements(since, until).await.unwrap();
-
-        assert_eq!(
-            announcements,
-            vec![
-                DividendAnnouncement {
-                    initiating_symbol: UnderlyingSymbol::new("AAPL").unwrap(),
-                    ex_date: NaiveDate::from_ymd_opt(2026, 8, 14),
-                },
-                DividendAnnouncement {
-                    initiating_symbol: UnderlyingSymbol::new("MSFT").unwrap(),
-                    ex_date: None,
-                },
-            ]
-        );
-        mock.assert();
-    }
-
-    // A 5xx from the announcements endpoint is retried up to the budget and
-    // then surfaced as a retryable Api error for the sync loop to log.
-    #[tokio::test]
-    async fn test_list_dividend_announcements_server_error_retries() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/corporate_actions/announcements");
-            then.status(500).body("Internal Server Error");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap()
-        .with_max_retries(2);
-
-        let since = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
-        let until = NaiveDate::from_ymd_opt(2026, 10, 10).unwrap();
-        let err = service
-            .list_dividend_announcements(since, until)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, AlpacaError::Api { status_code: 500, .. }));
-        mock.assert_calls(3);
     }
 }

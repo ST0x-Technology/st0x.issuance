@@ -2980,7 +2980,7 @@ mod tests {
     };
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
-    use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
@@ -3006,9 +3006,8 @@ mod tests {
     };
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
-        AlpacaError, AlpacaService, DividendAnnouncement, MintCallbackRequest,
-        RedeemRequest, RedeemRequestStatus, RedeemResponse,
-        TokenizationRequest,
+        AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
+        RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
     use crate::config::{VaultMode, VaultModeConfig};
     use crate::mint::test_utils::{
@@ -3306,14 +3305,6 @@ mod tests {
                     }
                 }),
             }
-        }
-
-        async fn list_dividend_announcements(
-            &self,
-            _since: NaiveDate,
-            _until: NaiveDate,
-        ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-            unimplemented!("not used in recover_post_alpaca tests")
         }
     }
 
