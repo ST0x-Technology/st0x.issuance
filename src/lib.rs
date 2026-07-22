@@ -2177,12 +2177,30 @@ mod tests {
             assert_eq!(error.first_network, crate::Network::Base);
             assert_eq!(error.first_vault, base_vault);
             assert_eq!(error.source.to_string(), "Base RPC unavailable");
+            // Counted per vault address rather than once for the shared
+            // message: the tracing-test buffer is global to the test binary,
+            // so a sibling test emitting the same line (e.g. the
+            // unconfigured-network test below) would inflate an
+            // unqualified count depending on scheduling.
             assert_eq!(
                 log_count_at!(
                     Level::DEBUG,
-                    &["Startup reconciliation failed for vault"]
+                    &[
+                        "Startup reconciliation failed for vault",
+                        "0x1111111111111111111111111111111111111111"
+                    ]
                 ),
-                2
+                1
+            );
+            assert_eq!(
+                log_count_at!(
+                    Level::DEBUG,
+                    &[
+                        "Startup reconciliation failed for vault",
+                        "0x2222222222222222222222222222222222222222"
+                    ]
+                ),
+                1
             );
             assert!(logs_contain_at!(
                 Level::WARN,

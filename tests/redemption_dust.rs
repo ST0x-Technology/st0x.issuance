@@ -74,6 +74,29 @@ where
     }
 }
 
+/// Waits for the redeem mock's dynamic responder to store the captured
+/// quantity.
+///
+/// `wait_for_mock_hit` returns once the request has *matched*, but the
+/// capture happens inside the mock's `respond_with` closure, which may not
+/// have run yet on the mock server's thread — asserting immediately after the
+/// hit reads `None` under CI timing.
+async fn wait_for_captured_qty(
+    captured: &Arc<Mutex<Option<String>>>,
+) -> Option<String> {
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(10);
+
+    loop {
+        let qty = captured.lock().unwrap().clone();
+        if qty.is_some() || start.elapsed() >= timeout {
+            return qty;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Mints tokens to the user via the full mint flow.
 /// Returns the exact amount of shares minted.
 async fn perform_mint_flow(
@@ -341,7 +364,7 @@ async fn test_redemption_returns_dust_to_user()
 
     harness::wait_for_mock_hit(&redeem_mock).await?;
 
-    let qty_sent_to_alpaca = captured_qty.lock().unwrap().clone();
+    let qty_sent_to_alpaca = wait_for_captured_qty(&captured_qty).await;
     assert_eq!(
         qty_sent_to_alpaca,
         Some(TRUNCATED_QTY_STR.to_string()),
@@ -441,7 +464,7 @@ async fn test_redemption_no_dust_when_9_decimals()
 
     harness::wait_for_mock_hit(&redeem_mock).await?;
 
-    let qty_sent = captured_qty.lock().unwrap().clone();
+    let qty_sent = wait_for_captured_qty(&captured_qty).await;
     assert_eq!(qty_sent, Some(mint_qty.to_string()));
 
     wait_for_balance(&vault, bot_wallet, U256::ZERO, "burned bot balance")
