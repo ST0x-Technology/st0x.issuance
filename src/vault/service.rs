@@ -1007,6 +1007,23 @@ impl VaultService for RealBlockchainService {
             block_number,
         })
     }
+
+    async fn vault_logic_is_expected(
+        &self,
+        orchestrator: Address,
+    ) -> Result<bool, VaultError> {
+        let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
+        Ok(contract.vaultLogicIsExpected().call().await?)
+    }
+
+    async fn next_burn_receipt_id(
+        &self,
+        orchestrator: Address,
+        token: Address,
+    ) -> Result<U256, VaultError> {
+        let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
+        Ok(contract.nextBurnReceiptId(token).call().await?)
+    }
 }
 
 #[cfg(test)]
