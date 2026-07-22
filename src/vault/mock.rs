@@ -163,6 +163,21 @@ struct OrchestratorMockState {
     readiness_call_count: AtomicUsize,
     #[cfg(test)]
     confirm_call_count: AtomicUsize,
+    /// Value returned by `vault_logic_is_expected`; `None` means healthy
+    /// (`true`).
+    #[cfg(test)]
+    vault_logic_expected: Mutex<Option<bool>>,
+    /// When set, `vault_logic_is_expected` fails with an RPC-style error.
+    #[cfg(test)]
+    vault_logic_should_error: Mutex<bool>,
+    /// Value returned by `next_burn_receipt_id`; `None` means `U256::ZERO`.
+    #[cfg(test)]
+    next_burn_receipt_id: Mutex<Option<U256>>,
+    /// When set, `next_burn_receipt_id` fails with an RPC-style error.
+    #[cfg(test)]
+    next_burn_receipt_id_should_error: Mutex<bool>,
+    #[cfg(test)]
+    vault_logic_call_count: AtomicUsize,
 }
 
 /// Mock blockchain service for testing.
@@ -477,6 +492,12 @@ impl MockVaultService {
         self.orchestrator.readiness_call_count.store(0, Ordering::Relaxed);
         self.orchestrator.confirm_call_count.store(0, Ordering::Relaxed);
         *self.orchestrator.pending_result.lock().unwrap() = None;
+        *self.orchestrator.vault_logic_expected.lock().unwrap() = None;
+        *self.orchestrator.vault_logic_should_error.lock().unwrap() = false;
+        *self.orchestrator.next_burn_receipt_id.lock().unwrap() = None;
+        *self.orchestrator.next_burn_receipt_id_should_error.lock().unwrap() =
+            false;
+        self.orchestrator.vault_logic_call_count.store(0, Ordering::Relaxed);
         *self.last_burn_proof_kind.lock().unwrap() = None;
     }
 
@@ -720,6 +741,41 @@ impl MockVaultService {
     ) -> Self {
         *self.orchestrator.readiness.lock().unwrap() = Some(readiness);
         self
+    }
+
+    /// Configures the `vault_logic_is_expected` health flag (default `true`).
+    #[cfg(test)]
+    pub(crate) fn with_vault_logic_expected(self, expected: bool) -> Self {
+        *self.orchestrator.vault_logic_expected.lock().unwrap() =
+            Some(expected);
+        self
+    }
+
+    /// Configures `vault_logic_is_expected` to fail with an RPC-style error.
+    #[cfg(test)]
+    pub(crate) fn with_vault_logic_error(self) -> Self {
+        *self.orchestrator.vault_logic_should_error.lock().unwrap() = true;
+        self
+    }
+
+    /// Configures the value returned by `next_burn_receipt_id`.
+    #[cfg(test)]
+    pub(crate) fn with_next_burn_receipt_id(self, next: U256) -> Self {
+        *self.orchestrator.next_burn_receipt_id.lock().unwrap() = Some(next);
+        self
+    }
+
+    /// Configures `next_burn_receipt_id` to fail with an RPC-style error.
+    #[cfg(test)]
+    pub(crate) fn with_next_burn_receipt_id_error(self) -> Self {
+        *self.orchestrator.next_burn_receipt_id_should_error.lock().unwrap() =
+            true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vault_logic_call_count(&self) -> usize {
+        self.orchestrator.vault_logic_call_count.load(Ordering::Relaxed)
     }
 
     /// Replaces the configured readiness on a live mock, e.g. to flip a
@@ -1468,6 +1524,55 @@ impl VaultService for MockVaultService {
                 Ok(result)
             }
         }
+    }
+
+    async fn vault_logic_is_expected(
+        &self,
+        _orchestrator: Address,
+    ) -> Result<bool, VaultError> {
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .vault_logic_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            if *self.orchestrator.vault_logic_should_error.lock().unwrap() {
+                return Err(VaultError::InvalidReceipt);
+            }
+            return Ok(self
+                .orchestrator
+                .vault_logic_expected
+                .lock()
+                .unwrap()
+                .unwrap_or(true));
+        }
+        #[cfg(not(test))]
+        Ok(true)
+    }
+
+    async fn next_burn_receipt_id(
+        &self,
+        _orchestrator: Address,
+        _token: Address,
+    ) -> Result<U256, VaultError> {
+        #[cfg(test)]
+        {
+            if *self
+                .orchestrator
+                .next_burn_receipt_id_should_error
+                .lock()
+                .unwrap()
+            {
+                return Err(VaultError::InvalidReceipt);
+            }
+            return Ok(self
+                .orchestrator
+                .next_burn_receipt_id
+                .lock()
+                .unwrap()
+                .unwrap_or(U256::ZERO));
+        }
+        #[cfg(not(test))]
+        Ok(U256::ZERO)
     }
 }
 

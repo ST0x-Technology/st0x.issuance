@@ -587,6 +587,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::close_mint,
                 admin::list_stuck,
                 admin::schedule_freeze_window,
+                admin::orchestrator_health,
             ],
         )
         .register("/", catchers::json_catchers());
