@@ -19,6 +19,18 @@ use st0x_issuance::{
 
 use crate::harness::create_provider;
 
+fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
+    mock_alpaca.mock(|when, then| {
+        when.method(GET).path("/v1beta1/events/corporate-actions");
+        then.status(200).header("content-type", "text/event-stream").body("");
+    });
+
+    format!(
+        "{}/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us",
+        mock_alpaca.base_url()
+    )
+}
+
 #[tokio::test]
 async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -67,6 +79,10 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: setup_corporate_actions_stream_mock(
+                &mock_alpaca,
+            ),
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),
