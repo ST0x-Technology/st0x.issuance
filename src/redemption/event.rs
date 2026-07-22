@@ -325,6 +325,21 @@ pub(crate) enum RedemptionEvent {
         block_number: u64,
         burned_at: DateTime<Utc>,
     },
+    /// Orchestrator-mode counterpart of `ExistingBurnRecovered`: an existing
+    /// on-chain orchestrator burn discovered during recovery, decoded from the
+    /// orchestrator's `Burned` event. Transitions to `Completed`. Carries
+    /// `dust_retained` derived the same way as `OrchestratorTokensBurned`
+    /// (from the redemption's own persisted `AlpacaCalled.dust_quantity`), so
+    /// both paths to terminal success carry identical audit data.
+    OrchestratorBurnRecovered {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        shares_burned: U256,
+        burn_range: BurnRange,
+        dust_retained: U256,
+        block_number: u64,
+        recovered_at: DateTime<Utc>,
+    },
     BurnRecoveryAttempted {
         issuer_request_id: IssuerRedemptionRequestId,
         tx_hash: B256,
@@ -399,6 +414,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::OrchestratorTokensBurned { .. } => {
                 "RedemptionEvent::OrchestratorTokensBurned".to_string()
+            }
+            Self::OrchestratorBurnRecovered { .. } => {
+                "RedemptionEvent::OrchestratorBurnRecovered".to_string()
             }
             Self::BurnRecoveryAttempted { .. } => {
                 "RedemptionEvent::BurnRecoveryAttempted".to_string()
@@ -925,6 +943,33 @@ mod tests {
                 serde_json::from_str(&serialized).unwrap();
             assert_eq!(event, deserialized);
         }
+    }
+
+    #[test]
+    fn orchestrator_burn_recovered_event_type_and_round_trip() {
+        let event = RedemptionEvent::OrchestratorBurnRecovered {
+            issuer_request_id: test_redemption_id(),
+            tx_hash: B256::random(),
+            shares_burned: uint!(17_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: uint!(0_U256),
+                next_burn_receipt_id_after: uint!(3_U256),
+            },
+            dust_retained: uint!(1_000_000_000_U256),
+            block_number: 45_000_100,
+            recovered_at: Utc::now(),
+        };
+
+        assert_eq!(
+            event.event_type(),
+            "RedemptionEvent::OrchestratorBurnRecovered"
+        );
+        assert_eq!(event.event_version(), "1.0");
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: RedemptionEvent =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(event, deserialized);
     }
 
     /// Tests that old BurnResumed events without external_tx_id default to None.

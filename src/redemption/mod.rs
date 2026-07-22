@@ -231,7 +231,7 @@ impl RedemptionServices {
     }
 }
 
-pub(crate) use cmd::{BurnParams, RedemptionCommand};
+pub(crate) use cmd::{BurnParams, ExistingBurnProof, RedemptionCommand};
 pub(crate) use event::{
     BurnFailureClassification, BurnRecord, RedemptionEvent, TokensBurnedData,
 };
@@ -317,6 +317,18 @@ pub(crate) enum Redemption {
         /// so terminal admin actions cannot bypass the acknowledgement guard.
         #[serde(default)]
         unresolved_burn_tx: Option<SendableTxWithHash>,
+        /// Mode anchor carried through the failure so recovery can reject a
+        /// cross-mode existing-burn proof. Absent on pre-orchestrator events
+        /// (`VaultDirect`); rebuilt from the prior state's metadata on replay.
+        #[serde(default)]
+        burn_mode: VaultMode,
+        /// The persisted Alpaca quantity carried through the failure so
+        /// existing-burn recovery can bind a proof's `shares_burned` to this
+        /// redemption's own economics. `None` only for pre-Alpaca failures
+        /// and pre-change snapshots — replay from events rebuilds it from
+        /// the prior state.
+        #[serde(default)]
+        alpaca_quantity: Option<Quantity>,
     },
     Closed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -896,10 +908,10 @@ impl Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         tx_id: TxId,
         tx_hash: B256,
-        planned_burns: Vec<BurnRecord>,
+        proof: ExistingBurnProof,
         block_number: u64,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Self::Failed { .. } = self else {
+        let Self::Failed { burn_mode, alpaca_quantity, .. } = self else {
             return Err(match self {
                 Self::Completed { .. } | Self::Closed { .. } => {
                     RedemptionError::AlreadyCompleted { issuer_request_id }
@@ -911,14 +923,74 @@ impl Redemption {
             });
         };
 
-        Ok(vec![RedemptionEvent::ExistingBurnRecovered {
-            issuer_request_id,
-            tx_id,
-            tx_hash,
-            burns: planned_burns,
-            block_number,
-            recovered_at: Utc::now(),
-        }])
+        match (burn_mode, proof) {
+            (
+                VaultMode::VaultDirect,
+                ExistingBurnProof::VaultDirect { burns },
+            ) => Ok(vec![RedemptionEvent::ExistingBurnRecovered {
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                burns,
+                block_number,
+                recovered_at: Utc::now(),
+            }]),
+            (
+                VaultMode::Orchestrator { .. },
+                ExistingBurnProof::Orchestrator {
+                    shares_burned,
+                    burn_range,
+                    dust_retained,
+                },
+            ) => {
+                // Terminal recovery records `shares_burned` as the economic
+                // value the journal backed: bind the proof to this
+                // redemption's own persisted quantity before terminalizing.
+                // `None` only for pre-change snapshots (a post-Alpaca
+                // failure always carries the quantity on replay); the burn
+                // manager's own pre-command check covers that legacy gap.
+                if let Some(alpaca_quantity) = alpaca_quantity {
+                    let expected =
+                        alpaca_quantity.to_u256_with_18_decimals().map_err(
+                            |error| RedemptionError::QuantityConversion {
+                                message: error.to_string(),
+                            },
+                        )?;
+                    if shares_burned != expected {
+                        return Err(
+                            RedemptionError::OrchestratorAmountMismatch {
+                                expected,
+                                actual: shares_burned,
+                            },
+                        );
+                    }
+                }
+
+                Ok(vec![RedemptionEvent::OrchestratorBurnRecovered {
+                    issuer_request_id,
+                    tx_hash,
+                    shares_burned,
+                    burn_range,
+                    dust_retained,
+                    block_number,
+                    recovered_at: Utc::now(),
+                }])
+            }
+            (
+                VaultMode::VaultDirect,
+                ExistingBurnProof::Orchestrator { .. },
+            ) => Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::VaultDirect,
+                found: VaultModeKind::Orchestrator,
+            }),
+            (
+                VaultMode::Orchestrator { .. },
+                ExistingBurnProof::VaultDirect { .. },
+            ) => Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::Orchestrator,
+                found: VaultModeKind::VaultDirect,
+            }),
+        }
     }
 
     /// Admin-closes a redemption that cannot be auto-recovered. Valid from
@@ -1925,13 +1997,13 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 tx_id,
                 tx_hash,
-                planned_burns,
+                proof,
                 block_number,
             } => self.handle_record_existing_burn(
                 issuer_request_id,
                 tx_id,
                 tx_hash,
-                planned_burns,
+                proof,
                 block_number,
             ),
             RedemptionCommand::CloseRedemption {
@@ -2082,6 +2154,7 @@ impl Redemption {
             RedemptionEvent::TokensBurned(_)
             | RedemptionEvent::OrchestratorTokensBurned { .. }
             | RedemptionEvent::ExistingBurnRecovered { .. }
+            | RedemptionEvent::OrchestratorBurnRecovered { .. }
             | RedemptionEvent::RedemptionClosed { .. }
             | RedemptionEvent::BurnForceCompleted { .. } => {
                 self.apply_terminal_event(event);
@@ -2147,6 +2220,24 @@ impl Redemption {
             .persisted_unresolved_burn_tx()
             .filter(|sendable_tx| !sendable_tx.tx.is_empty())
             .cloned();
+        // Anchor the mode from the failing state's own metadata before the
+        // transition drops it, so existing-burn recovery can reject a
+        // cross-mode proof. A `Failed -> Failed` reclassification (via
+        // `MarkFailed`) has no metadata, so preserve the already-anchored
+        // mode; pre-orchestrator states default to VaultDirect.
+        let burn_mode = match &*self {
+            Self::Failed { burn_mode, .. } => *burn_mode,
+            other => other
+                .metadata()
+                .map_or(VaultMode::VaultDirect, |metadata| metadata.burn_mode),
+        };
+        // Carry the economic anchor the same way: a `Failed -> Failed`
+        // reclassification preserves it, otherwise it comes from the failing
+        // state (None for pre-Alpaca failures, which have no quantity yet).
+        let alpaca_quantity = match &*self {
+            Self::Failed { alpaca_quantity, .. } => alpaca_quantity.clone(),
+            other => other.alpaca_quantity().cloned(),
+        };
         let (issuer_request_id, reason, failed_at) = match event {
             RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id,
@@ -2172,6 +2263,8 @@ impl Redemption {
             reason,
             failed_at,
             unresolved_burn_tx,
+            burn_mode,
+            alpaca_quantity,
         };
     }
 
@@ -2357,6 +2450,12 @@ impl Redemption {
                 tx_hash,
                 recovered_at,
                 ..
+            }
+            | RedemptionEvent::OrchestratorBurnRecovered {
+                issuer_request_id,
+                tx_hash,
+                recovered_at,
+                ..
             } => {
                 *self = Self::Completed {
                     issuer_request_id,
@@ -2501,8 +2600,8 @@ mod tests {
 
     use super::{
         BurnExternalTxId, BurnFailureClassification, BurnParams, BurnRecord,
-        BurnRecoveryAction, IssuerRedemptionRequestId, Redemption,
-        RedemptionCommand, RedemptionError, RedemptionEvent,
+        BurnRecoveryAction, ExistingBurnProof, IssuerRedemptionRequestId,
+        Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
         RedemptionMetadata, RedemptionServices, TokensBurnedData,
         has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
@@ -4879,6 +4978,316 @@ mod tests {
         }
     }
 
+    fn failed_from(
+        burning: Vec<RedemptionEvent>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Vec<RedemptionEvent> {
+        let mut events = burning;
+        events.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
+            issuer_request_id: issuer_request_id.clone(),
+            error: "burn timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+        events
+    }
+
+    #[tokio::test]
+    async fn record_existing_burn_orchestrator_proof_emits_orchestrator_recovered()
+     {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let given = failed_from(
+            orchestrator_burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(given)
+            .when(RedemptionCommand::RecordExistingBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id: TxId::Hash(tx_hash),
+                tx_hash,
+                proof: ExistingBurnProof::Orchestrator {
+                    shares_burned: uint!(17_000000000000000000_U256),
+                    burn_range: BurnRange {
+                        first_receipt_id: uint!(0_U256),
+                        next_burn_receipt_id_after: uint!(3_U256),
+                    },
+                    dust_retained: uint!(1_000000000_U256),
+                },
+                block_number: 46_000_000,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::OrchestratorBurnRecovered {
+                tx_hash: recorded_hash,
+                shares_burned,
+                burn_range,
+                dust_retained,
+                block_number,
+                ..
+            }] if *recorded_hash == tx_hash
+                && *shares_burned == uint!(17_000000000000000000_U256)
+                && *burn_range == BurnRange { first_receipt_id: uint!(0_U256), next_burn_receipt_id_after: uint!(3_U256) }
+                && *dust_retained == uint!(1_000000000_U256)
+                && *block_number == 46_000_000
+        ));
+    }
+
+    /// An orchestrator existing-burn proof is bound to the aggregate's own
+    /// persisted `alpaca_quantity`: a proof whose `shares_burned` diverges
+    /// must be rejected, never terminalized.
+    #[tokio::test]
+    async fn record_existing_burn_rejects_diverging_orchestrator_shares() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let given = failed_from(
+            orchestrator_burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(given)
+            .when(RedemptionCommand::RecordExistingBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id: TxId::Hash(tx_hash),
+                tx_hash,
+                proof: ExistingBurnProof::Orchestrator {
+                    // One share-wei above the persisted 17-token quantity.
+                    shares_burned: uint!(17_000000000000000001_U256),
+                    burn_range: BurnRange {
+                        first_receipt_id: uint!(0_U256),
+                        next_burn_receipt_id_after: uint!(3_U256),
+                    },
+                    dust_retained: uint!(1_000000000_U256),
+                },
+                block_number: 46_000_000,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(
+                    RedemptionError::OrchestratorAmountMismatch { .. }
+                )
+            ),
+            "a diverging proof must not terminalize the redemption, \
+             got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_existing_burn_vault_direct_proof_emits_existing_recovered()
+    {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let given = failed_from(
+            burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(given)
+            .when(RedemptionCommand::RecordExistingBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id: TxId::Hash(tx_hash),
+                tx_hash,
+                proof: ExistingBurnProof::VaultDirect {
+                    burns: vec![BurnRecord {
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_000000000000000000_U256),
+                    }],
+                },
+                block_number: 46_000_000,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::ExistingBurnRecovered { burns, .. }]
+                if burns.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_existing_burn_rejects_cross_mode_proofs() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let cross_mode_cases = [
+            (
+                failed_from(
+                    burning_given_events(&issuer_request_id),
+                    &issuer_request_id,
+                ),
+                ExistingBurnProof::Orchestrator {
+                    shares_burned: uint!(17_000000000000000000_U256),
+                    burn_range: BurnRange {
+                        first_receipt_id: uint!(0_U256),
+                        next_burn_receipt_id_after: uint!(3_U256),
+                    },
+                    dust_retained: U256::ZERO,
+                },
+            ),
+            (
+                failed_from(
+                    orchestrator_burning_given_events(&issuer_request_id),
+                    &issuer_request_id,
+                ),
+                ExistingBurnProof::VaultDirect {
+                    burns: vec![BurnRecord {
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_000000000000000000_U256),
+                    }],
+                },
+            ),
+        ];
+
+        for (given, proof) in cross_mode_cases {
+            let error = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(RedemptionCommand::RecordExistingBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_id: TxId::Hash(tx_hash),
+                    tx_hash,
+                    proof,
+                    block_number: 46_000_000,
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        RedemptionError::BurnModeMismatch { .. }
+                    )
+                ),
+                "expected BurnModeMismatch, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn record_existing_burn_rejects_non_failed_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(burning_given_events(&issuer_request_id))
+            .when(RedemptionCommand::RecordExistingBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id: TxId::Hash(tx_hash),
+                tx_hash,
+                proof: ExistingBurnProof::VaultDirect { burns: vec![] },
+                block_number: 46_000_000,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(RedemptionError::InvalidState { .. })
+            ),
+            "expected InvalidState, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_burn_recovered_replays_to_completed() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let mut history = failed_from(
+            orchestrator_burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+        history.push(RedemptionEvent::OrchestratorBurnRecovered {
+            issuer_request_id,
+            tx_hash,
+            shares_burned: uint!(17_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: uint!(0_U256),
+                next_burn_receipt_id_after: uint!(3_U256),
+            },
+            dust_retained: uint!(1_000000000_U256),
+            block_number: 46_000_000,
+            recovered_at: Utc::now(),
+        });
+
+        let redemption = replay::<Redemption>(history)
+            .expect("history should replay")
+            .expect("redemption should exist");
+
+        assert!(matches!(
+            redemption,
+            Redemption::Completed { burn_tx_hash, .. } if burn_tx_hash == tx_hash
+        ));
+    }
+
+    #[test]
+    fn failed_state_anchors_orchestrator_burn_mode() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let orchestrator_failed = replay::<Redemption>(failed_from(
+            orchestrator_burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        ))
+        .expect("history should replay")
+        .expect("redemption should exist");
+        assert!(matches!(
+            orchestrator_failed,
+            Redemption::Failed {
+                burn_mode: VaultMode::Orchestrator { .. },
+                ..
+            }
+        ));
+
+        let vault_direct_failed = replay::<Redemption>(failed_from(
+            burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        ))
+        .expect("history should replay")
+        .expect("redemption should exist");
+        assert!(matches!(
+            vault_direct_failed,
+            Redemption::Failed { burn_mode: VaultMode::VaultDirect, .. }
+        ));
+
+        // `MarkFailed` from `Failed` carries no metadata (the reconciler's
+        // reclassification after a definitive orchestrator revert); the
+        // already-anchored orchestrator mode must survive it — a downgrade to
+        // VaultDirect would reject a later valid orchestrator proof with
+        // BurnModeMismatch.
+        let mut reclassified = failed_from(
+            orchestrator_burning_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+        reclassified.push(RedemptionEvent::RedemptionFailed {
+            issuer_request_id,
+            reason: "orchestrator burn reverted on-chain".to_string(),
+            failed_at: Utc::now(),
+        });
+        let remarked = replay::<Redemption>(reclassified)
+            .expect("history should replay")
+            .expect("redemption should exist");
+        assert!(matches!(
+            remarked,
+            Redemption::Failed {
+                burn_mode: VaultMode::Orchestrator { .. },
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn burn_tokens_orchestrator_mode_emits_orchestrator_submitted() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6284,6 +6693,8 @@ mod tests {
                 reason: error,
                 failed_at,
                 unresolved_burn_tx: None,
+                burn_mode: VaultMode::VaultDirect,
+                alpaca_quantity: Some(Quantity::new(Decimal::from(150))),
             }
         );
     }
@@ -7077,17 +7488,22 @@ mod tests {
 
         let mut old_failed_snapshot =
             serde_json::to_value(failed).expect("snapshot should serialize");
-        old_failed_snapshot
+        let failed_fields = old_failed_snapshot
             .pointer_mut("/Failed")
             .and_then(serde_json::Value::as_object_mut)
-            .expect("failed snapshot should exist")
-            .remove("unresolved_burn_tx");
+            .expect("failed snapshot should exist");
+        failed_fields.remove("unresolved_burn_tx");
+        failed_fields.remove("burn_mode");
         let restored_failed: Redemption =
             serde_json::from_value(old_failed_snapshot)
                 .expect("old failed snapshot should deserialize");
         assert!(matches!(
             restored_failed,
-            Redemption::Failed { unresolved_burn_tx: None, .. }
+            Redemption::Failed {
+                unresolved_burn_tx: None,
+                burn_mode: VaultMode::VaultDirect,
+                ..
+            }
         ));
 
         let mut old_burning_snapshot =
