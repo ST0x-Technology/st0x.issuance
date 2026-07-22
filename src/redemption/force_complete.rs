@@ -31,6 +31,7 @@ use crate::receipt_inventory::{
     ReceiptInventory, ReceiptInventoryCommand, send_receipt_inventory_command,
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
+use crate::vault::orchestrator::BurnProofKind;
 use crate::vault::{
     BurnVerification, NetworkVaultServices, VerifiedBurn,
     verify_burn_in_receipt,
@@ -118,12 +119,16 @@ pub(crate) async fn verify_landed_burn<P: Provider>(
             || anyhow::anyhow!("transaction {burn_tx_hash} has no receipt"),
         )?;
 
+    // Custodian-era burns predate orchestrator mode, so the offline CLI
+    // force-complete only ever proves the vault-direct shape (see
+    // `ForceCompleteBurn` in SPEC.md).
     let verification = verify_burn_in_receipt(
         &receipt,
         vault,
         owner,
         burn_tx_hash,
         transaction.nonce(),
+        BurnProofKind::VaultDirect,
     )?;
     bind_verified_burns(planned_burns, &verification.burns)?;
 

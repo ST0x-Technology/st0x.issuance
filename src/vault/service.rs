@@ -32,6 +32,7 @@ use super::{
 use crate::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Errors;
 use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
 use crate::redemption::BurnExternalTxId;
+use crate::vault::orchestrator::BurnProofKind;
 
 pub type RealBlockchainServiceProvider = FillProvider<
     JoinFill<
@@ -560,6 +561,7 @@ impl VaultService for RealBlockchainService {
         vault: Address,
         owner: Address,
         tx_hash: B256,
+        expected_proof: BurnProofKind,
     ) -> Result<BurnVerification, VaultError> {
         let transaction = self
             .provider
@@ -591,6 +593,7 @@ impl VaultService for RealBlockchainService {
             owner,
             tx_hash,
             transaction.nonce(),
+            expected_proof,
         )
     }
 
@@ -1046,6 +1049,7 @@ mod tests {
     };
     use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
     use crate::test_utils::{LocalEvm, logs_contain_at};
+    use crate::vault::orchestrator::BurnProofKind;
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
         BurnRequestOrigin, BurnTxStatus, MintTxStatus, MultiBurnEntry,
@@ -1873,7 +1877,12 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let verification = service
-            .verify_burn_tx(vault_address, owner, persisted.hash)
+            .verify_burn_tx(
+                vault_address,
+                owner,
+                persisted.hash,
+                BurnProofKind::VaultDirect,
+            )
             .await
             .expect("matching transaction and receipt should verify");
 
@@ -1894,7 +1903,12 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let result = service
-            .verify_burn_tx(test_vault_address(), owner, requested_tx_hash)
+            .verify_burn_tx(
+                test_vault_address(),
+                owner,
+                requested_tx_hash,
+                BurnProofKind::VaultDirect,
+            )
             .await;
 
         assert!(matches!(result, Err(VaultError::InvalidReceipt)));
@@ -1910,7 +1924,12 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let result = service
-            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .verify_burn_tx(
+                test_vault_address(),
+                owner,
+                persisted.hash,
+                BurnProofKind::VaultDirect,
+            )
             .await;
 
         assert!(matches!(result, Err(VaultError::InvalidReceipt)));
@@ -1926,7 +1945,12 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let result = service
-            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .verify_burn_tx(
+                test_vault_address(),
+                owner,
+                persisted.hash,
+                BurnProofKind::VaultDirect,
+            )
             .await;
 
         assert!(matches!(
@@ -1948,7 +1972,12 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let result = service
-            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .verify_burn_tx(
+                test_vault_address(),
+                owner,
+                persisted.hash,
+                BurnProofKind::VaultDirect,
+            )
             .await;
 
         assert!(matches!(result, Err(VaultError::InvalidReceipt)));
