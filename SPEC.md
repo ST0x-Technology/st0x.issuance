@@ -751,6 +751,39 @@ action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
 
+**Scheduled freeze windows.** For a corporate action known in advance (an
+ex-date), the freeze/unfreeze pair can be armed ahead of time instead of fired
+by hand at the exact instants. `POST /admin/freeze-schedules` (internal
+API-key + IP-allowlist auth, like all admin endpoints) takes an underlying and a
+`freeze_at`/`unfreeze_at` window and enqueues two durable apalis jobs — a
+`Freeze` at `freeze_at` and an `Unfreeze` at `unfreeze_at`. The worker
+dispatches the exact same `Underlying` commands the CLI does; only the trigger
+differs. Scheduled transitions survive restarts (apalis persists the due time),
+and re-posting an identical window is an idempotent no-op while its jobs are
+pending or running (jobs are keyed by underlying + the full scheduled instant,
+including subseconds); a window whose job reached a terminal state (done,
+killed, or out of retries) releases its key on re-arm, so an infrastructure
+failure never permanently blocks a window. At startup, orphaned `Running` rows
+reset to `Pending` and terminal rows are vacuumed, mirroring the mint jobs;
+transitions that died without applying (killed or out of retries) are surfaced
+at ERROR before their rows are removed. Command idempotency makes a _repeated_
+transition landing on an already-transitioned asset harmless, but the two jobs
+of a window are independent with no cross-ordering guarantee, so the binary
+Freeze/Unfreeze model is **not** safe against overlap or reordering: an Unfreeze
+for one schedule can release another still-active window, and a freeze job that
+only succeeds after its paired unfreeze already ran leaves the asset frozen
+until an operator unfreezes it by hand. Operators must not arm overlapping
+windows for the same underlying. An underlying with no listing is rejected with
+404 (the `Underlying` commands would succeed for any symbol, so an unchecked
+typo would arm a freeze that gates nothing while reporting success; the check
+lives in the scheduler itself so every schedule source inherits it); an inverted
+or sub-second window is rejected with 422 (apalis schedules at second
+granularity, so a sub-second window has no defined execution order); a fully
+elapsed window is rejected rather than flapping the asset; a `freeze_at` already
+in the past with `unfreeze_at` still ahead (window in progress) freezes
+immediately. This is the schedule mechanism the automated corporate-actions
+sourcing feeds; until then an operator arms windows manually.
+
 ## Services
 
 Aggregates use services to interact with external systems while keeping business

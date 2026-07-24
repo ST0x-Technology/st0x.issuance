@@ -270,11 +270,11 @@ pub async fn initialize_rocket(
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
-    // The server never dispatches Underlying commands (freeze/unfreeze are
-    // issuer-CLI actions), but startup must still reconcile the schema version
-    // and catch the `underlying_view` projection up with the event log.
+    // Startup must reconcile the Underlying schema version and catch the
+    // `underlying_view` projection up before the CLI or scheduled freeze worker
+    // dispatches freeze/unfreeze commands.
     prepare_event_sourced_startup::<Underlying>(&pool).await?;
-    let (_underlying_store, _underlying_projection) =
+    let (underlying_store, _underlying_projection) =
         StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
     prepare_event_sourced_startup::<Account>(&pool).await?;
@@ -446,6 +446,33 @@ pub async fn initialize_rocket(
         }
     }
 
+    // Non-fatal, mirroring the mint jobs: without the reset a transition
+    // crashed mid-run waits for apalis's orphan re-enqueue timeout, and
+    // without the vacuum terminal rows accumulate and hold idempotency keys.
+    if let Err(error) =
+        tokenized_asset::schedule::reset_orphaned_freeze_schedule_jobs(&pool)
+            .await
+    {
+        warn!(target: "asset", error = %error,
+            "Failed to reset orphaned freeze-schedule jobs"
+        );
+    }
+    if let Err(error) =
+        tokenized_asset::schedule::vacuum_terminal_freeze_schedule_jobs(&pool)
+            .await
+    {
+        warn!(target: "asset", error = %error,
+            "Failed to vacuum terminal freeze-schedule jobs"
+        );
+    }
+
+    spawn_freeze_schedule_worker(apalis_pool.clone(), underlying_store);
+
+    let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
+        &apalis_pool,
+        pool.clone(),
+    );
+
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
@@ -460,6 +487,7 @@ pub async fn initialize_rocket(
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
         configured_networks,
+        freeze_scheduler,
     }))
 }
 
@@ -476,6 +504,7 @@ struct RocketState {
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
     vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
+    freeze_scheduler: tokenized_asset::schedule::FreezeScheduler,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -504,6 +533,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.configured_networks)
         .manage(state.pool)
         .manage(state.apalis_pool)
+        .manage(state.freeze_scheduler)
         .mount(
             "/",
             routes![
@@ -523,6 +553,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::reprocess_mint,
                 admin::close_mint,
                 admin::list_stuck,
+                admin::schedule_freeze_window,
             ],
         )
         .register("/", catchers::json_catchers());
@@ -1599,7 +1630,7 @@ fn spawn_mint_recovery_worker(
     });
 }
 
-/// Spawns a drainer worker for one mint side-effect job type, mirroring
+/// Spawns a drainer worker for one durable job type, mirroring
 /// [`spawn_mint_recovery_worker`]: a fresh worker id per registration
 /// (load-bearing for crash recovery) and an in-process restart loop on transient
 /// apalis/SQLite failures. No shutdown signal is wired, so a clean `Ok(())`
@@ -1607,14 +1638,17 @@ fn spawn_mint_recovery_worker(
 /// permanently strand that job stage's queue. A macro (not a generic fn)
 /// because apalis's `.build()` yields a deeply-nested worker type with no
 /// public alias, so the concrete job/context types must appear at the
-/// expansion site. Drainer-style: no apalis retry layer — a domain failure is
-/// recorded as a `MintingFailed` event that recovery retries.
+/// expansion site. Drainer-style: no apalis retry layer — the mint jobs record
+/// a `MintingFailed` event that recovery retries; other jobs rely on apalis's
+/// built-in `Failed`-row re-fetch. The `target:` names the domain tracing
+/// target the restart-loop warnings log under.
 macro_rules! spawn_drainer_worker {
     (
         ::<$ctx:ty, $job:ty>,
         $apalis_pool:expr,
         $ctx_val:expr,
-        $worker_name:expr $(,)?
+        $worker_name:expr,
+        target: $target:literal $(,)?
     ) => {{
         let apalis_pool: ApalisSqlitePool = $apalis_pool;
         let ctx: Arc<$ctx> = $ctx_val;
@@ -1641,11 +1675,11 @@ macro_rules! spawn_drainer_worker {
                     // would permanently strand every queued job for this stage.
                     Ok(()) => {
                         warn!(
-                            target: "mint",
+                            target: $target,
                             worker = worker_name,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
-                            "Mint job worker monitor exited cleanly without a \
+                            "Job worker monitor exited cleanly without a \
                              shutdown signal; restarting"
                         );
                         tokio::time::sleep(
@@ -1655,12 +1689,12 @@ macro_rules! spawn_drainer_worker {
                     }
                     Err(error) => {
                         warn!(
-                            target: "mint",
+                            target: $target,
                             worker = worker_name,
                             error = %error,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
-                            "Mint job worker crashed; restarting after backoff"
+                            "Job worker crashed; restarting after backoff"
                         );
                         tokio::time::sleep(
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF,
@@ -1712,6 +1746,7 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
             apalis_pool: apalis_pool.clone(),
         }),
         "mint-submit-worker",
+        target: "mint",
     );
 
     spawn_drainer_worker!(
@@ -1726,6 +1761,7 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
             apalis_pool: apalis_pool.clone(),
         }),
         "mint-confirm-worker",
+        target: "mint",
     );
 
     spawn_drainer_worker!(
@@ -1733,6 +1769,27 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
         apalis_pool,
         Arc::new(SendCallbackContext { mint_store, alpaca }),
         "mint-callback-worker",
+        target: "mint",
+    );
+}
+
+/// Spawns the drainer worker for scheduled freeze/unfreeze transitions armed
+/// via [`tokenized_asset::schedule::FreezeScheduler`]. Same supervision story
+/// as the mint job workers: fresh worker id per registration, restart loop on
+/// transient failures.
+fn spawn_freeze_schedule_worker(
+    apalis_pool: ApalisSqlitePool,
+    underlying_store: Arc<Store<Underlying>>,
+) {
+    spawn_drainer_worker!(
+        ::<tokenized_asset::schedule::FreezeScheduleCtx,
+            tokenized_asset::schedule::ApplyFreezeTransition>,
+        apalis_pool,
+        Arc::new(tokenized_asset::schedule::FreezeScheduleCtx {
+            underlying_store
+        }),
+        "freeze-schedule-worker",
+        target: "asset",
     );
 }
 
