@@ -272,17 +272,12 @@ pub(crate) async fn find_stuck(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256, uint};
-    use event_sorcery::{StoreBuilder, test_store};
+    use event_sorcery::StoreBuilder;
     use rust_decimal::Decimal;
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
-    use std::sync::Arc;
 
     use super::*;
-    use crate::alpaca::mock::MockAlpacaService;
-    use crate::mint::{Mint, MintCommand, MintServices};
-    use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::ANVIL_CHAIN_ID;
-    use crate::vault::mock::MockVaultService;
+    use crate::mint::{Mint, MintCommand};
 
     /// Inserts a `Lifecycle<Mint>`-shaped row into `mint_view` for a given
     /// query view. The adjusted variants reproduce the production `Mint`
@@ -341,21 +336,6 @@ mod tests {
         .unwrap();
     }
 
-    fn mint_services(pool: Pool<Sqlite>) -> MintServices {
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-
-        MintServices::with_single_vault(
-            Network::Base,
-            ANVIL_CHAIN_ID,
-            Arc::new(MockVaultService::new_success()),
-            Arc::new(MockAlpacaService::new_success()),
-            Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool,
-            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        )
-    }
-
     struct TestMintFields {
         issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -388,7 +368,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
-            .build(mint_services(pool.clone()))
+            .build(())
             .await
             .expect("Failed to build mint store");
 

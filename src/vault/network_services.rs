@@ -60,6 +60,8 @@ impl NetworkVaultServices {
         self.get(network).map(|entry| entry.chain_id)
     }
 
+    /// Test-only convenience wrapping one mock vault the way production
+    /// Rocket state wires the real per-network map.
     pub(crate) fn with_single_vault(
         network: Network,
         chain_id: u64,

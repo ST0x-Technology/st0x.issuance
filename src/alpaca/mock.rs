@@ -63,13 +63,6 @@ impl MockAlpacaService {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn with_callback_delay(mut self, delay_ms: u64) -> Self {
-        self.callback_delay_ms = delay_ms;
-        self
-    }
-
     /// Returns the number of times `send_mint_callback()` was called.
     #[cfg(test)]
     pub(crate) fn get_call_count(&self) -> usize {

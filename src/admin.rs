@@ -1,5 +1,6 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
@@ -18,9 +19,9 @@ use crate::alpaca::{
 };
 use crate::auth::InternalAuth;
 use crate::mint::{
-    DriveOutcome, IssuerMintRequestId, Mint, MintCommand, MintEvent, MintView,
-    TokenizationRequestId, find_by_issuer_request_id,
-    find_stuck as find_stuck_mints, recover_mint_manually,
+    IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
+    MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
+    recovery::enqueue_scheduled_mint_recovery,
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1117,13 +1118,14 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, vault_services, pool))]
+#[tracing::instrument(skip(_auth, pool, apalis_pool, store, vault_services))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
     store: &rocket::State<Arc<Store<Mint>>>,
     vault_services: &rocket::State<NetworkVaultServices>,
-    pool: &rocket::State<Pool<Sqlite>>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let issuer_request_id: IssuerMintRequestId = aggregate_id
@@ -1131,69 +1133,55 @@ pub(crate) async fn reprocess_mint(
         .map(IssuerMintRequestId::new)
         .map_err(|_| Status::BadRequest)?;
 
-    // Check current state via view
-    let (current_state, network) = match find_by_issuer_request_id(
-        pool.inner(),
-        &issuer_request_id,
-    )
-    .await
-    {
-        Ok(Some(view)) => {
-            let state = match &view {
-                MintView::NotFound => return Err(Status::NotFound),
-                MintView::Completed { .. } | MintView::Closed { .. } => {
-                    return Err(Status::Conflict);
-                }
-                MintView::Initiated { .. } => "Initiated",
-                MintView::JournalConfirmed { .. } => "JournalConfirmed",
-                MintView::JournalRejected { .. } => "JournalRejected",
-                MintView::Minting { .. } => "Minting",
-                MintView::MintIntended { .. } => "MintIntended",
-                MintView::MintTxSubmitted { .. } => "MintTxSubmitted",
-                MintView::CallbackPending { .. } => "CallbackPending",
-                MintView::MintingFailed { .. } => "MintingFailed",
-            };
-            let (_, _, network) = mint_view_asset(&view);
-            let Some(network) = network else {
-                error!(target: "admin", aggregate_id = aggregate_id,
-                    "Mint view has no network — cannot select a vault service"
-                );
-                return Err(Status::InternalServerError);
-            };
-            (state.to_string(), network)
-        }
+    let mint = match store.load(&issuer_request_id).await {
+        Ok(Some(mint)) => mint,
         Ok(None) => return Err(Status::NotFound),
-        Err(err) => {
-            error!(target: "admin", error = %err, "Failed to query mint view");
+        Err(error) => {
+            error!(target: "admin", aggregate_id, error = %error, "Failed to load mint");
             return Err(Status::InternalServerError);
         }
     };
-
-    let vault_service = vault_services.service(network).map_err(|error| {
-        error!(target: "admin", aggregate_id = aggregate_id,
-            error = %error,
-            "Cannot reprocess mint on an unconfigured network"
-        );
-        Status::UnprocessableEntity
-    })?;
-
-    let outcome = recover_mint_manually(
-        store.inner().as_ref(),
-        vault_service,
-        issuer_request_id,
-    )
-    .await;
-    if !matches!(outcome, DriveOutcome::Done) {
-        error!(target: "admin", aggregate_id = aggregate_id,
-            ?outcome,
-            "Failed to drive manual mint recovery to completion"
+    match mint.manual_recovery_decision() {
+        ManualRecoveryDecision::Eligible => {}
+        ManualRecoveryDecision::AlreadyTerminal => {
+            return Err(Status::Conflict);
+        }
+        ManualRecoveryDecision::Unrecoverable => {
+            return Err(Status::UnprocessableEntity);
+        }
+    }
+    let Some(network) = mint.network() else {
+        return Err(Status::UnprocessableEntity);
+    };
+    if let Err(error) = vault_services.service(network) {
+        error!(target: "admin", aggregate_id, ?network, error = %error,
+            "No vault service configured for mint network"
         );
         return Err(Status::UnprocessableEntity);
     }
+    let current_state = mint.state_name().to_string();
+
+    // Manual reprocess enqueues a durable recovery job — the same path the
+    // automatic startup re-scan and the periodic reconciler use. It frees any
+    // terminal recovery job for this mint and re-drives it through the per-state
+    // jobs to completion.
+    enqueue_scheduled_mint_recovery(
+        pool.inner(),
+        apalis_pool.inner(),
+        issuer_request_id,
+    )
+    .await
+    .map_err(|error| {
+        error!(target: "admin", aggregate_id = aggregate_id,
+            error = %error,
+            "Failed to enqueue scheduled mint recovery"
+        );
+        Status::InternalServerError
+    })?;
 
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
-        "Mint reprocessed successfully"
+        "Mint reprocess enqueued successfully"
     );
 
     Ok(Json(ReprocessResponse {
