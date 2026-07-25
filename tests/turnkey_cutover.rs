@@ -16,7 +16,11 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::{
     self, OffchainAssetReceiptVaultInstance,
 };
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
+use st0x_issuance::receipt_inventory::migration::{
+    MigrationOutcome, migrate_vault_receipts,
+};
 use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::underlying::UnderlyingSymbol;
 use st0x_issuance::{Config, SignerConfig, initialize_rocket};
 use std::path::{Path, PathBuf};
 
@@ -47,6 +51,46 @@ impl CutoverDatabases {
             turnkey_path,
         }
     }
+}
+
+/// Waits until the running service has recorded the vault's receipt inventory.
+///
+/// The migration refuses outright on an empty inventory, so without this the
+/// test would race the backfiller and fail for a reason unrelated to what it is
+/// proving.
+async fn wait_for_receipt_in_inventory(
+    database_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
+
+    for _ in 0..100 {
+        // Deliberately not filtered by aggregate id: reproducing the
+        // `{chain_id}:{vault}` key here would couple this wait to an encoding
+        // that has already been re-keyed once by migration. This scenario uses
+        // a single vault, so the aggregate type alone is an unambiguous signal.
+        let recorded: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'ReceiptInventory'
+            ",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        if recorded > 0 {
+            pool.close().await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    pool.close().await;
+    Err("no receipt ever entered the inventory".into())
 }
 
 async fn snapshot_database(
@@ -176,6 +220,76 @@ impl PostCutoverCanaries<'_, '_> {
     }
 }
 
+/// Runs freeze, migrate custody, unfreeze against the outgoing service's
+/// database — driving the migration engine the operator's tooling runs,
+/// exercised in the same order an operator would.
+///
+/// Note what this does and does not cover. The database snapshot handed to the
+/// replacement service is taken *before* this runs, so the freeze and unfreeze
+/// here act on the retiring store and are invisible to the restarted service.
+/// That is deliberate and mirrors production: the outgoing service is already
+/// stopped (see the module-level requirement in
+/// `src/receipt_inventory/migration.rs`), and the freeze exists to satisfy the
+/// migration's own quiescence check against real persisted state, not to
+/// configure the new service.
+///
+/// The migration is run twice: the second run stands in for the operator losing
+/// the terminal between the transaction confirming and success being recorded,
+/// and must be a no-op rather than a second transfer or a divergence failure.
+async fn run_operator_migration(
+    database_url: &str,
+    provider: &impl Provider,
+    chain_id: u64,
+    vault: Address,
+    outgoing: Address,
+    incoming: Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let underlying = UnderlyingSymbol::new("AAPL")?;
+    st0x_issuance::freeze_underlying(database_url, 5, &underlying).await?;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await?;
+
+    let outcome = migrate_vault_receipts(
+        &pool,
+        provider,
+        &underlying,
+        chain_id,
+        vault,
+        outgoing,
+        incoming,
+    )
+    .await?;
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
+        "the migration must report moving receipts, got {outcome:?}"
+    );
+
+    let rerun = migrate_vault_receipts(
+        &pool,
+        provider,
+        &underlying,
+        chain_id,
+        vault,
+        outgoing,
+        incoming,
+    )
+    .await?;
+    assert!(
+        matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
+        "re-running a completed migration must be a no-op, got {rerun:?}"
+    );
+
+    // The asset is frozen only for the duration of the move, so the migration
+    // must leave it unfreezable rather than wedged.
+    st0x_issuance::unfreeze_underlying(database_url, 5, &underlying).await?;
+    pool.close().await;
+
+    Ok(())
+}
+
 async fn start_service(
     config: Config,
 ) -> Result<Client, Box<dyn std::error::Error>> {
@@ -248,13 +362,15 @@ async fn single_deposit_for_owner(
     ))
 }
 
-/// Proves the Base-only wallet-rotation sequence used by the Turnkey
-/// migration runbook with multichain code present but additional chains disabled.
+/// Proves the Base-only wallet-rotation sequence with multichain code present
+/// but additional chains disabled, driving the operator's real commands:
+/// freeze, migrate receipt custody, unfreeze.
 ///
 /// The local signers model the old Fireblocks-controlled address and the new
-/// Turnkey-controlled address. Provider-specific credential and policy checks
-/// remain staging gates; this scenario proves the application-owned custody,
-/// persistence, restart, checkpoint, and transaction-idempotency invariants.
+/// Turnkey-controlled address; the custodian's own credential and policy
+/// checks remain staging gates outside this test's scope. This scenario proves
+/// the application-owned custody, persistence, restart, checkpoint, and
+/// transaction-idempotency invariants.
 #[tokio::test]
 async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -353,18 +469,15 @@ async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
     snapshot_database(&databases.fireblocks_url, &databases.turnkey_path)
         .await?;
 
-    fireblocks_receipt
-        .safeTransferFrom(
-            fireblocks_wallet,
-            turnkey_wallet,
-            minted_receipt_id,
-            minted_receipt_shares,
-            Bytes::new(),
-        )
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
+    run_operator_migration(
+        &databases.fireblocks_url,
+        &fireblocks_provider,
+        evm.chain_id,
+        evm.vault_address,
+        fireblocks_wallet,
+        turnkey_wallet,
+    )
+    .await?;
 
     assert_eq!(
         fireblocks_receipt
@@ -453,6 +566,157 @@ async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
     );
 
     turnkey_client.terminate().await;
+
+    Ok(())
+}
+
+/// Proves receipt custody can be moved back after a completed migration, so an
+/// aborted cutover is recoverable.
+///
+/// This matters because the two directions are authorized by different systems:
+/// the outbound leg is signed by the retiring custodian, the inbound leg by the
+/// replacement. If the reverse were not permitted on-chain, an aborted cutover
+/// would strand custody with no way back. The vault's
+/// `authorizeReceiptTransfer3` requires no role in either direction, only live
+/// certification and no blocking owner freeze — this asserts that symmetry
+/// against a real vault rather than trusting the reading.
+///
+/// No migration-specific code is exercised in reverse: the same
+/// `migrate_vault_receipts` runs with the wallets swapped, which is the point.
+#[tokio::test]
+async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
+    let temp_dir = tempfile::tempdir()?;
+    let databases = CutoverDatabases::in_directory(temp_dir.path());
+    let fireblocks_wallet = evm.wallet_address;
+    let turnkey_signer = PrivateKeySigner::random();
+    let turnkey_wallet = turnkey_signer.address();
+    assert_ne!(fireblocks_wallet, turnkey_wallet);
+
+    let fireblocks_provider = create_provider()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(
+            &evm.private_key,
+        )?))
+        .connect(&evm.endpoint)
+        .await?;
+    let gas = U256::from(10) * U256::from(10).pow(U256::from(18));
+    fireblocks_provider.anvil_set_balance(turnkey_wallet, gas).await?;
+
+    harness::preseed_tokenized_asset(
+        &databases.fireblocks_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+    evm.grant_deposit_role(fireblocks_wallet).await?;
+    evm.grant_certify_role(fireblocks_wallet).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Run the service only long enough to discover the receipt into inventory,
+    // which the migration cross-checks against the chain.
+    let (config, _subgraph) = harness::create_config_with_db(
+        &databases.fireblocks_url,
+        &mock_alpaca,
+        &evm,
+    )?;
+    let client = start_service(config).await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &fireblocks_provider,
+    );
+    let receipt_shares = U256::from(40) * U256::from(10).pow(U256::from(18));
+    let share_ratio = U256::from(10).pow(U256::from(18));
+    let deposit = vault
+        .deposit(receipt_shares, fireblocks_wallet, share_ratio, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let receipt_id = deposit
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| {
+            OffchainAssetReceiptVault::Deposit::decode_log(&log.inner).ok()
+        })
+        .ok_or("deposit must emit a Deposit event")?
+        .id;
+    let receipt_contract: Address = vault.receipt().call().await?.0.into();
+    let receipt = ReceiptInstance::new(receipt_contract, &fireblocks_provider);
+    wait_for_receipt_in_inventory(&databases.fireblocks_url).await?;
+    client.terminate().await;
+
+    let underlying = UnderlyingSymbol::new("AAPL")?;
+    st0x_issuance::freeze_underlying(&databases.fireblocks_url, 5, &underlying)
+        .await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&databases.fireblocks_url)
+        .await?;
+
+    let forward = migrate_vault_receipts(
+        &pool,
+        &fireblocks_provider,
+        &underlying,
+        evm.chain_id,
+        evm.vault_address,
+        fireblocks_wallet,
+        turnkey_wallet,
+    )
+    .await?;
+    assert!(
+        matches!(forward, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
+        "the forward migration must move receipts, got {forward:?}"
+    );
+    assert_eq!(
+        receipt.balanceOf(turnkey_wallet, receipt_id).call().await?,
+        receipt_shares,
+        "the incoming wallet must hold the receipt after the forward move"
+    );
+
+    // The rollback: same command, signer and recipient swapped.
+    let turnkey_provider = create_provider()
+        .wallet(EthereumWallet::from(turnkey_signer))
+        .connect(&evm.endpoint)
+        .await?;
+    let rolled_back = migrate_vault_receipts(
+        &pool,
+        &turnkey_provider,
+        &underlying,
+        evm.chain_id,
+        evm.vault_address,
+        turnkey_wallet,
+        fireblocks_wallet,
+    )
+    .await?;
+
+    assert!(
+        matches!(rolled_back, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
+        "the rollback must move receipts back, got {rolled_back:?}"
+    );
+    assert_eq!(
+        receipt.balanceOf(fireblocks_wallet, receipt_id).call().await?,
+        receipt_shares,
+        "custody must return to the outgoing wallet after rollback"
+    );
+    assert_eq!(
+        receipt.balanceOf(turnkey_wallet, receipt_id).call().await?,
+        U256::ZERO,
+        "the incoming wallet must retain nothing after rollback"
+    );
+
+    st0x_issuance::unfreeze_underlying(
+        &databases.fireblocks_url,
+        5,
+        &underlying,
+    )
+    .await?;
+    pool.close().await;
 
     Ok(())
 }

@@ -98,7 +98,9 @@ pub use telemetry::TelemetryGuard;
 pub use test_utils::{
     ANVIL_CHAIN_ID, ETHEREUM_TEST_CHAIN_ID, receipt_inventory_aggregate_id,
 };
-pub use tokenized_asset::cli::run_issuer_cli;
+pub use tokenized_asset::cli::{
+    freeze_underlying, run_issuer_cli, unfreeze_underlying,
+};
 pub use wallet::SignerConfig;
 
 struct AggregateCqrsSetup {

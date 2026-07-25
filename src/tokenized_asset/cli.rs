@@ -381,6 +381,48 @@ fn parse_confirmation(input: &str) -> bool {
     trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
 }
 
+/// Freezes an underlying on all networks.
+///
+/// Public so end-to-end tests can drive the real freeze operations the
+/// operator runs, instead of asserting against state produced some other way.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened or the command dispatch
+/// fails.
+pub async fn freeze_underlying(
+    database_url: &str,
+    database_max_connections: u32,
+    underlying: &UnderlyingSymbol,
+) -> anyhow::Result<()> {
+    let admin =
+        AssetAdmin::connect(database_url, database_max_connections).await?;
+    admin.freeze(underlying).await?;
+
+    Ok(())
+}
+
+/// Unfreezes an underlying on all networks.
+///
+/// The counterpart to [`freeze_underlying`], so a caller driving the operator
+/// sequence can leave the asset as it found it.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened or the command dispatch
+/// fails.
+pub async fn unfreeze_underlying(
+    database_url: &str,
+    database_max_connections: u32,
+    underlying: &UnderlyingSymbol,
+) -> anyhow::Result<()> {
+    let admin =
+        AssetAdmin::connect(database_url, database_max_connections).await?;
+    admin.unfreeze(underlying).await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
