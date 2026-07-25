@@ -119,6 +119,23 @@ pub(crate) enum RedemptionView {
 }
 
 impl RedemptionView {
+    /// The asset this redemption is for, when the state still carries it.
+    ///
+    /// `Failed` (and the other terminal shapes) drop the asset; callers that
+    /// need it there must recover it from the aggregate's `Detected` event.
+    pub(crate) const fn underlying(&self) -> Option<&UnderlyingSymbol> {
+        match self {
+            Self::Detected { underlying, .. }
+            | Self::AlpacaCalled { underlying, .. }
+            | Self::Burning { underlying, .. }
+            | Self::BurnFailed { underlying, .. } => Some(underlying),
+            Self::Unavailable
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Closed { .. } => None,
+        }
+    }
+
     fn update_alpaca_called(
         self,
         issuer_request_id: IssuerRedemptionRequestId,

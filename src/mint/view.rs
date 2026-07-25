@@ -168,6 +168,23 @@ impl MintView {
         serde_json::from_value(serde_json::to_value(mint)?)
     }
 
+    /// The asset this mint is for, when the state still carries it.
+    pub(crate) const fn underlying(&self) -> Option<&UnderlyingSymbol> {
+        match self {
+            Self::Initiated { underlying, .. }
+            | Self::JournalConfirmed { underlying, .. }
+            | Self::JournalRejected { underlying, .. }
+            | Self::Minting { underlying, .. }
+            | Self::MintIntended { underlying, .. }
+            | Self::MintTxSubmitted { underlying, .. }
+            | Self::MintingFailed { underlying, .. }
+            | Self::CallbackPending { underlying, .. } => Some(underlying),
+            Self::NotFound | Self::Completed { .. } | Self::Closed { .. } => {
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn state_name(&self) -> &'static str {
         match self {

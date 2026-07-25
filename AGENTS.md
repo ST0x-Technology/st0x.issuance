@@ -65,9 +65,9 @@ clarifies.
 ## Project Overview
 
 Rust **Issuer** bot for Alpaca's Instant Tokenization Network (ITN). It serves
-Alpaca's mint/redeem endpoints and coordinates Rain
-`OffchainAssetReceiptVault` contracts. This is general infrastructure for any
-Authorized Participant, bridging Alpaca equity holdings and Rain SFTs.
+Alpaca's mint/redeem endpoints and coordinates Rain `OffchainAssetReceiptVault`
+contracts. This is general infrastructure for any Authorized Participant,
+bridging Alpaca equity holdings and Rain SFTs.
 
 The system uses **Event Sourcing (ES)** and **CQRS** to maintain a complete
 audit trail, enable time-travel debugging, and provide a single source of truth.
@@ -81,7 +81,8 @@ audit trail, enable time-travel debugging, and provide a single source of truth.
 
 ### Dependency Management
 
-- **CRITICAL: Always use `cargo add`; NEVER manually choose Cargo.toml versions.**
+- **CRITICAL: Always use `cargo add`; NEVER manually choose Cargo.toml
+  versions.**
   - It selects the latest compatible version; Cargo.toml may then be modified
     with that version if needed
   - Example: `cargo add chrono` (NOT manually adding `chrono = "0.4.40"`)
@@ -333,6 +334,11 @@ to `RealBlockchainService`:
 
 Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 `wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
+
+**Receipt custody migration (`receipt_inventory/migration.rs`, temporary):**
+rotating the signer strands the vault's receipts at the old address. **Stop the
+service before moving custody** — startup reconciliation depletes receipts the
+old signer no longer holds.
 
 ### Core Flows
 

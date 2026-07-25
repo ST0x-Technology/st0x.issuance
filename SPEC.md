@@ -731,6 +731,41 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 - `issuer freeze <UNDERLYING>` — dispatch the `Freeze` command.
 - `issuer unfreeze <UNDERLYING>` — dispatch the `Unfreeze` command.
 - `issuer status <UNDERLYING>` — print the underlying's current freeze status.
+  The receipt-custody **migration engine**
+  (`receipt_inventory::migration::migrate_vault_receipts`) moves a vault's
+  ERC-1155 deposit receipts from their holding wallet to a replacement wallet.
+  Temporary, for the Turnkey signing-backend cutover; removed once every vault
+  has migrated. The operator command that executes it ships with the execution
+  work; the engine and its gates are specified here because every execution path
+  must run through them unchanged.
+
+The transfer is signed by the holding wallet itself: ERC-1155 lets a balance be
+moved only by its holder or by an operator the holder has approved via
+`setApprovalForAll`, and the migration relies on the holder case rather than
+granting any operator approval — ERC-1155 approval is all-or-nothing across
+every token the holder owns, so granting it for a one-shot transfer would be a
+far wider authorization than the operation needs. The recipient must clear an
+on-chain corroboration witness (an address the chain has never seen is refused),
+since an ERC-1155 transfer is final, with no counterparty and no recovery. The
+engine refuses while any burn is reserved against the vault's receipts, refuses
+while any mint or redemption of the migrating asset sits between initiation and
+a terminal state (in-flight work resumes against the wrong wallet after a
+custody move; work that cannot be attributed to an asset counts against every
+vault), and refuses when the vault has no tracked receipts rather than reporting
+an unverified no-op. Quiescence is deliberately not a freeze check: the
+corporate-action freeze has its own lifecycle, and a migration neither requires
+declaring one nor ends one that is real. The tracked inventory is cross-checked
+against on-chain balances, the vault's certification and owner-freeze gates are
+re-read immediately before submission, and post-conditions are verified per
+receipt identifier afterwards. Re-running after a successful move reports
+`AlreadyMigrated` instead of submitting a second transfer.
+
+The operator sequence around the engine is **stop the issuer service** → move
+custody → swap the signer configuration → start the service. Stopping first is
+not optional: startup reconciliation reads `balanceOf(bot_wallet)` for every
+tracked receipt, so a service still configured with the outgoing signer that
+restarts after custody has moved reads zero for every one of them, reconciles
+that as depletion, and drops the receipts from the aggregate.
 
 Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
 network argument: one freeze covers every listing of the underlying. The CLI
