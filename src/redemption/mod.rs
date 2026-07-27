@@ -402,7 +402,13 @@ const fn burn_failure_classification(
             OrchestratorRevertReason::ReceiptLogicMismatch => {
                 BurnFailureClassification::ReceiptLogicMismatch
             }
-            OrchestratorRevertReason::Unknown => {
+            // Mint-side reverts can never arise from a burn transaction;
+            // if one somehow surfaces here it stays unclassified.
+            OrchestratorRevertReason::NonceReplayed { .. }
+            | OrchestratorRevertReason::BadRecipientSignature
+            | OrchestratorRevertReason::RecipientCallbackRejected { .. }
+            | OrchestratorRevertReason::VaultAmountMismatch { .. }
+            | OrchestratorRevertReason::Unknown => {
                 BurnFailureClassification::Unclassified
             }
         },
