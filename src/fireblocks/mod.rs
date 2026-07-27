@@ -27,9 +27,10 @@ pub use vault_service::{
 };
 
 /// Fireblocks credentials and settings for the migration CLI, using the same
-/// environment variable names the retired integration used — the production
-/// env file still carries them for the old service, so nothing new is
-/// configured.
+/// environment variable names the retired integration used. The host wiring
+/// supplies `FIREBLOCKS_SECRET_PATH` (the deploy activation installs the key
+/// and exports the path); the remaining values come from the service
+/// environment file.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct FireblocksEnv {
     /// Fireblocks API User ID.

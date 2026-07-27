@@ -34,8 +34,18 @@ let
     )
   );
 
+  # One Fireblocks signing key per environment, scoped to that environment
+  # only. Temporary while receipt custody migrates off Fireblocks.
+  fireblocksKeyRules = builtins.listToAttrs (
+    map (env: {
+      name = "fireblocks-secret-issuance-${env}.key.age";
+      value.publicKeys = roles.${env}.service;
+    }) envNames
+  );
+
 in
 envSecretRules
+// fireblocksKeyRules
 // {
   "tailscale-authkey-prod.age".publicKeys = roles.prod.service;
   "tailscale-authkey-staging.age".publicKeys = roles.staging.service;
