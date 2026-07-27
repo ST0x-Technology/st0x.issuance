@@ -163,26 +163,19 @@ async fn wait_for_recovery_to_resolve(
     }
 }
 
-/// Fetches `GET /admin/orchestrator-health`, failing loudly on a non-OK
-/// status so a broken endpoint can never read as "healthy".
-async fn fetch_orchestrator_health(client: &Client) -> serde_json::Value {
-    authenticated_get_json(client, "/admin/orchestrator-health").await
-}
-
-/// Seeded history for a control redemption: a classified `BurnFailed`
-/// (`AllowanceInsufficient`) the reconciler provably never resolves — typed
-/// classifications are never auto-retried. Its persistent `/admin/stuck`
-/// entry proves the seeds replay and the stuck surfacing works, so a target
-/// redemption's absence in the same snapshot is positive evidence of
-/// recovery (see `wait_for_recovery_to_resolve`).
+/// Event stream for a control redemption parked in a classified
+/// `BurnFailed` — a state recovery provably never resolves (the reconciler
+/// skips typed classifications) — seeded alongside a recovery target so the
+/// absence-based assertion in [`wait_for_recovery_to_resolve`] is
+/// non-vacuous.
 fn classified_control_events(
     control_id: &str,
     control_tx_hash: B256,
     orchestrator_address: Address,
     user_wallet: Address,
     old: &str,
-) -> [(&'static str, serde_json::Value); 4] {
-    [
+) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
         (
             "RedemptionEvent::Detected",
             json!({
@@ -236,6 +229,12 @@ fn classified_control_events(
             }),
         ),
     ]
+}
+
+/// Fetches `GET /admin/orchestrator-health`, failing loudly on a non-OK
+/// status so a broken endpoint can never read as "healthy".
+async fn fetch_orchestrator_health(client: &Client) -> serde_json::Value {
+    authenticated_get_json(client, "/admin/orchestrator-health").await
 }
 
 /// A burn spanning multiple orchestrator-custodied receipts: three separate
@@ -565,7 +564,7 @@ async fn orchestrator_recovery_confirms_landed_burn_without_resubmitting()
     let pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
     for (aggregate_id, aggregate_events) in
-        [(&issuer_request_id, &events), (&control_id, &control_events)]
+        [(&issuer_request_id, &events[..]), (&control_id, &control_events[..])]
     {
         for (sequence, (event_type, payload)) in
             (1i64..).zip(aggregate_events.iter())
@@ -695,6 +694,8 @@ async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
     let user_wallet =
         PrivateKeySigner::from_bytes(&USER_PRIVATE_KEY)?.address();
 
+    // Control redemption making the absence assertion below non-vacuous —
+    // see `wait_for_recovery_to_resolve`.
     let control_tx_hash = B256::random();
     let control_id = format!("{control_tx_hash:#x}");
     let control_events = classified_control_events(
@@ -763,7 +764,7 @@ async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
     let pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
     for (aggregate_id, aggregate_events) in
-        [(&issuer_request_id, &events), (&control_id, &control_events)]
+        [(&issuer_request_id, &events[..]), (&control_id, &control_events[..])]
     {
         for (sequence, (event_type, payload)) in
             (1i64..).zip(aggregate_events.iter())
@@ -803,8 +804,8 @@ async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
 
     // Startup recovery confirms the landed burn: the redemption leaves the
     // recoverable states and no longer surfaces in /admin/stuck — while the
-    // unresolvable control still does, proving the absence is recovery's
-    // doing rather than a seed that never replayed.
+    // unresolvable control redemption still does, proving the absence is
+    // recovery's doing rather than a seed that never replayed.
     wait_for_recovery_to_resolve(&client, &issuer_request_id, &control_id)
         .await?;
 
