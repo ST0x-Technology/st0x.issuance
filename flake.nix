@@ -170,14 +170,16 @@
 
         crateSrc = craneLib.cleanCargoSource ./.;
 
-        # Vendoring reads the whole workspace lock, so the main crate's git dep
-        # (event-sorcery/sqlite-es) needs a pinned hash even though the dto
-        # crate never pulls it in.
+        # Vendoring reads the whole workspace lock, so the main crate's two git
+        # deps (event-sorcery/sqlite-es + fireblocks-sdk) need pinned hashes
+        # even though the dto crate never pulls them in.
         cargoVendorDir = craneLib.vendorCargoDeps {
           src = crateSrc;
           outputHashes = {
             "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.2#8f5c81f3472ac4ca84bbcebbddaa0b3b01f2cfea" =
               "sha256-d0bl1jVmPeu9UPl4cNjY+cAaaLEDmLxw1BQhGrH5eV8=";
+            "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix/confirming-not-terminal#18227211082342818efaf6a1b58c89c65a6f17cd" =
+              "sha256-KThUI0Cvh1JELem7SUQ1K3WqMccFeYfS3BqfLXwk2AE=";
           };
         };
 

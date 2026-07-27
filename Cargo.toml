@@ -77,6 +77,7 @@ apalis = "=1.0.0-rc.9"
 apalis-sqlite = "=1.0.0-rc.8"
 apalis-core = "=1.0.0-rc.9"
 apalis-codec = "=0.1.0-rc.9"
+fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", branch = "fix/confirming-not-terminal", version = "2025.10.17" }
 
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"
@@ -87,6 +88,7 @@ event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", 
 httpmock = { workspace = true }
 proptest = "1.10.0"
 rand = "0.8"
+rsa = "0.9.10"
 rust_decimal_macros = "1.40.0"
 st0x-issuance-client = { path = "crates/client" }
 tempfile = "3.23.0"

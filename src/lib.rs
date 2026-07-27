@@ -79,6 +79,7 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod chain;
 pub(crate) mod config;
+pub mod fireblocks;
 pub(crate) mod jobs;
 mod openapi;
 pub(crate) mod poll_checkpoint;
