@@ -16,14 +16,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use super::{
-    BurnRange, BurnTxStatus, BurnVerification, MintResult, MintTxStatus,
-    MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
-    OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
-    PreparedMintTx, ReceiptInformation, SubmittedTx, VaultError, VaultService,
-    WalletNonceGuard,
+    BurnRange, BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
+    MintTxStatus, MintedLogQuery, MintedLogScan, MultiBurnParams,
+    MultiBurnResult, MultiBurnResultEntry, OrchestratorBurnParams,
+    OrchestratorBurnReadiness, OrchestratorBurnResult, OrchestratorMintParams,
+    OrchestratorMintResult, PreparedMintTx, ReceiptInformation, SubmittedTx,
+    VaultError, VaultService, WalletNonceGuard,
 };
 #[cfg(test)]
-use super::{OrchestratorRevertReason, VerifiedBurn, VerifiedShareTransfer};
+use super::{
+    OrchestratorMintedLog, OrchestratorRevertReason, VerifiedBurn,
+    VerifiedShareTransfer,
+};
 use crate::redemption::BurnExternalTxId;
 use crate::vault::orchestrator::BurnProofKind;
 use crate::vault::{SendableTxWithHash, TxId};
@@ -78,6 +82,11 @@ enum MockBehavior {
     /// where signed-tx preparation fails before the tx is stored in the event.
     #[cfg(test)]
     PrepareTxFails,
+    /// Mint preparation returns a syntactically complete envelope whose
+    /// persisted hash does not match its bytes, testing the
+    /// `PreparedMintTx::validate` rejection path.
+    #[cfg(test)]
+    InvalidPreparedMint,
 }
 
 /// Configured outcome for `verify_burn_tx` in tests.
@@ -178,6 +187,45 @@ struct OrchestratorMockState {
     next_burn_receipt_id_should_error: Mutex<bool>,
     #[cfg(test)]
     vault_logic_call_count: AtomicUsize,
+    /// Cached result from `prepare_orchestrator_mint_tx` for retrieval in
+    /// `confirm_orchestrator_mint`.
+    pending_mint_result: Mutex<Option<OrchestratorMintResult>>,
+    /// When set, `confirm_orchestrator_mint` fails with
+    /// `VaultError::OrchestratorReverted` carrying this reason.
+    #[cfg(test)]
+    mint_confirm_revert: Mutex<Option<OrchestratorRevertReason>>,
+    /// Landed mint returned by `find_orchestrator_minted_log`; `None` means
+    /// no full match on-chain.
+    #[cfg(test)]
+    minted_log: Mutex<Option<OrchestratorMintedLog>>,
+    /// Optional `(orchestrator, to, token)` binding for the configured
+    /// `minted_log`: when set, a query naming a different orchestrator,
+    /// recipient, or token does NOT match — mirroring the address half of
+    /// the real lookup's four-field full-match, which the log's own fields
+    /// (`nonce`, `shares_minted`) cannot express.
+    #[cfg(test)]
+    minted_log_binding: Mutex<Option<(Address, Address, Address)>>,
+    /// When set, `validate_mint_authorization` fails with this outcome.
+    #[cfg(test)]
+    mint_auth_failure: Mutex<Option<MockMintAuthFailure>>,
+    #[cfg(test)]
+    last_mint_params: Mutex<Option<OrchestratorMintParams>>,
+    #[cfg(test)]
+    mint_preparation_call_count: AtomicUsize,
+    #[cfg(test)]
+    mint_auth_validation_call_count: AtomicUsize,
+    #[cfg(test)]
+    find_minted_log_call_count: AtomicUsize,
+}
+
+/// Configurable failure outcomes for the mock's
+/// `validate_mint_authorization`, mirroring the typed `VaultError` variants
+/// the endpoint maps to actionable responses.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MockMintAuthFailure {
+    SignerMismatch,
+    NonceUsed,
 }
 
 /// Mock blockchain service for testing.
@@ -400,6 +448,13 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_invalid_prepared_mint() -> Self {
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::InvalidPreparedMint;
+        service
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_prepare_tx_failure() -> Self {
         let mut service = Self::new_success();
         service.behavior = MockBehavior::PrepareTxFails;
@@ -498,6 +553,21 @@ impl MockVaultService {
         *self.orchestrator.next_burn_receipt_id_should_error.lock().unwrap() =
             false;
         self.orchestrator.vault_logic_call_count.store(0, Ordering::Relaxed);
+        *self.orchestrator.pending_mint_result.lock().unwrap() = None;
+        *self.orchestrator.mint_confirm_revert.lock().unwrap() = None;
+        *self.orchestrator.minted_log.lock().unwrap() = None;
+        *self.orchestrator.minted_log_binding.lock().unwrap() = None;
+        *self.orchestrator.mint_auth_failure.lock().unwrap() = None;
+        *self.orchestrator.last_mint_params.lock().unwrap() = None;
+        self.orchestrator
+            .mint_preparation_call_count
+            .store(0, Ordering::Relaxed);
+        self.orchestrator
+            .mint_auth_validation_call_count
+            .store(0, Ordering::Relaxed);
+        self.orchestrator
+            .find_minted_log_call_count
+            .store(0, Ordering::Relaxed);
         *self.last_burn_proof_kind.lock().unwrap() = None;
     }
 
@@ -788,6 +858,93 @@ impl MockVaultService {
         *self.orchestrator.readiness.lock().unwrap() = Some(readiness);
     }
 
+    /// Configures `confirm_orchestrator_mint` to fail with
+    /// `VaultError::OrchestratorReverted` carrying the given typed reason.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_mint_confirm_revert(
+        self,
+        reason: OrchestratorRevertReason,
+    ) -> Self {
+        *self.orchestrator.mint_confirm_revert.lock().unwrap() = Some(reason);
+        self
+    }
+
+    /// Overrides the result `confirm_orchestrator_mint` returns.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_mint_result(
+        self,
+        result: OrchestratorMintResult,
+    ) -> Self {
+        *self.orchestrator.pending_mint_result.lock().unwrap() = Some(result);
+        self
+    }
+
+    /// Configures the landed mint `find_orchestrator_minted_log` can find.
+    /// Like the real implementation, the lookup only reports it when the
+    /// query full-matches — on the fields the log carries: its `nonce` and
+    /// `shares_minted` (amount) must equal the queried ones. A log configured
+    /// with a different nonce or amount exercises the
+    /// "nonce consumed by a different mint" path. Pair with
+    /// [`Self::with_minted_log_binding`] to also pin the query's address
+    /// fields (`orchestrator`, `to`, `token`), which the log itself cannot
+    /// express.
+    #[cfg(test)]
+    pub(crate) fn with_minted_log(self, log: OrchestratorMintedLog) -> Self {
+        *self.orchestrator.minted_log.lock().unwrap() = Some(log);
+        self
+    }
+
+    /// Binds the configured `minted_log` to an exact
+    /// `(orchestrator, to, token)`: a lookup passing any other address must
+    /// miss (or mismatch, for `token`), mirroring the address half of the
+    /// real scan's four-field full-match.
+    #[cfg(test)]
+    pub(crate) fn with_minted_log_binding(
+        self,
+        orchestrator: Address,
+        to: Address,
+        token: Address,
+    ) -> Self {
+        *self.orchestrator.minted_log_binding.lock().unwrap() =
+            Some((orchestrator, to, token));
+        self
+    }
+
+    /// Configures `validate_mint_authorization` to fail with the given typed
+    /// outcome.
+    #[cfg(test)]
+    pub(crate) fn with_mint_auth_failure(
+        self,
+        failure: MockMintAuthFailure,
+    ) -> Self {
+        *self.orchestrator.mint_auth_failure.lock().unwrap() = Some(failure);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_last_orchestrator_mint_params(
+        &self,
+    ) -> Option<OrchestratorMintParams> {
+        self.orchestrator.last_mint_params.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestrator_mint_preparation_call_count(&self) -> usize {
+        self.orchestrator.mint_preparation_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mint_auth_validation_call_count(&self) -> usize {
+        self.orchestrator
+            .mint_auth_validation_call_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_minted_log_call_count(&self) -> usize {
+        self.orchestrator.find_minted_log_call_count.load(Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     pub(crate) fn last_orchestrator_burn_params(
         &self,
@@ -834,6 +991,16 @@ fn default_orchestrator_burn_result() -> OrchestratorBurnResult {
             first_receipt_id: U256::from(1u8),
             next_burn_receipt_id_after: U256::from(2u8),
         },
+        gas_used: 50000,
+        block_number: 5000,
+    }
+}
+
+fn default_orchestrator_mint_result() -> OrchestratorMintResult {
+    OrchestratorMintResult {
+        tx_hash: MOCK_MINT_TX_HASH,
+        nonce: B256::with_last_byte(1),
+        shares_minted: U256::from(100_000_000_000_000_000_000u128),
         gas_used: 50000,
         block_number: 5000,
     }
@@ -1034,7 +1201,10 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails => Err(VaultError::InvalidReceipt),
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
+                Err(VaultError::InvalidReceipt)
+            }
         }
     }
 
@@ -1189,7 +1359,8 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails => {
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
                 let result = self
                     .pending_burn_result
                     .lock()
@@ -1513,7 +1684,8 @@ impl VaultService for MockVaultService {
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails => {
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
                 let result = self
                     .orchestrator
                     .pending_result
@@ -1574,23 +1746,247 @@ impl VaultService for MockVaultService {
         #[cfg(not(test))]
         Ok(U256::ZERO)
     }
+
+    async fn prepare_orchestrator_mint_tx(
+        &self,
+        params: &OrchestratorMintParams,
+    ) -> Result<PreparedMintTx, VaultError> {
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .mint_preparation_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            if matches!(self.behavior, MockBehavior::PrepareTxFails) {
+                return Err(VaultError::InvalidReceipt);
+            }
+            *self.orchestrator.last_mint_params.lock().unwrap() =
+                Some(params.clone());
+        }
+
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce: 1,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(params.orchestrator),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(1), false);
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+        let tx_hash = *envelope.tx_hash();
+
+        // Fill the pending result only when a test has not already configured
+        // an override, so `with_orchestrator_mint_result` survives prepare.
+        {
+            let mut pending = self
+                .orchestrator
+                .pending_mint_result
+                .lock()
+                .expect("pending_mint_result mutex poisoned");
+            if pending.is_none() {
+                *pending = Some(OrchestratorMintResult {
+                    tx_hash,
+                    nonce: params.authorization.nonce,
+                    shares_minted: params.amount,
+                    gas_used: 21000,
+                    block_number: 1000,
+                });
+            }
+        }
+
+        #[cfg(test)]
+        let persisted_hash =
+            if matches!(self.behavior, MockBehavior::InvalidPreparedMint) {
+                B256::ZERO
+            } else {
+                tx_hash
+            };
+        #[cfg(not(test))]
+        let persisted_hash = tx_hash;
+
+        Ok(PreparedMintTx {
+            tx: envelope.encoded_2718(),
+            hash: persisted_hash,
+            nonce: envelope.nonce(),
+            signed_at: chrono::Utc::now(),
+            external_tx_id: params.external_tx_id.clone().unwrap_or_else(
+                || format!("mint-{}", params.receipt_info.issuer_request_id),
+            ),
+        })
+    }
+
+    async fn confirm_orchestrator_mint(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<OrchestratorMintResult, VaultError> {
+        #[cfg(test)]
+        {
+            let reason_opt =
+                *self.orchestrator.mint_confirm_revert.lock().unwrap();
+            if let Some(reason) = reason_opt {
+                return Err(VaultError::OrchestratorReverted {
+                    tx_hash: MOCK_MINT_TX_HASH,
+                    reason,
+                });
+            }
+        }
+
+        match &self.behavior {
+            MockBehavior::Success => {
+                let result = self
+                    .orchestrator
+                    .pending_mint_result
+                    .lock()
+                    .expect("pending_mint_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(default_orchestrator_mint_result);
+
+                Ok(result)
+            }
+            #[cfg(test)]
+            MockBehavior::Failure => Err(VaultError::InvalidReceipt),
+            #[cfg(test)]
+            MockBehavior::ConfirmRevert => {
+                Err(VaultError::Reverted { tx_hash: MOCK_MINT_TX_HASH })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPending => {
+                Err(VaultError::ConfirmationPending {
+                    tx_id: _tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPendingBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::ConfirmationPending {
+                    tx_id: _tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::SubmitFailure
+            | MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::SubmitRevert
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
+                let result = self
+                    .orchestrator
+                    .pending_mint_result
+                    .lock()
+                    .expect("pending_mint_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(default_orchestrator_mint_result);
+                Ok(result)
+            }
+        }
+    }
+
+    async fn find_orchestrator_minted_log(
+        &self,
+        query: MintedLogQuery,
+    ) -> Result<MintedLogScan, VaultError> {
+        let MintedLogQuery { nonce, amount, .. } = query;
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .find_minted_log_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            // Mirror the real scan's three-way verdict. The stored log
+            // carries `nonce`/`shares_minted`; the optional
+            // `(orchestrator, to, token)` binding stands in for the address
+            // fields it lacks. A query naming a different orchestrator or
+            // recipient finds no log at ITS `(to, nonce)` pair —
+            // `NotFound` — while the right pair with a differing `token`
+            // or `amount` is the pair's one landing disagreeing on the
+            // signed facts: the proven `Mismatch`. A missing or
+            // different-nonce log means nothing was found at the pair.
+            let binding = *self.orchestrator.minted_log_binding.lock().unwrap();
+            let stored = self.orchestrator.minted_log.lock().unwrap().clone();
+            return Ok(match stored {
+                Some(log) if log.nonce == nonce => {
+                    let pair_matches =
+                        binding.is_none_or(|(orchestrator, to, _)| {
+                            query.orchestrator == orchestrator && query.to == to
+                        });
+                    if !pair_matches {
+                        MintedLogScan::NotFound
+                    } else if binding
+                        .is_none_or(|(_, _, token)| query.token == token)
+                        && log.shares_minted == amount
+                    {
+                        MintedLogScan::FullMatch(log)
+                    } else {
+                        MintedLogScan::Mismatch
+                    }
+                }
+                _ => MintedLogScan::NotFound,
+            });
+        }
+
+        #[cfg(not(test))]
+        {
+            let _ = (nonce, amount);
+            Ok(MintedLogScan::NotFound)
+        }
+    }
+
+    async fn validate_mint_authorization(
+        &self,
+        query: MintedLogQuery,
+        authorization: &MintAuthorization,
+    ) -> Result<(), VaultError> {
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .mint_auth_validation_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            let failure_opt =
+                *self.orchestrator.mint_auth_failure.lock().unwrap();
+            match failure_opt {
+                Some(MockMintAuthFailure::SignerMismatch) => {
+                    return Err(VaultError::MintAuthSignerMismatch {
+                        expected: query.to,
+                        recovered: Address::ZERO,
+                    });
+                }
+                Some(MockMintAuthFailure::NonceUsed) => {
+                    return Err(VaultError::MintAuthNonceUsed {
+                        to: query.to,
+                        nonce: query.nonce,
+                    });
+                }
+                None => {}
+            }
+        }
+
+        let _ = (query, authorization);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bytes, U256, address, b256};
     use chrono::Utc;
     use rust_decimal::Decimal;
 
-    use super::MockVaultService;
+    use super::{
+        MockMintAuthFailure, MockVaultService, default_orchestrator_mint_result,
+    };
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::orchestrator::BurnProofKind;
     use crate::vault::{
-        BurnRequestOrigin, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
-        SendableTxWithHash, VaultError, VaultService,
+        BurnRequestOrigin, MintAuthorization, MintedLogQuery, MintedLogScan,
+        MultiBurnEntry, MultiBurnParams, OrchestratorMintParams,
+        OrchestratorMintResult, OrchestratorMintedLog,
+        OrchestratorRevertReason, ReceiptInformation, SendableTxWithHash, TxId,
+        VaultError, VaultService,
     };
 
     fn test_sendable_tx() -> SendableTxWithHash {
@@ -2030,6 +2426,288 @@ mod tests {
             U256::from(17u64),
             burns,
             transfers,
+        );
+    }
+
+    /// The signed-tuple query derived from [`test_orchestrator_mint_params`],
+    /// with `nonce` taken from the authorization as the callers do.
+    fn params_query(params: &OrchestratorMintParams) -> MintedLogQuery {
+        MintedLogQuery {
+            orchestrator: params.orchestrator,
+            to: params.to,
+            nonce: params.authorization.nonce,
+            token: params.token,
+            amount: params.amount,
+            lookback_blocks: None,
+        }
+    }
+
+    fn test_orchestrator_mint_params() -> OrchestratorMintParams {
+        OrchestratorMintParams {
+            orchestrator: address!(
+                "0x00000000000000000000000000000000000000aa"
+            ),
+            token: test_vault(),
+            to: test_receiver(),
+            amount: U256::from(1_000_000u64),
+            authorization: MintAuthorization {
+                nonce: B256::repeat_byte(0x07),
+                signature: Bytes::from_static(&[0xaa; 65]),
+            },
+            receipt_info: test_receipt_info(),
+            external_tx_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mint_mock_round_trip_records_and_confirms() {
+        let mock = MockVaultService::new_success();
+        let params = test_orchestrator_mint_params();
+
+        assert_eq!(mock.orchestrator_mint_preparation_call_count(), 0);
+        assert!(mock.get_last_orchestrator_mint_params().is_none());
+
+        let prepared = mock
+            .prepare_orchestrator_mint_tx(&params)
+            .await
+            .expect("mock prepare must succeed");
+        assert_eq!(
+            prepared.external_tx_id,
+            format!("mint-{}", params.receipt_info.issuer_request_id)
+        );
+        assert_eq!(mock.orchestrator_mint_preparation_call_count(), 1);
+        let recorded = mock
+            .get_last_orchestrator_mint_params()
+            .expect("prepare must record its params");
+        assert_eq!(recorded.to, params.to);
+        assert_eq!(recorded.amount, params.amount);
+        assert_eq!(recorded.authorization, params.authorization);
+
+        let result = mock
+            .confirm_orchestrator_mint(&TxId::Hash(prepared.hash))
+            .await
+            .expect("mock confirm must succeed");
+        assert_eq!(result.tx_hash, prepared.hash);
+        assert_eq!(result.nonce, params.authorization.nonce);
+        assert_eq!(result.shares_minted, params.amount);
+    }
+
+    /// `InvalidPreparedMint` must corrupt the orchestrator preparation —
+    /// persisting a hash that does not match the envelope's bytes — so
+    /// callers can exercise the `PreparedMintTx::validate` rejection path in
+    /// orchestrator mode.
+    #[tokio::test]
+    async fn orchestrator_mint_mock_honors_invalid_prepared_mint() {
+        let mock = MockVaultService::new_invalid_prepared_mint();
+
+        let prepared = mock
+            .prepare_orchestrator_mint_tx(&test_orchestrator_mint_params())
+            .await
+            .expect("mock prepare must succeed");
+
+        assert!(
+            prepared.validate().is_err(),
+            "InvalidPreparedMint must produce an envelope that fails \
+             validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mint_mock_result_override_survives_prepare() {
+        let override_result = OrchestratorMintResult {
+            tx_hash: b256!(
+                "0x1212121212121212121212121212121212121212121212121212121212121212"
+            ),
+            nonce: B256::repeat_byte(0x33),
+            shares_minted: U256::from(42u64),
+            gas_used: 777,
+            block_number: 4242,
+        };
+        let mock = MockVaultService::new_success()
+            .with_orchestrator_mint_result(override_result.clone());
+
+        mock.prepare_orchestrator_mint_tx(&test_orchestrator_mint_params())
+            .await
+            .expect("mock prepare must succeed");
+
+        let result = mock
+            .confirm_orchestrator_mint(&TxId::Hash(B256::ZERO))
+            .await
+            .expect("mock confirm must succeed");
+        assert_eq!(result, override_result);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mint_mock_confirm_revert_and_auth_failures() {
+        let mock = MockVaultService::new_success()
+            .with_orchestrator_mint_confirm_revert(
+                OrchestratorRevertReason::NonceReplayed {
+                    to: test_receiver(),
+                    nonce: B256::repeat_byte(0x07),
+                },
+            );
+        let result =
+            mock.confirm_orchestrator_mint(&TxId::Hash(B256::ZERO)).await;
+        assert!(matches!(
+            result,
+            Err(VaultError::OrchestratorReverted {
+                reason: OrchestratorRevertReason::NonceReplayed { .. },
+                ..
+            })
+        ));
+
+        let params = test_orchestrator_mint_params();
+        let mock = MockVaultService::new_success()
+            .with_mint_auth_failure(MockMintAuthFailure::SignerMismatch);
+        let result = mock
+            .validate_mint_authorization(
+                params_query(&params),
+                &params.authorization,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(VaultError::MintAuthSignerMismatch { .. })
+        ));
+        assert_eq!(mock.mint_auth_validation_call_count(), 1);
+
+        let mock = MockVaultService::new_success()
+            .with_mint_auth_failure(MockMintAuthFailure::NonceUsed);
+        let result = mock
+            .validate_mint_authorization(
+                params_query(&params),
+                &params.authorization,
+            )
+            .await;
+        assert!(matches!(result, Err(VaultError::MintAuthNonceUsed { .. })));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mint_mock_minted_log_and_reset() {
+        let minted = OrchestratorMintedLog {
+            tx_hash: b256!(
+                "0x3434343434343434343434343434343434343434343434343434343434343434"
+            ),
+            nonce: B256::repeat_byte(0x07),
+            shares_minted: U256::from(1_000_000u64),
+            block_number: 4242,
+        };
+        let params = test_orchestrator_mint_params();
+        let mock = MockVaultService::new_success()
+            .with_minted_log(minted.clone())
+            .with_mint_auth_failure(MockMintAuthFailure::NonceUsed);
+
+        let query = params_query(&params);
+        let found = mock
+            .find_orchestrator_minted_log(query)
+            .await
+            .expect("mock lookup must succeed");
+        assert_eq!(found, MintedLogScan::FullMatch(minted.clone()));
+        assert_eq!(mock.find_minted_log_call_count(), 1);
+
+        // The lookup honors the real scan's three-way verdict: an amount
+        // differing from the configured log at the same nonce is the proven
+        // consumed-by-a-different-mint case (`Mismatch`), while a different
+        // nonce means no log exists at the queried pair (`NotFound`) —
+        // never conflated.
+        let wrong_amount = mock
+            .find_orchestrator_minted_log(MintedLogQuery {
+                amount: params.amount + U256::from(1u8),
+                ..query
+            })
+            .await
+            .expect("mock lookup must succeed");
+        assert_eq!(
+            wrong_amount,
+            MintedLogScan::Mismatch,
+            "a differing amount at the same nonce must be the proven \
+             mismatch verdict"
+        );
+        let wrong_nonce = mock
+            .find_orchestrator_minted_log(MintedLogQuery {
+                nonce: B256::repeat_byte(0x08),
+                ..query
+            })
+            .await
+            .expect("mock lookup must succeed");
+        assert_eq!(
+            wrong_nonce,
+            MintedLogScan::NotFound,
+            "a different nonce must find no log at the queried pair"
+        );
+
+        // The optional binding stands in for the address fields the log
+        // lacks, aligning the mock with the real four-field full-match: a
+        // wrong recipient/orchestrator misses (`NotFound`), a wrong token at
+        // the right pair is the proven `Mismatch`, and the exact query still
+        // full-matches.
+        let bound = MockVaultService::new_success()
+            .with_minted_log(minted.clone())
+            .with_minted_log_binding(query.orchestrator, query.to, query.token);
+        assert_eq!(
+            bound
+                .find_orchestrator_minted_log(query)
+                .await
+                .expect("mock lookup must succeed"),
+            MintedLogScan::FullMatch(minted),
+            "the exact bound query must still full-match"
+        );
+        assert_eq!(
+            bound
+                .find_orchestrator_minted_log(MintedLogQuery {
+                    to: Address::repeat_byte(0x99),
+                    ..query
+                })
+                .await
+                .expect("mock lookup must succeed"),
+            MintedLogScan::NotFound,
+            "a wrong recipient must find no log at ITS pair"
+        );
+        assert_eq!(
+            bound
+                .find_orchestrator_minted_log(MintedLogQuery {
+                    token: Address::repeat_byte(0x99),
+                    ..query
+                })
+                .await
+                .expect("mock lookup must succeed"),
+            MintedLogScan::Mismatch,
+            "a wrong token at the right pair must be the proven mismatch"
+        );
+
+        mock.prepare_orchestrator_mint_tx(&params)
+            .await
+            .expect("mock prepare must succeed");
+
+        mock.reset();
+
+        assert_eq!(mock.orchestrator_mint_preparation_call_count(), 0);
+        assert_eq!(mock.find_minted_log_call_count(), 0);
+        assert_eq!(mock.mint_auth_validation_call_count(), 0);
+        assert!(mock.get_last_orchestrator_mint_params().is_none());
+        let found = mock
+            .find_orchestrator_minted_log(query)
+            .await
+            .expect("mock lookup must succeed");
+        assert_eq!(
+            found,
+            MintedLogScan::NotFound,
+            "reset must clear the configured minted log"
+        );
+        mock.validate_mint_authorization(
+            params_query(&params),
+            &params.authorization,
+        )
+        .await
+        .expect("reset must clear the configured auth failure");
+        let result = mock
+            .confirm_orchestrator_mint(&TxId::Hash(B256::ZERO))
+            .await
+            .expect("mock confirm must succeed");
+        assert_eq!(
+            result,
+            default_orchestrator_mint_result(),
+            "reset must clear the pending mint result"
         );
     }
 }

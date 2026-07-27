@@ -38,8 +38,10 @@ pub(crate) use network_services::{
 };
 
 pub(crate) use orchestrator::{
-    BurnRange, OrchestratorBurnParams, OrchestratorBurnReadiness,
-    OrchestratorBurnResult, OrchestratorRevertReason,
+    BurnRange, MintAuthorization, MintedLogQuery, MintedLogScan,
+    OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
+    OrchestratorMintParams, OrchestratorMintResult, OrchestratorMintedLog,
+    OrchestratorRevertReason,
 };
 
 /// Service abstraction for vault operations.
@@ -281,6 +283,75 @@ pub(crate) trait VaultService: Send + Sync {
         _orchestrator: Address,
         _token: Address,
     ) -> Result<U256, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Builds and signs the `ST0xOrchestrator.mint()` transaction without
+    /// broadcasting it. The returned bytes must be persisted (via
+    /// `MintTxIntended`) before [`VaultService::submit_mint`], which
+    /// rebroadcasts them mode-agnostically. No `previewDeposit`, no
+    /// multicall — the orchestrator asserts 1:1 on-chain and forwards shares
+    /// to the recipient. The call uses exactly the signed
+    /// `(token, to, amount, nonce)` from the authorization.
+    ///
+    /// Production callers land with the orchestrator mint aggregate arms
+    /// (mirroring how `check_orchestrator_burn_readiness` above awaited its
+    /// caller); the allow is removed then.
+    #[allow(dead_code)]
+    async fn prepare_orchestrator_mint_tx(
+        &self,
+        _params: &OrchestratorMintParams,
+    ) -> Result<PreparedMintTx, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Confirms a previously submitted orchestrator mint, parsing the
+    /// orchestrator's `Minted` event. A mined-but-reverted mint fails with
+    /// [`VaultError::OrchestratorReverted`] carrying the decoded typed reason
+    /// (`NonceReplayed`, `VaultLogicMismatch`, ...).
+    #[allow(dead_code)]
+    async fn confirm_orchestrator_mint(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<OrchestratorMintResult, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Looks up a landed orchestrator mint by its `Minted` log and reports a
+    /// three-way [`MintedLogScan`] verdict: `FullMatch` when a log at
+    /// `(to, nonce)` also matches `token`/`amount` (this mint's landing),
+    /// `Mismatch` when a log at `(to, nonce)` disagrees on either (a
+    /// different mint provably consumed the pair), and `NotFound` when the
+    /// scanned window holds no log at the pair at all — which, with the
+    /// nonce consumed, is an inconclusive chain view, never proof. Callers
+    /// must never conflate the last two (SPEC "Recipient Authorization" ->
+    /// "Nonce").
+    #[allow(dead_code)]
+    async fn find_orchestrator_minted_log(
+        &self,
+        _query: MintedLogQuery,
+    ) -> Result<MintedLogScan, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Validates a delivered recipient authorization before it is stored:
+    /// the signature must recover to `query.to` over the orchestrator's own
+    /// `mintAuthDigest(token, to, amount, nonce)` (ECDSA, or ERC-1271 when
+    /// `to` is a contract), and `(to, nonce)` must not already be consumed
+    /// on-chain (`nonceUsed`). An EMPTY signature skips signer recovery —
+    /// the future bridge recipient authorizes via the orchestrator's
+    /// `authorizeMint` callback instead — but still checks the nonce.
+    ///
+    /// `query` supplies the signed tuple's addresses and amount; the nonce
+    /// is read from the delivered `authorization` itself (never
+    /// `query.nonce`), so the validated pair is exactly the one the mint
+    /// will consume.
+    #[allow(dead_code)]
+    async fn validate_mint_authorization(
+        &self,
+        _query: MintedLogQuery,
+        _authorization: &MintAuthorization,
+    ) -> Result<(), VaultError> {
         Err(VaultError::InvalidReceipt)
     }
 }
@@ -903,6 +974,33 @@ pub(crate) enum VaultError {
     /// it.
     #[error("Burned event diverges from the mined burn calldata: {tx_hash:?}")]
     BurnedEventMismatch { tx_hash: B256 },
+    /// A delivered mint authorization's signature recovered to a signer other
+    /// than the recipient it must authorize.
+    #[error(
+        "Mint authorization signature recovered {recovered:?}, expected the recipient {expected:?}"
+    )]
+    MintAuthSignerMismatch { expected: Address, recovered: Address },
+    /// A delivered mint authorization's `(to, nonce)` is already consumed
+    /// on-chain — submitting with it could only revert `NonceReplayed`.
+    #[error(
+        "Mint authorization nonce {nonce:?} is already consumed on-chain for recipient {to:?}"
+    )]
+    MintAuthNonceUsed { to: Address, nonce: B256 },
+    /// A contract recipient rejected the mint authorization signature via
+    /// ERC-1271 `isValidSignature`.
+    #[error(
+        "Contract recipient {to:?} rejected the mint authorization signature (ERC-1271)"
+    )]
+    MintAuthRejectedByContract { to: Address },
+    /// An empty-signature authorization names a recipient with no contract
+    /// code. Only a contract can answer the orchestrator's `authorizeMint`
+    /// callback, so this authorization could never be satisfied on-chain.
+    #[error(
+        "Empty-signature mint authorization requires a contract recipient; {to:?} has no code"
+    )]
+    MintAuthEmptySignatureForEoa { to: Address },
+    #[error(transparent)]
+    Signature(#[from] alloy::primitives::SignatureError),
     #[error(
         "Node returned transaction hash {returned:?} for persisted transaction {expected:?}"
     )]
