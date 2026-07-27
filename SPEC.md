@@ -2619,7 +2619,7 @@ effects on that chain:
 - HTTP JSON-RPC provider (Alloy)
 - `VaultService` (Turnkey or local signer, bound to that chain's `chain_id`)
 - `backfill_start_block` for receipt backfill
-- Subgraph URL for receipt indexing
+- Subgraph URL for resolving the OA schema hash used to encode receipt metadata
 
 Constructed once at startup from config; immutable for the process lifetime.
 Alpaca calls a single issuer URL; payload `network` selects the runtime.
@@ -2692,3 +2692,190 @@ rekey change itself.
 | Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
 | Shared `VaultService` with runtime chain_id switch        | Signing backends bind `chain_id` at construction; a runtime switch is error-prone                       |
 | Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |
+
+## Environments
+
+The service is deployed to two environments, **production** and **staging**.
+They are separate hosts, data volumes, databases, and encrypted environment
+files; both run the same artifact. Which environment a process is depends on
+which host it was deployed to, not on a runtime switch: the systemd unit injects
+`ENVIRONMENT`, and that value gates non-production surfaces (today, only whether
+the OpenAPI docs are served) rather than selecting chain, credentials, or broker
+identity.
+
+### Purpose of staging
+
+Staging is the pre-production gate: a change reaches production only after the
+revision carrying it has run on staging against a live Alpaca sandbox and a live
+chain, with the flows it touches exercised there.
+
+Staging already exists and already runs sandbox mint and redeem validation. Its
+limitation is the network it runs on: it operates on production chains, so
+exercising the cash-settlement path requires production-chain value.
+
+That limit is what creates pressure to validate in production instead, by
+registering an asset there that exists only for testing. Such an asset gets its
+own vault, but it shares everything else with real Authorized Participant (AP)
+traffic: the same event store and database, the same bot signer and wallet, and
+the same production Alpaca account. So a failed test becomes a production
+incident and the production asset list carries a row that serves no holder.
+Moving staging onto a test network is what removes the pressure, by making the
+full path exercisable somewhere that backs no real liability.
+
+Staging is deliberately narrow: it is not a load or performance environment, and
+the Alpaca sandbox is its only external _business_ counterparty. It is not
+otherwise isolated from the internet — see Isolation below.
+
+### Network colocation
+
+Staging should operate on a test network rather than on production chains. The
+network is chosen so that a single test network can serve every role a full
+staging exercise touches:
+
+- the chain hosting the staging `OffchainAssetReceiptVault` instances,
+- the chain the liquidity bot trades on in staging,
+- the chain the Alpaca sandbox settles cash (USDC) deposits and withdrawals on,
+- a reachable JSON-RPC endpoint for that chain,
+- a subgraph on it, for resolving the schema hash used to encode receipt
+  metadata on mints and burns,
+- signer support for its `chain_id`, and obtainable gas for the bot wallet.
+
+The first three are what colocation is about: sharing them means staging needs
+no cross-chain value transport, so the mint, redemption, and cash-settlement
+paths are all exercisable on a test network. The last three are infrastructure
+the chain must have before it can be a `ChainRegistry` entry at all, and they
+are the constraints most likely to disqualify an otherwise suitable network.
+
+This is what multichain support unlocks. While the registry holds a single
+hardcoded Base entry, a test-network staging environment is not reachable: the
+network the broker settles cash on is reachable from the trading chain only by
+bridging, and no bridge path exists between the corresponding test networks, so
+staging has to run on production chains. Once the network becomes a
+configuration choice, staging can move to whichever test network satisfies the
+roles above.
+
+That configurability is a precondition, not a given. On the legacy single-chain
+config path the wire-level `network` is fixed to `base` while `CHAIN_ID` is
+env-driven, so repointing `CHAIN_ID` and `RPC_URL` alone would run against a
+different chain while still labelling assets `base` to Alpaca. Staging moves
+only once multichain config parsing lands (see the Multi-chain section).
+
+Which test network to use is an external constraint set by the Alpaca sandbox
+and must be confirmed with Alpaca before staging is repointed — both that the
+sandbox settles cash on it and that the ITN issuer can be enabled for its
+`network` wire value. The choice is shared with `st0x.liquidity`, which must
+trade on the same network for the colocation property to hold.
+
+Validating a **new production network** is a different exercise and this
+environment does not cover it. What qualifies a production chain is that chain's
+own vaults, permissions, RPC, subgraph, signer, and gas — none of which a test
+network exercises, whatever wire value is configured against it. So qualifying
+an additional production chain stays a scoped, time-boxed validation against
+that chain itself, which is what the multichain staging-validation runbook
+describes, and it is deliberately separate from the standing staging
+environment.
+
+### Isolation
+
+Each environment has its own host and data volume, database, encrypted
+environment file, signer and signing wallet, vault instances, and Alpaca
+account. Secrets are encrypted per environment to that environment's service
+role — its host key **plus** the shared operator key. Cross-environment
+isolation is therefore one-directional and specific: staging ciphertext cannot
+be read with production's host key, so compromising the staging host does not
+expose production credentials. The shared operator key is not isolated by
+environment: it decrypts both environments' env files and the Terraform state
+and variables, including the single infrastructure API token that provisions
+both stacks. That key is consequently a production-grade secret regardless of
+which environment it is being used against.
+
+Isolation of credentials does not by itself keep a staging process pointed at
+staging. Chain endpoints and broker identity come from the environment file, and
+nothing cross-checks them against `ENVIRONMENT`, so a staging host configured
+with production endpoints would act on production funds. Vault addresses are not
+env-configured at all — they are registered per asset and live in that
+environment's database — so an environment inherits its vaults from whichever
+database it opens, which makes the database boundary part of the isolation
+boundary rather than an afterthought. Closing the endpoint gap requires the
+deploy-time configuration gate to reject the mismatch: a staging deployment
+configured with a production chain, broker base URL, or broker account must fail
+the deploy, as must the reverse, and an environment file that sets `ENVIRONMENT`
+itself must be rejected so the deploy-time and runtime environment cannot
+diverge.
+
+Reachability is not part of the isolation boundary today. Staging exposes the
+Alpaca callback port to the internet exactly as production does, and because
+`ENVIRONMENT=staging` enables the non-production surfaces, it additionally
+serves the OpenAPI schema without authentication. Restricting staging's callback
+port to sandbox and operator ranges is the intended end state; until then,
+staging's public surface is strictly larger than production's.
+
+Isolation is what lets staging be treated as expendable. Because nothing in
+staging backs a real liability, its database is disposable. Disposable does not
+mean self-healing: the service refuses to create a missing database in either
+environment — a missing file always means misconfiguration, never a cue to start
+empty — so a reset is a deliberate sequence of stopping the service, backing up
+or removing the file, recreating an empty database, letting migrations run, and
+reseeding assets. Production's database is not disposable, and asset
+registration there is irreversible without a restore.
+
+### Promotion
+
+Staging should track the trunk automatically, so that what it runs is the
+candidate for the next production deploy rather than a hand-picked revision.
+Today it does not: every staging deploy is a manual dispatch of an
+operator-chosen revision, which is the hand-picked case this is meant to
+replace. Production deploys stay explicit and are released from a tag.
+
+A staging deploy is only meaningful if it is verified, so deployment should
+conclude with an automated smoke check against the running service, and a failed
+check should fail the deploy rather than leave an unverified environment marked
+good. That gate does not exist today either: the smoke script is an operator
+tool invoked from a runbook, not a step in the deploy.
+
+Promotion binds to a revision, not to a branch. The tag a production deploy
+releases must point at the exact commit that passed staging, so that what ships
+is what was verified; a tag cut from a later trunk state has not been staged,
+whatever else has. The smoke check is the standing floor and runs on every
+staging deploy, covering the always-on paths — service start, chain
+connectivity, and the internal status endpoints. A change additionally requires
+exercising the flows it touches against the Alpaca sandbox, and the record of
+that exercise is what the promotion decision rests on. Neither is a claim that
+every change re-runs every flow: the floor is automated and universal, the
+flow-level exercise is scoped to the change.
+
+### Observability
+
+Staging signals should carry a staging deployment environment so they are
+distinguishable from production in the shared observability stack, and staging
+should never route to production alerting: a noisy staging deploy must not page
+anyone. Neither holds today — the deployment environment reported to the
+telemetry backend is a hardcoded constant, so staging traces arrive labelled as
+production and are indistinguishable from them. Deriving that attribute from the
+environment the process is actually running as is what makes the invariant below
+checkable.
+
+**Invariants:**
+
+1. No signer, wallet, vault, database, or Alpaca account is shared between
+   staging and production. The operator and infrastructure keys are the
+   deliberate exception, and are held to production standards.
+2. A staging secret is not decryptable with production's host key.
+3. Once staging is on a test network, a staging deployment cannot be configured
+   with a production broker base URL or broker account, nor a production
+   deployment with sandbox ones, and the deploy fails if it is.
+4. Production carries no tokenized asset that exists solely to validate service
+   behaviour.
+5. Staging telemetry is tagged as staging and never reaches production alert
+   routing.
+6. Issuance staging and liquidity staging operate on the same network.
+
+**Alternatives considered:**
+
+| Alternative                                                                 | Rejected because                                                                                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Keep staging on a production chain, validating with a production test asset | Test mints and redemptions land in the production event store and vaults, so a failed test is a production incident, and the production asset list carries a validation-only row                                                                                                                        |
+| Staging on a production chain with separate vaults                          | Test flows still consume production-chain gas and finality, and cash settlement still requires a bridge, so the settlement path cannot be exercised without production value                                                                                                                            |
+| Issuance and liquidity staging on different networks                        | Reintroduces the cross-chain transport dependency in staging that colocation removes, so the mint, redeem, and settlement paths cannot be exercised end to end without a bridge                                                                                                                         |
+| Ephemeral per-branch environments                                           | Each needs its own vaults, funded signer, subgraph, and broker registration before it can mint anything, so the per-environment cost is dominated by setup that cannot be torn down and rebuilt per branch. Whether broker registration is self-service is unconfirmed, and would only add to that cost |
+| Mocking Alpaca in staging instead of using the sandbox                      | The integration risk this environment exists to catch is precisely in the real ITN contract; a mock re-encodes our own assumptions                                                                                                                                                                      |
