@@ -6,7 +6,8 @@ use super::{
     ClientId, IssuerMintRequestId, MintExternalTxId, Network, Quantity,
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
-use crate::vault::{PreparedMintTx, TxId};
+use crate::config::VaultMode;
+use crate::vault::{MintAuthorization, PreparedMintTx, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MintCommand {
@@ -19,6 +20,14 @@ pub(crate) enum MintCommand {
         network: Network,
         client_id: ClientId,
         wallet: Address,
+        /// The asset's `VaultMode` resolved from config at initiate time.
+        /// Persisted on `Initiated` to anchor mode derivation for the whole
+        /// mint lifecycle. Deliberately NOT `#[serde(default)]`: commands
+        /// have no historical payloads to stay compatible with (unlike
+        /// `MintEvent::Initiated`), and a silently defaulted `VaultDirect`
+        /// would mis-anchor the mint — omission must be a hard
+        /// deserialization error.
+        mint_mode: VaultMode,
     },
     ConfirmJournal {
         issuer_request_id: IssuerMintRequestId,
@@ -144,5 +153,20 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
         acknowledged_unresolved_mint_tx_hash: Option<B256>,
+    },
+
+    /// Associates the liquidity bot's validated `MintAuthV1` with this mint,
+    /// delivered out-of-band via the internal mint-authorization call after
+    /// `Initiate` (orchestrator mode only). The handler rejects delivery when
+    /// this mint's persisted `mint_mode` is `VaultDirect` (an authorization
+    /// for a vault-direct mint is meaningless — nothing will ever consume
+    /// it), is idempotent on redelivery of an identical authorization, and
+    /// rejects a conflicting one so the nonce cannot be swapped mid-flight.
+    /// Produces `MintAuthorizationReceived`; does not change the lifecycle
+    /// state. On-chain validation (signer, `nonceUsed`) happens at the
+    /// endpoint before this command — the aggregate stays deterministic.
+    AuthorizeMint {
+        issuer_request_id: IssuerMintRequestId,
+        mint_authorization: MintAuthorization,
     },
 }

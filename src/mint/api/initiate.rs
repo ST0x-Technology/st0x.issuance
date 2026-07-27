@@ -11,6 +11,7 @@ use super::{
     MintApiError, MintResponse, validate_asset_exists, validate_client_eligible,
 };
 use crate::auth::IssuerAuth;
+use crate::config::Config;
 use crate::mint::{
     ClientId, IssuerMintRequestId, Mint, MintCommand, MintView, Network,
     Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
@@ -32,7 +33,7 @@ pub(crate) struct MintRequest {
     pub(crate) wallet: Address,
 }
 
-#[tracing::instrument(skip(_auth, mint_store, pool), fields(
+#[tracing::instrument(skip(_auth, mint_store, pool, config), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     underlying = %request.underlying.as_str(),
     client_id = %request.client_id,
@@ -43,6 +44,7 @@ pub(crate) async fn initiate_mint(
     _auth: IssuerAuth,
     mint_store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    config: &rocket::State<Config>,
     request: Json<MintRequest>,
 ) -> Result<Json<MintResponse>, MintApiError> {
     let request = request.into_inner();
@@ -64,6 +66,12 @@ pub(crate) async fn initiate_mint(
 
     let issuer_request_id = IssuerMintRequestId::random();
 
+    // Resolve the asset's mode from config exactly once, here at initiate
+    // time: the persisted anchor on `Initiated` is what every later
+    // mode-dependent step derives from, even if the asset's configured
+    // vault_mode flips mid-flight.
+    let mint_mode = config.vault_mode_for(&request.underlying);
+
     let command = MintCommand::Initiate {
         issuer_request_id: issuer_request_id.clone(),
         tokenization_request_id: request.tokenization_request_id,
@@ -73,6 +81,7 @@ pub(crate) async fn initiate_mint(
         network: request.network,
         client_id: request.client_id,
         wallet: request.wallet,
+        mint_mode,
     };
 
     mint_store.send(&issuer_request_id, command).await.map_err(|error| {
@@ -103,18 +112,20 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use tracing_test::traced_test;
 
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
     use crate::auth::FailedAuthRateLimiter;
+    use crate::config::{Config, VaultMode, VaultModeConfig};
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, test_config,
     };
     use crate::mint::api::{ErrorResponse, MintResponse};
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintCommand, MintView, Network,
+        ClientId, IssuerMintRequestId, Mint, MintCommand, MintView, Network,
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
         view::find_by_issuer_request_id,
     };
@@ -221,6 +232,137 @@ mod tests {
 
         assert!(!mint_response.issuer_request_id.to_string().is_empty());
         assert_eq!(mint_response.status, "created");
+    }
+
+    /// The persisted `Initiated.mint_mode` anchor is resolved from the
+    /// per-asset config at initiate time: under a mixed config, an
+    /// orchestrator-mode asset's mint anchors `Orchestrator` while a
+    /// default-mode asset's mint anchors `VaultDirect`, side by side.
+    #[traced_test]
+    #[tokio::test]
+    async fn initiate_persists_configured_per_asset_mint_mode() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, network, .. } =
+            harness.setup_account_and_asset().await;
+
+        // Second asset on the same deployment, left on the vault-direct
+        // default.
+        let msft = UnderlyingSymbol::new("MSFT").unwrap();
+        let msft_token = TokenSymbol::new("tMSFT");
+        harness
+            .asset_store
+            .send(
+                &AssetKey::new(msft.clone(), network),
+                TokenizedAssetCommand::Add {
+                    underlying: msft.clone(),
+                    token: msft_token.clone(),
+                    network,
+                    vault: address!(
+                        "0x9999999999999999999999999999999999999999"
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to add second asset");
+
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+            ..
+        } = harness;
+        let store_handle = mint_store.clone();
+
+        let orchestrator_address =
+            address!("0x00000000000000000000000000000000000000aa");
+        let config = Config {
+            vault_mode_config: VaultModeConfig::new(
+                HashMap::from([(
+                    underlying.as_str().to_string(),
+                    VaultMode::Orchestrator { address: orchestrator_address },
+                )]),
+                VaultMode::VaultDirect,
+            ),
+            ..test_config()
+        };
+
+        let rocket = rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let mut anchored = Vec::new();
+        for (tokenization_id, symbol, token_symbol) in [
+            ("alp-orch-1", underlying.as_str(), "tAAPL"),
+            ("alp-direct-1", msft.as_str(), "tMSFT"),
+        ] {
+            let request_body = serde_json::json!({
+                "tokenization_request_id": tokenization_id,
+                "qty": "100.5",
+                "underlying_symbol": symbol,
+                "token_symbol": token_symbol,
+                "network": "base",
+                "client_id": client_id,
+                "wallet_address":
+                    "0x1234567890abcdef1234567890abcdef12345678"
+            });
+            let response = client
+                .post("/inkind/issuance")
+                .header(ContentType::JSON)
+                .header(Header::new(
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
+                ))
+                .remote("127.0.0.1:8000".parse().unwrap())
+                .body(request_body.to_string())
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+            let mint_response: MintResponse = serde_json::from_str(
+                &response.into_string().await.expect("valid response body"),
+            )
+            .expect("valid JSON response");
+            anchored.push(mint_response.issuer_request_id);
+        }
+
+        let orchestrator_mint = store_handle
+            .load(&anchored[0])
+            .await
+            .expect("aggregate must load")
+            .expect("aggregate must exist");
+        assert!(
+            matches!(
+                &orchestrator_mint,
+                Mint::Initiated {
+                    mint_mode: VaultMode::Orchestrator { address },
+                    ..
+                } if *address == orchestrator_address
+            ),
+            "orchestrator-mode asset must anchor Orchestrator, \
+             got {orchestrator_mint:?}"
+        );
+
+        let vault_direct_mint = store_handle
+            .load(&anchored[1])
+            .await
+            .expect("aggregate must load")
+            .expect("aggregate must exist");
+        assert!(
+            matches!(
+                &vault_direct_mint,
+                Mint::Initiated { mint_mode: VaultMode::VaultDirect, .. }
+            ),
+            "default-mode asset must anchor VaultDirect, \
+             got {vault_direct_mint:?}"
+        );
     }
 
     #[traced_test]
@@ -942,6 +1084,7 @@ mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
 
         let command = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: TokenizationRequestId::new("alp-123"),
             quantity: Quantity::new(Decimal::from(100)),
