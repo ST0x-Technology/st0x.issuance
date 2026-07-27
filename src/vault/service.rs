@@ -2,7 +2,7 @@ use alloy::consensus::Transaction;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionResponse};
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill,
     NonceFiller, SimpleNonceManager, WalletFiller,
@@ -12,25 +12,28 @@ use alloy::providers::{
 };
 use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
-use alloy::sol_types::SolInterface;
+use alloy::sol_types::{SolCall, SolInterface};
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use super::rain_meta::OaSchemaCache;
 use super::{
-    BurnTxStatus, BurnVerification, MintResult, MultiBurnResult,
-    MultiBurnResultEntry, OrchestratorBurnParams, OrchestratorBurnReadiness,
-    OrchestratorBurnResult, OrchestratorRevertReason, PreparedMintTx,
-    ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
-    VaultService, WalletNonceGuard, classify_checked_receipt,
-    verify_burn_in_receipt,
+    BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
+    MintedLogQuery, MintedLogScan, MultiBurnResult, MultiBurnResultEntry,
+    OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
+    OrchestratorMintParams, OrchestratorMintResult, OrchestratorMintedLog,
+    OrchestratorRevertReason, PreparedMintTx, ReceiptInformation,
+    SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
+    WalletNonceGuard, classify_checked_receipt, verify_burn_in_receipt,
 };
 use crate::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Errors;
-use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
+use crate::bindings::{
+    IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault,
+};
 use crate::redemption::BurnExternalTxId;
 use crate::vault::orchestrator::BurnProofKind;
 
@@ -47,6 +50,29 @@ pub type RealBlockchainServiceProvider = FillProvider<
     >,
     RootProvider,
 >;
+
+/// Total backward window `find_orchestrator_minted_log` scans for a landed
+/// `Minted` log, from the chain head. A consuming transaction can only land
+/// after the mint's authorization was delivered (the delivery endpoint
+/// rejects an already-consumed nonce), so the sought log is at most as old
+/// as the mint's own recovery timeline — this window (~5.8 days on Base's 2s
+/// blocks) covers the automatic retry schedule and same-week manual
+/// re-drives with ample margin.
+const MINTED_LOG_LOOKBACK_BLOCKS: u64 = 250_000;
+
+/// Blocks per `eth_getLogs` call in the `Minted`-log scan, mirroring the
+/// receipt backfiller's `BLOCK_CHUNK_SIZE` (providers typically cap
+/// `eth_getLogs` ranges around this size).
+const MINTED_LOG_CHUNK_BLOCKS: u64 = 2_000;
+
+/// Blocks a `Minted` log must be buried under before the scan treats it as
+/// proof that a mint landed: the scan ceiling is the chain head minus this
+/// depth, so a log from a block that later reorgs out cannot terminalize a
+/// mint whose shares no longer exist. 32 blocks (~64s on Base) comfortably
+/// exceeds observed OP-stack reorg depth; the cost of the lag is one deferred
+/// recovery pass for a landing younger than the window (the lookup's `None`
+/// is retryable).
+const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -129,8 +155,9 @@ impl RealBlockchainService {
             .and_then(|data| IST0xOrchestratorV1Errors::abi_decode(&data).ok())
             .map_or(OrchestratorRevertReason::Unknown, |decoded| {
                 use IST0xOrchestratorV1Errors::{
-                    InsufficientReceipts, ReceiptLogicMismatch,
-                    VaultLogicMismatch,
+                    BadRecipientSignature, InsufficientReceipts, NonceReplayed,
+                    ReceiptLogicMismatch, RecipientCallbackRejected,
+                    VaultAmountMismatch, VaultLogicMismatch,
                 };
                 match decoded {
                     InsufficientReceipts(error) => {
@@ -144,6 +171,26 @@ impl RealBlockchainService {
                     }
                     ReceiptLogicMismatch(_) => {
                         OrchestratorRevertReason::ReceiptLogicMismatch
+                    }
+                    NonceReplayed(error) => {
+                        OrchestratorRevertReason::NonceReplayed {
+                            to: error.to,
+                            nonce: error.nonce,
+                        }
+                    }
+                    BadRecipientSignature(_) => {
+                        OrchestratorRevertReason::BadRecipientSignature
+                    }
+                    RecipientCallbackRejected(error) => {
+                        OrchestratorRevertReason::RecipientCallbackRejected {
+                            recipient: error.recipient,
+                        }
+                    }
+                    VaultAmountMismatch(error) => {
+                        OrchestratorRevertReason::VaultAmountMismatch {
+                            expected: error.expected,
+                            actual: error.actual,
+                        }
                     }
                     _ => OrchestratorRevertReason::Unknown,
                 }
@@ -877,6 +924,323 @@ impl VaultService for RealBlockchainService {
         let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
         Ok(contract.nextBurnReceiptId(token).call().await?)
     }
+
+    async fn prepare_orchestrator_mint_tx(
+        &self,
+        params: &OrchestratorMintParams,
+    ) -> Result<PreparedMintTx, VaultError> {
+        let external_tx_id =
+            params.external_tx_id.clone().unwrap_or_else(|| {
+                format!("mint-{}", params.receipt_info.issuer_request_id)
+            });
+        let oa_schema = self.oa_schema_cache.get(params.token).await;
+        let receipt_info_bytes =
+            params.receipt_info.encode(oa_schema.as_deref())?;
+
+        let orchestrator_contract =
+            IST0xOrchestratorV1::new(params.orchestrator, &self.provider);
+
+        let tx = orchestrator_contract
+            .mint(
+                params.token,
+                params.to,
+                params.amount,
+                params.authorization.to_binding(),
+                receipt_info_bytes,
+            )
+            .into_transaction_request();
+
+        let envelope = self
+            .provider
+            .fill(tx)
+            .await?
+            .try_into_envelope()
+            .map_err(Box::new)?;
+        let prepared_tx = PreparedMintTx {
+            nonce: envelope.nonce(),
+            hash: *envelope.tx_hash(),
+            tx: envelope.encoded_2718(),
+            signed_at: Utc::now(),
+            external_tx_id,
+        };
+        prepared_tx.validate()?;
+
+        Ok(prepared_tx)
+    }
+
+    async fn confirm_orchestrator_mint(
+        &self,
+        tx_id: &TxId,
+    ) -> Result<OrchestratorMintResult, VaultError> {
+        debug!(target: "vault", tx_hash = %tx_id,
+            "Getting orchestrator mint tx data from chain"
+        );
+
+        let tx_hash = tx_id.to_hash().ok_or(VaultError::InvalidReceipt)?;
+
+        let receipt = PendingTransactionBuilder::new(
+            self.provider.root().clone(),
+            tx_hash,
+        )
+        .with_timeout(Some(Duration::from_secs(120)))
+        .get_receipt()
+        .await
+        .map_err(|error| VaultError::ConfirmationPending {
+            tx_id: TxId::Hash(tx_hash),
+            message: error.to_string(),
+        })?;
+
+        let block_number =
+            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+
+        // A mined-but-reverted orchestrator mint is a definitive failure;
+        // decode its typed reason so the aggregate records the right
+        // classification (NonceReplayed routes into the full-match recovery).
+        if !receipt.status() {
+            let reason = self
+                .decode_orchestrator_revert(
+                    tx_hash,
+                    block_number.saturating_sub(1),
+                )
+                .await;
+            return Err(VaultError::OrchestratorReverted { tx_hash, reason });
+        }
+
+        // Bind the decoded event to OUR mint before recording it: emitted by
+        // the orchestrator this persisted transaction targeted
+        // (`receipt.to`), with the transaction's own sender as `caller`. The
+        // mint calls into the recipient contract before completing (ERC-1271
+        // today, `authorizeMint` on the bridge path), so an unbound decode
+        // could pick up a same-topic log the recipient emitted with an
+        // inflated amount. Token, `to`, and amount are then bound
+        // transitively: the orchestrator emits exactly one `Minted` per
+        // `mint()` call, with fields taken from our own persisted calldata.
+        let orchestrator = receipt.to.ok_or(VaultError::InvalidReceipt)?;
+        let minted = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                if log.address() != orchestrator {
+                    return None;
+                }
+                let decoded =
+                    log.log_decode::<IST0xOrchestratorV1::Minted>().ok()?;
+                (decoded.data().caller == receipt.from).then_some(decoded)
+            })
+            .ok_or(VaultError::EventNotFound { tx_hash })?;
+        let minted = minted.data();
+
+        Ok(OrchestratorMintResult {
+            tx_hash,
+            nonce: minted.nonce,
+            shares_minted: minted.amount,
+            gas_used: receipt.gas_used,
+            block_number,
+        })
+    }
+
+    /// Scans backward from the chain head in bounded chunks (providers cap
+    /// `eth_getLogs` block ranges), stopping at the first log carrying the
+    /// queried `(to, nonce)` pair — the on-chain uniqueness key, consumed at
+    /// most once, so the first such log is the ONLY such log and decides the
+    /// verdict: [`MintedLogScan::FullMatch`] when its `token`/`amount` agree,
+    /// [`MintedLogScan::Mismatch`] when they don't. The sought log is at
+    /// most as old as the mint being recovered, so a hit costs one or two
+    /// calls; only [`MintedLogScan::NotFound`] walks the whole window
+    /// (`lookback_blocks` override, else [`MINTED_LOG_LOOKBACK_BLOCKS`]).
+    ///
+    /// The filter is by `to` (topic3) alone, deliberately NOT by `token`
+    /// (topic2): a topic-filtered token would make a same-`(to, nonce)`
+    /// landing under a different token invisible, turning the provable
+    /// `Mismatch` verdict into an inconclusive `NotFound` — the exact
+    /// conflation the three-way verdict exists to prevent.
+    ///
+    /// A chunk failure aborts the scan and surfaces to the caller
+    /// deliberately, without per-chunk retries: every caller already owns a
+    /// safe retry of the whole lookup (the confirm path records a retryable
+    /// `Unclassified` failure; recovery backs off to its next pass), so an
+    /// inner retry layer would only duplicate that policy.
+    async fn find_orchestrator_minted_log(
+        &self,
+        query: MintedLogQuery,
+    ) -> Result<MintedLogScan, VaultError> {
+        let MintedLogQuery {
+            orchestrator,
+            to,
+            nonce,
+            token,
+            amount,
+            lookback_blocks,
+        } = query;
+        let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
+        // The ceiling excludes the newest blocks so a reorged-out log can
+        // never count as proof (see `MINTED_LOG_CONFIRMATION_BLOCKS`).
+        let head = self
+            .provider
+            .get_block_number()
+            .await?
+            .saturating_sub(MINTED_LOG_CONFIRMATION_BLOCKS);
+        let floor = head.saturating_sub(
+            lookback_blocks.unwrap_or(MINTED_LOG_LOOKBACK_BLOCKS),
+        );
+
+        let mut to_block = head;
+        loop {
+            let from_block =
+                to_block.saturating_sub(MINTED_LOG_CHUNK_BLOCKS - 1).max(floor);
+            // `to` is an indexed topic; `nonce`, `amount` live in the data
+            // payload and `token` (topic2) is read from the decoded log
+            // rather than filtered on (see the method comment). Topic
+            // positions follow the ABI's indexed-param order —
+            // `Minted(caller indexed, token indexed, to indexed, amount,
+            // nonce)` — so `to` is topic3 (pinned by
+            // `minted_event_indexes_token_and_to_as_topics_2_and_3` below).
+            trace!(target: "vault",
+                from_block,
+                to_block,
+                to = %to,
+                "Scanning chunk for orchestrator Minted log"
+            );
+            let logs = contract
+                .Minted_filter()
+                .topic3(to)
+                .from_block(from_block)
+                .to_block(to_block)
+                .query()
+                .await?;
+
+            for (minted, log) in logs {
+                if minted.nonce != nonce || minted.to != to {
+                    continue;
+                }
+                if minted.token == token && minted.amount == amount {
+                    return Ok(MintedLogScan::FullMatch(
+                        OrchestratorMintedLog {
+                            tx_hash: log
+                                .transaction_hash
+                                .ok_or(VaultError::InvalidReceipt)?,
+                            nonce,
+                            shares_minted: minted.amount,
+                            block_number: log
+                                .block_number
+                                .ok_or(VaultError::InvalidReceipt)?,
+                        },
+                    ));
+                }
+                // `(to, nonce)` is consumed at most once on-chain, so this
+                // log is the pair's one landing — and it is not this
+                // mint's: affirmative proof of a different mint.
+                warn!(target: "vault",
+                    to = %to,
+                    nonce = %nonce,
+                    expected_token = %token,
+                    landed_token = %minted.token,
+                    expected_amount = %amount,
+                    landed_amount = %minted.amount,
+                    "Minted log at (to, nonce) disagrees on token/amount; a \
+                     different mint consumed the pair"
+                );
+                return Ok(MintedLogScan::Mismatch);
+            }
+
+            if from_block <= floor {
+                // The span a `NotFound` actually looked back over — the
+                // callers' logs carry the mint facts; this records how far
+                // the (inconclusive) absence reading goes.
+                debug!(target: "vault",
+                    head,
+                    floor,
+                    scanned_blocks = head - floor + 1,
+                    to = %to,
+                    nonce = %nonce,
+                    token = %token,
+                    amount = %amount,
+                    "No Minted log at (to, nonce) within the lookback window"
+                );
+                return Ok(MintedLogScan::NotFound);
+            }
+            to_block = from_block - 1;
+        }
+    }
+
+    async fn validate_mint_authorization(
+        &self,
+        query: MintedLogQuery,
+        authorization: &MintAuthorization,
+    ) -> Result<(), VaultError> {
+        let MintedLogQuery { orchestrator, to, nonce, token, amount, .. } =
+            query;
+        let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
+
+        // Consumed-nonce first: definitive regardless of recipient type, and
+        // a submission with a used nonce could only revert NonceReplayed.
+        if contract.nonceUsed(to, nonce).call().await? {
+            return Err(VaultError::MintAuthNonceUsed { to, nonce });
+        }
+
+        // The bridge/`IMintRecipient` recipient authorizes on-chain via the
+        // orchestrator's `authorizeMint` callback — there is no signature to
+        // recover (SPEC Decision 1). Only a CONTRACT can answer that
+        // callback: an EOA with an empty signature could never be satisfied
+        // on-chain, so it is rejected here instead of passing preflight and
+        // reverting at the mint.
+        if authorization.signature.is_empty() {
+            if self.provider.get_code_at(to).await?.is_empty() {
+                return Err(VaultError::MintAuthEmptySignatureForEoa { to });
+            }
+            return Ok(());
+        }
+
+        // The contract's own digest view guarantees the exact EIP-712 domain
+        // and struct hash the orchestrator will verify at mint time.
+        let digest =
+            contract.mintAuthDigest(token, to, amount, nonce).call().await?;
+
+        if self.provider.get_code_at(to).await?.is_empty() {
+            let signature =
+                Signature::from_raw(authorization.signature.as_ref())?;
+            let recovered = signature.recover_address_from_prehash(&digest)?;
+            if recovered != to {
+                return Err(VaultError::MintAuthSignerMismatch {
+                    expected: to,
+                    recovered,
+                });
+            }
+            return Ok(());
+        }
+
+        // Contract recipient: ERC-1271. The magic success value is the
+        // `isValidSignature(bytes32,bytes)` selector itself. Anything short
+        // of it is a rejection, not a transport failure: a revert (a
+        // recipient without `isValidSignature` typically reverts the unknown
+        // call) or a response that fails the `bytes4` decode (a permissive
+        // fallback returning empty data). Only a transport-level failure
+        // propagates as retryable.
+        match IERC1271::new(to, &self.provider)
+            .isValidSignature(digest, authorization.signature.clone())
+            .call()
+            .await
+        {
+            Ok(magic)
+                if magic
+                    == alloy::primitives::FixedBytes(
+                        IERC1271::isValidSignatureCall::SELECTOR,
+                    ) =>
+            {
+                Ok(())
+            }
+            Err(error) if error.as_revert_data().is_some() => {
+                Err(VaultError::MintAuthRejectedByContract { to })
+            }
+            Err(error @ alloy::contract::Error::TransportError(_)) => {
+                Err(error.into())
+            }
+            Ok(_) | Err(_) => {
+                Err(VaultError::MintAuthRejectedByContract { to })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -900,8 +1264,9 @@ mod tests {
         Block, FeeHistory, Transaction as RpcTransaction, TransactionReceipt,
         TransactionRequest,
     };
+    use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
-    use alloy::sol_types::{SolCall, SolError};
+    use alloy::sol_types::{SolCall, SolError, SolEvent};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use std::sync::Arc;
@@ -909,11 +1274,14 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        OrchestratorBurnParams, OrchestratorBurnReadiness,
-        OrchestratorRevertReason, RealBlockchainService,
+        MintAuthorization, MintedLogQuery, OrchestratorBurnParams,
+        OrchestratorBurnReadiness, OrchestratorMintParams,
+        OrchestratorMintedLog, OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider,
     };
-    use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
+    use crate::bindings::{
+        IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault,
+    };
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
@@ -922,8 +1290,8 @@ mod tests {
     use crate::vault::orchestrator::BurnProofKind;
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
-        SendableTxWithHash, TxId, VaultError, VaultService,
+        BurnTxStatus, MintedLogScan, MultiBurnEntry, MultiBurnParams,
+        ReceiptInformation, SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_OA_SCHEMA: &str =
@@ -2786,5 +3154,986 @@ mod tests {
                 "a transport failure must not be classified as a readiness outcome"
             );
         }
+    }
+
+    fn test_mint_authorization() -> MintAuthorization {
+        MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from_static(&[0xaa; 65]),
+        }
+    }
+
+    fn test_orchestrator_mint_params(to: Address) -> OrchestratorMintParams {
+        OrchestratorMintParams {
+            orchestrator: test_orchestrator_address(),
+            token: test_vault_address(),
+            to,
+            amount: U256::from(1_000_000u64),
+            authorization: test_mint_authorization(),
+            receipt_info: test_receipt_info(),
+            external_tx_id: None,
+        }
+    }
+
+    /// The signed-tuple query the validation tests hand to
+    /// `validate_mint_authorization`, with `nonce` taken from the delivered
+    /// authorization as the callers do.
+    fn auth_query(recipient: Address, nonce: B256) -> MintedLogQuery {
+        MintedLogQuery {
+            orchestrator: test_orchestrator_address(),
+            to: recipient,
+            nonce,
+            token: test_vault_address(),
+            amount: U256::from(1_000_000u64),
+            lookback_blocks: None,
+        }
+    }
+
+    fn create_minted_receipt(
+        tx_hash: B256,
+        to: Address,
+        amount: U256,
+        nonce: B256,
+        succeeded: bool,
+    ) -> TransactionReceipt {
+        create_minted_receipt_from(
+            tx_hash,
+            to,
+            amount,
+            nonce,
+            succeeded,
+            test_orchestrator_address(),
+        )
+    }
+
+    /// Like [`create_minted_receipt`], with the `Minted` log's emitting
+    /// contract chosen by the caller — for pinning that the confirm path
+    /// binds the event to the orchestrator the transaction targeted.
+    fn create_minted_receipt_from(
+        tx_hash: B256,
+        to: Address,
+        amount: U256,
+        nonce: B256,
+        succeeded: bool,
+        emitter: Address,
+    ) -> TransactionReceipt {
+        let minted_event = IST0xOrchestratorV1::Minted {
+            caller: address!("2222222222222222222222222222222222222222"),
+            token: test_vault_address(),
+            to,
+            amount,
+            nonce,
+        };
+
+        let logs = if succeeded {
+            vec![alloy::rpc::types::Log {
+                inner: alloy::primitives::Log {
+                    address: emitter,
+                    data: minted_event.into_log_data(),
+                },
+                block_hash: Some(b256!(
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )),
+                block_number: Some(0x9c4),
+                block_timestamp: None,
+                transaction_hash: Some(tx_hash),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                removed: false,
+            }]
+        } else {
+            vec![]
+        };
+
+        let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
+            status: Eip658Value::Eip658(succeeded),
+            cumulative_gas_used: 0x8000,
+            logs,
+        };
+
+        TransactionReceipt {
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(fixed_bytes!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            )),
+            block_number: Some(0x9c4),
+            from: address!("2222222222222222222222222222222222222222"),
+            to: Some(test_orchestrator_address()),
+            gas_used: 0x8000,
+            effective_gas_price: 0x3b9a_ca00,
+            contract_address: None,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mint_prepare_encodes_signed_facts_verbatim() {
+        let asserter = Asserter::new();
+        setup_asserter_for_fill(&asserter, 7);
+        let signer = PrivateKeySigner::random();
+        let service = create_service_with_signer(asserter, signer);
+
+        let recipient = test_receiver();
+        let params = test_orchestrator_mint_params(recipient);
+
+        let prepared = service
+            .prepare_orchestrator_mint_tx(&params)
+            .await
+            .expect("expected PreparedMintTx");
+
+        assert_eq!(prepared.nonce, 7);
+        assert_eq!(
+            prepared.external_tx_id,
+            format!("mint-{}", params.receipt_info.issuer_request_id),
+            "deterministic externalTxId must derive from the issuer request id"
+        );
+        let envelope = TxEnvelope::decode_2718(&mut prepared.tx.as_slice())
+            .expect("prepared orchestrator mint must decode");
+        assert_eq!(*envelope.tx_hash(), prepared.hash);
+        assert_eq!(envelope.to(), Some(test_orchestrator_address()));
+
+        // The calldata must carry exactly the signed (token, to, amount,
+        // nonce) plus the CBOR receipt information — no previewDeposit, no
+        // multicall.
+        let expected_receipt_info = params
+            .receipt_info
+            .encode(Some(TEST_OA_SCHEMA))
+            .expect("receipt info must encode");
+        let expected_calldata = IST0xOrchestratorV1::mintCall {
+            token: params.token,
+            to: params.to,
+            amount: params.amount,
+            auth: params.authorization.to_binding(),
+            receiptInformation: expected_receipt_info,
+        }
+        .abi_encode();
+        assert_eq!(
+            envelope.input().as_ref(),
+            expected_calldata.as_slice(),
+            "calldata must be mint(token, to, amount, auth, receiptInformation)"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_parses_minted_event() {
+        let tx_hash = b256!(
+            "0x8888888888888888888888888888888888888888888888888888888888888888"
+        );
+        let recipient = test_receiver();
+        let nonce = B256::repeat_byte(0x07);
+        let receipt = create_minted_receipt(
+            tx_hash,
+            recipient,
+            U256::from(1_000_000u64),
+            nonce,
+            true,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_mint(&TxId::Hash(tx_hash))
+            .await
+            .expect("expected OrchestratorMintResult");
+
+        assert_eq!(result.tx_hash, tx_hash);
+        assert_eq!(result.nonce, nonce);
+        assert_eq!(result.shares_minted, U256::from(1_000_000u64));
+        assert_eq!(result.gas_used, 0x8000);
+        assert_eq!(result.block_number, 0x9c4);
+    }
+
+    /// The mint calls into the recipient contract before completing, so a
+    /// same-signature `Minted` event emitted by anything other than the
+    /// orchestrator the transaction targeted must never be recorded: the
+    /// confirm path binds the log to `receipt.to` and reads anything else as
+    /// `EventNotFound`.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_ignores_foreign_minted_logs() {
+        let tx_hash = b256!(
+            "0x6666666666666666666666666666666666666666666666666666666666666666"
+        );
+        let recipient = test_receiver();
+        let receipt = create_minted_receipt_from(
+            tx_hash,
+            recipient,
+            U256::from(1_000_000u64),
+            B256::repeat_byte(0x07),
+            true,
+            // The spoof vector: the RECIPIENT emitting an inflated Minted.
+            recipient,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_orchestrator_mint(&TxId::Hash(tx_hash)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::EventNotFound { tx_hash: hash })
+                    if hash == tx_hash
+            ),
+            "a foreign contract's Minted log must not confirm the mint, \
+             got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_without_minted_event_is_not_found() {
+        let tx_hash = b256!(
+            "0x8888888888888888888888888888888888888888888888888888888888888888"
+        );
+        let receipt = create_minted_receipt(
+            tx_hash,
+            test_receiver(),
+            U256::from(1u8),
+            B256::ZERO,
+            true,
+        );
+        let mut receipt = receipt;
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 0x8000,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_orchestrator_mint(&TxId::Hash(tx_hash)).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::EventNotFound { tx_hash: hash }) if hash == tx_hash
+        ));
+    }
+
+    /// A mined-but-reverted orchestrator mint replays the transaction as an
+    /// `eth_call` at its mined block and decodes the mint-side typed revert
+    /// reasons.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_decodes_typed_revert_reasons() {
+        let recipient = test_receiver();
+        let nonce = B256::repeat_byte(0x07);
+        let cases = [
+            (
+                Bytes::from(
+                    IST0xOrchestratorV1::NonceReplayed { to: recipient, nonce }
+                        .abi_encode(),
+                ),
+                OrchestratorRevertReason::NonceReplayed {
+                    to: recipient,
+                    nonce,
+                },
+            ),
+            (
+                Bytes::from(
+                    IST0xOrchestratorV1::VaultAmountMismatch {
+                        expected: U256::from(10u8),
+                        actual: U256::from(9u8),
+                    }
+                    .abi_encode(),
+                ),
+                OrchestratorRevertReason::VaultAmountMismatch {
+                    expected: U256::from(10u8),
+                    actual: U256::from(9u8),
+                },
+            ),
+            (
+                Bytes::from(
+                    IST0xOrchestratorV1::BadRecipientSignature {}.abi_encode(),
+                ),
+                OrchestratorRevertReason::BadRecipientSignature,
+            ),
+            (
+                Bytes::from(
+                    IST0xOrchestratorV1::RecipientCallbackRejected {
+                        recipient,
+                    }
+                    .abi_encode(),
+                ),
+                OrchestratorRevertReason::RecipientCallbackRejected {
+                    recipient,
+                },
+            ),
+        ];
+
+        for (revert_data, expected_reason) in cases {
+            let persisted = SendableTxWithHash::valid_for_test(
+                17,
+                test_orchestrator_address(),
+                Bytes::from_static(&[0xde, 0xad]),
+            );
+            let owner = persisted.signer_for_test();
+            let receipt = create_minted_receipt(
+                persisted.hash,
+                owner,
+                U256::ZERO,
+                B256::ZERO,
+                false,
+            );
+            let transaction = rpc_transaction(&persisted, owner);
+
+            let asserter = Asserter::new();
+            asserter.push_success(&receipt); // eth_getTransactionReceipt
+            asserter.push_success(&receipt); // eth_getTransactionReceipt (polling)
+            asserter.push_success(&transaction); // eth_getTransactionByHash
+            asserter.push_failure(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(
+                    serde_json::value::to_raw_value(&format!("{revert_data}"))
+                        .expect("revert data must serialize"),
+                ),
+            }); // eth_call replay
+            let service = create_service_with_asserter(asserter);
+
+            let result = service
+                .confirm_orchestrator_mint(&TxId::Hash(persisted.hash))
+                .await;
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(VaultError::OrchestratorReverted { tx_hash, reason })
+                        if *tx_hash == persisted.hash
+                            && *reason == expected_reason
+                ),
+                "expected {expected_reason:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_mint_authorization_accepts_recipient_signature() {
+        let signer = PrivateKeySigner::random();
+        let recipient = signer.address();
+        let digest = B256::repeat_byte(0x42);
+        let signature = signer
+            .sign_hash_sync(&digest)
+            .expect("test signer must sign the digest");
+        let authorization = MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from(signature.as_bytes().to_vec()),
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&format!("{digest}")); // mintAuthDigest
+        asserter.push_success(&Bytes::new()); // eth_getCode: EOA
+        let service = create_service_with_asserter(asserter);
+
+        service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await
+            .expect("a recipient-signed authorization must validate");
+    }
+
+    #[tokio::test]
+    async fn validate_mint_authorization_rejects_wrong_signer() {
+        let recipient = test_receiver();
+        let other_signer = PrivateKeySigner::random();
+        let digest = B256::repeat_byte(0x42);
+        let signature = other_signer
+            .sign_hash_sync(&digest)
+            .expect("test signer must sign the digest");
+        let authorization = MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from(signature.as_bytes().to_vec()),
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&format!("{digest}")); // mintAuthDigest
+        asserter.push_success(&Bytes::new()); // eth_getCode: EOA
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthSignerMismatch {
+                    expected,
+                    recovered,
+                }) if *expected == recipient
+                    && *recovered == other_signer.address()
+            ),
+            "expected MintAuthSignerMismatch, got {result:?}"
+        );
+    }
+
+    /// An EMPTY signature is valid input (the future bridge recipient
+    /// authorizes via the orchestrator's `authorizeMint` callback), so signer
+    /// recovery is skipped — but a consumed nonce is still rejected.
+    #[tokio::test]
+    async fn validate_mint_authorization_empty_signature_still_checks_nonce() {
+        let recipient = test_receiver();
+        let authorization = MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::new(),
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x80])); // code: contract
+        let service = create_service_with_asserter(asserter);
+        service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await
+            .expect(
+                "an empty signature for a contract recipient must validate \
+                 without recovery",
+            );
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 1u64)); // nonceUsed: true
+        let service = create_service_with_asserter(asserter);
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthNonceUsed { to, nonce })
+                    if *to == recipient
+                        && *nonce == authorization.nonce
+            ),
+            "expected MintAuthNonceUsed, got {result:?}"
+        );
+    }
+
+    /// An empty signature is only satisfiable by a contract recipient (the
+    /// orchestrator's `authorizeMint` callback); an EOA recipient must be
+    /// rejected at validation instead of passing preflight and reverting at
+    /// the mint.
+    #[tokio::test]
+    async fn validate_mint_authorization_empty_signature_rejects_eoa() {
+        let recipient = test_receiver();
+        let authorization = MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::new(),
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&Bytes::new()); // code: EOA
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthEmptySignatureForEoa { to })
+                    if *to == recipient
+            ),
+            "an empty signature naming an EOA must be rejected, got {result:?}"
+        );
+    }
+
+    /// Signature bytes arrive over the authorization channel, so malformed
+    /// input is the expected case: a truncated signature must surface the
+    /// typed parse error, not a panic or a silent mismatch.
+    #[tokio::test]
+    async fn validate_mint_authorization_rejects_malformed_signature() {
+        let recipient = test_receiver();
+        let authorization = MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from_static(&[0xaa; 12]),
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&B256::repeat_byte(0x42)); // mintAuthDigest
+        asserter.push_success(&Bytes::new()); // code: EOA
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(VaultError::Signature(_))),
+            "a truncated signature must fail with the typed parse error, \
+             got {result:?}"
+        );
+    }
+
+    /// A contract recipient is validated via ERC-1271 `isValidSignature`:
+    /// the selector magic value accepts, anything else rejects.
+    #[tokio::test]
+    async fn validate_mint_authorization_uses_erc1271_for_contract_recipient() {
+        let recipient = test_receiver();
+        let digest = B256::repeat_byte(0x42);
+        let authorization = test_mint_authorization();
+        let contract_code = Bytes::from_static(&[0x60, 0x80]);
+        let mut magic_word = [0u8; 32];
+        magic_word[..4]
+            .copy_from_slice(&IERC1271::isValidSignatureCall::SELECTOR);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&format!("{digest}")); // mintAuthDigest
+        asserter.push_success(&contract_code); // eth_getCode: contract
+        asserter.push_success(&B256::from(magic_word)); // isValidSignature
+        let service = create_service_with_asserter(asserter);
+        service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await
+            .expect("the ERC-1271 magic value must validate");
+
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&format!("{digest}")); // mintAuthDigest
+        asserter.push_success(&contract_code); // eth_getCode: contract
+        asserter.push_success(&B256::ZERO); // isValidSignature: wrong magic
+        let service = create_service_with_asserter(asserter);
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthRejectedByContract { to })
+                    if *to == recipient
+            ),
+            "expected MintAuthRejectedByContract, got {result:?}"
+        );
+    }
+
+    /// The remaining contract-recipient outcomes: an `isValidSignature`
+    /// revert and an empty return (a permissive fallback) are both
+    /// deliberate rejections, while a transport-level failure propagates as
+    /// retryable instead of masquerading as a rejection.
+    #[tokio::test]
+    async fn validate_mint_authorization_erc1271_failure_outcomes() {
+        let recipient = test_receiver();
+        let authorization = test_mint_authorization();
+        let contract_code = Bytes::from_static(&[0x60, 0x80]);
+
+        // Revert from the recipient — a rejection.
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&B256::repeat_byte(0x42)); // mintAuthDigest
+        asserter.push_success(&contract_code); // code: contract
+        asserter.push_failure(ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: Some(
+                serde_json::value::to_raw_value("0x08c379a0")
+                    .expect("revert data must serialize"),
+            ),
+        }); // isValidSignature reverts
+        let service = create_service_with_asserter(asserter);
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthRejectedByContract { to })
+                    if *to == recipient
+            ),
+            "an isValidSignature revert must be a rejection, got {result:?}"
+        );
+
+        // Empty return data (no ERC-1271 implementation behind a permissive
+        // fallback) — also a rejection, not a transport failure.
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&B256::repeat_byte(0x42)); // mintAuthDigest
+        asserter.push_success(&contract_code); // code: contract
+        asserter.push_success(&Bytes::new()); // isValidSignature: empty return
+        let service = create_service_with_asserter(asserter);
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(VaultError::MintAuthRejectedByContract { to })
+                    if *to == recipient
+            ),
+            "an empty isValidSignature return must be a rejection, \
+             got {result:?}"
+        );
+
+        // A transport-level failure must propagate as retryable.
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 0u64)); // nonceUsed: false
+        asserter.push_success(&B256::repeat_byte(0x42)); // mintAuthDigest
+        asserter.push_success(&contract_code); // code: contract
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "node unavailable".into(),
+            data: None,
+        }); // isValidSignature transport failure
+        let service = create_service_with_asserter(asserter);
+        let result = service
+            .validate_mint_authorization(
+                auth_query(recipient, authorization.nonce),
+                &authorization,
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(VaultError::Contract(_))),
+            "a transport failure must propagate, not read as a rejection, \
+             got {result:?}"
+        );
+    }
+
+    /// The `Minted`-log lookup only proves this mint landed on a full
+    /// `(to, nonce, token, amount)` match — a bare `(to, nonce)` hit whose
+    /// amount differs is a different mint and must not match.
+    #[traced_test]
+    #[tokio::test]
+    async fn find_orchestrator_minted_log_requires_full_match() {
+        let recipient = test_receiver();
+        let nonce = B256::repeat_byte(0x07);
+        let amount = U256::from(1_000_000u64);
+        let tx_hash = b256!(
+            "0x8888888888888888888888888888888888888888888888888888888888888888"
+        );
+
+        let minted_log = |log_amount: U256, log_nonce: B256| {
+            let minted_event = IST0xOrchestratorV1::Minted {
+                caller: address!("2222222222222222222222222222222222222222"),
+                token: test_vault_address(),
+                to: recipient,
+                amount: log_amount,
+                nonce: log_nonce,
+            };
+            vec![alloy::rpc::types::Log {
+                inner: alloy::primitives::Log {
+                    address: test_orchestrator_address(),
+                    data: minted_event.into_log_data(),
+                },
+                block_hash: None,
+                block_number: Some(0x9c4),
+                block_timestamp: None,
+                transaction_hash: Some(tx_hash),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                removed: false,
+            }]
+        };
+
+        let query = MintedLogQuery {
+            orchestrator: test_orchestrator_address(),
+            to: recipient,
+            nonce,
+            token: test_vault_address(),
+            amount,
+            lookback_blocks: None,
+        };
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // eth_blockNumber
+        asserter.push_success(&minted_log(amount, nonce)); // eth_getLogs
+        let service = create_service_with_asserter(asserter);
+        let found = service
+            .find_orchestrator_minted_log(query)
+            .await
+            .expect("log query must succeed");
+        assert_eq!(
+            found,
+            MintedLogScan::FullMatch(OrchestratorMintedLog {
+                tx_hash,
+                nonce,
+                shares_minted: amount,
+                block_number: 0x9c4,
+            })
+        );
+
+        // Same (to, nonce), different amount: the pair's one landing belongs
+        // to a DIFFERENT mint — the proven `Mismatch` verdict, never
+        // conflated with an empty scan.
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // eth_blockNumber
+        asserter.push_success(&minted_log(U256::from(999u64), nonce));
+        let service = create_service_with_asserter(asserter);
+        let found = service
+            .find_orchestrator_minted_log(query)
+            .await
+            .expect("log query must succeed");
+        assert_eq!(
+            found,
+            MintedLogScan::Mismatch,
+            "an amount mismatch at the pair must be the proven verdict"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["disagrees on token/amount", "landed_amount=999",]
+        ));
+
+        // Different nonce entirely: nothing at the queried pair.
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // eth_blockNumber
+        asserter.push_success(&minted_log(amount, B256::repeat_byte(0x08)));
+        let service = create_service_with_asserter(asserter);
+        let found = service
+            .find_orchestrator_minted_log(query)
+            .await
+            .expect("log query must succeed");
+        assert_eq!(found, MintedLogScan::NotFound);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "No Minted log at (to, nonce) within the lookback window",
+                // head 100 minus the 32-block confirmation ceiling => 68,
+                // floor 0 => 69 scanned blocks.
+                "scanned_blocks=69"
+            ]
+        ));
+    }
+
+    /// A landing at the queried `(to, nonce)` under a DIFFERENT token is the
+    /// proven `Mismatch` verdict. This is exactly why the scan must not
+    /// topic-filter on `token`: filtered, this log would never be returned
+    /// and the provable mismatch would degrade into an inconclusive
+    /// `NotFound`.
+    #[traced_test]
+    #[tokio::test]
+    async fn find_orchestrator_minted_log_reports_other_token_as_mismatch() {
+        let recipient = test_receiver();
+        let nonce = B256::repeat_byte(0x07);
+        let amount = U256::from(1_000_000u64);
+
+        let minted_event = IST0xOrchestratorV1::Minted {
+            caller: address!("2222222222222222222222222222222222222222"),
+            token: address!("0x9999999999999999999999999999999999999999"),
+            to: recipient,
+            amount,
+            nonce,
+        };
+        let other_token_log = vec![alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: test_orchestrator_address(),
+                data: minted_event.into_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(0x9c4),
+            block_timestamp: None,
+            transaction_hash: Some(b256!(
+                "0x8888888888888888888888888888888888888888888888888888888888888888"
+            )),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }];
+
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // eth_blockNumber
+        asserter.push_success(&other_token_log); // eth_getLogs
+        let service = create_service_with_asserter(asserter);
+        let found = service
+            .find_orchestrator_minted_log(MintedLogQuery {
+                orchestrator: test_orchestrator_address(),
+                to: recipient,
+                nonce,
+                token: test_vault_address(),
+                amount,
+                lookback_blocks: None,
+            })
+            .await
+            .expect("log query must succeed");
+
+        assert_eq!(
+            found,
+            MintedLogScan::Mismatch,
+            "a different-token landing at the pair must be the proven \
+             mismatch verdict"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["disagrees on token/amount", "landed_token=0x9999"]
+        ));
+    }
+
+    /// `lookback_blocks` overrides the scan's backward window —
+    /// reconciliation of an inconclusive replay re-queries wider than the
+    /// default recovery-timeline window.
+    #[traced_test]
+    #[tokio::test]
+    async fn find_orchestrator_minted_log_honors_lookback_override() {
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // eth_blockNumber
+        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
+        let service = create_service_with_asserter(asserter);
+
+        let found = service
+            .find_orchestrator_minted_log(MintedLogQuery {
+                orchestrator: test_orchestrator_address(),
+                to: test_receiver(),
+                nonce: B256::repeat_byte(0x07),
+                token: test_vault_address(),
+                amount: U256::from(1_000_000u64),
+                lookback_blocks: Some(10),
+            })
+            .await
+            .expect("log query must succeed");
+
+        assert_eq!(found, MintedLogScan::NotFound);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "No Minted log at (to, nonce) within the lookback window",
+                // head 100 minus the 32-block ceiling => 68; floor
+                // 68 - 10 = 58 => 11 scanned blocks, not the default window.
+                "scanned_blocks=11"
+            ]
+        ));
+    }
+
+    /// `find_orchestrator_minted_log` filters with `to` as topic3 (and
+    /// deliberately NOT `token`, so a different-token landing at the same
+    /// `(to, nonce)` stays visible as the `Mismatch` verdict), which is only
+    /// correct while the ABI indexes exactly `(caller, token, to)` in that
+    /// order. The mocked provider cannot catch a wrong topic position (it
+    /// returns the pushed logs regardless of the filter), so pin the
+    /// ABI-generated topic layout the runtime filter must line up with — a
+    /// reordering or de-indexing in the contract ABI fails here instead of
+    /// silently never matching on-chain.
+    #[test]
+    fn minted_event_indexes_token_and_to_as_topics_2_and_3() {
+        let caller = address!("0x1111111111111111111111111111111111111111");
+        let token = address!("0x2222222222222222222222222222222222222222");
+        let to = address!("0x3333333333333333333333333333333333333333");
+
+        let log_data = IST0xOrchestratorV1::Minted {
+            caller,
+            token,
+            to,
+            amount: U256::from(1u8),
+            nonce: B256::repeat_byte(0x07),
+        }
+        .into_log_data();
+
+        let topics = log_data.topics();
+        assert_eq!(
+            topics.len(),
+            4,
+            "Minted must index exactly three parameters"
+        );
+        assert_eq!(topics[0], IST0xOrchestratorV1::Minted::SIGNATURE_HASH);
+        assert_eq!(topics[1], caller.into_word(), "caller must be topic1");
+        assert_eq!(topics[2], token.into_word(), "token must be topic2");
+        assert_eq!(topics[3], to.into_word(), "to must be topic3");
+    }
+
+    /// The `Minted`-log scan walks backward from the head in bounded chunks
+    /// (providers cap `eth_getLogs` ranges) and keeps going past an empty
+    /// chunk until it finds the match in an older one.
+    #[tokio::test]
+    async fn find_orchestrator_minted_log_walks_chunks_backward() {
+        let recipient = test_receiver();
+        let nonce = B256::repeat_byte(0x07);
+        let amount = U256::from(1_000_000u64);
+        let tx_hash = b256!(
+            "0x8888888888888888888888888888888888888888888888888888888888888888"
+        );
+
+        let minted_event = IST0xOrchestratorV1::Minted {
+            caller: address!("2222222222222222222222222222222222222222"),
+            token: test_vault_address(),
+            to: recipient,
+            amount,
+            nonce,
+        };
+        let older_chunk_logs = vec![alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: test_orchestrator_address(),
+                data: minted_event.into_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(500),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }];
+
+        // Head 3000 spans two 2000-block chunks: [1001..3000] (empty) then
+        // [0..1000] (the landing).
+        let asserter = Asserter::new();
+        asserter.push_success(&3000u64); // eth_blockNumber
+        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
+        asserter.push_success(&older_chunk_logs);
+        let service = create_service_with_asserter(asserter);
+
+        let found = service
+            .find_orchestrator_minted_log(MintedLogQuery {
+                orchestrator: test_orchestrator_address(),
+                to: recipient,
+                nonce,
+                token: test_vault_address(),
+                amount,
+                lookback_blocks: None,
+            })
+            .await
+            .expect("log query must succeed");
+        assert_eq!(
+            found,
+            MintedLogScan::FullMatch(OrchestratorMintedLog {
+                tx_hash,
+                nonce,
+                shares_minted: amount,
+                block_number: 500,
+            })
+        );
     }
 }

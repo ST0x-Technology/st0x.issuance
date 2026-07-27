@@ -42,3 +42,10 @@ sol!(
     ST0xOrchestrator,
     env!("ST0X_ORCHESTRATOR_ABI")
 );
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    IERC1271,
+    env!("IERC1271_ABI")
+);
