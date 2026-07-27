@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use event_sorcery::{Projection, ProjectionError};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use uuid::Uuid;
 
 use super::{
     ClientId, IssuerMintRequestId, Mint, Network, Quantity, TokenSymbol,
@@ -16,6 +17,17 @@ pub(crate) enum MintViewError {
     Projection(#[from] ProjectionError<Mint>),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("mint view row id {view_id} is not a valid issuer request id")]
+    InvalidViewId { view_id: String },
+    #[error(
+        "tokenization request {tokenization_request_id} matches {matches} mints; refusing ambiguous authorization routing"
+    )]
+    AmbiguousTokenizationRequest {
+        tokenization_request_id: TokenizationRequestId,
+        matches: usize,
+    },
 }
 
 /// Query-oriented representation of a live `Mint` projection.
@@ -215,6 +227,96 @@ pub(crate) async fn find_by_issuer_request_id(
         .map_err(Into::into)
 }
 
+/// Maps Alpaca's `tokenization_request_id` to our issuer id. The internal
+/// mint-authorization call is keyed by the tokenization id — the only mint id
+/// the liquidity bot shares with us; `IssuerMintRequestId` is minted here and
+/// never leaves the Alpaca channel.
+///
+/// SQL only PRUNES candidate rows (served by the
+/// `idx_mint_view_live_tokenization_request_id` expression index — the query
+/// must keep the exact COALESCE expression the index is built on); every
+/// candidate is then loaded through the type-safe projection and re-verified
+/// against `Mint::tokenization_request_id()`, so no domain value is ever
+/// parsed out of the view JSON here.
+///
+/// Nothing enforces tokenization-id uniqueness across mints, so matches are
+/// partitioned by [`Mint::accepts_mint_authorization`]: exactly one
+/// still-accepting mint wins regardless of stale same-id duplicates (a
+/// completed mint from a reused id must never wedge the live one's
+/// authorization), and a sole non-accepting match is still returned so late
+/// deliveries keep their informative rejections (409 naming the state,
+/// vault-direct 422). Anything genuinely ambiguous fails loudly rather than
+/// routing an authorization to an arbitrary aggregate.
+pub(crate) async fn find_issuer_id_by_tokenization_request_id(
+    pool: &Pool<Sqlite>,
+    tokenization_request_id: &TokenizationRequestId,
+) -> Result<Option<IssuerMintRequestId>, MintViewError> {
+    let candidate_ids: Vec<String> =
+        sqlx::query_scalar(tokenization_id_candidate_query())
+            .bind(&tokenization_request_id.0)
+            .fetch_all(pool)
+            .await?;
+
+    let projection = Projection::<Mint>::sqlite(pool.clone());
+    let mut accepting = Vec::new();
+    let mut stale = Vec::new();
+    for view_id in candidate_ids {
+        let issuer_request_id = view_id
+            .parse::<Uuid>()
+            .map(IssuerMintRequestId::new)
+            .map_err(|_| MintViewError::InvalidViewId { view_id })?;
+
+        let Some(mint) = projection.load(&issuer_request_id).await? else {
+            continue;
+        };
+        if mint.tokenization_request_id() != Some(tokenization_request_id) {
+            continue;
+        }
+
+        if mint.accepts_mint_authorization() {
+            accepting.push(issuer_request_id);
+        } else {
+            stale.push(issuer_request_id);
+        }
+    }
+
+    // The ambiguity error reports every matching mint — accepting AND stale
+    // — so the operator sees the true collision size (an `(accepting, _)`
+    // binding would silently under-count when both kinds exist).
+    let matches = accepting.len() + stale.len();
+    match (accepting.len(), stale.len()) {
+        (1, _) => Ok(accepting.pop()),
+        (0, 0 | 1) => Ok(stale.pop()),
+        _ => Err(MintViewError::AmbiguousTokenizationRequest {
+            tokenization_request_id: tokenization_request_id.clone(),
+            matches,
+        }),
+    }
+}
+
+/// The candidate-pruning query behind
+/// [`find_issuer_id_by_tokenization_request_id`]. Its WHERE clause must
+/// structurally match the COALESCE expression
+/// `idx_mint_view_live_tokenization_request_id` is built on, or SQLite falls
+/// back to a table scan — pinned by the query-plan test.
+const fn tokenization_id_candidate_query() -> &'static str {
+    "
+    SELECT view_id
+    FROM mint_view
+    WHERE COALESCE(
+        json_extract(payload, '$.Live.Initiated.tokenization_request_id'),
+        json_extract(payload, '$.Live.JournalConfirmed.tokenization_request_id'),
+        json_extract(payload, '$.Live.JournalRejected.tokenization_request_id'),
+        json_extract(payload, '$.Live.Minting.tokenization_request_id'),
+        json_extract(payload, '$.Live.TxIntended.tokenization_request_id'),
+        json_extract(payload, '$.Live.TxSubmitted.tokenization_request_id'),
+        json_extract(payload, '$.Live.CallbackPending.tokenization_request_id'),
+        json_extract(payload, '$.Live.MintingFailed.tokenization_request_id'),
+        json_extract(payload, '$.Live.Completed.tokenization_request_id')
+    ) = ?
+    "
+}
+
 /// Finds all mints that need recovery (not in terminal states).
 ///
 /// Returns mints in JournalConfirmed, Minting, MintingFailed, or CallbackPending states.
@@ -294,6 +396,7 @@ mod tests {
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 
     use super::*;
+    use crate::config::VaultMode;
     use crate::mint::{Mint, MintCommand};
 
     /// Inserts a `Lifecycle<Mint>`-shaped row into `mint_view` for a given
@@ -395,6 +498,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 MintCommand::Initiate {
+                    mint_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: TokenizationRequestId::new(
                         "alp-888",
@@ -453,6 +557,214 @@ mod tests {
             .expect("Query should succeed");
 
         assert!(result.is_none());
+    }
+
+    fn initiate_command(
+        issuer_request_id: &IssuerMintRequestId,
+        tokenization_request_id: &str,
+    ) -> MintCommand {
+        MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new(
+                tokenization_request_id,
+            ),
+            quantity: Quantity::new(Decimal::from(50)),
+            underlying: UnderlyingSymbol::new("TSLA").unwrap(),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::Base,
+            client_id: ClientId::new(),
+            wallet: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+        }
+    }
+
+    /// The tokenization-id lookup prunes candidates in SQL across every live
+    /// state's payload path, then confirms through the projection — so it
+    /// must keep finding a mint after it advances past `Initiated`, and must
+    /// ignore other mints' ids.
+    #[tokio::test]
+    async fn find_issuer_id_by_tokenization_id_follows_state_changes() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to build mint store");
+
+        let issuer_request_id = IssuerMintRequestId::random();
+        store
+            .send(
+                &issuer_request_id,
+                initiate_command(&issuer_request_id, "alp-tok-lookup"),
+            )
+            .await
+            .expect("Failed to initiate mint");
+        let other_id = IssuerMintRequestId::random();
+        store
+            .send(&other_id, initiate_command(&other_id, "alp-tok-other"))
+            .await
+            .expect("Failed to initiate other mint");
+
+        let found = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-lookup"),
+        )
+        .await
+        .expect("lookup must succeed");
+        assert_eq!(found, Some(issuer_request_id.clone()));
+
+        // Advance past Initiated: the lookup must match the
+        // JournalConfirmed payload path too.
+        store
+            .send(
+                &issuer_request_id,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("Failed to confirm journal");
+        let found = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-lookup"),
+        )
+        .await
+        .expect("lookup must succeed");
+        assert_eq!(found, Some(issuer_request_id));
+
+        let missing = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-unknown"),
+        )
+        .await
+        .expect("lookup must succeed");
+        assert_eq!(missing, None);
+    }
+
+    /// The candidate query must be served by
+    /// `idx_mint_view_live_tokenization_request_id` — SQLite only uses an
+    /// expression index when the WHERE clause structurally matches the
+    /// indexed expression, so any drift between the migration and the query
+    /// silently regresses to a table scan. Pin the query plan.
+    #[tokio::test]
+    async fn find_issuer_id_by_tokenization_id_lookup_uses_expression_index() {
+        let pool = setup_test_db().await;
+
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::tokenization_id_candidate_query()
+            )))
+            .bind("alp-tok-plan")
+            .fetch_all(&pool)
+            .await
+            .expect("query plan must be explainable");
+
+        assert!(
+            plan.iter().any(|(_, _, _, detail)| detail
+                .contains("idx_mint_view_live_tokenization_request_id")),
+            "the lookup must be served by the expression index, got plan: \
+             {plan:?}"
+        );
+    }
+
+    /// A stale terminal mint from a reused tokenization id must never wedge
+    /// the live one: the lookup prefers the single still-accepting mint, and
+    /// still returns a sole stale match so late deliveries keep their
+    /// informative rejections.
+    #[tokio::test]
+    async fn find_issuer_id_by_tokenization_id_prefers_live_over_stale() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to build mint store");
+
+        // The stale duplicate: initiated with the same tokenization id, then
+        // journal-rejected — terminal, can never accept an authorization.
+        let stale_id = IssuerMintRequestId::random();
+        store
+            .send(&stale_id, initiate_command(&stale_id, "alp-tok-reused"))
+            .await
+            .expect("Failed to initiate stale mint");
+        store
+            .send(
+                &stale_id,
+                MintCommand::RejectJournal {
+                    issuer_request_id: stale_id.clone(),
+                    reason: "journal failed".to_string(),
+                },
+            )
+            .await
+            .expect("Failed to reject journal");
+
+        // Only the stale mint exists yet: it must still be returned so a
+        // late delivery gets its informative rejection instead of a 404.
+        let found = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-reused"),
+        )
+        .await
+        .expect("lookup must succeed");
+        assert_eq!(found, Some(stale_id.clone()));
+
+        // The live mint reusing the id: it must win over the stale one.
+        let live_id = IssuerMintRequestId::random();
+        store
+            .send(&live_id, initiate_command(&live_id, "alp-tok-reused"))
+            .await
+            .expect("Failed to initiate live mint");
+
+        let found = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-reused"),
+        )
+        .await
+        .expect("lookup must succeed despite the stale duplicate");
+        assert_eq!(
+            found,
+            Some(live_id),
+            "the live mint must win over the stale terminal duplicate"
+        );
+    }
+
+    /// Nothing enforces tokenization-id uniqueness across mints, so an
+    /// ambiguous id must fail loudly instead of routing an authorization to
+    /// an arbitrary aggregate.
+    #[tokio::test]
+    async fn find_issuer_id_by_tokenization_id_rejects_ambiguous_matches() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to build mint store");
+
+        for _ in 0..2 {
+            let issuer_request_id = IssuerMintRequestId::random();
+            store
+                .send(
+                    &issuer_request_id,
+                    initiate_command(&issuer_request_id, "alp-tok-dup"),
+                )
+                .await
+                .expect("Failed to initiate mint");
+        }
+
+        let result = find_issuer_id_by_tokenization_request_id(
+            &pool,
+            &TokenizationRequestId::new("alp-tok-dup"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MintViewError::AmbiguousTokenizationRequest {
+                    matches: 2,
+                    ..
+                })
+            ),
+            "a duplicated tokenization id must be rejected, got {result:?}"
+        );
     }
 
     fn test_mint_fields() -> TestMintFields {
