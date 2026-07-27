@@ -1451,6 +1451,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::config::VaultMode;
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, network_vault_services,
     };
@@ -1793,6 +1794,7 @@ mod tests {
 
         vec![
             MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
@@ -2357,6 +2359,7 @@ mod tests {
             .send(
                 issuer_request_id,
                 MintCommand::Initiate {
+                    mint_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: TokenizationRequestId::new(
                         "tok-reconcile",

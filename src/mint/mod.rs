@@ -1,4 +1,4 @@
-mod api;
+pub(crate) mod api;
 mod cmd;
 mod event;
 pub(crate) mod job;
@@ -13,16 +13,19 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use uuid::Uuid;
 
+use crate::config::VaultMode;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, TokenizedAssetViewFailure,
 };
-use crate::vault::{PreparedMintTx, TxId, UnconfiguredNetworkError};
+use crate::vault::{
+    MintAuthorization, PreparedMintTx, TxId, UnconfiguredNetworkError,
+};
 
 pub use api::MintResponse;
 
 #[cfg(test)]
 pub(crate) use api::test_utils;
-pub(crate) use api::{confirm_journal, initiate_mint};
+pub(crate) use api::{authorize_mint, confirm_journal, initiate_mint};
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
 pub(crate) use view::{MintView, find_all_recoverable_mints, find_stuck};
@@ -148,6 +151,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
     },
     JournalConfirmed {
         issuer_request_id: IssuerMintRequestId,
@@ -159,6 +175,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
     },
     JournalRejected {
@@ -171,6 +200,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         reason: String,
         rejected_at: DateTime<Utc>,
     },
@@ -184,6 +226,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
         /// Failure history carried across a retry transition
@@ -206,6 +261,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
         prepared_tx: PreparedMintTx,
@@ -223,6 +291,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
         prepared_tx: Option<PreparedMintTx>,
@@ -239,6 +320,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         tx_hash: B256,
         receipt_id: U256,
@@ -257,6 +351,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
@@ -293,6 +400,19 @@ pub(crate) enum Mint {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// Mode anchor from `Initiated.mint_mode` — every mode-dependent mint
+        /// step derives from this persisted value, never from live config.
+        /// Snapshots persisted before orchestrator mode default to
+        /// `VaultDirect`.
+        #[serde(default)]
+        mint_mode: VaultMode,
+        /// The liquidity bot's validated `MintAuthV1`, absent until the
+        /// internal mint-authorization call arrives (orchestrator mode only;
+        /// always `None` for vault-direct mints). Orthogonal to `mint_mode` —
+        /// an orchestrator mint whose authorization has not arrived yet is
+        /// still an orchestrator mint.
+        #[serde(default)]
+        mint_authorization: Option<MintAuthorization>,
         journal_confirmed_at: DateTime<Utc>,
         tx_hash: B256,
         receipt_id: U256,
@@ -592,6 +712,193 @@ impl Mint {
                 Some(tokenization_request_id)
             }
             Self::Closed { .. } => None,
+        }
+    }
+
+    /// The mode anchored on `Initiated` — the only source mode-dependent
+    /// steps derive from.
+    pub(crate) const fn mint_mode(&self) -> Option<VaultMode> {
+        match self {
+            Self::Initiated { mint_mode, .. }
+            | Self::JournalConfirmed { mint_mode, .. }
+            | Self::JournalRejected { mint_mode, .. }
+            | Self::Minting { mint_mode, .. }
+            | Self::TxIntended { mint_mode, .. }
+            | Self::TxSubmitted { mint_mode, .. }
+            | Self::CallbackPending { mint_mode, .. }
+            | Self::MintingFailed { mint_mode, .. }
+            | Self::Completed { mint_mode, .. } => Some(*mint_mode),
+            Self::Closed { .. } => None,
+        }
+    }
+
+    pub(crate) const fn underlying(&self) -> Option<&UnderlyingSymbol> {
+        match self {
+            Self::Initiated { underlying, .. }
+            | Self::JournalConfirmed { underlying, .. }
+            | Self::JournalRejected { underlying, .. }
+            | Self::Minting { underlying, .. }
+            | Self::TxIntended { underlying, .. }
+            | Self::TxSubmitted { underlying, .. }
+            | Self::CallbackPending { underlying, .. }
+            | Self::MintingFailed { underlying, .. }
+            | Self::Completed { underlying, .. } => Some(underlying),
+            Self::Closed { .. } => None,
+        }
+    }
+
+    /// The recipient wallet — the `to` a mint authorization must be signed
+    /// over.
+    pub(crate) const fn wallet(&self) -> Option<Address> {
+        match self {
+            Self::Initiated { wallet, .. }
+            | Self::JournalConfirmed { wallet, .. }
+            | Self::JournalRejected { wallet, .. }
+            | Self::Minting { wallet, .. }
+            | Self::TxIntended { wallet, .. }
+            | Self::TxSubmitted { wallet, .. }
+            | Self::CallbackPending { wallet, .. }
+            | Self::MintingFailed { wallet, .. }
+            | Self::Completed { wallet, .. } => Some(*wallet),
+            Self::Closed { .. } => None,
+        }
+    }
+
+    pub(crate) const fn quantity(&self) -> Option<&Quantity> {
+        match self {
+            Self::Initiated { quantity, .. }
+            | Self::JournalConfirmed { quantity, .. }
+            | Self::JournalRejected { quantity, .. }
+            | Self::Minting { quantity, .. }
+            | Self::TxIntended { quantity, .. }
+            | Self::TxSubmitted { quantity, .. }
+            | Self::CallbackPending { quantity, .. }
+            | Self::MintingFailed { quantity, .. }
+            | Self::Completed { quantity, .. } => Some(quantity),
+            Self::Closed { .. } => None,
+        }
+    }
+
+    /// Whether this mint's lifecycle state can still accept a recipient
+    /// authorization — the exact states [`Self::handle_authorize_mint`]
+    /// destructures (keep the two in sync). The tokenization-id lookup uses
+    /// this to prefer a live mint over stale same-id duplicates.
+    pub(crate) const fn mint_authorization(
+        &self,
+    ) -> Option<&MintAuthorization> {
+        match self {
+            Self::Initiated { mint_authorization, .. }
+            | Self::JournalConfirmed { mint_authorization, .. }
+            | Self::JournalRejected { mint_authorization, .. }
+            | Self::Minting { mint_authorization, .. }
+            | Self::TxIntended { mint_authorization, .. }
+            | Self::TxSubmitted { mint_authorization, .. }
+            | Self::CallbackPending { mint_authorization, .. }
+            | Self::MintingFailed { mint_authorization, .. }
+            | Self::Completed { mint_authorization, .. } => {
+                mint_authorization.as_ref()
+            }
+            Self::Closed { .. } => None,
+        }
+    }
+
+    pub(crate) const fn accepts_mint_authorization(&self) -> bool {
+        matches!(
+            self,
+            Self::Initiated { .. }
+                | Self::JournalConfirmed { .. }
+                | Self::Minting { .. }
+        )
+    }
+
+    /// Associates the liquidity bot's validated authorization with this mint
+    /// without changing the lifecycle state.
+    ///
+    /// Valid only before a transaction is intended: once `PrepareMint` signs,
+    /// the nonce is baked into the persisted bytes, so a late delivery could
+    /// not change what gets submitted. Idempotent on redelivery of an
+    /// identical authorization; a conflicting one is rejected so the nonce
+    /// can never be swapped mid-flight. On-chain validation (signer,
+    /// `nonceUsed`) happens at the endpoint before this command — the
+    /// aggregate enforces only mode and lifecycle invariants. The accepted
+    /// states below must stay in sync with
+    /// [`Self::accepts_mint_authorization`].
+    fn handle_authorize_mint(
+        &self,
+        provided_id: IssuerMintRequestId,
+        mint_authorization: MintAuthorization,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let (Self::Initiated {
+            issuer_request_id: expected_id,
+            underlying,
+            mint_mode,
+            mint_authorization: existing,
+            ..
+        }
+        | Self::JournalConfirmed {
+            issuer_request_id: expected_id,
+            underlying,
+            mint_mode,
+            mint_authorization: existing,
+            ..
+        }
+        | Self::Minting {
+            issuer_request_id: expected_id,
+            underlying,
+            mint_mode,
+            mint_authorization: existing,
+            ..
+        }) = self
+        else {
+            return Err(MintError::AuthorizationNotAcceptable {
+                current_state: self.state_name().to_string(),
+            });
+        };
+
+        Self::validate_issuer_request_id(expected_id, &provided_id)?;
+
+        if matches!(mint_mode, VaultMode::VaultDirect) {
+            return Err(MintError::AuthorizationForVaultDirectAsset {
+                underlying: underlying.clone(),
+            });
+        }
+
+        match existing {
+            Some(existing) if *existing == mint_authorization => Ok(vec![]),
+            Some(_) => Err(MintError::ConflictingMintAuthorization),
+            None => Ok(vec![MintEvent::MintAuthorizationReceived {
+                issuer_request_id: provided_id,
+                mint_authorization,
+                received_at: Utc::now(),
+            }]),
+        }
+    }
+
+    /// Sets the delivered authorization on the current state; the lifecycle
+    /// position is untouched.
+    /// Mirrors [`Self::handle_authorize_mint`]'s accepted states: the event
+    /// is only ever emitted from these three, so any other state is an
+    /// impossible replay and applies as a no-op — a hypothetical late
+    /// emission must never attach a nonce after the transaction is signed
+    /// (states past intent still CARRY the authorization; they receive it
+    /// through the state-transition applies, not through this event).
+    fn apply_mint_authorization_received(
+        &mut self,
+        authorization: MintAuthorization,
+    ) {
+        match self {
+            Self::Initiated { mint_authorization, .. }
+            | Self::JournalConfirmed { mint_authorization, .. }
+            | Self::Minting { mint_authorization, .. } => {
+                *mint_authorization = Some(authorization);
+            }
+            Self::JournalRejected { .. }
+            | Self::TxIntended { .. }
+            | Self::TxSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::MintingFailed { .. }
+            | Self::Completed { .. }
+            | Self::Closed { .. } => {}
         }
     }
 
@@ -990,6 +1297,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
         } = self.clone()
         else {
             return;
@@ -1005,6 +1314,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at: confirmed_at,
         };
     }
@@ -1024,6 +1335,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
         } = self.clone()
         else {
             return;
@@ -1039,6 +1352,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             reason,
             rejected_at,
         };
@@ -1055,6 +1370,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
         } = self.clone()
         else {
@@ -1071,6 +1388,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at: started_at,
             retry: None,
@@ -1103,6 +1422,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at,
             retry: _,
@@ -1117,6 +1438,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at,
             ..
@@ -1135,6 +1458,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at,
             prepared_tx,
@@ -1154,6 +1479,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at,
             retry: _,
@@ -1172,6 +1499,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at,
             prepared_tx,
@@ -1197,6 +1526,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1210,6 +1541,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1223,6 +1556,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }) = self.clone()
@@ -1240,6 +1575,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             tx_hash,
             receipt_id,
@@ -1313,6 +1650,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1326,6 +1665,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1339,6 +1680,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }) = self.clone()
@@ -1356,6 +1699,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             error,
             failed_at,
@@ -1375,6 +1720,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             tx_hash,
             receipt_id,
@@ -1397,6 +1744,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             tx_hash,
             receipt_id,
@@ -1426,6 +1775,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1439,6 +1790,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1452,6 +1805,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }
@@ -1465,6 +1820,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             ..
         }) = self.clone()
@@ -1482,6 +1839,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             tx_hash,
             receipt_id,
@@ -1528,6 +1887,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             attempts,
             failed_from,
@@ -1547,6 +1908,8 @@ impl Mint {
             client_id,
             wallet,
             initiated_at,
+            mint_mode,
+            mint_authorization,
             journal_confirmed_at,
             minting_started_at: started_at,
             retry: Some(MintRetryContext { attempts, failed_from, tx_hash }),
@@ -1655,6 +2018,7 @@ impl EventSourced for Mint {
                 client_id,
                 wallet,
                 initiated_at,
+                mint_mode,
             } => Some(Self::Initiated {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
@@ -1665,6 +2029,10 @@ impl EventSourced for Mint {
                 client_id: *client_id,
                 wallet: *wallet,
                 initiated_at: *initiated_at,
+                mint_mode: *mint_mode,
+                // The authorization arrives out-of-band strictly after
+                // `Initiated` is persisted; a fresh mint never has one.
+                mint_authorization: None,
             }),
             _ => None,
         }
@@ -1693,6 +2061,7 @@ impl EventSourced for Mint {
                 network,
                 client_id,
                 wallet,
+                mint_mode,
             } => Ok(vec![MintEvent::Initiated {
                 issuer_request_id,
                 tokenization_request_id,
@@ -1703,10 +2072,16 @@ impl EventSourced for Mint {
                 client_id,
                 wallet,
                 initiated_at: Utc::now(),
+                mint_mode,
             }]),
             MintCommand::ConfirmJournal { .. }
             | MintCommand::RejectJournal { .. } => {
                 Err(MintError::NotInInitiatedState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
+            MintCommand::AuthorizeMint { .. } => {
+                Err(MintError::AuthorizationNotAcceptable {
                     current_state: "Uninitialized".to_string(),
                 })
             }
@@ -1756,6 +2131,7 @@ impl EventSourced for Mint {
                 network,
                 client_id,
                 wallet,
+                mint_mode,
             } => {
                 if matches!(self, Self::Initiated { .. }) {
                     Err(MintError::AlreadyInitiated {
@@ -1772,9 +2148,15 @@ impl EventSourced for Mint {
                         client_id,
                         wallet,
                         initiated_at: Utc::now(),
+                        mint_mode,
                     }])
                 }
             }
+            MintCommand::AuthorizeMint {
+                issuer_request_id,
+                mint_authorization,
+            } => self
+                .handle_authorize_mint(issuer_request_id, mint_authorization),
             MintCommand::ConfirmJournal { issuer_request_id } => {
                 self.handle_confirm_journal(issuer_request_id)
             }
@@ -1869,6 +2251,7 @@ impl Mint {
                 client_id,
                 wallet,
                 initiated_at,
+                mint_mode,
             } => {
                 *self = Self::Initiated {
                     issuer_request_id,
@@ -1880,8 +2263,17 @@ impl Mint {
                     client_id,
                     wallet,
                     initiated_at,
+                    mint_mode,
+                    // The authorization arrives out-of-band strictly after
+                    // `Initiated`; a fresh mint never has one.
+                    mint_authorization: None,
                 };
             }
+            MintEvent::MintAuthorizationReceived {
+                issuer_request_id: _,
+                mint_authorization,
+                received_at: _,
+            } => self.apply_mint_authorization_received(mint_authorization),
             MintEvent::JournalConfirmed {
                 issuer_request_id: _,
                 confirmed_at,
@@ -1976,6 +2368,18 @@ pub(crate) enum MintError {
         "Mint already initiated for tokenization request: {tokenization_request_id}"
     )]
     AlreadyInitiated { tokenization_request_id: String },
+    #[error(
+        "Mint authorization delivered for vault-direct mint of {underlying}: nothing will ever consume it"
+    )]
+    AuthorizationForVaultDirectAsset { underlying: UnderlyingSymbol },
+    #[error(
+        "A different mint authorization is already recorded for this mint; the nonce cannot be swapped mid-flight"
+    )]
+    ConflictingMintAuthorization,
+    #[error(
+        "Mint authorization cannot be accepted in state {current_state}: authorizations are only accepted before the mint transaction is prepared"
+    )]
+    AuthorizationNotAcceptable { current_state: String },
     #[error("Mint not in Initiated state. Current state: {current_state}")]
     NotInInitiatedState { current_state: String },
     #[error(
@@ -2084,7 +2488,7 @@ impl From<UnconfiguredNetworkError> for MintError {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::primitives::{Address, B256, address, b256, uint};
+    use alloy::primitives::{Address, B256, Bytes, address, b256, uint};
     use chrono::{DateTime, Utc};
     use event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
     use proptest::prelude::*;
@@ -2101,12 +2505,13 @@ pub(crate) mod tests {
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
         has_unresolved_signer_intent,
     };
+    use crate::config::VaultMode;
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, TokenizedAsset, TokenizedAssetCommand,
     };
-    use crate::vault::{PreparedMintTx, TxId};
+    use crate::vault::{MintAuthorization, PreparedMintTx, TxId};
 
     pub(super) const VAULT: Address =
         address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -2717,6 +3122,7 @@ pub(crate) mod tests {
     ) -> Vec<MintEvent> {
         vec![
             MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
@@ -2755,6 +3161,7 @@ pub(crate) mod tests {
         let now = Utc::now();
         vec![
             MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
@@ -3583,6 +3990,7 @@ pub(crate) mod tests {
         let events = TestHarness::<Mint>::with(())
             .given_no_previous_events()
             .when(MintCommand::Initiate {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 quantity: quantity.clone(),
@@ -3608,6 +4016,7 @@ pub(crate) mod tests {
                 client_id: event_client_id,
                 wallet: event_wallet,
                 initiated_at,
+                mint_mode,
             } => {
                 assert_eq!(event_issuer_id, &issuer_request_id);
                 assert_eq!(event_tokenization_id, &tokenization_request_id);
@@ -3618,6 +4027,7 @@ pub(crate) mod tests {
                 assert_eq!(event_client_id, &client_id);
                 assert_eq!(event_wallet, &wallet);
                 assert!(initiated_at.timestamp() > 0);
+                assert_eq!(mint_mode, &VaultMode::VaultDirect);
             }
             MintEvent::JournalConfirmed { .. }
             | MintEvent::JournalRejected { .. }
@@ -3629,9 +4039,569 @@ pub(crate) mod tests {
             | MintEvent::MintCompleted { .. }
             | MintEvent::ExistingMintRecovered { .. }
             | MintEvent::MintRetryStarted { .. }
+            | MintEvent::MintAuthorizationReceived { .. }
             | MintEvent::MintClosed { .. } => {
                 panic!("Expected MintInitiated event, got {:?}", &events[0])
             }
+        }
+    }
+
+    /// Historic `Initiated` events predate `mint_mode` entirely; they must
+    /// replay as `VaultDirect` — the only mode that existed when they were
+    /// written.
+    #[test]
+    fn initiated_event_without_mint_mode_replays_as_vault_direct() {
+        let historic = serde_json::json!({
+            "Initiated": {
+                "issuer_request_id": IssuerMintRequestId::random().to_string(),
+                "tokenization_request_id": "alp-legacy-1",
+                "quantity": "100",
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "network": "base",
+                "client_id": ClientId::new(),
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "initiated_at": "2025-01-01T00:00:00Z"
+            }
+        });
+
+        let event: MintEvent = serde_json::from_value(historic)
+            .expect("historic Initiated event must deserialize");
+        let MintEvent::Initiated { mint_mode, .. } = &event else {
+            panic!("expected Initiated, got {event:?}");
+        };
+        assert_eq!(mint_mode, &VaultMode::VaultDirect);
+
+        let mint = replay::<Mint>(vec![event])
+            .expect("historic event must replay")
+            .expect("mint must exist");
+        assert!(matches!(
+            mint,
+            Mint::Initiated { mint_mode: VaultMode::VaultDirect, .. }
+        ));
+    }
+
+    /// Pre-orchestrator aggregate snapshots lack `mint_mode`; deserializing
+    /// them must default to `VaultDirect` rather than fail.
+    #[test]
+    fn state_snapshot_without_mint_mode_deserializes_as_vault_direct() {
+        let mint = Mint::Initiated {
+            mint_authorization: None,
+            issuer_request_id: IssuerMintRequestId::random(),
+            tokenization_request_id: TokenizationRequestId::new("alp-snap-1"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: Utc::now(),
+            mint_mode: VaultMode::Orchestrator {
+                address: address!("0x00000000000000000000000000000000000000aa"),
+            },
+        };
+
+        let mut old_snapshot =
+            serde_json::to_value(&mint).expect("state must serialize");
+        old_snapshot
+            .pointer_mut("/Initiated")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("Initiated snapshot object")
+            .remove("mint_mode");
+
+        let restored: Mint = serde_json::from_value(old_snapshot)
+            .expect("old snapshot must deserialize");
+        assert!(matches!(
+            restored,
+            Mint::Initiated { mint_mode: VaultMode::VaultDirect, .. }
+        ));
+    }
+
+    /// The mode anchored on `Initiated` flows through every lifecycle
+    /// transition: replay derives it from the mint's own event history alone
+    /// (live config is not an input to replay), so a mint initiated while its
+    /// asset was orchestrator-mode stays orchestrator-mode through
+    /// journal-confirm, minting, intent, submission, and failure — regardless
+    /// of what the asset's configured vault_mode says later.
+    #[test]
+    fn mint_mode_anchor_survives_replay_through_lifecycle() {
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+        let issuer_request_id = IssuerMintRequestId::random();
+        let base_events = vec![
+            MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-anchor-1",
+                ),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: Utc::now(),
+                mint_mode: orchestrator,
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: Utc::now(),
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: Utc::now(),
+            },
+            MintEvent::MintTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::default(),
+                intended_at: Utc::now(),
+            },
+            MintEvent::MintTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: "mint-anchor-1".to_string(),
+                tx_id: TxId::Hash(B256::repeat_byte(0x22)),
+                submitted_at: Utc::now(),
+            },
+        ];
+
+        let submitted = replay::<Mint>(base_events.clone())
+            .expect("lifecycle must replay")
+            .expect("mint must exist");
+        assert!(
+            matches!(
+                &submitted,
+                Mint::TxSubmitted { mint_mode, .. } if *mint_mode == orchestrator
+            ),
+            "TxSubmitted must carry the orchestrator anchor, got {submitted:?}"
+        );
+
+        let mut failed_events = base_events;
+        failed_events.push(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "boom".to_string(),
+            failed_at: Utc::now(),
+        });
+        let failed = replay::<Mint>(failed_events)
+            .expect("failed lifecycle must replay")
+            .expect("mint must exist");
+        assert!(
+            matches!(
+                &failed,
+                Mint::MintingFailed { mint_mode, .. }
+                    if *mint_mode == orchestrator
+            ),
+            "MintingFailed must carry the orchestrator anchor, got {failed:?}"
+        );
+    }
+
+    /// The anchor also survives the transitions the lifecycle test does not
+    /// reach: the recovery retry (`MintingFailed -> Minting`), the recovered
+    /// and terminal success states (`CallbackPending`, `Completed`), and the
+    /// journal-rejection terminal. Retry preservation is what keeps a
+    /// recovered orchestrator mint on the orchestrator path.
+    #[test]
+    fn mint_mode_anchor_survives_retry_rejection_and_terminal_states() {
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+        let issuer_request_id = IssuerMintRequestId::random();
+        let initiated = MintEvent::Initiated {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("alp-anchor-2"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: Utc::now(),
+            mint_mode: orchestrator,
+        };
+
+        let mut events = vec![
+            initiated.clone(),
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: Utc::now(),
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: Utc::now(),
+            },
+            MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "boom".to_string(),
+                failed_at: Utc::now(),
+            },
+            MintEvent::MintRetryStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: None,
+                started_at: Utc::now(),
+                manual_retry_id: None,
+            },
+        ];
+        let retried = replay::<Mint>(events.clone())
+            .expect("retry lifecycle must replay")
+            .expect("mint must exist");
+        assert!(
+            matches!(
+                &retried,
+                Mint::Minting { mint_mode, .. } if *mint_mode == orchestrator
+            ),
+            "the retry transition must preserve the anchor, got {retried:?}"
+        );
+
+        events.push(MintEvent::ExistingMintRecovered {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: B256::repeat_byte(0x33),
+            receipt_id: uint!(1_U256),
+            shares_minted: uint!(100_000000000000000000_U256),
+            block_number: 1000,
+            recovered_at: Utc::now(),
+        });
+        let recovered = replay::<Mint>(events.clone())
+            .expect("recovered lifecycle must replay")
+            .expect("mint must exist");
+        assert!(
+            matches!(
+                &recovered,
+                Mint::CallbackPending { mint_mode, .. }
+                    if *mint_mode == orchestrator
+            ),
+            "CallbackPending must carry the anchor, got {recovered:?}"
+        );
+
+        events.push(MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at: Utc::now(),
+        });
+        let completed = replay::<Mint>(events)
+            .expect("completed lifecycle must replay")
+            .expect("mint must exist");
+        assert!(
+            matches!(
+                &completed,
+                Mint::Completed { mint_mode, .. }
+                    if *mint_mode == orchestrator
+            ),
+            "Completed must carry the anchor, got {completed:?}"
+        );
+
+        let rejected = replay::<Mint>(vec![
+            initiated,
+            MintEvent::JournalRejected {
+                issuer_request_id,
+                reason: "insufficient shares".to_string(),
+                rejected_at: Utc::now(),
+            },
+        ])
+        .expect("rejected lifecycle must replay")
+        .expect("mint must exist");
+        assert!(
+            matches!(
+                &rejected,
+                Mint::JournalRejected { mint_mode, .. }
+                    if *mint_mode == orchestrator
+            ),
+            "JournalRejected must carry the anchor, got {rejected:?}"
+        );
+    }
+
+    fn orchestrator_initiated_event(
+        issuer_request_id: &IssuerMintRequestId,
+        mint_mode: VaultMode,
+    ) -> MintEvent {
+        MintEvent::Initiated {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("alp-auth-1"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: Utc::now(),
+            mint_mode,
+        }
+    }
+
+    fn test_authorization() -> MintAuthorization {
+        MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from_static(&[0xaa; 65]),
+        }
+    }
+
+    /// `MintAuthorizationReceived` applies only in the states
+    /// `handle_authorize_mint` emits from: a hypothetical late emission must
+    /// never swap the nonce after the transaction is signed — past intent it
+    /// replays as a no-op and the originally bound authorization stays.
+    #[test]
+    fn late_authorization_event_replays_as_a_noop_past_intent() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+
+        let history = vec![
+            orchestrator_initiated_event(&issuer_request_id, orchestrator),
+            MintEvent::MintAuthorizationReceived {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: test_authorization(),
+                received_at: Utc::now(),
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: Utc::now(),
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: Utc::now(),
+            },
+            MintEvent::MintTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::valid_for_test(
+                    1,
+                    "mint-late-auth".to_string(),
+                ),
+                intended_at: Utc::now(),
+            },
+            // No command emits this past intent; if one ever does, it must
+            // not rebind the nonce the signed transaction already carries.
+            MintEvent::MintAuthorizationReceived {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: MintAuthorization {
+                    nonce: B256::repeat_byte(0x08),
+                    signature: Bytes::from_static(&[0xbb; 65]),
+                },
+                received_at: Utc::now(),
+            },
+        ];
+
+        let mint = replay::<Mint>(history)
+            .expect("history must replay")
+            .expect("mint must exist");
+
+        assert!(
+            matches!(
+                &mint,
+                Mint::TxIntended { mint_authorization: Some(authorization), .. }
+                    if *authorization == test_authorization()
+            ),
+            "the late event must not rebind the authorization, got {mint:?}"
+        );
+    }
+
+    /// `AuthorizeMint` records the authorization on an orchestrator-mode mint
+    /// from every pre-intent state — without changing the lifecycle position.
+    #[tokio::test]
+    async fn authorize_mint_records_authorization_without_lifecycle_change() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+        let initiated =
+            orchestrator_initiated_event(&issuer_request_id, orchestrator);
+        let journal_confirmed = MintEvent::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            confirmed_at: Utc::now(),
+        };
+        let minting_started = MintEvent::MintingStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            started_at: Utc::now(),
+        };
+
+        let cases: Vec<(Vec<MintEvent>, &str)> = vec![
+            (vec![initiated.clone()], "Initiated"),
+            (
+                vec![initiated.clone(), journal_confirmed.clone()],
+                "JournalConfirmed",
+            ),
+            (vec![initiated, journal_confirmed, minting_started], "Minting"),
+        ];
+
+        for (given, expected_state) in cases {
+            let events = TestHarness::<Mint>::with(())
+                .given(given.clone())
+                .when(MintCommand::AuthorizeMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mint_authorization: test_authorization(),
+                })
+                .await
+                .events();
+
+            assert_eq!(events.len(), 1, "from {expected_state}");
+            let MintEvent::MintAuthorizationReceived {
+                mint_authorization, ..
+            } = &events[0]
+            else {
+                panic!(
+                    "expected MintAuthorizationReceived from {expected_state}, \
+                     got {:?}",
+                    events[0]
+                );
+            };
+            assert_eq!(mint_authorization, &test_authorization());
+
+            // Applying the event sets the authorization but leaves the
+            // lifecycle position untouched.
+            let mut history = given;
+            history.push(events[0].clone());
+            let mint = replay::<Mint>(history)
+                .expect("history must replay")
+                .expect("mint must exist");
+            assert_eq!(mint.state_name(), expected_state);
+            assert!(matches!(
+                &mint,
+                Mint::Initiated {
+                    mint_authorization: Some(authorization),
+                    ..
+                } | Mint::JournalConfirmed {
+                    mint_authorization: Some(authorization),
+                    ..
+                } | Mint::Minting {
+                    mint_authorization: Some(authorization),
+                    ..
+                } if *authorization == test_authorization()
+            ));
+        }
+    }
+
+    /// An authorization for a vault-direct mint is meaningless — nothing will
+    /// ever consume it — so delivery is rejected and never stored.
+    #[tokio::test]
+    async fn authorize_mint_rejects_vault_direct_mint() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let error = TestHarness::<Mint>::with(())
+            .given(vec![orchestrator_initiated_event(
+                &issuer_request_id,
+                VaultMode::VaultDirect,
+            )])
+            .when(MintCommand::AuthorizeMint {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: test_authorization(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(
+                    MintError::AuthorizationForVaultDirectAsset { .. }
+                )
+            ),
+            "expected AuthorizationForVaultDirectAsset, got {error:?}"
+        );
+    }
+
+    /// Redelivery of the identical authorization is a no-op (the liquidity
+    /// bot retries deliveries); a different one is rejected so the nonce can
+    /// never be swapped mid-flight.
+    #[tokio::test]
+    async fn authorize_mint_is_idempotent_and_rejects_conflicts() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+        let given = vec![
+            orchestrator_initiated_event(&issuer_request_id, orchestrator),
+            MintEvent::MintAuthorizationReceived {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: test_authorization(),
+                received_at: Utc::now(),
+            },
+        ];
+
+        let events = TestHarness::<Mint>::with(())
+            .given(given.clone())
+            .when(MintCommand::AuthorizeMint {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: test_authorization(),
+            })
+            .await
+            .events();
+        assert!(
+            events.is_empty(),
+            "identical redelivery must be a no-op, got {events:?}"
+        );
+
+        let conflicting = MintAuthorization {
+            nonce: B256::repeat_byte(0x08),
+            signature: Bytes::from_static(&[0xbb; 65]),
+        };
+        let error = TestHarness::<Mint>::with(())
+            .given(given)
+            .when(MintCommand::AuthorizeMint {
+                issuer_request_id: issuer_request_id.clone(),
+                mint_authorization: conflicting,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(MintError::ConflictingMintAuthorization)
+            ),
+            "expected ConflictingMintAuthorization, got {error:?}"
+        );
+    }
+
+    /// Once `PrepareMint` signs, the nonce is baked into the persisted bytes;
+    /// a late delivery could not change what gets submitted and is rejected.
+    #[tokio::test]
+    async fn authorize_mint_rejected_after_transaction_intent() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let orchestrator = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+        let mut given = vec![
+            orchestrator_initiated_event(&issuer_request_id, orchestrator),
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: Utc::now(),
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: Utc::now(),
+            },
+            MintEvent::MintTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::default(),
+                intended_at: Utc::now(),
+            },
+        ];
+
+        for expected_state in ["MintIntended", "TxSubmitted"] {
+            let error = TestHarness::<Mint>::with(())
+                .given(given.clone())
+                .when(MintCommand::AuthorizeMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mint_authorization: test_authorization(),
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        MintError::AuthorizationNotAcceptable {
+                            current_state,
+                        }
+                    ) if current_state == expected_state
+                ),
+                "expected AuthorizationNotAcceptable from {expected_state}, \
+                 got {error:?}"
+            );
+
+            given.push(MintEvent::MintTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: "mint-auth-late".to_string(),
+                tx_id: TxId::Hash(B256::repeat_byte(0x22)),
+                submitted_at: Utc::now(),
+            });
         }
     }
 
@@ -3648,6 +4618,7 @@ pub(crate) mod tests {
 
         let error = TestHarness::<Mint>::with(())
             .given(vec![MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 quantity: quantity.clone(),
@@ -3659,6 +4630,7 @@ pub(crate) mod tests {
                 initiated_at: chrono::Utc::now(),
             }])
             .when(MintCommand::Initiate {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id,
                 tokenization_request_id,
                 quantity,
@@ -3702,11 +4674,14 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
         }])
         .unwrap()
         .unwrap();
 
         let Mint::Initiated {
+            mint_authorization: _,
+            mint_mode: _,
             issuer_request_id: applied_issuer_id,
             tokenization_request_id: applied_tokenization_id,
             quantity: applied_quantity,
@@ -3745,6 +4720,7 @@ pub(crate) mod tests {
         let initiated_at = Utc::now();
 
         let mut mint = Mint::Initiated {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -3754,6 +4730,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
         };
 
         let confirmed_at = Utc::now();
@@ -3789,6 +4766,7 @@ pub(crate) mod tests {
         let initiated_at = Utc::now();
 
         let mut mint = Mint::Initiated {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -3798,6 +4776,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
         };
 
         let rejected_at = Utc::now();
@@ -3837,6 +4816,7 @@ pub(crate) mod tests {
 
         let events = TestHarness::<Mint>::with(())
             .given(vec![MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
                 quantity,
@@ -3885,6 +4865,7 @@ pub(crate) mod tests {
         let error = TestHarness::<Mint>::with(())
             .given(vec![
                 MintEvent::Initiated {
+                    mint_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id,
                     quantity,
@@ -3924,6 +4905,7 @@ pub(crate) mod tests {
 
         let events = TestHarness::<Mint>::with(())
             .given(vec![MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
                 quantity,
@@ -3985,6 +4967,7 @@ pub(crate) mod tests {
 
         let error = TestHarness::<Mint>::with(())
             .given(vec![MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: correct_issuer_request_id,
                 tokenization_request_id,
                 quantity,
@@ -4026,6 +5009,7 @@ pub(crate) mod tests {
 
         let error = TestHarness::<Mint>::with(())
             .given(vec![MintEvent::Initiated {
+                mint_mode: VaultMode::VaultDirect,
                 issuer_request_id: correct_issuer_request_id,
                 tokenization_request_id,
                 quantity,
@@ -4067,6 +5051,7 @@ pub(crate) mod tests {
         let journal_confirmed_at = Utc::now();
 
         let mut mint = Mint::JournalConfirmed {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: quantity.clone(),
@@ -4076,6 +5061,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
             journal_confirmed_at,
         };
 
@@ -4086,6 +5072,8 @@ pub(crate) mod tests {
         });
 
         let Mint::Minting {
+            mint_authorization: _,
+            mint_mode: _,
             issuer_request_id: state_issuer_id,
             tokenization_request_id: state_tok_id,
             quantity: state_quantity,
@@ -4135,6 +5123,7 @@ pub(crate) mod tests {
         let minting_started_at = Utc::now();
 
         let mut mint = Mint::Minting {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -4144,6 +5133,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
             journal_confirmed_at,
             minting_started_at,
             retry: None,
@@ -4206,6 +5196,7 @@ pub(crate) mod tests {
         let minting_started_at = Utc::now();
 
         let mut mint = Mint::Minting {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -4215,6 +5206,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
             journal_confirmed_at,
             minting_started_at,
             retry: None,
@@ -4276,6 +5268,7 @@ pub(crate) mod tests {
         let minted_at = Utc::now();
 
         let mut mint = Mint::CallbackPending {
+            mint_authorization: None,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -4285,6 +5278,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
             journal_confirmed_at,
             tx_hash,
             receipt_id,
@@ -4359,6 +5353,7 @@ pub(crate) mod tests {
             client_id,
             wallet,
             initiated_at,
+            mint_mode: VaultMode::VaultDirect,
         }])
         .unwrap()
         .unwrap();
