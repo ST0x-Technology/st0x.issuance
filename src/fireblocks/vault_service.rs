@@ -7,7 +7,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use fireblocks_sdk::apis;
 use fireblocks_sdk::apis::transactions_api::{
     CreateTransactionError, CreateTransactionParams,
-    GetTransactionByExternalIdParams,
+    GetTransactionByExternalIdError, GetTransactionByExternalIdParams,
 };
 use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionStatus};
@@ -59,8 +59,58 @@ pub enum FireblocksVaultError {
     #[error(
         "failed to look up existing transaction by externalTxId: {external_tx_id}"
     )]
-    ExternalTxIdLookupFailed { external_tx_id: String },
+    ExternalTxIdLookupFailed {
+        external_tx_id: String,
+        #[source]
+        source: Box<apis::Error<GetTransactionByExternalIdError>>,
+    },
+    #[error(
+        "every submission attempt under {base_external_tx_id} (and its \
+         -retry-N successors, {attempts} in total) resolved to a terminally \
+         failed prior transaction; something re-fails this transfer faster \
+         than the ids can be walked — investigate the failures in the \
+         Fireblocks console before retrying"
+    )]
+    RetryAttemptsExhausted { base_external_tx_id: String, attempts: u32 },
+    #[error(
+        "Fireblocks transaction {tx_id} is still {status:?} after the polling \
+         window — it may yet complete (console approval can take longer). \
+         Approve or reject it in the Fireblocks console, then re-run this \
+         command: the deterministic externalTxId resumes the same transaction \
+         instead of submitting a second one."
+    )]
+    PollTimedOut { tx_id: String, status: TransactionStatus },
 }
+
+/// How [`FireblocksVaultService::submit_contract_call`] obtained its
+/// transaction id: freshly created for the given `externalTxId`, or recovered
+/// from a previous run that already claimed that id.
+///
+/// Callers deciding whether to retry under a fresh id need the distinction:
+/// Fireblocks reserves an `externalTxId` permanently, so a *recovered*
+/// transaction that turns out terminally failed belongs to a previous attempt
+/// whose id is spent — only then is submitting under a successor id correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    Created { tx_id: String },
+    Recovered { tx_id: String },
+}
+
+impl Submission {
+    #[must_use]
+    pub fn tx_id(&self) -> &str {
+        match self {
+            Self::Created { tx_id } | Self::Recovered { tx_id } => tx_id,
+        }
+    }
+}
+
+/// Upper bound on the `externalTxId` successors
+/// [`FireblocksVaultService::submit_contract_call_to_completion`] walks
+/// through. Each step means a previous attempt failed terminally after its
+/// cause was supposedly fixed; several in a row is an operational problem no
+/// amount of fresh ids will solve.
+const MAX_SUBMISSION_ATTEMPTS: u32 = 5;
 
 /// Fetches the vault account address from Fireblocks.
 ///
@@ -104,7 +154,7 @@ async fn vault_address_via(
 
     let address_str = addresses
         .first()
-        .and_then(|a| a.address.as_deref())
+        .and_then(|account_address| account_address.address.as_deref())
         .ok_or_else(|| FireblocksVaultError::NoAddress {
             vault_id: vault_account_id.clone(),
             asset_id: asset_id.clone(),
@@ -119,9 +169,9 @@ async fn vault_address_via(
 /// enables Fireblocks TAP policies to enforce contract/method whitelisting.
 /// Fireblocks handles transaction building, signing, and broadcasting.
 ///
-/// The service uses a read-only RPC provider for:
-/// - Calling view functions (previewDeposit, balanceOf)
-/// - Fetching transaction receipts to parse events
+/// The service holds a read-only RPC provider solely for
+/// [`FireblocksVaultService::fetch_receipt`] — the retired mint/burn view
+/// calls did not survive into this slice.
 pub struct FireblocksVaultService<P> {
     client: Client,
     vault_account_id: String,
@@ -231,13 +281,89 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     /// Returns an error if no asset is configured for this chain, the contract
     /// is not whitelisted, or the submission fails and cannot be recovered by
     /// `externalTxId` lookup.
+    /// Submits a CONTRACT_CALL and polls it to completion, walking to a fresh
+    /// `externalTxId` when a recovered previous attempt turns out terminally
+    /// failed.
+    ///
+    /// Fireblocks reserves an `externalTxId` forever, including for
+    /// transactions that ended rejected or reverted. Retrying after the
+    /// operator fixes the failure's cause (a TAP rule, expired certification)
+    /// must therefore not reuse the spent id: the base id resumes only a
+    /// still-pending or completed transaction, and each terminally failed
+    /// prior attempt shifts submission to `{base}-retry-{n}`. A fresh
+    /// submission that itself fails terminally is a real failure and
+    /// propagates; only inherited corpses are walked past.
+    ///
+    /// # Errors
+    ///
+    /// As [`FireblocksVaultService::submit_contract_call`] and
+    /// [`FireblocksVaultService::wait_for_completion`], plus
+    /// [`FireblocksVaultError::RetryAttemptsExhausted`] when every candidate
+    /// id is already spent by a terminally failed prior attempt.
+    pub async fn submit_contract_call_to_completion(
+        &self,
+        contract_address: Address,
+        calldata: &Bytes,
+        note: &str,
+        base_external_tx_id: &str,
+    ) -> Result<B256, FireblocksVaultError> {
+        for attempt in 0..MAX_SUBMISSION_ATTEMPTS {
+            let external_tx_id = if attempt == 0 {
+                base_external_tx_id.to_string()
+            } else {
+                format!("{base_external_tx_id}-retry-{attempt}")
+            };
+
+            let submission = self
+                .submit_contract_call(
+                    contract_address,
+                    calldata,
+                    note,
+                    &external_tx_id,
+                )
+                .await?;
+
+            match self.wait_for_completion(submission.tx_id()).await {
+                Ok(tx_hash) => return Ok(tx_hash),
+                Err(FireblocksVaultError::TransactionFailed {
+                    tx_id,
+                    status,
+                }) if matches!(submission, Submission::Recovered { .. }) => {
+                    warn!(target: "fireblocks",
+                        %external_tx_id,
+                        fireblocks_tx_id = %tx_id,
+                        ?status,
+                        "Recovered transaction from a previous attempt is \
+                         terminally failed and its externalTxId is spent; \
+                         submitting under a fresh retry id"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(FireblocksVaultError::RetryAttemptsExhausted {
+            base_external_tx_id: base_external_tx_id.to_string(),
+            attempts: MAX_SUBMISSION_ATTEMPTS,
+        })
+    }
+
+    /// Submits a single CONTRACT_CALL transaction to Fireblocks under
+    /// `external_tx_id`, reporting whether the id created a fresh transaction
+    /// or recovered one a previous run already claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no asset is configured for this chain, the
+    /// contract is not whitelisted, or the submission fails and cannot be
+    /// recovered by `externalTxId` lookup.
     pub async fn submit_contract_call(
         &self,
         contract_address: Address,
         calldata: &Bytes,
         note: &str,
         external_tx_id: &str,
-    ) -> Result<String, FireblocksVaultError> {
+    ) -> Result<Submission, FireblocksVaultError> {
         let asset_id = self.chain_asset_ids.get(self.chain_id).ok_or(
             FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
         )?;
@@ -261,9 +387,10 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             self.client.transactions_api().create_transaction(params).await;
 
         match create_response {
-            Ok(response) => {
-                response.id.ok_or(FireblocksVaultError::MissingTransactionId)
-            }
+            Ok(response) => response
+                .id
+                .map(|tx_id| Submission::Created { tx_id })
+                .ok_or(FireblocksVaultError::MissingTransactionId),
             Err(ref err) if is_duplicate_external_tx_id_error(err) => {
                 warn!(target: "fireblocks",
                     %external_tx_id,
@@ -271,7 +398,9 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                     "Duplicate externalTxId — looking up existing transaction"
                 );
 
-                self.recover_by_external_tx_id(external_tx_id).await
+                self.recover_by_external_tx_id(external_tx_id)
+                    .await
+                    .map(|tx_id| Submission::Recovered { tx_id })
             }
             Err(err) => {
                 // The SDK's Display impl only shows the status code, discarding
@@ -314,10 +443,9 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                     error = ?err,
                     "Failed to look up transaction by externalTxId"
                 );
-                // Convert the GetTransactionByExternalIdError into our error type.
-                // The underlying error is an API/network error, so wrap generically.
                 FireblocksVaultError::ExternalTxIdLookupFailed {
                     external_tx_id: external_tx_id.to_string(),
+                    source: Box::new(err),
                 }
             })?;
 
@@ -369,11 +497,20 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .await?;
 
         if result.status != TransactionStatus::Completed {
+            // A still-pending status after the polling window is a timeout,
+            // not a terminal failure — the transaction may complete once
+            // console approval clears, and re-running resumes it via the
+            // deterministic externalTxId.
             if is_still_pending(result.status) {
                 warn!(target: "fireblocks", fireblocks_tx_id = %tx_id,
                     status = ?result.status,
                     "Polling timed out but transaction may still confirm on-chain"
                 );
+
+                return Err(FireblocksVaultError::PollTimedOut {
+                    tx_id: tx_id.to_string(),
+                    status: result.status,
+                });
             }
 
             return Err(FireblocksVaultError::TransactionFailed {
@@ -1056,7 +1193,7 @@ mod tests {
 
         let service = build_test_service(mock_client(&server));
 
-        let tx_id = service
+        let submission = service
             .submit_contract_call(
                 contract,
                 &Bytes::from(vec![0xde, 0xad]),
@@ -1066,7 +1203,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(tx_id, "recovered-tx-1");
+        assert_eq!(
+            submission,
+            Submission::Recovered { tx_id: "recovered-tx-1".to_string() },
+            "a duplicate id must be reported as recovered, not created"
+        );
         lookup.assert();
     }
 
@@ -1117,8 +1258,99 @@ mod tests {
             result,
             Err(FireblocksVaultError::ExternalTxIdLookupFailed {
                 external_tx_id,
+                ..
             }) if external_tx_id == "ext-dup-2"
         ));
+    }
+
+    /// A terminal failure permanently spends its externalTxId at Fireblocks,
+    /// so a re-run after the operator fixes the cause (a TAP rule, expired
+    /// certification) must not resume the corpse: the walk recovers the dead
+    /// transaction under the base id, recognizes it as terminally failed, and
+    /// submits fresh under `-retry-1`. This is the fix-and-retry path the
+    /// migration runbook depends on.
+    #[tokio::test]
+    async fn a_terminally_failed_prior_attempt_walks_to_a_fresh_retry_id() {
+        let contract = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+        let landed_hash = "0x8888888888888888888888888888888888888888888888888888888888888888";
+
+        let server = MockServer::start();
+        mock_whitelisted_contracts(
+            &server,
+            &contract.to_string().to_lowercase(),
+            "BASECHAIN_ETH",
+        );
+        // The base id is spent by a previous run.
+        let base_create = server.mock(|when, then| {
+            when.method("POST")
+                .path("/transactions")
+                .body_includes(r#""externalTxId":"ext-walk-1""#);
+            then.status(409)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "message":
+                        "Transaction with this externalTxId already exists",
+                    "code": 1438
+                }));
+        });
+        // The retry id is free and the fresh submission completes.
+        let retry_create = server.mock(|when, then| {
+            when.method("POST")
+                .path("/transactions")
+                .body_includes(r#""externalTxId":"ext-walk-1-retry-1""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "id": "fb-fresh-1" }));
+        });
+        // Recovery under the base id finds the terminally failed corpse.
+        server.mock(|when, then| {
+            when.method("GET").path_includes("ext-walk-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "dead-tx-1",
+                    "status": "FAILED",
+                    "txHash": ""
+                }));
+        });
+        server.mock(|when, then| {
+            when.method("GET").path_includes("dead-tx-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "dead-tx-1",
+                    "status": "FAILED",
+                    "txHash": ""
+                }));
+        });
+        server.mock(|when, then| {
+            when.method("GET").path_includes("fb-fresh-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "fb-fresh-1",
+                    "status": "COMPLETED",
+                    "txHash": landed_hash
+                }));
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let tx_hash = service
+            .submit_contract_call_to_completion(
+                contract,
+                &Bytes::from(vec![0xde, 0xad]),
+                "note",
+                "ext-walk-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tx_hash, landed_hash.parse::<B256>().unwrap());
+        base_create.assert();
+        retry_create.assert();
     }
 
     fn make_response_error(

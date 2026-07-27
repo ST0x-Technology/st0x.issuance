@@ -113,6 +113,12 @@ impl std::fmt::Debug for FireblocksConfig {
 pub enum FireblocksConfigError {
     #[error("IO error")]
     Io(#[from] std::io::Error),
+    #[error("failed to read the Fireblocks secret at {path}")]
+    SecretUnreadable {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl FireblocksConfig {
@@ -126,7 +132,15 @@ impl FireblocksConfig {
         chain_asset_ids: ChainAssetIds,
         environment: Environment,
     ) -> Result<Self, FireblocksConfigError> {
-        let secret = std::fs::read(secret_path)?;
+        // The secret path is wired through deploy activation, so a missing or
+        // not-yet-decrypted key file is the most likely startup failure — the
+        // error must name the path it tried.
+        let secret = std::fs::read(secret_path).map_err(|source| {
+            FireblocksConfigError::SecretUnreadable {
+                path: secret_path.to_path_buf(),
+                source,
+            }
+        })?;
 
         Ok(Self {
             api_user_id,
