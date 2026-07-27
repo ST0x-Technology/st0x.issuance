@@ -739,21 +739,31 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   work; the engine and its gates are specified here because every execution path
   must run through them unchanged.
 
-The transfer is signed by the holding wallet itself: ERC-1155 lets a balance be
-moved only by its holder or by an operator the holder has approved via
+**No wallet address is ever an argument.** An ERC-1155 transfer to a wrong
+address is final — no counterparty, no recovery, and the receipts back tokens
+that are still outstanding — so every address the migration uses is derived
+from configuration the system already holds rather than typed. The outgoing
+wallet is whatever the signing configuration resolves: whatever signs is
+necessarily what custody leaves. The destination is derived by the execution
+path from the same environment, never named by an operator, and must clear an
+on-chain corroboration witness: an address with no transaction history and no
+native balance has no on-chain existence, which is what a corrupted config
+value looks like. The corroboration is a witness type, so the transfer cannot
+be reached without it.
+
+The transfer is signed by the holding wallet itself: ERC-1155 lets a balance
+be moved only by its holder or by an operator the holder has approved via
 `setApprovalForAll`, and the migration relies on the holder case rather than
 granting any operator approval — ERC-1155 approval is all-or-nothing across
 every token the holder owns, so granting it for a one-shot transfer would be a
-far wider authorization than the operation needs. The recipient must clear an
-on-chain corroboration witness (an address the chain has never seen is refused),
-since an ERC-1155 transfer is final, with no counterparty and no recovery. The
-engine refuses while any burn is reserved against the vault's receipts, and
-refuses when the vault has no tracked receipts rather than reporting an
-unverified no-op. The tracked inventory is cross-checked against on-chain
-balances, the vault's certification and owner-freeze gates are re-read
-immediately before submission, and post-conditions are verified per receipt
-identifier afterwards. Re-running after a successful move reports
-`AlreadyMigrated` instead of submitting a second transfer.
+far wider authorization than the operation needs. The engine refuses while any
+burn is reserved against the vault's receipts, and refuses when the vault has
+no tracked receipts rather than reporting an unverified no-op. The tracked
+inventory is cross-checked against on-chain balances, the vault's
+certification and owner-freeze gates are re-read immediately before
+submission, and post-conditions are verified per receipt identifier
+afterwards. Re-running after a successful move reports `AlreadyMigrated`
+instead of submitting a second transfer.
 
 The operator sequence around the engine is **stop the issuer service** → move
 custody → swap the signer configuration → start the service. Stopping first is
@@ -761,6 +771,25 @@ not optional: startup reconciliation reads `balanceOf(bot_wallet)` for every
 tracked receipt, so a service still configured with the outgoing signer that
 restarts after custody has moved reads zero for every one of them, reconciles
 that as depletion, and drops the receipts from the aggregate.
+
+Custody is therefore part of the `ReceiptInventory` aggregate's own state,
+maintained by two events. `CustodyConfirmed { holder }` records the wallet the
+balances were read against, emitted only when custody goes from unobserved to
+known or the holder genuinely changes — the periodic reconciler's re-confirms
+are no-ops, so the log does not grow per pass.
+`CustodyMigrated { from, to,
+tx_hash }` records a completed move; its `from` is
+what a rollback later reads its destination out of. Balances in this aggregate
+are `balanceOf(holder, id)` readings, so the holder is part of what they mean: a
+zero only means "spent" while the holder is unchanged. Once it has rotated, a
+zero means "held elsewhere", and depleting on it would erase inventory whose
+receipts sit untouched at the previous wallet — permanently, since the receipt
+backfiller has already checkpointed past the deposits that created them. A
+reconciliation pass that finds the wallet rotated and holding none of the
+claimed receipts writes nothing, logs at ERROR, and fails, leaving the inventory
+intact. This is what makes a single-asset cutover safe: the vaults that have not
+migrated yet are refused rather than wiped. A pass that cannot read every
+balance confirms nothing, so one flaky call cannot disarm the guard.
 
 Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
 network argument: one freeze covers every listing of the underlying. The CLI
@@ -933,6 +962,12 @@ Commands:
   reservation after its burn confirmed on-chain: clear the reservation and
   reduce the mirror balance by the reserved amount. Idempotent; emits `Depleted`
   for any receipt the settlement empties
+- `ConfirmCustody { holder }` - Record the wallet the balances were read
+  against, once a reconciliation pass has verified it holds the tracked
+  receipts. No-op when the holder is unchanged, so the periodic reconciler
+  cannot grow the log a pass at a time
+- `RecordCustodyMigration { from, to, tx_hash }` - Record a verified custody
+  move (issued by `migrate-receipts` only after post-conditions hold)
 
 Release and settle are keyed only by redemption; `apply` uses the stored
 `reserved` amounts, so neither carries a `burns` payload.
@@ -954,6 +989,12 @@ Events:
   definitive terminal/reverted failure, restoring availability
 - `BurnSettled { redemption_issuer_request_id }` - Reservation consumed after
   on-chain confirmation; mirror balance reduced by the reserved amount
+- `CustodyConfirmed { holder }` - The wallet these balances belong to, emitted
+  when custody goes from unobserved to known or the holder changes — never per
+  reconciliation pass
+- `CustodyMigrated { from, to, tx_hash }` - Custody of every tracked receipt
+  moved to a replacement wallet; `from` is where a rollback returns it to, read
+  off the aggregate instead of asked for
 
 **Startup reservation recovery** (`recover_stuck_reservations`) runs after
 redemption recovery. For each vault it enumerates the redemptions holding a

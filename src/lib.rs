@@ -405,6 +405,13 @@ pub async fn initialize_rocket(
     spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
     spawn_burn_recovery_reconciler(managers.burn.clone());
 
+    // Flipped by the rocket shutdown fairing so the chain-scanning loops stop
+    // with the server. A poller that outlives its server keeps reading a
+    // database and a chain that a replacement deployment may already be
+    // operating on — the exact wrong-service-still-running hazard the custody
+    // guard exists to refuse.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     for (network, runtime) in chain_registry.runtimes() {
         spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
             pool: pool.clone(),
@@ -419,6 +426,7 @@ pub async fn initialize_rocket(
                 pool.clone(),
                 apalis_pool.clone(),
             ),
+            shutdown: shutdown_rx.clone(),
         });
     }
 
@@ -442,8 +450,12 @@ pub async fn initialize_rocket(
                 burn_manager: managers.burn.clone(),
             });
 
+            let mut poller_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                poller.run().await;
+                tokio::select! {
+                    () = poller.run() => {}
+                    _ = poller_shutdown.changed() => {}
+                }
             });
         }
     }
@@ -490,6 +502,7 @@ pub async fn initialize_rocket(
         vault_services: network_vault_services,
         configured_networks,
         freeze_scheduler,
+        shutdown: shutdown_tx,
     }))
 }
 
@@ -507,6 +520,8 @@ struct RocketState {
     vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
     freeze_scheduler: tokenized_asset::schedule::FreezeScheduler,
+    /// Stops the spawned chain-scanning loops when the server shuts down.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -522,7 +537,16 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;
 
+    let stop_pollers = state.shutdown;
     let rocket = rocket::custom(figment)
+        .attach(rocket::fairing::AdHoc::on_shutdown(
+            "stop background pollers",
+            |_| {
+                Box::pin(async move {
+                    let _ = stop_pollers.send(true);
+                })
+            },
+        ))
         .manage(state.config)
         .manage(state.rate_limiter)
         .manage(state.account_store)
@@ -1317,6 +1341,7 @@ struct PeriodicBackfillSpawn<P, H> {
     backfill_start_block: u64,
     receipt_poll_interval: Duration,
     handler: H,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Spawns the periodic receipt-backfill reconciliation loop. Each pass re-reads
@@ -1339,6 +1364,7 @@ where
         backfill_start_block,
         receipt_poll_interval,
         handler,
+        mut shutdown,
     } = spawn;
 
     tokio::spawn(async move {
@@ -1364,7 +1390,10 @@ where
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => break,
+            }
 
             // Re-read the enabled vault set each pass so runtime-added assets
             // are reconciled without a restart.

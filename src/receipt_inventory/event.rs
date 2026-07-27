@@ -1,4 +1,4 @@
-use alloy::primitives::{Bytes, TxHash};
+use alloy::primitives::{Address, Bytes, TxHash};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,28 @@ pub(crate) enum ReceiptInventoryEvent {
     BurnSettled {
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     },
+    /// The wallet these balances belong to, recorded the first time a
+    /// reconciliation pass confirms it holds the tracked receipts.
+    ///
+    /// Balances here are `balanceOf(holder, receipt_id)` readings, so the holder
+    /// is part of what they mean. Recording it is what lets a later signer
+    /// rotation be recognised as a rotation instead of read as every receipt
+    /// having been spent at once. Emitted when the verified holder differs
+    /// from the recorded one — the first confirmation, or a wallet verified to
+    /// hold every tracked receipt after a rotation. Re-confirming the wallet
+    /// already on record is a no-op, never an event per pass.
+    CustodyConfirmed {
+        holder: Address,
+    },
+    /// Custody of every tracked receipt moved to a replacement wallet.
+    ///
+    /// `from` is retained because it is where a rollback returns custody to, so
+    /// reversing a migration needs no address from an operator.
+    CustodyMigrated {
+        from: Address,
+        to: Address,
+        tx_hash: TxHash,
+    },
 }
 
 impl DomainEvent for ReceiptInventoryEvent {
@@ -80,6 +102,12 @@ impl DomainEvent for ReceiptInventoryEvent {
             }
             Self::BurnSettled { .. } => {
                 "ReceiptInventoryEvent::BurnSettled".to_string()
+            }
+            Self::CustodyConfirmed { .. } => {
+                "ReceiptInventoryEvent::CustodyConfirmed".to_string()
+            }
+            Self::CustodyMigrated { .. } => {
+                "ReceiptInventoryEvent::CustodyMigrated".to_string()
             }
         }
     }

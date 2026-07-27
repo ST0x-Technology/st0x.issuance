@@ -170,15 +170,14 @@ Command -> Aggregate.handle() -> Validate & Produce Events -> Persist Events
 **Critical Methods:**
 
 - `handle(command) -> Result<Vec<Event>, Error>`: Business logic. Validates the
-  command against current state and returns 0+ events (e.g. `ConfirmJournal` may
+  command against current state, returns 0+ events (e.g. `ConfirmJournal` may
   produce both `JournalConfirmed` and `MintingStarted`).
-- `apply(event)`: Deterministically updates state from events. Pure, never fails
-  - events are historical facts that already occurred.
+- `apply(event)`: Deterministically updates state from events. Pure, never
+  fails - events are historical facts.
 
 **Benefits:** complete audit trail; time-travel debugging (replay to any point);
 testability via Given-When-Then; rebuild/add views by replaying events; multiple
-projections from the same events; event store is the single source of truth, all
-else derived.
+projections from the same events; the event store is the single source of truth.
 
 **CRITICAL: Events Are Permanent:**
 
@@ -195,8 +194,8 @@ else derived.
 well-designed service trait:
 
 - **Models domain capabilities**: Methods describe what the system can DO in
-  domain terms, not how it's implemented. "Domain" is context-dependent - here,
-  burning tokens is domain because 1:1 backing is the value proposition.
+  domain terms, not how it's implemented. "Domain" is context-dependent (see
+  "Domain context" below).
 - **Plugs into command handlers**: When a command says "do X", the service
   provides the capability to do X; events are produced from what the service
   did.
@@ -242,8 +241,7 @@ naming.
 
 - **Aggregates**: entity state reconstructed by replaying events (O(n)); enforce
   business rules and invariants; naming reflects **entity lifecycle**
-  (`NotLinked`/`Linked`, `NotAdded`/`Added`) - where the entity is in its
-  lifecycle.
+  (`NotLinked`/`Linked`, `NotAdded`/`Added`).
 - **Views**: materialized projections optimized for reads, filtered access, and
   cross-entity queries; naming is **query-oriented** (`Unavailable` instead of
   `NotAdded`/`Removed`).
@@ -308,37 +306,38 @@ SQLite for event store and views, with an async runtime for coordination.
 IDs, ERC-20 shares representing vault ownership; `deposit()` mints, `withdraw()`
 burns.
 
-- **Contract Documentation**: Rain contracts are thoroughly documented with
-  inline comments on parameters, behavior, and rationale. Always consult the
-  Solidity source for authoritative behavior, parameter meanings, and formulas
-  (contracts use 18-decimal fixed-point arithmetic for share ratios):
+- **Contract Documentation**: Rain contracts carry thorough inline comments on
+  parameters, behavior, and rationale. Always consult the Solidity source for
+  authoritative behavior, parameter meanings, and formulas (contracts use
+  18-decimal fixed-point arithmetic for share ratios):
   - Primary: `lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol`
   - Base: `lib/ethgild/src/abstract/ReceiptVault.sol`
 
-**Redemption Wallet:** on-chain address where APs send tokens to redeem; we
-monitor it for incoming transfers.
+**Redemption Wallet:** on-chain address where APs send tokens to redeem;
+monitored for incoming transfers.
 
-**MonitorService:** watches the redemption wallet via a WebSocket subscription;
-methods `watch_transfers()`, `get_transfer_details()`.
+**MonitorService:** watches the redemption wallet via WebSocket; methods
+`watch_transfers()`, `get_transfer_details()`.
 
 **Signing Backends (`src/wallet/`):** two mutually exclusive backends, both
-resolving into a `ResolvedSigner` holding an `EthereumWallet`. `config.rs` then
-wraps that wallet into a signing `Provider` via `ProviderBuilder` and passes it
-to `RealBlockchainService`:
+resolving into a `ResolvedSigner` holding an `EthereumWallet`, which `config.rs`
+wraps into a signing `Provider` for `RealBlockchainService`:
 
 - **Local**: `EVM_PRIVATE_KEY` → raw private key signer (dev/test)
 - **Turnkey**: `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS`
   → remote signing via Turnkey's AWS Nitro secure enclaves;
-  `TURNKEY_API_PRIVATE_KEY` is a P-256 key used to authenticate requests to
-  Turnkey, not the wallet signing key (prod)
+  `TURNKEY_API_PRIVATE_KEY` is a P-256 key authenticating requests to Turnkey,
+  not the wallet signing key (prod)
 
 Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 `wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
 
 **Receipt custody migration (`receipt_inventory/migration.rs`, temporary):**
 rotating the signer strands the vault's receipts at the old address. **Stop the
-service before moving custody** — startup reconciliation depletes receipts the
-old signer no longer holds.
+service before moving custody.** No wallet address is ever an argument to the
+migration engine; destinations are derived and gated by the
+`CorroboratedRecipient` witness. Custody is aggregate state, so a rotated
+wallet reading zero is refused, not depleted.
 
 ### Core Flows
 

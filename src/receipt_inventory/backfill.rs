@@ -509,6 +509,7 @@ where
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id: discovery.receipt_id,
                 on_chain_balance: Shares::from(current_balance),
+                observed_wallet: self.bot_wallet,
             },
         )
         .await?;
@@ -545,6 +546,7 @@ where
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id,
                 on_chain_balance: Shares::from(on_chain_balance),
+                observed_wallet: self.bot_wallet,
             },
         )
         .await?;

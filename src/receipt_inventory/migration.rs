@@ -30,7 +30,8 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use super::{
-    ReceiptId, ReceiptInventory, Shares, SharesOverflow, load_inventory,
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
+    SharesOverflow, load_inventory, send_receipt_inventory_command,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::underlying::{AssetStatus, UnderlyingSymbol, load_freeze_status};
@@ -306,6 +307,20 @@ pub(crate) enum MigrationRefusal {
     )]
     BalanceCountMismatch { vault: Address, requested: usize, returned: usize },
 
+    #[error(
+        "recipient {recipient} is the zero address; custody would be burned"
+    )]
+    RecipientIsZeroAddress { recipient: Address },
+
+    #[error(
+        "chain {chain_id} has never seen recipient {recipient}: it has sent no \
+         transaction and holds no native balance. That is what a mistyped \
+         address looks like, and receipts moved to one cannot be recovered by \
+         anyone. Check the address, and fund the incoming wallet for gas \
+         before migrating."
+    )]
+    RecipientUnknownToChain { recipient: Address, chain_id: u64 },
+
     #[error(transparent)]
     SharesOverflow(#[from] SharesOverflow),
 
@@ -447,6 +462,79 @@ pub enum MigrationOutcome {
     },
 }
 
+/// A destination the chain itself has already seen.
+///
+/// Existence implies corroboration: [`CorroboratedRecipient::verify`] is the
+/// only constructor, so no caller can reach [`migrate_vault_receipts`] with an
+/// address whose only evidence is that somebody typed it correctly. An ERC-1155
+/// transfer is final and has no counterparty to ask for it back, so a mistyped
+/// destination is not a recoverable mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorroboratedRecipient(Address);
+
+impl CorroboratedRecipient {
+    /// Confirms the chain has independent evidence that `recipient` exists.
+    ///
+    /// An address that has never sent a transaction and holds no native balance
+    /// has no on-chain existence at all — which is precisely what a
+    /// fat-fingered address looks like, since the odds of a typo landing on a
+    /// used address are negligible. Both legitimate destinations clear it: the
+    /// incoming signing wallet has to be funded for gas before it can run the
+    /// service, and the outgoing wallet a rollback returns custody to has been
+    /// signing for months.
+    ///
+    /// The error type is erased to `anyhow` for the same reason as
+    /// [`migrate_vault_receipts`]: [`MigrationRefusal`] stays crate-internal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the zero address, and when the chain has no record
+    /// of the address at all.
+    pub async fn verify<P: Provider>(
+        provider: &P,
+        recipient: Address,
+    ) -> anyhow::Result<Self> {
+        if recipient.is_zero() {
+            return Err(
+                MigrationRefusal::RecipientIsZeroAddress { recipient }.into()
+            );
+        }
+
+        let chain_id =
+            provider.get_chain_id().await.map_err(ReceiptCustodyError::from)?;
+
+        let nonce = provider
+            .get_transaction_count(recipient)
+            .await
+            .map_err(ReceiptCustodyError::from)?;
+
+        let balance = provider
+            .get_balance(recipient)
+            .await
+            .map_err(ReceiptCustodyError::from)?;
+
+        if nonce == 0 && balance.is_zero() {
+            return Err(MigrationRefusal::RecipientUnknownToChain {
+                recipient,
+                chain_id,
+            }
+            .into());
+        }
+
+        Ok(Self(recipient))
+    }
+
+    const fn address(self) -> Address {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CorroboratedRecipient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Migrates one vault's receipt custody to `recipient`, end to end.
 ///
 /// Public so the operator CLI and the cutover end-to-end test drive the same
@@ -480,8 +568,10 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
     chain_id: u64,
     vault: Address,
     holder: Address,
-    recipient: Address,
+    recipient: CorroboratedRecipient,
 ) -> anyhow::Result<MigrationOutcome> {
+    let recipient = recipient.address();
+
     let store =
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
@@ -528,7 +618,28 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
             Ok(MigrationOutcome::AlreadyMigrated { receipts })
         }
         SourceCustody::Holds(holdings) => {
-            Ok(migrate_vault_custody(&custody, &holdings, recipient).await?)
+            let outcome =
+                migrate_vault_custody(&custody, &holdings, recipient).await?;
+
+            // Recorded only after the move is verified, so the inventory's
+            // custody history never claims a transfer that did not land. This
+            // is what a later rollback reads its destination from, instead of
+            // being handed an address.
+            if let MigrationOutcome::Migrated { transaction, .. } = &outcome {
+                send_receipt_inventory_command(
+                    &store,
+                    chain_id,
+                    &vault,
+                    ReceiptInventoryCommand::RecordCustodyMigration {
+                        from: holder,
+                        to: recipient,
+                        tx_hash: *transaction,
+                    },
+                )
+                .await?;
+            }
+
+            Ok(outcome)
         }
     }
 }
@@ -1720,5 +1831,77 @@ mod tests {
             "a transaction that did not move custody must not report success, \
              got {refusal:?}"
         );
+    }
+
+    /// An ERC-1155 transfer to a wrong address is final: no counterparty, no
+    /// recovery, and the receipts back tokens that are still outstanding. These
+    /// cover the last gate before the transfer, the only one that consults
+    /// something other than what the operator typed.
+    mod recipient_corroboration {
+        use alloy::providers::ProviderBuilder;
+
+        use super::*;
+        use crate::test_utils::LocalEvm;
+
+        #[tokio::test]
+        async fn an_address_the_chain_has_never_seen_is_refused() {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+            let typo = Address::random();
+            let error = CorroboratedRecipient::verify(&provider, typo)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::RecipientUnknownToChain {
+                        recipient,
+                        ..
+                    }) if *recipient == typo
+                ),
+                "an unfunded, never-used address is what a typo looks like and \
+                 must not be accepted, got: {error:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_zero_address_is_refused() {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+            let error = CorroboratedRecipient::verify(&provider, Address::ZERO)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::RecipientIsZeroAddress { .. })
+                ),
+                "got: {error:?}"
+            );
+        }
+
+        /// The legitimate destination in both directions clears the gate: the
+        /// incoming wallet must be funded for gas before it can run the
+        /// service, and the wallet a rollback returns custody to has been
+        /// signing all along.
+        #[tokio::test]
+        async fn a_funded_wallet_is_corroborated() {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+            let corroborated =
+                CorroboratedRecipient::verify(&provider, evm.wallet_address)
+                    .await
+                    .unwrap();
+
+            assert_eq!(corroborated.address(), evm.wallet_address);
+        }
     }
 }

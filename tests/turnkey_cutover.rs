@@ -17,7 +17,7 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::{
 };
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::receipt_inventory::migration::{
-    MigrationOutcome, migrate_vault_receipts,
+    CorroboratedRecipient, MigrationOutcome, migrate_vault_receipts,
 };
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::underlying::UnderlyingSymbol;
@@ -70,12 +70,16 @@ async fn wait_for_receipt_in_inventory(
         // Deliberately not filtered by aggregate id: reproducing the
         // `{chain_id}:{vault}` key here would couple this wait to an encoding
         // that has already been re-keyed once by migration. This scenario uses
-        // a single vault, so the aggregate type alone is an unambiguous signal.
+        // a single vault, so the aggregate type alone identifies it — but the
+        // event type matters: startup reconciliation records custody as soon
+        // as the service boots, so "any inventory event" fires long before the
+        // deposit this wait is actually for has been discovered.
         let recorded: i64 = sqlx::query_scalar(
             "
             SELECT COUNT(*)
             FROM events
             WHERE aggregate_type = 'ReceiptInventory'
+              AND event_type = 'ReceiptInventoryEvent::Discovered'
             ",
         )
         .fetch_one(&pool)
@@ -251,6 +255,8 @@ async fn run_operator_migration(
         .max_connections(5)
         .connect(database_url)
         .await?;
+
+    let incoming = CorroboratedRecipient::verify(provider, incoming).await?;
 
     let outcome = migrate_vault_receipts(
         &pool,
@@ -666,7 +672,8 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         evm.chain_id,
         evm.vault_address,
         fireblocks_wallet,
-        turnkey_wallet,
+        CorroboratedRecipient::verify(&fireblocks_provider, turnkey_wallet)
+            .await?,
     )
     .await?;
     assert!(
@@ -691,7 +698,8 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         evm.chain_id,
         evm.vault_address,
         turnkey_wallet,
-        fireblocks_wallet,
+        CorroboratedRecipient::verify(&turnkey_provider, fireblocks_wallet)
+            .await?,
     )
     .await?;
 
@@ -717,6 +725,222 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
     )
     .await?;
     pool.close().await;
+
+    Ok(())
+}
+
+/// Proves the complete single-asset rehearsal, end to end, in the order the
+/// operator will run it: cutover, operate, reverse, resume.
+///
+/// 1. The outgoing service mints a receipt (pre-cutover custody).
+/// 2. Stop; custody migrates forward; the replacement service starts.
+/// 3. The replacement service performs one canary redemption of the
+///    pre-cutover receipt and one canary mint — the two directions of the flow
+///    against the new custody.
+/// 4. Stop; custody rolls back — including the canary mint's receipt, which
+///    only exists because of step 3 and which the resumed service could not
+///    burn against if it were left behind.
+/// 5. The original service resumes on the same event history and redeems the
+///    canary, proving the rehearsal ends with a fully operational deployment
+///    on the outgoing wallet, not merely with balances returned.
+///
+/// The rollback deliberately carries the database forward rather than
+/// restoring the pre-cutover backup: the replacement service performed real
+/// writes (a redemption and a mint), and discarding them would fork history.
+/// Only custody and the signer configuration reverse.
+#[tokio::test]
+async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
+    let (redeem_mock, poll_mock) =
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
+    let temp_dir = tempfile::tempdir()?;
+    let databases = CutoverDatabases::in_directory(temp_dir.path());
+    let resumed_path = temp_dir.path().join("fireblocks-resumed.db");
+    let resumed_url = format!("sqlite:{}?mode=rwc", resumed_path.display());
+
+    let fireblocks_wallet = evm.wallet_address;
+    let user_signer = PrivateKeySigner::random();
+    let user_wallet = user_signer.address();
+    let turnkey_signer = PrivateKeySigner::random();
+    let turnkey_private_key: B256 = turnkey_signer.to_bytes();
+    let turnkey_wallet = turnkey_signer.address();
+    assert_ne!(fireblocks_wallet, turnkey_wallet);
+
+    let fireblocks_provider = create_provider()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(
+            &evm.private_key,
+        )?))
+        .connect(&evm.endpoint)
+        .await?;
+    let test_gas_balance = U256::from(10) * U256::from(10).pow(U256::from(18));
+    fireblocks_provider
+        .anvil_set_balance(user_wallet, test_gas_balance)
+        .await?;
+    fireblocks_provider
+        .anvil_set_balance(turnkey_wallet, test_gas_balance)
+        .await?;
+
+    harness::preseed_tokenized_asset(
+        &databases.fireblocks_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+    setup_cutover_roles(&evm, user_wallet, fireblocks_wallet, turnkey_wallet)
+        .await?;
+
+    let (fireblocks_config, _fireblocks_subgraph) =
+        harness::create_config_with_db(
+            &databases.fireblocks_url,
+            &mock_alpaca,
+            &evm,
+        )?;
+    let fireblocks_client = start_service(fireblocks_config).await?;
+    let pre_cutover_mint = mint_before_cutover(
+        &fireblocks_client,
+        &evm,
+        &user_signer,
+        user_wallet,
+        &mint_callback_mock,
+    )
+    .await?;
+    fireblocks_client.terminate().await;
+
+    // Forward cutover. The migration runs against the same database the
+    // replacement service will use, as it does in production, so the custody
+    // events are part of the history the service starts from.
+    snapshot_database(&databases.fireblocks_url, &databases.turnkey_path)
+        .await?;
+    run_operator_migration(
+        &databases.turnkey_url,
+        &fireblocks_provider,
+        evm.chain_id,
+        evm.vault_address,
+        fireblocks_wallet,
+        turnkey_wallet,
+    )
+    .await?;
+
+    let (mut turnkey_config, _turnkey_subgraph) =
+        harness::create_config_with_db(
+            &databases.turnkey_url,
+            &mock_alpaca,
+            &evm,
+        )?;
+    turnkey_config.signer = SignerConfig::Local(turnkey_private_key);
+    let turnkey_client = start_service(turnkey_config).await?;
+
+    PostCutoverCanaries {
+        client: &turnkey_client,
+        evm: &evm,
+        user_signer: &user_signer,
+        user_wallet,
+        turnkey_wallet,
+        pre_cutover_mint: &pre_cutover_mint,
+        mint_callback_mock: &mint_callback_mock,
+        redeem_mock: &redeem_mock,
+        poll_mock: &poll_mock,
+    }
+    .run()
+    .await?;
+    turnkey_client.terminate().await;
+
+    // The reversal. The canary mint left its receipt with the incoming wallet,
+    // so the rollback has real, newly created custody to return — not just the
+    // original receipts.
+    snapshot_database(&databases.turnkey_url, &resumed_path).await?;
+    run_operator_migration(
+        &resumed_url,
+        &create_provider()
+            .wallet(EthereumWallet::from(turnkey_signer))
+            .connect(&evm.endpoint)
+            .await?,
+        evm.chain_id,
+        evm.vault_address,
+        turnkey_wallet,
+        fireblocks_wallet,
+    )
+    .await?;
+
+    resume_on_outgoing_wallet_and_redeem_canary(
+        &resumed_url,
+        &evm,
+        &mock_alpaca,
+        &user_signer,
+        fireblocks_wallet,
+        &redeem_mock,
+        &poll_mock,
+    )
+    .await?;
+
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "the rehearsal must produce exactly two mints: pre-cutover and canary"
+    );
+    assert_eq!(
+        redeem_mock.calls_async().await,
+        2,
+        "the rehearsal must produce exactly two redemptions: canary and \
+         post-rollback"
+    );
+
+    Ok(())
+}
+
+/// The rehearsal's final act: the outgoing wallet's service resumes on the
+/// rolled-back state and redeems the canary receipt minted by the replacement,
+/// proving the reversal restored an operational deployment.
+async fn resume_on_outgoing_wallet_and_redeem_canary(
+    database_url: &str,
+    evm: &LocalEvm,
+    mock_alpaca: &MockServer,
+    user_signer: &PrivateKeySigner,
+    fireblocks_wallet: Address,
+    redeem_mock: &Mock<'_>,
+    poll_mock: &Mock<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (resumed_config, _resumed_subgraph) =
+        harness::create_config_with_db(database_url, mock_alpaca, evm)?;
+    let resumed_client = start_service(resumed_config).await?;
+
+    let user_provider = create_provider()
+        .wallet(EthereumWallet::from(user_signer.clone()))
+        .connect(&evm.endpoint)
+        .await?;
+    let user_vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+    let canary_shares =
+        user_vault.balanceOf(user_signer.address()).call().await?;
+    assert!(
+        canary_shares > U256::ZERO,
+        "the user must still hold the canary shares minted on the replacement"
+    );
+
+    user_vault
+        .transfer(fireblocks_wallet, canary_shares)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    harness::wait_for_mock_hits(redeem_mock, 2).await?;
+    harness::wait_for_mock_hits(poll_mock, 2).await?;
+    harness::wait_for_burn(&user_vault, fireblocks_wallet).await?;
+    assert_eq!(
+        user_vault.balanceOf(user_signer.address()).call().await?,
+        U256::ZERO,
+        "the resumed service must redeem the canary shares in full"
+    );
+
+    resumed_client.terminate().await;
 
     Ok(())
 }
