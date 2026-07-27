@@ -638,6 +638,12 @@ pub(crate) struct ReceiptInventory {
     /// from. Absent on inventories that predate custody being recorded.
     #[serde(default)]
     custody: Custody,
+    /// How many custody migrations this vault has recorded. Gives each
+    /// deliberate re-migration (forward after a rollback, or vice versa) a
+    /// distinct transfer identity while retries of the same attempt keep the
+    /// original one.
+    #[serde(default)]
+    migrations_recorded: u32,
 }
 
 /// Which wallet holds this vault's receipts.
@@ -679,6 +685,12 @@ impl Custody {
 impl ReceiptInventory {
     pub(crate) const fn custody(&self) -> &Custody {
         &self.custody
+    }
+
+    /// How many custody migrations this vault has recorded — the ordinal that
+    /// gives each deliberate re-migration a fresh transfer identity.
+    pub(crate) const fn migrations_recorded(&self) -> u32 {
+        self.migrations_recorded
     }
 
     /// Receipts with shares reserved against an in-flight redemption burn.
@@ -1089,15 +1101,27 @@ impl ReceiptInventory {
                 Ok(vec![ReceiptInventoryEvent::CustodyConfirmed { holder }])
             }
 
+            // Idempotent for the verify-and-record flow: the same completed
+            // move observed again (a re-run after a lost terminal, or a
+            // rollback preflight) must not append a second event. Keyed on the
+            // destination alone — once custody is recorded at `to`, a repeat
+            // observation must not rewrite `moved_from` history, whatever
+            // wallet the repeat claims it came from.
             ReceiptInventoryCommand::RecordCustodyMigration {
                 from,
                 to,
                 tx_hash,
-            } => Ok(vec![ReceiptInventoryEvent::CustodyMigrated {
-                from,
-                to,
-                tx_hash,
-            }]),
+            } => {
+                if self.custody.holder() == Some(to) {
+                    return Ok(vec![]);
+                }
+
+                Ok(vec![ReceiptInventoryEvent::CustodyMigrated {
+                    from,
+                    to,
+                    tx_hash,
+                }])
+            }
         }
     }
 
@@ -1260,6 +1284,8 @@ impl ReceiptInventory {
             ReceiptInventoryEvent::CustodyMigrated { from, to, .. } => {
                 self.custody =
                     Custody::Held { holder: to, moved_from: Some(from) };
+                self.migrations_recorded =
+                    self.migrations_recorded.saturating_add(1);
             }
         }
     }
@@ -4147,7 +4173,7 @@ mod tests {
                     ReceiptInventoryCommand::RecordCustodyMigration {
                         from: HOLDER,
                         to: REPLACEMENT,
-                        tx_hash,
+                        tx_hash: Some(tx_hash),
                     },
                     &(),
                 )
@@ -4165,6 +4191,46 @@ mod tests {
             );
         }
 
+        /// The same completed move observed again — a re-run after a lost
+        /// terminal, or a rollback preflight — must not append a second event.
+        #[tokio::test]
+        async fn recording_the_same_migration_twice_emits_one_event() {
+            let mut aggregate = ReceiptInventory::default();
+
+            let events = aggregate
+                .transition(
+                    ReceiptInventoryCommand::RecordCustodyMigration {
+                        from: HOLDER,
+                        to: REPLACEMENT,
+                        tx_hash: None,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            for event in events {
+                aggregate.apply_event(event);
+            }
+
+            let repeat = aggregate
+                .transition(
+                    ReceiptInventoryCommand::RecordCustodyMigration {
+                        from: HOLDER,
+                        to: REPLACEMENT,
+                        tx_hash: None,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                repeat.is_empty(),
+                "re-recording an identical move must be a no-op, got \
+                 {repeat:?}"
+            );
+        }
+
         /// Reconciliation passes after a migration keep confirming the new
         /// holder; that must not erase where custody came from, or a rollback
         /// after the first post-cutover pass would have nowhere to go.
@@ -4178,7 +4244,7 @@ mod tests {
             aggregate.apply_event(ReceiptInventoryEvent::CustodyMigrated {
                 from: HOLDER,
                 to: REPLACEMENT,
-                tx_hash,
+                tx_hash: Some(tx_hash),
             });
             aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
                 holder: REPLACEMENT,

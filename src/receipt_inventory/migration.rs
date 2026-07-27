@@ -20,8 +20,10 @@
 //! migrate, swap the signer configuration, start again.
 
 use alloy::eips::BlockId;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{PendingTransactionError, Provider};
+use alloy::rpc::types::TransactionRequest;
 use async_trait::async_trait;
 use event_sorcery::StoreBuilder;
 use itertools::izip;
@@ -34,35 +36,59 @@ use super::{
     SharesOverflow, load_inventory, send_receipt_inventory_command,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
-use crate::underlying::{AssetStatus, UnderlyingSymbol, load_freeze_status};
+use crate::fireblocks::{
+    FireblocksConfig, FireblocksVaultError, FireblocksVaultService,
+};
+use crate::mint::find_stuck as find_stuck_mints;
+use crate::redemption::view::find_stuck as find_stuck_redemptions;
+use crate::redemption::{IssuerRedemptionRequestId, RedemptionEvent};
+use crate::tokenized_asset::UnderlyingSymbol;
 
-/// Refuses unless the vault is quiescent: the underlying frozen, and no burn
-/// reserved against its receipts.
+/// Refuses unless the deployment is quiescent: no burn reserved against this
+/// vault's receipts, and no mint or redemption anywhere between initiation and
+/// its terminal state.
 ///
-/// Both conditions are needed, and the second is not implied by the first.
-/// Freezing an underlying rejects new mints but deliberately lets in-flight
-/// redemptions run to completion, so a frozen asset can still have a burn about
-/// to land on the very receipts being moved.
-pub(crate) fn require_quiescent(
-    underlying: &UnderlyingSymbol,
-    status: AssetStatus,
+/// Deliberately not a freeze check. The `Underlying` freeze means "corporate
+/// action in progress" — a different fact with its own lifecycle — and a custody
+/// migration must neither require declaring one nor end one that is real. What
+/// the migration actually needs is that no work is in flight:
+///
+/// - A **reserved burn** is about to consume the very receipts being moved.
+/// - A **non-terminal redemption** that holds no reservation yet (detected,
+///   Alpaca called) resumes on restart and plans a burn against the *new*
+///   wallet while the participant's money already moved — irreversibly, since
+///   Alpaca is called before the burn.
+/// - A **non-terminal mint** resumes by rebroadcasting a transaction signed by
+///   the *old* wallet, depositing a fresh receipt at an address the migrated
+///   deployment no longer watches.
+///
+/// The in-flight gates are scoped to the migrating asset: a stuck mint or
+/// redemption only ever resumes against its own vault, so live work on one
+/// asset proves nothing about another's receipts — and a permanently stuck
+/// aggregate (a legacy shape awaiting its own recovery feature) must not
+/// hold every other vault's migration hostage. Work that cannot be
+/// attributed to an asset counts against every vault instead of none.
+pub(crate) const fn require_quiescent(
     vault: Address,
     reserved: &[ReceiptId],
+    redemptions_in_flight: usize,
+    mints_in_flight: usize,
 ) -> Result<(), MigrationRefusal> {
-    match status {
-        AssetStatus::Frozen => {}
-        AssetStatus::Enabled => {
-            return Err(MigrationRefusal::AssetNotFrozen {
-                underlying: underlying.clone(),
-            });
-        }
-    }
-
     if !reserved.is_empty() {
         return Err(MigrationRefusal::BurnReserved {
             vault,
             receipts: reserved.len(),
         });
+    }
+
+    if redemptions_in_flight > 0 {
+        return Err(MigrationRefusal::RedemptionsInFlight {
+            count: redemptions_in_flight,
+        });
+    }
+
+    if mints_in_flight > 0 {
+        return Err(MigrationRefusal::MintsInFlight { count: mints_in_flight });
     }
 
     Ok(())
@@ -180,6 +206,10 @@ pub(crate) struct MigratableHoldings {
     vault: Address,
     holder: Address,
     holdings: Vec<ReceiptHolding>,
+    /// How many custody migrations the vault had recorded when these holdings
+    /// were reconciled — the salt that gives a deliberate re-migration a
+    /// fresh transfer identity while a retry keeps the original.
+    migration_ordinal: u32,
 }
 
 /// A single receipt identifier and the balance held against it.
@@ -205,6 +235,10 @@ pub(crate) enum SourceCustody {
 impl MigratableHoldings {
     pub(crate) const fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    pub(crate) const fn migration_ordinal(&self) -> u32 {
+        self.migration_ordinal
     }
 
     pub(crate) const fn vault(&self) -> Address {
@@ -250,10 +284,21 @@ impl MigratableHoldings {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MigrationRefusal {
     #[error(
-        "{underlying} is not frozen; freeze it first so no new mint can land \
-         in the vault while custody moves"
+        "{count} redemption(s) are between detection and a terminal state; \
+         they resume against the wrong wallet after a custody move. Drain them \
+         to terminal (see /admin/stuck) before migrating"
     )]
-    AssetNotFrozen { underlying: UnderlyingSymbol },
+    RedemptionsInFlight { count: usize },
+
+    #[error(
+        "{count} mint(s) are between initiation and a terminal state; recovery \
+         rebroadcasts their old-wallet-signed transactions after a custody \
+         move. Drain them to terminal (see /admin/stuck) before migrating"
+    )]
+    MintsInFlight { count: usize },
+
+    #[error(transparent)]
+    HolderMismatch(Box<HolderMismatch>),
 
     #[error(
         "vault {vault} has {receipts} receipt(s) reserved for an in-flight \
@@ -372,6 +417,12 @@ pub(crate) enum ReceiptCustodyError {
 
     #[error(transparent)]
     PostConditionFailed(Box<PostConditionFailure>),
+
+    #[error(transparent)]
+    Fireblocks(#[from] Box<FireblocksVaultError>),
+
+    #[error("custody transfer {tx_hash} has no receipt after confirmation")]
+    MissingReceipt { tx_hash: B256 },
 }
 
 /// A recipient balance that fell over a transfer that should only have raised
@@ -424,6 +475,31 @@ pub(crate) struct PostConditionFailure {
 impl From<PostConditionFailure> for ReceiptCustodyError {
     fn from(failure: PostConditionFailure) -> Self {
         Self::PostConditionFailed(Box::new(failure))
+    }
+}
+
+/// A wallet whose on-chain balances do not match the tracked inventory, so it
+/// cannot be confirmed as the custody holder.
+///
+/// Boxed inside [`MigrationRefusal`] because five inline fields push every
+/// `Result` in this module over clippy's large-error threshold.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "wallet {holder} does not hold vault {vault}'s tracked receipts (receipt \
+     {receipt_id}: tracked {tracked}, held {held}); custody cannot be \
+     confirmed against a wallet the chain says holds something else"
+)]
+pub(crate) struct HolderMismatch {
+    pub(crate) vault: Address,
+    pub(crate) holder: Address,
+    pub(crate) receipt_id: ReceiptId,
+    pub(crate) tracked: Shares,
+    pub(crate) held: Shares,
+}
+
+impl From<HolderMismatch> for MigrationRefusal {
+    fn from(mismatch: HolderMismatch) -> Self {
+        Self::HolderMismatch(Box::new(mismatch))
     }
 }
 
@@ -524,7 +600,7 @@ impl CorroboratedRecipient {
         Ok(Self(recipient))
     }
 
-    const fn address(self) -> Address {
+    pub(crate) const fn address(self) -> Address {
         self.0
     }
 }
@@ -556,52 +632,94 @@ impl std::fmt::Display for CorroboratedRecipient {
 ///
 /// # Errors
 ///
-/// Returns an error if the store cannot be opened, the underlying is not
-/// frozen, a burn is reserved against the vault's receipts, the vault has no
-/// tracked receipts, the tracked inventory disagrees with the chain, the vault
-/// refuses the transfer, the transfer reverts, or the post-conditions do not
-/// hold after submission.
+/// Returns an error if the store cannot be opened, any burn is reserved or any
+/// mint/redemption is in flight, the vault has no tracked receipts, the tracked
+/// inventory disagrees with the chain, the vault refuses the transfer, the
+/// transfer reverts, or the post-conditions do not hold after submission.
 pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
     pool: &Pool<Sqlite>,
     provider: P,
-    underlying: &UnderlyingSymbol,
-    chain_id: u64,
-    vault: Address,
+    identity: VaultIdentity<'_>,
     holder: Address,
     recipient: CorroboratedRecipient,
 ) -> anyhow::Result<MigrationOutcome> {
+    let custody =
+        OnchainReceiptCustody::resolve(provider, identity.vault).await?;
+
+    execute_migration(pool, &custody, identity, holder, recipient).await
+}
+
+/// The vault a custody operation addresses: its chain, its address, and the
+/// asset it belongs to. The asset scopes the in-flight quiescence gates —
+/// stuck work only ever resumes against its own vault.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultIdentity<'a> {
+    pub chain_id: u64,
+    pub vault: Address,
+    pub underlying: &'a UnderlyingSymbol,
+}
+
+/// [`migrate_vault_receipts`] with the transfer submitted through the
+/// Fireblocks API instead of a locally held key — the production forward leg.
+///
+/// Every gate is identical to the in-binary path: same quiescence checks, same
+/// inventory/chain agreement, same certification and owner-freeze re-read,
+/// same per-identifier post-condition deltas. Only the submission mechanism
+/// differs, behind the same [`ReceiptCustody`] seam the tests exercise.
+///
+/// # Errors
+///
+/// As [`migrate_vault_receipts`], plus Fireblocks-side failures: authentication,
+/// a non-whitelisted Receipt contract, TAP policy rejection, or a transaction
+/// that reaches a terminal non-completed status.
+pub async fn migrate_vault_receipts_via_fireblocks<
+    P: Provider + Clone + Send + Sync,
+>(
+    pool: &Pool<Sqlite>,
+    provider: P,
+    fireblocks: &FireblocksConfig,
+    identity: VaultIdentity<'_>,
+    holder: Address,
+    recipient: CorroboratedRecipient,
+) -> anyhow::Result<MigrationOutcome> {
+    let custody = FireblocksReceiptCustody::resolve(
+        provider,
+        fireblocks,
+        identity.chain_id,
+        identity.vault,
+    )
+    .await?;
+
+    execute_migration(pool, &custody, identity, holder, recipient).await
+}
+
+async fn execute_migration(
+    pool: &Pool<Sqlite>,
+    custody: &(impl ReceiptCustody + Sync),
+    identity: VaultIdentity<'_>,
+    holder: Address,
+    recipient: CorroboratedRecipient,
+) -> anyhow::Result<MigrationOutcome> {
+    let VaultIdentity { chain_id, vault, underlying } = identity;
     let recipient = recipient.address();
 
     let store =
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
-    let status = load_freeze_status(pool, underlying).await?;
     let inventory = load_inventory(&store, chain_id, &vault).await?;
-
-    require_quiescent(
-        underlying,
-        status,
-        vault,
-        &inventory.reserved_receipts(),
-    )?;
-
-    let tracked: Vec<ReceiptHolding> = inventory
-        .receipts_with_balance()
-        .into_iter()
-        .map(|receipt| ReceiptHolding {
-            receipt_id: receipt.receipt_id,
-            balance: receipt.available_balance,
-        })
-        .collect();
-
-    if tracked.is_empty() {
-        return Err(MigrationRefusal::InventoryEmpty { vault, chain_id }.into());
-    }
-
-    let custody = OnchainReceiptCustody::resolve(provider, vault).await?;
+    let tracked = quiescent_tracked_holdings(
+        pool, &inventory, chain_id, vault, underlying,
+    )
+    .await?;
 
     match reconcile_holdings(
-        &custody, chain_id, vault, holder, recipient, &tracked,
+        custody,
+        chain_id,
+        vault,
+        holder,
+        recipient,
+        &tracked,
+        inventory.migrations_recorded(),
     )
     .await?
     {
@@ -615,11 +733,28 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
                 receipts,
                 "Receipt custody already migrated"
             );
+
+            // An already-completed move is still recorded (idempotently): the
+            // production forward transfer is signed by the custodian itself,
+            // outside this binary, so this observation is the only way the
+            // event a rollback derives its destination from ever lands.
+            send_receipt_inventory_command(
+                &store,
+                chain_id,
+                &vault,
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: holder,
+                    to: recipient,
+                    tx_hash: None,
+                },
+            )
+            .await?;
+
             Ok(MigrationOutcome::AlreadyMigrated { receipts })
         }
         SourceCustody::Holds(holdings) => {
             let outcome =
-                migrate_vault_custody(&custody, &holdings, recipient).await?;
+                migrate_vault_custody(custody, &holdings, recipient).await?;
 
             // Recorded only after the move is verified, so the inventory's
             // custody history never claims a transfer that did not land. This
@@ -633,7 +768,7 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
                     ReceiptInventoryCommand::RecordCustodyMigration {
                         from: holder,
                         to: recipient,
-                        tx_hash: *transaction,
+                        tx_hash: Some(*transaction),
                     },
                 )
                 .await?;
@@ -642,6 +777,367 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
             Ok(outcome)
         }
     }
+}
+
+/// Confirms on-chain that `holder` holds exactly every tracked balance for
+/// this vault, then records it as the inventory's custody holder.
+///
+/// This is the bootstrap for deployments whose events predate custody
+/// tracking: the displacement guard treats unobserved custody as "a zero
+/// balance means spent", so every vault's holder must be on record before any
+/// service starts against a rotated wallet. The address is operator-supplied,
+/// but it cannot be recorded wrongly: a mistyped wallet holds none of the
+/// tracked receipts and is refused with the first mismatch.
+///
+/// Requires quiescence like the migration itself — recording custody while
+/// work is in flight would capture a moving target.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened, work is in flight, the
+/// vault has no tracked receipts, or `holder`'s on-chain balances do not match
+/// the tracked inventory exactly.
+pub async fn confirm_custody_holder<P: Provider + Clone + Send + Sync>(
+    pool: &Pool<Sqlite>,
+    provider: P,
+    identity: VaultIdentity<'_>,
+    holder: Address,
+) -> anyhow::Result<usize> {
+    let VaultIdentity { chain_id, vault, underlying } = identity;
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+    let tracked = quiescent_tracked_holdings(
+        pool, &inventory, chain_id, vault, underlying,
+    )
+    .await?;
+
+    let custody = OnchainReceiptCustody::resolve(provider, vault).await?;
+    let receipt_ids: Vec<ReceiptId> =
+        tracked.iter().map(|held| held.receipt_id).collect();
+    let held = custody.held_balances(vault, holder, &receipt_ids).await?;
+
+    if held.len() != receipt_ids.len() {
+        return Err(MigrationRefusal::BalanceCountMismatch {
+            vault,
+            requested: receipt_ids.len(),
+            returned: held.len(),
+        }
+        .into());
+    }
+
+    for (holding, onchain) in izip!(&tracked, &held) {
+        if holding.balance != *onchain {
+            return Err(MigrationRefusal::from(HolderMismatch {
+                vault,
+                holder,
+                receipt_id: holding.receipt_id,
+                tracked: holding.balance,
+                held: *onchain,
+            })
+            .into());
+        }
+    }
+
+    send_receipt_inventory_command(
+        &store,
+        chain_id,
+        &vault,
+        ReceiptInventoryCommand::ConfirmCustody { holder },
+    )
+    .await?;
+
+    Ok(tracked.len())
+}
+
+/// Proof that the Turnkey connection can sign the rollback, produced before
+/// anything moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollbackSigningProof {
+    /// Where the signed (never broadcast) rollback would send custody.
+    pub destination: Address,
+    /// How many tracked receipts the rollback transaction covers.
+    pub receipts: usize,
+    /// Native balance of the Turnkey wallet — it needs gas to actually
+    /// broadcast a rollback and to operate the service afterwards.
+    pub turnkey_gas: U256,
+    /// Native balance of the wallet custody currently sits with.
+    pub holder_gas: U256,
+}
+
+/// Signs the exact rollback-shaped transaction with Turnkey — **without
+/// broadcasting it** — proving the connection end to end.
+///
+/// The transaction is a `safeBatchTransferFrom` of every tracked receipt from
+/// the Turnkey wallet back to the current holder, the real shape a rollback
+/// would submit.
+///
+/// This is the gate that keeps the forward move from being a one-way door: the
+/// custodian signs the forward transfer outside this binary, and if the
+/// Turnkey credentials, organization, address, or signing policy turn out
+/// broken only *after* custody has moved, there is no way back and no service
+/// that can run. A successful sign here proves the API credentials, the
+/// organization, the address, and the policy against the real transaction
+/// shape; the signer itself verifies the recovered signature matches the
+/// Turnkey address before returning.
+///
+/// Gas and fee fields are fixed rather than estimated: estimating a transfer
+/// of receipts the Turnkey wallet does not hold yet would revert, and the
+/// signature's validity does not depend on them.
+///
+/// `destination` is the Fireblocks wallet the rollback would return custody
+/// to, derived by the caller from the Fireblocks API — never typed.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened, the vault has no tracked
+/// receipts, or Turnkey refuses or mis-signs the transaction.
+pub async fn verify_rollback_signing<P: Provider>(
+    pool: &Pool<Sqlite>,
+    provider: P,
+    wallet: &EthereumWallet,
+    identity: VaultIdentity<'_>,
+    turnkey: Address,
+    destination: Address,
+) -> anyhow::Result<RollbackSigningProof> {
+    let VaultIdentity { chain_id, vault, underlying } = identity;
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    // The same loader the migration itself uses: the signed shape is only
+    // "exact" if it covers the identical holdings a real rollback would move,
+    // gated by the identical quiescence checks.
+    let tracked = quiescent_tracked_holdings(
+        pool, &inventory, chain_id, vault, underlying,
+    )
+    .await?;
+
+    let vault_contract = OffchainAssetReceiptVault::new(vault, &provider);
+    let receipt_contract = Address::from(
+        vault_contract
+            .receipt()
+            .call()
+            .await
+            .map_err(|error| ReceiptCustodyError::Contract(Box::new(error)))?
+            .0,
+    );
+
+    let receipt = Receipt::new(receipt_contract, &provider);
+    let ids: Vec<U256> =
+        tracked.iter().map(|held| held.receipt_id.inner()).collect();
+    let amounts: Vec<U256> =
+        tracked.iter().map(|held| held.balance.inner()).collect();
+    let calldata = receipt
+        .safeBatchTransferFrom(turnkey, destination, ids, amounts, Bytes::new())
+        .calldata()
+        .clone();
+
+    let nonce = provider
+        .get_transaction_count(turnkey)
+        .await
+        .map_err(ReceiptCustodyError::from)?;
+
+    let request = TransactionRequest::default()
+        .with_from(turnkey)
+        .with_to(receipt_contract)
+        .with_input(calldata)
+        .with_chain_id(chain_id)
+        .with_nonce(nonce)
+        .with_gas_limit(ROLLBACK_PROOF_GAS_LIMIT)
+        .with_max_fee_per_gas(ROLLBACK_PROOF_MAX_FEE_PER_GAS)
+        .with_max_priority_fee_per_gas(ROLLBACK_PROOF_MAX_PRIORITY_FEE);
+
+    // Signing only: the transaction is built and signed but never submitted.
+    // The Turnkey signer verifies the recovered signature matches its address
+    // before returning, so success is proof of control, not just of an HTTP
+    // 200.
+    request.build(wallet).await?;
+
+    let turnkey_gas = provider
+        .get_balance(turnkey)
+        .await
+        .map_err(ReceiptCustodyError::from)?;
+    let holder_gas = provider
+        .get_balance(destination)
+        .await
+        .map_err(ReceiptCustodyError::from)?;
+
+    Ok(RollbackSigningProof {
+        destination,
+        receipts: tracked.len(),
+        turnkey_gas,
+        holder_gas,
+    })
+}
+
+/// Deliberately generous: the signature's validity does not depend on these,
+/// and the transaction is never broadcast.
+const ROLLBACK_PROOF_GAS_LIMIT: u64 = 1_000_000;
+const ROLLBACK_PROOF_MAX_FEE_PER_GAS: u128 = 100_000_000_000;
+const ROLLBACK_PROOF_MAX_PRIORITY_FEE: u128 = 1_000_000_000;
+
+/// The wallet a rollback returns custody to, read from the recorded migration.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened or no custody migration was
+/// ever recorded for this vault.
+pub async fn recorded_migration_origin(
+    pool: &Pool<Sqlite>,
+    chain_id: u64,
+    vault: Address,
+) -> anyhow::Result<Address> {
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    inventory.custody().moved_from().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault {vault} on chain {chain_id} has no recorded custody \
+             migration to roll back; record the forward move first (re-run \
+             migrate-receipts once custody has actually moved)"
+        )
+    })
+}
+
+/// The recorded custody holder for this vault, if any.
+///
+/// The migrate CLI uses this to decide direction when the incoming wallet's
+/// credentials are what is configured: a recorded holder that is not the
+/// incoming wallet means the forward move happened (or must be verified)
+/// out-of-band; a recorded holder that *is* the incoming wallet means the only
+/// move left is a rollback.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened.
+pub async fn recorded_custody_holder(
+    pool: &Pool<Sqlite>,
+    chain_id: u64,
+    vault: Address,
+) -> anyhow::Result<Option<Address>> {
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    Ok(inventory.custody().holder())
+}
+
+/// Loads the tracked holdings after proving the deployment is quiescent.
+///
+/// Shared by every operation that reads or moves custody: none of them may run
+/// over in-flight work, and all of them are meaningless on an empty inventory.
+async fn quiescent_tracked_holdings(
+    pool: &Pool<Sqlite>,
+    inventory: &ReceiptInventory,
+    chain_id: u64,
+    vault: Address,
+    underlying: &UnderlyingSymbol,
+) -> anyhow::Result<Vec<ReceiptHolding>> {
+    let redemptions_in_flight = stuck_redemptions_for(pool, underlying).await?;
+    let mints_in_flight = stuck_mints_for(pool, underlying).await?;
+
+    require_quiescent(
+        vault,
+        &inventory.reserved_receipts(),
+        redemptions_in_flight,
+        mints_in_flight,
+    )?;
+
+    // A zero balance is nothing to move, and a vault whose every balance is
+    // zero has nothing to migrate — treating it as migratable is how a
+    // fully-spent vault could "verify" a move on two zero readings.
+    let tracked: Vec<ReceiptHolding> = inventory
+        .receipts_with_balance()
+        .into_iter()
+        .map(|receipt| ReceiptHolding {
+            receipt_id: receipt.receipt_id,
+            balance: receipt.available_balance,
+        })
+        .filter(|holding| !holding.balance.is_zero())
+        .collect();
+
+    if tracked.is_empty() {
+        return Err(MigrationRefusal::InventoryEmpty { vault, chain_id }.into());
+    }
+
+    Ok(tracked)
+}
+
+/// Counts the stuck redemptions that could resume against `underlying`'s
+/// vault.
+///
+/// Terminal-looking view shapes (`Failed`) no longer carry the asset, so
+/// those are attributed from the aggregate's `Detected` event; a redemption
+/// that cannot be attributed at all counts against every vault rather than
+/// none.
+async fn stuck_redemptions_for(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+
+    for (issuer_request_id, view) in find_stuck_redemptions(pool).await? {
+        let counts = match view.underlying() {
+            Some(asset) => asset == underlying,
+            None => detected_redemption_underlying(pool, &issuer_request_id)
+                .await?
+                .is_none_or(|asset| asset == *underlying),
+        };
+
+        if counts {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+/// Counts the stuck mints that could resume against `underlying`'s vault,
+/// counting any unattributable mint against every vault.
+async fn stuck_mints_for(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> anyhow::Result<usize> {
+    Ok(find_stuck_mints(pool)
+        .await?
+        .iter()
+        .filter(|(_, view)| {
+            view.underlying().is_none_or(|asset| asset == underlying)
+        })
+        .count())
+}
+
+/// Recovers a redemption's asset from its `Detected` event when the view has
+/// already dropped it.
+async fn detected_redemption_underlying(
+    pool: &Pool<Sqlite>,
+    issuer_request_id: &IssuerRedemptionRequestId,
+) -> anyhow::Result<Option<UnderlyingSymbol>> {
+    let aggregate_id = issuer_request_id.to_string();
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+        ORDER BY sequence
+        "#,
+        aggregate_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        if let RedemptionEvent::Detected { underlying, .. } =
+            serde_json::from_str(&row.payload)?
+        {
+            return Ok(Some(underlying));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Cross-checks the tracked inventory against the chain, yielding the set to
@@ -667,6 +1163,7 @@ pub(crate) async fn reconcile_holdings(
     holder: Address,
     recipient: Address,
     tracked: &[ReceiptHolding],
+    migration_ordinal: u32,
 ) -> Result<SourceCustody, MigrationRefusal> {
     let receipt_ids: Vec<ReceiptId> =
         tracked.iter().map(|held| held.receipt_id).collect();
@@ -725,6 +1222,7 @@ pub(crate) async fn reconcile_holdings(
         vault,
         holder,
         holdings,
+        migration_ordinal,
     }))
 }
 
@@ -1132,6 +1630,178 @@ impl<P: Provider + Clone + Send + Sync> ReceiptCustody
     }
 }
 
+/// Receipt custody whose transfer is submitted through the Fireblocks API —
+/// the production forward leg, where the holder's key lives with the custodian
+/// and this binary signs nothing.
+///
+/// Balance reads and the permission gates delegate to the on-chain
+/// implementation; only [`ReceiptCustody::transfer_custody`] differs. The
+/// `externalTxId` is deterministic over the batch content and the UTC date, so
+/// a crashed or retried run within the same day resumes the original
+/// Fireblocks transaction instead of submitting a second transfer, while a
+/// deliberate later re-migration (after a rollback) gets a fresh identity.
+pub(crate) struct FireblocksReceiptCustody<P> {
+    onchain: OnchainReceiptCustody<P>,
+    client: FireblocksVaultService<P>,
+    receipt_contract: Address,
+    chain_id: u64,
+}
+
+impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
+    pub(crate) async fn resolve(
+        provider: P,
+        config: &FireblocksConfig,
+        chain_id: u64,
+        vault: Address,
+    ) -> Result<Self, ReceiptCustodyError> {
+        let receipt_contract = OffchainAssetReceiptVault::new(vault, &provider)
+            .receipt()
+            .call()
+            .await?;
+
+        let client =
+            FireblocksVaultService::new(config, provider.clone(), chain_id)
+                .map_err(Box::new)?;
+
+        Ok(Self {
+            onchain: OnchainReceiptCustody::new(
+                provider,
+                vault,
+                receipt_contract,
+            ),
+            client,
+            receipt_contract,
+            chain_id,
+        })
+    }
+}
+
+#[async_trait]
+impl<P: Provider + Clone + Send + Sync> ReceiptCustody
+    for FireblocksReceiptCustody<P>
+{
+    async fn held_balances(
+        &self,
+        vault: Address,
+        holder: Address,
+        receipt_ids: &[ReceiptId],
+    ) -> Result<Vec<Shares>, ReceiptCustodyError> {
+        self.onchain.held_balances(vault, holder, receipt_ids).await
+    }
+
+    async fn transfer_permission(
+        &self,
+        vault: Address,
+        from: Address,
+        to: Address,
+    ) -> Result<TransferPermission, ReceiptCustodyError> {
+        self.onchain.transfer_permission(vault, from, to).await
+    }
+
+    async fn transfer_custody(
+        &self,
+        permit: &TransferPermit,
+        holdings: &MigratableHoldings,
+    ) -> Result<B256, ReceiptCustodyError> {
+        self.onchain.check_vault(permit.vault())?;
+        ensure_permit_covers(permit, holdings)?;
+
+        let receipt =
+            Receipt::new(self.receipt_contract, &self.onchain.provider);
+        let (ids, amounts) = holdings.batch_arguments();
+        let external_tx_id = migration_external_tx_id(
+            self.chain_id,
+            permit.vault(),
+            permit.to(),
+            &ids,
+            &amounts,
+            holdings.migration_ordinal(),
+        );
+        let calldata = receipt
+            .safeBatchTransferFrom(
+                permit.from(),
+                permit.to(),
+                ids,
+                amounts,
+                Bytes::new(),
+            )
+            .calldata()
+            .clone();
+        let note = format!(
+            "receipt custody migration: vault {} -> {}",
+            permit.vault(),
+            permit.to()
+        );
+
+        let fireblocks_tx_id = self
+            .client
+            .submit_contract_call(
+                self.receipt_contract,
+                &calldata,
+                &note,
+                &external_tx_id,
+            )
+            .await
+            .map_err(Box::new)?;
+        let tx_hash = self
+            .client
+            .wait_for_completion(&fireblocks_tx_id)
+            .await
+            .map_err(Box::new)?;
+
+        // Fireblocks can report `Completed` while the EVM transaction itself
+        // reverted; a reverted transfer moved nothing, so it is a definitive
+        // failure rather than a hash to report as success.
+        let confirmed = self
+            .onchain
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(ReceiptCustodyError::MissingReceipt { tx_hash })?;
+
+        if !confirmed.status() {
+            return Err(ReceiptCustodyError::Reverted {
+                vault: permit.vault(),
+                tx_hash,
+            });
+        }
+
+        Ok(tx_hash)
+    }
+}
+
+/// Deterministic `externalTxId` for a custody migration batch.
+///
+/// Stable over the batch content — chain, vault, destination, identifiers,
+/// amounts — so a retry of the same attempt deduplicates against the original
+/// Fireblocks transaction (across restarts, crashes, and midnight), and
+/// salted with the vault's migration ordinal so a deliberate re-migration
+/// (the rehearsal's forward leg happens again at the real cutover, after the
+/// rollback restored identical balances and recorded another migration) is a
+/// new transaction rather than a stale dedup hit.
+fn migration_external_tx_id(
+    chain_id: u64,
+    vault: Address,
+    to: Address,
+    ids: &[U256],
+    amounts: &[U256],
+    migration_ordinal: u32,
+) -> String {
+    let mut preimage = Vec::with_capacity(8 + 44 + (ids.len() * 64));
+    preimage.extend_from_slice(&chain_id.to_be_bytes());
+    preimage.extend_from_slice(vault.as_slice());
+    preimage.extend_from_slice(to.as_slice());
+    preimage.extend_from_slice(&migration_ordinal.to_be_bytes());
+    for (id, amount) in izip!(ids, amounts) {
+        preimage.extend_from_slice(&id.to_be_bytes::<32>());
+        preimage.extend_from_slice(&amount.to_be_bytes::<32>());
+    }
+
+    let digest = alloy::primitives::keccak256(&preimage);
+
+    format!("receipt-migration-{}", alloy::hex::encode(&digest[..16]))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
@@ -1320,16 +1990,12 @@ mod tests {
         }
     }
 
-    fn rklb() -> UnderlyingSymbol {
-        UnderlyingSymbol::new("RKLB").expect("valid symbol")
-    }
-
     async fn reconcile(
         custody: &FakeCustody,
         tracked: &[ReceiptHolding],
     ) -> Result<SourceCustody, MigrationRefusal> {
         reconcile_holdings(
-            custody, CHAIN_ID, VAULT, OUTGOING, INCOMING, tracked,
+            custody, CHAIN_ID, VAULT, OUTGOING, INCOMING, tracked, 0,
         )
         .await
     }
@@ -1358,38 +2024,18 @@ mod tests {
     }
 
     #[test]
-    fn quiescence_accepts_a_frozen_idle_vault() {
-        assert!(
-            require_quiescent(&rklb(), AssetStatus::Frozen, VAULT, &[]).is_ok()
-        );
-    }
-
-    #[test]
-    fn quiescence_refuses_an_unfrozen_asset() {
-        let refusal =
-            require_quiescent(&rklb(), AssetStatus::Enabled, VAULT, &[])
-                .unwrap_err();
-
-        assert!(
-            matches!(
-                refusal,
-                MigrationRefusal::AssetNotFrozen { ref underlying }
-                    if *underlying == rklb()
-            ),
-            "an enabled asset can still mint into the vault, got {refusal:?}"
-        );
+    fn quiescence_accepts_an_idle_deployment() {
+        require_quiescent(VAULT, &[], 0, 0).unwrap();
     }
 
     #[test]
     fn quiescence_refuses_while_a_burn_is_reserved() {
-        // A freeze rejects new mints but lets in-flight redemptions finish, so
-        // a reservation outliving the freeze is exactly the race that would
-        // burn against custody we just moved.
+        // In-flight redemptions can outlive any operational pause, so a
+        // reservation is exactly the race that would burn against custody we
+        // just moved.
         let reserved = [ReceiptId::from(U256::from(1))];
 
-        let refusal =
-            require_quiescent(&rklb(), AssetStatus::Frozen, VAULT, &reserved)
-                .unwrap_err();
+        let refusal = require_quiescent(VAULT, &reserved, 0, 0).unwrap_err();
 
         assert!(
             matches!(
@@ -1398,6 +2044,36 @@ mod tests {
                     if vault == VAULT && receipts == 1
             ),
             "a reserved burn must halt the migration, got {refusal:?}"
+        );
+    }
+
+    /// A redemption between detection and terminal holds no reservation yet,
+    /// but resumes on restart and plans a burn against the new wallet while
+    /// the participant's money already moved. The gate must catch it even
+    /// though the reservation gate cannot.
+    #[test]
+    fn quiescence_refuses_while_a_redemption_is_in_flight() {
+        let refusal = require_quiescent(VAULT, &[], 2, 0).unwrap_err();
+
+        assert!(
+            matches!(
+                refusal,
+                MigrationRefusal::RedemptionsInFlight { count: 2 }
+            ),
+            "in-flight redemptions must halt the migration, got {refusal:?}"
+        );
+    }
+
+    /// A non-terminal mint's recovery rebroadcasts a transaction signed by the
+    /// old wallet, depositing a fresh receipt at an address the migrated
+    /// deployment no longer watches.
+    #[test]
+    fn quiescence_refuses_while_a_mint_is_in_flight() {
+        let refusal = require_quiescent(VAULT, &[], 0, 1).unwrap_err();
+
+        assert!(
+            matches!(refusal, MigrationRefusal::MintsInFlight { count: 1 }),
+            "in-flight mints must halt the migration, got {refusal:?}"
         );
     }
 
@@ -1902,6 +2578,514 @@ mod tests {
                     .unwrap();
 
             assert_eq!(corroborated.address(), evm.wallet_address);
+        }
+    }
+
+    /// The idempotency identity for a Fireblocks-submitted migration must be
+    /// stable over the batch content (so an in-flight retry deduplicates) and
+    /// sensitive to it (so a different batch is a different transaction).
+    mod migration_external_id {
+        use super::*;
+
+        #[test]
+        fn identical_batches_share_an_identity() {
+            let ids = vec![U256::from(1), U256::from(2)];
+            let amounts = vec![U256::from(10), U256::from(20)];
+
+            assert_eq!(
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 0),
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 0),
+            );
+        }
+
+        #[test]
+        fn different_batches_get_different_identities() {
+            let ids = vec![U256::from(1)];
+            let amounts = vec![U256::from(10)];
+            let other_amounts = vec![U256::from(11)];
+
+            assert_ne!(
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 0),
+                migration_external_tx_id(
+                    1,
+                    VAULT,
+                    INCOMING,
+                    &ids,
+                    &other_amounts,
+                    0
+                ),
+                "a changed batch must not deduplicate against the old one"
+            );
+            assert_ne!(
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 0),
+                migration_external_tx_id(1, VAULT, OUTGOING, &ids, &amounts, 0),
+                "a changed destination must not deduplicate either"
+            );
+        }
+
+        /// The rehearsal's exact hazard: rollback restores identical balances,
+        /// so the real cutover re-submits an identical batch — possibly the
+        /// same day. The migration ordinal is what makes it a new Fireblocks
+        /// transaction instead of a stale dedup hit, while a retry of the
+        /// same attempt (same ordinal) still deduplicates.
+        #[test]
+        fn a_re_migration_after_rollback_gets_a_fresh_identity() {
+            let ids = vec![U256::from(1)];
+            let amounts = vec![U256::from(10)];
+
+            assert_ne!(
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 0),
+                migration_external_tx_id(1, VAULT, INCOMING, &ids, &amounts, 2),
+                "an identical batch at a later migration ordinal must be a \
+                 new transaction identity"
+            );
+        }
+    }
+
+    /// The two operator gates that bootstrap and protect custody state:
+    /// `confirm_custody_holder` (the only writer of trusted custody before a
+    /// migration) and `verify_rollback_signing` (the proof that keeps the
+    /// forward move from being a one-way door).
+    mod custody_bootstrap {
+        use alloy::network::EthereumWallet;
+        use alloy::primitives::TxHash;
+        use alloy::providers::ProviderBuilder;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::sol_types::SolEvent;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        use super::*;
+        use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm};
+
+        async fn pool_with_migrations() -> Pool<Sqlite> {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect(":memory:")
+                .await
+                .unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            pool
+        }
+
+        /// Deposits one receipt at the EVM wallet and mirrors it into the
+        /// inventory, returning the signing provider and the receipt's id and
+        /// share balance.
+        async fn seeded_vault(
+            evm: &LocalEvm,
+            pool: &Pool<Sqlite>,
+        ) -> (impl Provider + Clone + use<>, U256, U256) {
+            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+            evm.grant_certify_role(evm.wallet_address).await.unwrap();
+            evm.certify_vault(U256::MAX).await.unwrap();
+
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect(&evm.endpoint)
+                .await
+                .unwrap();
+
+            let vault = crate::bindings::OffchainAssetReceiptVault::new(
+                evm.vault_address,
+                &provider,
+            );
+            let shares = U256::from(25) * U256::from(10).pow(U256::from(18));
+            let deposited = vault
+                .deposit(
+                    shares,
+                    evm.wallet_address,
+                    U256::from(10).pow(U256::from(18)),
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            let receipt_id = deposited
+                .inner
+                .logs()
+                .iter()
+                .find_map(|log| {
+                    crate::bindings::OffchainAssetReceiptVault::Deposit::decode_log(
+                        &log.inner,
+                    )
+                    .ok()
+                })
+                .expect("deposit must emit a Deposit event")
+                .id;
+
+            let store = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            send_receipt_inventory_command(
+                &store,
+                ANVIL_CHAIN_ID,
+                &evm.vault_address,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(receipt_id),
+                    balance: Shares::from(shares),
+                    block_number: 1,
+                    tx_hash: TxHash::ZERO,
+                    source: crate::receipt_inventory::ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            (provider, receipt_id, shares)
+        }
+
+        async fn recorded_holder(
+            pool: &Pool<Sqlite>,
+            vault: Address,
+        ) -> Option<Address> {
+            let store = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault)
+                .await
+                .unwrap()
+                .custody()
+                .holder()
+        }
+
+        /// The bootstrap only records a holder whose on-chain balances match
+        /// the tracked inventory exactly.
+        #[tokio::test]
+        async fn a_holder_with_matching_balances_is_confirmed() {
+            let evm = LocalEvm::new().await.unwrap();
+            let pool = pool_with_migrations().await;
+            let (provider, _, _) = seeded_vault(&evm, &pool).await;
+            let underlying: UnderlyingSymbol = "TSLA".parse().unwrap();
+
+            let receipts = confirm_custody_holder(
+                &pool,
+                provider,
+                VaultIdentity {
+                    chain_id: ANVIL_CHAIN_ID,
+                    vault: evm.vault_address,
+                    underlying: &underlying,
+                },
+                evm.wallet_address,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(receipts, 1);
+            assert_eq!(
+                recorded_holder(&pool, evm.vault_address).await,
+                Some(evm.wallet_address),
+                "the verified holder must be on record"
+            );
+        }
+
+        /// A wallet that does not hold the tracked receipts is refused and
+        /// nothing is recorded — a mistyped or wrong-workspace wallet cannot
+        /// become the trusted custody holder.
+        #[tokio::test]
+        async fn a_holder_without_the_receipts_is_refused() {
+            let evm = LocalEvm::new().await.unwrap();
+            let pool = pool_with_migrations().await;
+            let (provider, _, _) = seeded_vault(&evm, &pool).await;
+            let underlying: UnderlyingSymbol = "TSLA".parse().unwrap();
+
+            let error = confirm_custody_holder(
+                &pool,
+                provider,
+                VaultIdentity {
+                    chain_id: ANVIL_CHAIN_ID,
+                    vault: evm.vault_address,
+                    underlying: &underlying,
+                },
+                Address::random(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("holds"),
+                "the refusal must name the balance mismatch, got: {error}"
+            );
+            assert_eq!(
+                recorded_holder(&pool, evm.vault_address).await,
+                None,
+                "no custody may be recorded from a failed verification"
+            );
+        }
+
+        /// The rollback proof signs the exact tracked batch without
+        /// broadcasting: the proof covers every tracked receipt, names the
+        /// derived destination, and reports gas for both wallets.
+        #[tokio::test]
+        async fn rollback_signing_proof_covers_the_tracked_batch() {
+            let evm = LocalEvm::new().await.unwrap();
+            let pool = pool_with_migrations().await;
+            let (provider, receipt_id, _) = seeded_vault(&evm, &pool).await;
+            let underlying: UnderlyingSymbol = "TSLA".parse().unwrap();
+
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let wallet = EthereumWallet::from(signer);
+            let destination = Address::random();
+
+            let proof = verify_rollback_signing(
+                &pool,
+                &provider,
+                &wallet,
+                VaultIdentity {
+                    chain_id: ANVIL_CHAIN_ID,
+                    vault: evm.vault_address,
+                    underlying: &underlying,
+                },
+                evm.wallet_address,
+                destination,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(proof.receipts, 1);
+            assert_eq!(proof.destination, destination);
+            assert!(
+                !proof.turnkey_gas.is_zero(),
+                "the signing wallet is funded on the local chain"
+            );
+            assert!(
+                proof.holder_gas.is_zero(),
+                "a random destination holds no gas yet"
+            );
+
+            // Signing proved control without moving anything: the receipt
+            // still sits with its holder.
+            let vault_contract =
+                crate::bindings::OffchainAssetReceiptVault::new(
+                    evm.vault_address,
+                    &provider,
+                );
+            let receipt_contract =
+                Address::from(vault_contract.receipt().call().await.unwrap().0);
+            let receipt = Receipt::new(receipt_contract, &provider);
+            assert!(
+                !receipt
+                    .balanceOf(evm.wallet_address, receipt_id)
+                    .call()
+                    .await
+                    .unwrap()
+                    .is_zero(),
+                "the proof must not move custody"
+            );
+        }
+    }
+
+    /// The Fireblocks-submitted transfer path, end to end against a real vault
+    /// with the Fireblocks API mocked: the custody impl builds the batch
+    /// calldata, submits it as a `CONTRACT_CALL`, polls to completion, and
+    /// verifies the returned transaction actually landed and did not revert.
+    mod fireblocks_transfer {
+        use alloy::network::EthereumWallet;
+        use alloy::providers::ProviderBuilder;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::sol_types::SolEvent;
+        use fireblocks_sdk::{Client, ClientBuilder};
+        use httpmock::MockServer;
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePrivateKey;
+        use std::sync::LazyLock;
+
+        use super::*;
+        use crate::fireblocks::parse_chain_asset_ids;
+        use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm};
+
+        static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+            let mut rng = rand::thread_rng();
+            let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+            key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        });
+
+        fn mock_client(server: &MockServer) -> Client {
+            ClientBuilder::new("test-api-user", &TEST_RSA_PEM)
+                .with_url(&server.base_url())
+                .build()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn transfer_custody_returns_the_hash_of_a_landed_transfer() {
+            let evm = LocalEvm::new().await.unwrap();
+            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+            evm.grant_certify_role(evm.wallet_address).await.unwrap();
+            evm.certify_vault(U256::MAX).await.unwrap();
+
+            let holder = evm.wallet_address;
+            let recipient = Address::random();
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect(&evm.endpoint)
+                .await
+                .unwrap();
+
+            let vault = crate::bindings::OffchainAssetReceiptVault::new(
+                evm.vault_address,
+                &provider,
+            );
+            let shares = U256::from(40) * U256::from(10).pow(U256::from(18));
+            let deposited = vault
+                .deposit(
+                    shares,
+                    holder,
+                    U256::from(10).pow(U256::from(18)),
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            let receipt_id = deposited
+                .inner
+                .logs()
+                .iter()
+                .find_map(|log| {
+                    crate::bindings::OffchainAssetReceiptVault::Deposit::decode_log(
+                        &log.inner,
+                    )
+                    .ok()
+                })
+                .expect("deposit must emit a Deposit event")
+                .id;
+            let receipt_contract =
+                Address::from(vault.receipt().call().await.unwrap().0);
+
+            // Holdings and permit are established while the holder still owns
+            // the receipts, exactly as the engine does before submitting.
+            let onchain = OnchainReceiptCustody::resolve(
+                provider.clone(),
+                evm.vault_address,
+            )
+            .await
+            .unwrap();
+            let tracked = [ReceiptHolding {
+                receipt_id: ReceiptId::from(receipt_id),
+                balance: Shares::from(shares),
+            }];
+            let SourceCustody::Holds(holdings) = reconcile_holdings(
+                &onchain,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                holder,
+                recipient,
+                &tracked,
+                0,
+            )
+            .await
+            .unwrap() else {
+                panic!("the holder must still own the receipts")
+            };
+            let TransferPermission::Permitted(permit) = onchain
+                .transfer_permission(evm.vault_address, holder, recipient)
+                .await
+                .unwrap()
+            else {
+                panic!("a certified vault must permit the transfer")
+            };
+
+            // The "custodian" executes the batch on-chain; the mocked
+            // Fireblocks API then reports that transaction as the completed
+            // CONTRACT_CALL, exactly as production does once approvals clear.
+            let receipt_instance = Receipt::new(receipt_contract, &provider);
+            let landed = receipt_instance
+                .safeBatchTransferFrom(
+                    holder,
+                    recipient,
+                    vec![receipt_id],
+                    vec![shares],
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            let landed_hash = landed.transaction_hash;
+
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method("GET").path("/contracts");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!([
+                        {
+                            "id": "contract-wallet-123",
+                            "name": "Receipt",
+                            "assets": [
+                                {
+                                    "id": "TESTCHAIN_ETH",
+                                    "address": receipt_contract
+                                        .to_string()
+                                        .to_lowercase()
+                                }
+                            ]
+                        }
+                    ]));
+            });
+            let create_mock = server.mock(|when, then| {
+                when.method("POST").path("/transactions");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "id": "fb-tx-1" }));
+            });
+            server.mock(|when, then| {
+                when.method("GET").path("/transactions/fb-tx-1");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "fb-tx-1",
+                        "status": "COMPLETED",
+                        "txHash": format!("{landed_hash:#x}"),
+                    }));
+            });
+
+            let custody = FireblocksReceiptCustody {
+                onchain,
+                client: FireblocksVaultService::for_tests(
+                    mock_client(&server),
+                    provider.clone(),
+                    ANVIL_CHAIN_ID,
+                    parse_chain_asset_ids(&format!(
+                        "{ANVIL_CHAIN_ID}:TESTCHAIN_ETH"
+                    ))
+                    .unwrap(),
+                ),
+                receipt_contract,
+                chain_id: ANVIL_CHAIN_ID,
+            };
+
+            let returned =
+                custody.transfer_custody(&permit, &holdings).await.unwrap();
+
+            assert_eq!(
+                returned, landed_hash,
+                "the custody impl must report the hash of the transfer that \
+                 actually landed"
+            );
+            assert_eq!(
+                create_mock.calls_async().await,
+                1,
+                "exactly one CONTRACT_CALL must be submitted"
+            );
         }
     }
 }

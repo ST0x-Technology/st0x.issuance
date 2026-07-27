@@ -39,6 +39,14 @@ pub enum FireblocksVaultError {
     )]
     TransactionFailed { tx_id: String, status: TransactionStatus },
     #[error(
+        "Fireblocks transaction {tx_id} is still {status:?} after the polling \
+         window — it may yet complete (console approval can take longer). \
+         Approve or reject it in the Fireblocks console, then re-run this \
+         command: the deterministic externalTxId resumes the same transaction \
+         instead of submitting a second one."
+    )]
+    PollTimedOut { tx_id: String, status: TransactionStatus },
+    #[error(
         "Fireblocks transaction {tx_id} did not include a transaction hash"
     )]
     MissingTxHash { tx_id: String },
@@ -369,11 +377,20 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .await?;
 
         if result.status != TransactionStatus::Completed {
+            // A still-pending status after the polling window is a timeout,
+            // not a terminal failure — the transaction may complete once
+            // console approval clears, and re-running resumes it via the
+            // deterministic externalTxId.
             if is_still_pending(result.status) {
                 warn!(target: "fireblocks", fireblocks_tx_id = %tx_id,
                     status = ?result.status,
                     "Polling timed out but transaction may still confirm on-chain"
                 );
+
+                return Err(FireblocksVaultError::PollTimedOut {
+                    tx_id: tx_id.to_string(),
+                    status: result.status,
+                });
             }
 
             return Err(FireblocksVaultError::TransactionFailed {
@@ -399,6 +416,28 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     ///
     /// The transaction receipt.
     ///
+    /// The read-only provider this service fetches receipts through.
+    pub const fn read_provider(&self) -> &P {
+        &self.read_provider
+    }
+
+    /// Test constructor injecting a client pointed at a mock server.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        client: Client,
+        read_provider: P,
+        chain_id: u64,
+        chain_asset_ids: ChainAssetIds,
+    ) -> Self {
+        Self {
+            client,
+            vault_account_id: "0".to_string(),
+            chain_asset_ids,
+            read_provider,
+            chain_id,
+        }
+    }
+
     /// # Errors
     ///
     /// Returns an error if the RPC call fails or no receipt exists for the

@@ -48,9 +48,13 @@ pub(crate) enum ReceiptInventoryCommand {
         holder: Address,
     },
     /// Record that custody of every tracked receipt moved to a new wallet.
+    ///
+    /// `tx_hash` is `None` when the transfer was signed outside this binary
+    /// and verified against on-chain balances after the fact. Idempotent: a
+    /// move already recorded with the same endpoints produces no event.
     RecordCustodyMigration {
         from: Address,
         to: Address,
-        tx_hash: TxHash,
+        tx_hash: Option<TxHash>,
     },
 }

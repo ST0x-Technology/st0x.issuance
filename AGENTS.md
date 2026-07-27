@@ -175,9 +175,9 @@ Command -> Aggregate.handle() -> Validate & Produce Events -> Persist Events
 - `apply(event)`: Deterministically updates state from events. Pure, never
   fails - events are historical facts.
 
-**Benefits:** complete audit trail; time-travel debugging (replay to any point);
-testability via Given-When-Then; rebuild/add views by replaying events; multiple
-projections from the same events; the event store is the single source of truth.
+**Benefits:** complete audit trail; time-travel debugging; Given-When-Then
+testability; rebuild/add views by replaying events; multiple projections from
+the same events; the event store is the single source of truth.
 
 **CRITICAL: Events Are Permanent:**
 
@@ -332,12 +332,16 @@ wraps into a signing `Provider` for `RealBlockchainService`:
 Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 `wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
 
-**Receipt custody migration (`receipt_inventory/migration.rs`, temporary):**
-rotating the signer strands the vault's receipts at the old address. **Stop the
-service before moving custody.** No wallet address is ever an argument to the
-migration engine; destinations are derived and gated by the
-`CorroboratedRecipient` witness. Custody is aggregate state, so a rotated
-wallet reading zero is refused, not depleted.
+**Receipt custody migration (`receipt_inventory/migration.rs` +
+`src/fireblocks/`, temporary):** rotating the signer strands the vault's
+receipts at the old address. **Stop the service before `migrate-receipts`.** No
+wallet address is an argument: Fireblocks wallet from its API, Turnkey wallet
+from `TURNKEY_ADDRESS`, direction from recorded custody; forward submits via the
+restored narrow Fireblocks client, rollback signs with Turnkey. Ownership
+verification (exact balances before, per-identifier gain after) is the check.
+Custody is aggregate state: a rotated wallet reading zero is refused, not
+depleted. Quiescence gates on in-flight mints/redemptions, never on freeze
+(freeze = corporate action). See `docs/turnkey-receipt-migration-plan.md`.
 
 ### Core Flows
 
@@ -847,13 +851,11 @@ artifacts).
 // minting without backing shares.
 let confirmed = wait_for_journal_confirmation(&mint_id).await?;
 
-// Bad: Restates WHAT (obvious from code)
-// Execute mint command
+// Bad: Restates WHAT // Execute mint command
 execute_mint_command(mint);
 ```
 
-Use `///` doc comments for public APIs. Keep comments focused on "why" not
-"what".
+Use `///` doc comments for public APIs; comments explain "why" not "what".
 
 ## Code Style
 
@@ -892,24 +894,11 @@ can't be mixed up in function arguments.
 ### Avoid deep nesting
 
 Use early returns and `let-else` for flat code instead of nested `if let` / `if`
-pyramids:
-
-```rust
-fn validate(d: Option<&Data>) -> Res<()> {
-    let d = d.ok_or(Error::NoData)?;
-    if d.qty <= 0 { return Err(Error::Qty); }
-    if !d.sym.ok() { return Err(Error::Sym); }
-    Ok(())
-}
-```
+pyramids: guard clauses first (`let value = input.ok_or(Error::NoData)?;`,
+`if bad { return Err(...); }`), then the happy path unindented.
 
 ### Struct field access
 
-Prefer direct field access over unnecessary constructors/getters:
-
-```rust
-let req = MintRequest { qty: 100.into(), underlying: "AAPL".into(), .. };
-println!("{}", req.qty); // direct access; don't add getters like
-// `fn qty(&self) -> Decimal { self.qty }` that just forward to fields
-}
-```
+Prefer direct field access over unnecessary constructors/getters: use struct
+literal syntax and read fields directly; never add getters like
+`fn qty(&self) -> Decimal { self.qty }` that just forward to fields.
