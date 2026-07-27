@@ -42,7 +42,14 @@ let
   #   2. Decrypt and install the env-file secrets (chmod 0640 group st0x).
   #   3. Chown any existing data files so the st0x user can access them.
   #   4. Record the deployed git revision for ops tooling.
-  #   5. Touch the marker (ConditionPathExists in the unit) and restart.
+  #   5. Touch the marker (ConditionPathExists in the unit) and restart —
+  #      unless the operator hold file (/run/st0x/<name>.hold) exists, in
+  #      which case the binary and secrets are installed and validated but the
+  #      service is left stopped. The hold protects a custody-migration
+  #      window: while it is present, NO deploy — intentional or stray — can
+  #      start a service against custody that has not finished moving. /run is
+  #      tmpfs, so a reboot clears the hold along with the marker; re-create
+  #      it before any deploy if the window is still open.
   #
   # If any step fails, deploy-rs exits non-zero and rolls back automatically.
   mkIssuanceProfile =
@@ -98,8 +105,16 @@ let
         "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
 
         "echo '${gitRev}' > /run/st0x/${name}.git-rev"
-        "touch ${cfg.markerFile}"
-        "systemctl restart ${name}"
+        ''
+          if [ -f /run/st0x/${name}.hold ]; then
+            echo 'hold file /run/st0x/${name}.hold present:' \
+              '${name} installed and validated but left stopped'
+            rm -f ${cfg.markerFile}
+          else
+            touch ${cfg.markerFile}
+            systemctl restart ${name}
+          fi
+        ''
       ]
     );
 

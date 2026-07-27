@@ -18,10 +18,10 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::{
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::receipt_inventory::migration::{
     CorroboratedRecipient, MigrationOutcome, VaultIdentity,
-    migrate_vault_receipts,
+    migrate_vault_receipts, recorded_migration_origin,
 };
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::underlying::UnderlyingSymbol;
+use st0x_issuance::tokenized_asset::UnderlyingSymbol;
 use st0x_issuance::{Config, SignerConfig, initialize_rocket};
 use std::path::{Path, PathBuf};
 
@@ -227,6 +227,10 @@ struct PostCutoverCanaries<'context, 'server> {
 }
 
 impl PostCutoverCanaries<'_, '_> {
+    /// The canary redemption runs FIRST: it burns against a just-migrated
+    /// pre-cutover receipt, which is the actual proof that custody moved and
+    /// the inventory reconciled against the new holder. The canary mint only
+    /// proves the new signer can sign fresh work, so it runs second.
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let user_provider = create_provider()
             .wallet(EthereumWallet::from(self.user_signer.clone()))
@@ -235,18 +239,6 @@ impl PostCutoverCanaries<'_, '_> {
         let user_vault = OffchainAssetReceiptVaultInstance::new(
             self.evm.vault_address,
             &user_provider,
-        );
-        let canary_shares = mint_after_cutover(
-            self.client,
-            self.user_wallet,
-            &self.pre_cutover_mint.client_id,
-            self.mint_callback_mock,
-        )
-        .await?;
-        assert_eq!(
-            user_vault.balanceOf(self.user_wallet).call().await?,
-            self.pre_cutover_mint.shares + canary_shares,
-            "the new wallet must complete exactly one canary mint"
         );
 
         user_vault
@@ -261,24 +253,32 @@ impl PostCutoverCanaries<'_, '_> {
         harness::wait_for_burn(&user_vault, self.turnkey_wallet).await?;
         assert_eq!(
             user_vault.balanceOf(self.user_wallet).call().await?,
+            U256::ZERO,
+            "the canary redemption must consume every pre-cutover share"
+        );
+
+        let canary_shares = mint_after_cutover(
+            self.client,
+            self.user_wallet,
+            &self.pre_cutover_mint.client_id,
+            self.mint_callback_mock,
+        )
+        .await?;
+        assert_eq!(
+            user_vault.balanceOf(self.user_wallet).call().await?,
             canary_shares,
-            "only the post-cutover canary shares must remain after redemption"
+            "the new wallet must complete exactly one canary mint"
         );
 
         Ok(())
     }
 }
 
-/// Migrates custody against the outgoing service's database — driving the
-/// migration engine the operator's tooling runs, exercised as an operator
-/// would.
-///
-/// Note what this does and does not cover. The database snapshot handed to the
-/// replacement service is taken *before* this runs, so the migration here acts
-/// on the retiring store. That is deliberate and mirrors production: the
-/// outgoing service is already stopped (see the module-level requirement in
-/// `src/receipt_inventory/migration.rs`), and the quiescence gate checks real
-/// persisted state — reservations and in-flight work — not service liveness.
+/// Migrates custody against the given database — the same engine `issuer
+/// migrate-receipts` runs, exercised in the same order an operator would. The
+/// migration deliberately touches no freeze state: freezing means "corporate
+/// action in progress", and the window is controlled operationally (liquidity
+/// rebalancing paused, service stopped) instead.
 ///
 /// The migration is run twice: the second run stands in for the operator losing
 /// the terminal between the transaction confirming and success being recorded,
@@ -291,18 +291,17 @@ async fn run_operator_migration(
     outgoing: Address,
     incoming: Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let underlying = UnderlyingSymbol::new("AAPL")?;
-
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(database_url)
         .await?;
 
-    let identity = VaultIdentity { chain_id, vault, underlying: &underlying };
-    let recipient = CorroboratedRecipient::verify(&provider, incoming).await?;
+    let underlying: UnderlyingSymbol = CUTOVER_UNDERLYING.parse()?;
+    let incoming = CorroboratedRecipient::verify(provider, incoming).await?;
 
+    let identity = VaultIdentity { chain_id, vault, underlying: &underlying };
     let outcome =
-        migrate_vault_receipts(&pool, provider, identity, outgoing, recipient)
+        migrate_vault_receipts(&pool, provider, identity, outgoing, incoming)
             .await?;
     assert!(
         matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
@@ -310,7 +309,7 @@ async fn run_operator_migration(
     );
 
     let rerun =
-        migrate_vault_receipts(&pool, provider, identity, outgoing, recipient)
+        migrate_vault_receipts(&pool, provider, identity, outgoing, incoming)
             .await?;
     assert!(
         matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
@@ -395,14 +394,14 @@ async fn single_deposit_for_owner(
 }
 
 /// Proves the Base-only wallet-rotation sequence with multichain code present
-/// but additional chains disabled, driving the operator's real command: migrate
-/// receipt custody over a stopped, quiescent deployment.
+/// but additional chains disabled, driving the operator's real sequence:
+/// stop the service, migrate receipt custody, start the replacement.
 ///
 /// The local signers model the old Fireblocks-controlled address and the new
-/// Turnkey-controlled address; the custodian's own credential and policy
-/// checks remain staging gates outside this test's scope. This scenario proves
-/// the application-owned custody, persistence, restart, checkpoint, and
-/// transaction-idempotency invariants.
+/// Turnkey-controlled address; the custodian's own credential and policy checks
+/// remain staging gates, described in `docs/turnkey-receipt-migration-plan.md`.
+/// This scenario proves the application-owned custody, persistence, restart,
+/// checkpoint, and transaction-idempotency invariants.
 #[tokio::test]
 async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -683,26 +682,24 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
     wait_for_receipt_in_inventory(&databases.fireblocks_url).await?;
     client.terminate().await;
 
-    let underlying = UnderlyingSymbol::new("AAPL")?;
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&databases.fireblocks_url)
         .await?;
 
+    let underlying: UnderlyingSymbol = CUTOVER_UNDERLYING.parse()?;
     let identity = VaultIdentity {
         chain_id: evm.chain_id,
         vault: evm.vault_address,
         underlying: &underlying,
     };
-    let incoming =
-        CorroboratedRecipient::verify(&fireblocks_provider, turnkey_wallet)
-            .await?;
     let forward = migrate_vault_receipts(
         &pool,
         &fireblocks_provider,
         identity,
         fireblocks_wallet,
-        incoming,
+        CorroboratedRecipient::verify(&fireblocks_provider, turnkey_wallet)
+            .await?,
     )
     .await?;
     assert!(
@@ -715,20 +712,28 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         "the incoming wallet must hold the receipt after the forward move"
     );
 
-    // The rollback: same command, signer and recipient swapped.
+    // The rollback: same command with the wallets swapped, and its destination
+    // derived from the recorded forward migration rather than named — exactly
+    // what the CLI reads in production.
+    let derived_destination =
+        recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
+            .await?;
+    assert_eq!(
+        derived_destination, fireblocks_wallet,
+        "the rollback destination must derive from the recorded migration"
+    );
+
     let turnkey_provider = create_provider()
         .wallet(EthereumWallet::from(turnkey_signer))
         .connect(&evm.endpoint)
         .await?;
-    let rollback_destination =
-        CorroboratedRecipient::verify(&turnkey_provider, fireblocks_wallet)
-            .await?;
     let rolled_back = migrate_vault_receipts(
         &pool,
         &turnkey_provider,
         identity,
         turnkey_wallet,
-        rollback_destination,
+        CorroboratedRecipient::verify(&turnkey_provider, derived_destination)
+            .await?,
     )
     .await?;
 
@@ -982,8 +987,9 @@ async fn resume_on_outgoing_wallet_and_redeem_canary(
 /// tokens remain outstanding and unbacked, and `BurnFailed` recovery will not
 /// auto-fail the redemption because the on-chain *share* balance is present —
 /// it is the *receipt* that is missing. Nothing here recovers on its own. The
-/// operator sequence, not the code, is what prevents this: pause the authorized
-/// participant's redemptions and stop the service for the window.
+/// operator sequence, not the code, is what prevents this: pause rebalancing
+/// so no redemption arrives (the sole participant is our own bot), and stop
+/// the service for the window.
 #[tokio::test]
 async fn test_cutover_without_receipt_transfer_cannot_burn_historical_shares()
 -> Result<(), Box<dyn std::error::Error>> {
