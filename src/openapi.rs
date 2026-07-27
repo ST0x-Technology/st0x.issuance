@@ -23,6 +23,7 @@ expressed as an OpenAPI scheme."
         crate::tokenized_asset::api::get_tokenized_asset,
         crate::tokenized_asset::api::get_tokenized_asset_status,
         crate::tokenized_asset::api::add_tokenized_asset,
+        crate::mint::api::authorize_mint,
         crate::account::api::register_account,
         crate::account::api::whitelist_wallet,
         crate::account::api::unwhitelist_wallet,
@@ -48,6 +49,8 @@ expressed as an OpenAPI scheme."
         crate::account::api::RegisterAccountResponse,
         crate::account::api::WhitelistWalletRequest,
         crate::account::api::WhitelistWalletResponse,
+        crate::mint::api::MintAuthorizationRequest,
+        crate::mint::api::MintAuthorizationResponse,
         crate::admin::AggregateKind,
         crate::admin::ReprocessResponse,
         crate::admin::StuckAggregate,
@@ -118,6 +121,7 @@ mod tests {
             "/admin/reprocess/mint/{aggregate_id}",
             "/admin/close/mint/{aggregate_id}",
             "/admin/freeze-schedules",
+            "/internal/mints/{tokenization_request_id}/authorization",
         ] {
             assert!(
                 paths.contains_key(path),
@@ -201,6 +205,24 @@ mod tests {
         assert_eq!(
             schemas["TokenizedAssetStatus"]["enum"],
             serde_json::json!(["enabled", "frozen"])
+        );
+
+        // The authorization DTOs carry `schema(value_type = String)` over
+        // `B256`/`Bytes`/`IssuerMintRequestId`; the overrides must hold so
+        // the schema advertises the 0x-hex strings the liquidity bot sends
+        // rather than alloy's internal representations.
+        assert_eq!(
+            schemas["MintAuthorizationRequest"]["properties"]["nonce"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["MintAuthorizationRequest"]["properties"]["signature"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["MintAuthorizationResponse"]["properties"]["issuer_request_id"]
+                ["type"],
+            "string"
         );
     }
 }

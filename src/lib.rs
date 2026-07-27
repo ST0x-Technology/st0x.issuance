@@ -580,6 +580,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
                 mint::confirm_journal,
+                mint::authorize_mint,
                 admin::recover_redemption,
                 admin::close_redemption,
                 admin::force_complete_redemption,

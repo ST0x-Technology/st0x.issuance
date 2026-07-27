@@ -33,6 +33,7 @@ use super::{
 };
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::burn_excess::has_unresolved_excess_burn_intent;
+use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
@@ -121,8 +122,28 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                 network,
                 wallet,
                 journal_confirmed_at,
+                mint_mode,
                 ..
             } => {
+                // Fail closed on the anchor: this build has no orchestrator
+                // submission path (it lands in the commits stacked above,
+                // which replace this guard), and minting an
+                // orchestrator-anchored mint through the vault-direct
+                // multicall would use the wrong custody model — mirroring
+                // the redemption side's `BurnModeMismatch` refusal. The mint
+                // stays in `Minting`, visible in `/admin/stuck` past the
+                // threshold.
+                if let VaultMode::Orchestrator { .. } = mint_mode {
+                    warn!(
+                        target: "mint",
+                        issuer_request_id = %self.issuer_request_id,
+                        "Orchestrator-anchored mint has no submission path \
+                         in this build; deferring instead of minting \
+                         vault-direct"
+                    );
+                    return Ok(());
+                }
+
                 self.submit_from_minting(
                     ctx,
                     &mint,
@@ -2417,6 +2438,54 @@ mod tests {
         assert!(logs_contain_at!(
             Level::WARN,
             &[test, "Mint submission failed"]
+        ));
+    }
+
+    /// An orchestrator-anchored mint must never take the vault-direct
+    /// submission path: this build has no orchestrator submission, so the job
+    /// defers (mint stays `Minting`, vault untouched) instead of minting
+    /// through the wrong custody model.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_defers_orchestrator_anchored_mint() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        if let Some(MintEvent::Initiated { mint_mode, .. }) = events.first_mut()
+        {
+            *mint_mode = VaultMode::Orchestrator { address: Address::random() };
+        }
+        seed_mint_events(&harness.pool, &issuer_request_id, events).await;
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "an orchestrator-anchored mint must stay in Minting, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.get_wallet_lock_call_count(),
+            0,
+            "the vault-direct preparation must never run for an \
+             orchestrator-anchored mint"
+        );
+
+        let test = "submit_mint_job_defers_orchestrator_anchored_mint";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "no submission path", "deferring"]
         ));
     }
 

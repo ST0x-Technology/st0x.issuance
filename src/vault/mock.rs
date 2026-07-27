@@ -201,6 +201,10 @@ struct OrchestratorMockState {
     /// When set, `validate_mint_authorization` fails with this outcome.
     #[cfg(test)]
     mint_auth_failure: Mutex<Option<MockMintAuthFailure>>,
+    /// When set, `validate_mint_authorization` never resolves, standing in
+    /// for an unresponsive RPC provider so deadline handling is testable.
+    #[cfg(test)]
+    mint_auth_hang: Mutex<bool>,
     #[cfg(test)]
     last_mint_params: Mutex<Option<OrchestratorMintParams>>,
     #[cfg(test)]
@@ -219,6 +223,12 @@ struct OrchestratorMockState {
 pub(crate) enum MockMintAuthFailure {
     SignerMismatch,
     NonceUsed,
+    /// An empty-signature authorization naming an EOA recipient — only a
+    /// contract can answer the orchestrator's `authorizeMint` callback.
+    EmptySignatureForEoa,
+    /// A non-authorization failure (e.g. an RPC read error) — the outcome the
+    /// endpoint must surface as a 502, never as a 422 rejection.
+    ReadFailed,
 }
 
 /// Mock blockchain service for testing.
@@ -550,6 +560,7 @@ impl MockVaultService {
         *self.orchestrator.mint_confirm_revert.lock().unwrap() = None;
         *self.orchestrator.minted_log.lock().unwrap() = None;
         *self.orchestrator.mint_auth_failure.lock().unwrap() = None;
+        *self.orchestrator.mint_auth_hang.lock().unwrap() = false;
         *self.orchestrator.last_mint_params.lock().unwrap() = None;
         self.orchestrator
             .mint_preparation_call_count
@@ -880,6 +891,14 @@ impl MockVaultService {
         failure: MockMintAuthFailure,
     ) -> Self {
         *self.orchestrator.mint_auth_failure.lock().unwrap() = Some(failure);
+        self
+    }
+
+    /// Configures `validate_mint_authorization` to never resolve, standing
+    /// in for an unresponsive RPC provider.
+    #[cfg(test)]
+    pub(crate) fn with_mint_auth_hang(self) -> Self {
+        *self.orchestrator.mint_auth_hang.lock().unwrap() = true;
         self
     }
 
@@ -1883,6 +1902,9 @@ impl VaultService for MockVaultService {
             self.orchestrator
                 .mint_auth_validation_call_count
                 .fetch_add(1, Ordering::Relaxed);
+            if *self.orchestrator.mint_auth_hang.lock().unwrap() {
+                std::future::pending::<()>().await;
+            }
             let failure_opt =
                 *self.orchestrator.mint_auth_failure.lock().unwrap();
             match failure_opt {
@@ -1897,6 +1919,14 @@ impl VaultService for MockVaultService {
                         to: query.to,
                         nonce: query.nonce,
                     });
+                }
+                Some(MockMintAuthFailure::EmptySignatureForEoa) => {
+                    return Err(VaultError::MintAuthEmptySignatureForEoa {
+                        to: query.to,
+                    });
+                }
+                Some(MockMintAuthFailure::ReadFailed) => {
+                    return Err(VaultError::InvalidReceipt);
                 }
                 None => {}
             }

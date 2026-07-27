@@ -307,6 +307,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::*;
+    use crate::config::VaultMode;
     use crate::mint::{ClientId, Network, Quantity, TokenizationRequestId};
 
     async fn migrated_pool() -> SqlitePool {
@@ -355,6 +356,7 @@ mod tests {
         wallet: Address,
     ) -> MintEvent {
         MintEvent::Initiated {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new(
                 tokenization_request_id,
