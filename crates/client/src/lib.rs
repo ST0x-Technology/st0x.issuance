@@ -136,7 +136,7 @@ impl IssuanceClient {
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
-    use st0x_issuance_dto::TokenizedAssetStatus;
+    use st0x_issuance_dto::{TokenizedAssetStatus, VaultModeTag};
 
     use super::*;
 
@@ -157,7 +157,8 @@ mod tests {
                 .header(API_KEY_HEADER, "test-key");
             then.status(200).json_body(json!({
                 "underlying": "SGOV",
-                "status": "frozen"
+                "status": "frozen",
+                "vault_mode": "orchestrator"
             }));
         });
 
@@ -170,6 +171,10 @@ mod tests {
         mock.assert();
         assert_eq!(status.underlying, UnderlyingSymbol::new("SGOV").unwrap());
         assert_eq!(status.status, TokenizedAssetStatus::Frozen);
+        // The mode tag is what st0x.liquidity switches its mint flow on —
+        // this is the cross-repo path, so the client must surface it, not
+        // merely tolerate it.
+        assert_eq!(status.vault_mode, VaultModeTag::Orchestrator);
     }
 
     #[tokio::test]
