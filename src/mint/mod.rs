@@ -1302,9 +1302,15 @@ impl Mint {
     }
 
     /// Records an orchestrator mint proven landed by the full-match
-    /// `Minted`-log lookup after a `NonceReplayed` revert. Pure — emits
-    /// `OrchestratorMintRecovered`. Idempotent: a no-op once the mint has
-    /// advanced past `TxSubmitted`.
+    /// `Minted`-log lookup — driven from `Minting` by the `SubmitMintJob`'s
+    /// pre-submit check (the double-mint guard) and from `TxSubmitted` by
+    /// the `ConfirmMintJob`'s `NonceReplayed` recovery. `TxIntended` and
+    /// `MintingFailed` have no driving caller; they are accepted purely as
+    /// concurrent-delivery defenses — a discovering job read its state
+    /// before a sibling job recorded an intent or a failure, and rejecting
+    /// the proven landing would discard it for a whole re-drive cycle.
+    /// Pure — emits `OrchestratorMintRecovered`. Idempotent: a no-op once
+    /// the mint has advanced to `CallbackPending`.
     fn handle_record_orchestrator_mint_recovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
@@ -6157,6 +6163,54 @@ pub(crate) mod tests {
             .await
             .events();
         assert!(events.is_empty(), "a re-delivered recovery must be a no-op");
+    }
+
+    /// `TxIntended` and `MintingFailed` have no driving caller — the
+    /// recovery command reaches them only when a sibling job recorded an
+    /// intent or a failure after the discovering job loaded its state — but
+    /// the arms must still record the proven landing rather than discard it
+    /// for a whole re-drive cycle.
+    #[tokio::test]
+    async fn record_orchestrator_mint_recovered_accepts_race_states() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let mut intended_events =
+            orchestrator_events_through_minting_authorized(&issuer_request_id);
+        intended_events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: Utc::now(),
+        });
+        let failed_events = orchestrator_minting_failed_events(
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+            MintFailureClassification::NonceConsumedByOtherMint,
+        );
+
+        for events in [intended_events, failed_events] {
+            let emitted = TestHarness::<Mint>::with(())
+                .given(events)
+                .when(MintCommand::RecordOrchestratorMintRecovered {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: B256::ZERO,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: uint!(100_000000000000000000_U256),
+                    block_number: 777,
+                })
+                .await
+                .events();
+            assert!(
+                matches!(
+                    emitted.as_slice(),
+                    [MintEvent::OrchestratorMintRecovered { .. }]
+                ),
+                "a race-state delivery must still record the landing, got \
+                 {emitted:?}"
+            );
+        }
     }
 
     /// A vault receipt is a vault-direct proof: the bot never custodies a
