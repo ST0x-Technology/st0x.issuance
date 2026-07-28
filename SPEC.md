@@ -1513,24 +1513,24 @@ reference these as "Decision N".
    (whether Alpaca's ITN flow can carry an AP-produced signature through to us):
    the signature never goes through Alpaca. We validate the authorization
    (EIP-712/1271 signer check + `nonceUsed()` view) when the liquidity bot
-   delivers it, and associate it with the corresponding mint (e.g. by
-   `tokenization_request_id`) before the on-chain mint step. It is persisted by
+   delivers it, and associate it with the corresponding mint by
+   `tokenization_request_id` before the on-chain mint step. It is persisted by
    its own `AuthorizeMint` -> `MintAuthorizationReceived` pair, not on
-   `Initiated`, which is already written by the time it arrives. The exact
-   internal-call wire shape and correlation key are implementation details owned
-   by RAI-1220 (issuance side) plus the liquidity bot. **The launch scope is
-   deliberately staged:** this migration implements only the liquidity-bot
-   signature path (liquidity bot as the sole AP and recipient). A later phase
-   (the Atomic Bridge project) adds an atomic-bridge contract as a second
-   recipient type, using the orchestrator's `IMintRecipient.authorizeMint`
-   callback path — for that recipient `MintAuthV1.signature` is **empty** and
-   the orchestrator gates the mint on the contract's own on-chain intent instead
-   of a signature. We do not build that now, but we must not preclude it: the
-   issuance bot's authorization handling must treat the signature as opaque,
-   tolerate an **empty** signature (the callback case), and must not hardcode
-   "the recipient is always the liquidity bot." (A third option, the bot
-   self-signing and forwarding, stays a last resort only — it defeats the
-   compromised-mint-key protection this feature exists for.) Blocks RAI-1220.
+   `Initiated`, which is already written by the time it arrives. The concrete
+   internal-call wire shape and correlation key are settled — see "Recipient
+   Authorization" below. **The launch scope is deliberately staged:** this
+   migration implements only the liquidity-bot signature path (liquidity bot as
+   the sole AP and recipient). A later phase (the Atomic Bridge project) adds an
+   atomic-bridge contract as a second recipient type, using the orchestrator's
+   `IMintRecipient.authorizeMint` callback path — for that recipient
+   `MintAuthV1.signature` is **empty** and the orchestrator gates the mint on
+   the contract's own on-chain intent instead of a signature. We do not build
+   that now, but we must not preclude it: the issuance bot's authorization
+   handling must treat the signature as opaque, tolerate an **empty** signature
+   (the callback case), and must not hardcode "the recipient is always the
+   liquidity bot." (A third option, the bot self-signing and forwarding, stays a
+   last resort only — it defeats the compromised-mint-key protection this
+   feature exists for.) Blocks RAI-1220.
 2. **Nonce strategy** — _settled._ The nonce is fixed per mint, persisted in the
    event stream on `MintAuthorizationReceived` (before the first submission),
    and reused unchanged on retry, so `NonceReplayed` means the earlier mint
@@ -3744,7 +3744,11 @@ We run an HTTP server that implements these endpoints.
    address for AP
 4. **`POST /tokenized-assets`** - Add a new tokenized asset
 5. **`GET /tokenized-assets/<underlying>/status`** - Per-asset listing + freeze
-   status, consumed by the liquidity rebalance guard
+   status + `vault_mode`, consumed by the liquidity rebalance guard
+6. **`POST /internal/mints/<tokenization_request_id>/authorization`** - The
+   liquidity bot delivers its `MintAuthV1 { nonce, signature }` recipient
+   authorization for an orchestrator-mode mint (see "Orchestrator Migration" ->
+   "Recipient Authorization" for the wire shape and semantics)
 
 ### Endpoints We Call
 
