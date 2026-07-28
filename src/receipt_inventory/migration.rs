@@ -30,7 +30,8 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use super::{
-    ReceiptId, ReceiptInventory, Shares, SharesOverflow, load_inventory,
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
+    SharesOverflow, load_inventory, send_receipt_inventory_command,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::find_stuck as find_stuck_mints;
@@ -637,7 +638,28 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
             Ok(MigrationOutcome::AlreadyMigrated { receipts })
         }
         SourceCustody::Holds(holdings) => {
-            Ok(migrate_vault_custody(&custody, &holdings, recipient).await?)
+            let outcome =
+                migrate_vault_custody(&custody, &holdings, recipient).await?;
+
+            // Recorded only after the move is verified, so the inventory's
+            // custody history never claims a transfer that did not land. This
+            // is what a later rollback reads its destination from, instead of
+            // being handed an address.
+            if let MigrationOutcome::Migrated { transaction, .. } = &outcome {
+                send_receipt_inventory_command(
+                    &store,
+                    chain_id,
+                    &vault,
+                    ReceiptInventoryCommand::RecordCustodyMigration {
+                        from: holder,
+                        to: recipient,
+                        tx_hash: *transaction,
+                    },
+                )
+                .await?;
+            }
+
+            Ok(outcome)
         }
     }
 }

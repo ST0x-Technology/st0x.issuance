@@ -356,6 +356,10 @@ const fn receipt_inventory_operation(
         ReceiptInventoryCommand::ReserveBurn { .. } => "reserve_burn",
         ReceiptInventoryCommand::ReleaseBurn { .. } => "release_burn",
         ReceiptInventoryCommand::SettleBurn { .. } => "settle_burn",
+        ReceiptInventoryCommand::ConfirmCustody { .. } => "confirm_custody",
+        ReceiptInventoryCommand::RecordCustodyMigration { .. } => {
+            "record_custody_migration"
+        }
     }
 }
 
@@ -630,9 +634,53 @@ pub(crate) struct ReceiptInventory {
     /// Maps issuer_request_id to receipt_id for ITN mints.
     /// Used by mint recovery to check if a mint succeeded on-chain.
     itn_receipts: HashMap<IssuerMintRequestId, ReceiptId>,
+    /// The wallet these balances are held by, and the wallet each moved away
+    /// from. Absent on inventories that predate custody being recorded.
+    #[serde(default)]
+    custody: Custody,
+}
+
+/// Which wallet holds this vault's receipts.
+///
+/// Balances in this aggregate are `balanceOf(holder, receipt_id)` readings, so
+/// they only mean anything relative to a holder. Leaving that holder implicit is
+/// what allows a zero reading taken against the wrong wallet to be applied as a
+/// depletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Custody {
+    /// No custody has been observed yet. Inventories built before custody was
+    /// recorded start here.
+    #[default]
+    Unobserved,
+    /// `holder` is confirmed to hold the tracked receipts. `moved_from` is the
+    /// wallet custody was migrated away from, which is where a rollback returns
+    /// it to.
+    Held { holder: Address, moved_from: Option<Address> },
+}
+
+impl Custody {
+    pub(crate) const fn holder(&self) -> Option<Address> {
+        match self {
+            Self::Unobserved => None,
+            Self::Held { holder, .. } => Some(*holder),
+        }
+    }
+
+    /// The wallet custody was last migrated away from — a rollback's
+    /// destination, known without anyone having to name an address.
+    pub(crate) const fn moved_from(&self) -> Option<Address> {
+        match self {
+            Self::Unobserved => None,
+            Self::Held { moved_from, .. } => *moved_from,
+        }
+    }
 }
 
 impl ReceiptInventory {
+    pub(crate) const fn custody(&self) -> &Custody {
+        &self.custody
+    }
+
     /// Receipts with shares reserved against an in-flight redemption burn.
     ///
     /// Freezing an underlying rejects new mints but lets in-flight redemptions
@@ -825,6 +873,24 @@ pub(crate) enum ReceiptInventoryError {
         available: Shares,
         required: Shares,
     },
+    #[error(
+        "Refusing balance reading for receipt {receipt_id} taken against \
+         wallet {observed_wallet}: recorded custody holder is {holder}. \
+         Point the service at the holder or migrate custody with \
+         `issuer migrate-receipts`."
+    )]
+    CustodyDisplaced {
+        receipt_id: ReceiptId,
+        holder: Address,
+        observed_wallet: Address,
+    },
+    #[error(
+        "Refusing to deplete receipt {receipt_id} from a zero reading at \
+         wallet {observed_wallet}: no custody holder has ever been \
+         confirmed for this vault, so the reading cannot be distinguished \
+         from a wallet rotation. Run `issuer confirm-custody` first."
+    )]
+    CustodyUnconfirmed { receipt_id: ReceiptId, observed_wallet: Address },
 }
 
 impl ReceiptInventory {
@@ -860,10 +926,39 @@ impl ReceiptInventory {
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id,
                 on_chain_balance,
+                observed_wallet,
             } => {
                 let Some(metadata) = self.receipts.get(&receipt_id) else {
                     return Ok(vec![]);
                 };
+
+                // A reading only means anything relative to the wallet it was
+                // taken against. Refuse readings from a wallet other than the
+                // recorded holder, and refuse a destructive zero reading while
+                // custody has never been confirmed — a rotated wallet reading
+                // zero is indistinguishable from a spent receipt, and applying
+                // it would erase inventory the backfill checkpoint can never
+                // rediscover.
+                match self.custody.holder() {
+                    Some(holder) if holder != observed_wallet => {
+                        return Err(ReceiptInventoryError::CustodyDisplaced {
+                            receipt_id,
+                            holder,
+                            observed_wallet,
+                        });
+                    }
+                    None if on_chain_balance.is_zero()
+                        && !metadata.balance.is_zero() =>
+                    {
+                        return Err(
+                            ReceiptInventoryError::CustodyUnconfirmed {
+                                receipt_id,
+                                observed_wallet,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
 
                 let mirror = metadata.balance;
                 let available = metadata.available();
@@ -980,6 +1075,29 @@ impl ReceiptInventory {
                 .chain(depletions)
                 .collect())
             }
+
+            // Idempotent by design: the reconciler issues this on every clean
+            // pass, and an event per pass is what drove the RAI-617 OOM.
+            // Confirming the wallet already on record is a no-op; a different
+            // wallet — verified by the caller to hold every tracked receipt —
+            // records the change.
+            ReceiptInventoryCommand::ConfirmCustody { holder } => {
+                if self.custody.holder() == Some(holder) {
+                    return Ok(vec![]);
+                }
+
+                Ok(vec![ReceiptInventoryEvent::CustodyConfirmed { holder }])
+            }
+
+            ReceiptInventoryCommand::RecordCustodyMigration {
+                from,
+                to,
+                tx_hash,
+            } => Ok(vec![ReceiptInventoryEvent::CustodyMigrated {
+                from,
+                to,
+                tx_hash,
+            }]),
         }
     }
 
@@ -1129,6 +1247,20 @@ impl ReceiptInventory {
                     metadata.balance = new_balance;
                 }
             }
+
+            // Confirming custody establishes the holder without disturbing a
+            // migration already recorded against it.
+            ReceiptInventoryEvent::CustodyConfirmed { holder } => {
+                let moved_from = self.custody.moved_from();
+                self.custody = Custody::Held { holder, moved_from };
+            }
+
+            // A migration both moves the holder and records where it came from,
+            // which is where a rollback returns it to.
+            ReceiptInventoryEvent::CustodyMigrated { from, to, .. } => {
+                self.custody =
+                    Custody::Held { holder: to, moved_from: Some(from) };
+            }
         }
     }
 }
@@ -1251,6 +1383,10 @@ mod tests {
 
     const TEST_OA_SCHEMA: &str =
         "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
+
+    /// The wallet balance readings are taken against in these tests.
+    const OBSERVER: Address =
+        address!("00000000000000000000000000000000000000ab");
 
     fn make_receipt_id(n: u64) -> ReceiptId {
         ReceiptId::from(U256::from(n))
@@ -2399,6 +2535,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(100),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -2448,6 +2585,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(40),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -2486,6 +2624,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(50),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -2538,6 +2677,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(0),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -2562,6 +2702,9 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_zero_drain_preserves_reservation() {
         let mut aggregate = ReceiptInventory::default();
+        aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
+            holder: OBSERVER,
+        });
         drive(
             &mut aggregate,
             discover_receipt_cmd(
@@ -2587,6 +2730,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(0),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -2714,6 +2858,9 @@ mod tests {
         let redemption_id: IssuerRedemptionRequestId =
             "red-00000001".parse().unwrap();
         let mut aggregate = ReceiptInventory::default();
+        aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
+            holder: OBSERVER,
+        });
         drive(
             &mut aggregate,
             discover_receipt_cmd(
@@ -2739,6 +2886,7 @@ mod tests {
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id: make_receipt_id(1),
                 on_chain_balance: make_shares(0),
+                observed_wallet: OBSERVER,
             },
         )
         .await;
@@ -3169,6 +3317,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(100),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -3210,6 +3359,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(50),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -3233,6 +3383,9 @@ mod tests {
     async fn test_reconcile_zero_balance_emits_balance_reconciled_and_depleted()
     {
         let mut aggregate = ReceiptInventory::default();
+        aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
+            holder: OBSERVER,
+        });
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
@@ -3259,6 +3412,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(0),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -3288,6 +3442,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(99),
                     on_chain_balance: make_shares(0),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -3329,6 +3484,7 @@ mod tests {
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
                     on_chain_balance: make_shares(100),
+                    observed_wallet: OBSERVER,
                 },
                 &(),
             )
@@ -3811,6 +3967,224 @@ mod tests {
                 untouched, unexpected_id,
                 "aborted migration must leave the row untouched"
             );
+        }
+    }
+
+    mod custody {
+        use super::*;
+
+        const HOLDER: Address =
+            address!("00000000000000000000000000000000000000aa");
+        const REPLACEMENT: Address =
+            address!("00000000000000000000000000000000000000bb");
+
+        /// The aggregate-level backstop: a reading taken against a wallet
+        /// other than the recorded holder is refused outright — through this
+        /// handler there is no reader (reconciler, backfiller, or future
+        /// caller) that can apply a wrong-wallet reading.
+        #[tokio::test]
+        async fn a_reading_from_a_wallet_other_than_the_holder_is_refused() {
+            let mut aggregate = ReceiptInventory::default();
+            aggregate.apply_event(ReceiptInventoryEvent::Discovered {
+                receipt_id: make_receipt_id(1),
+                balance: make_shares(100),
+                block_number: 1,
+                tx_hash: TxHash::ZERO,
+                source: ReceiptSource::External,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            });
+            aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
+                holder: HOLDER,
+            });
+
+            let refusal = aggregate
+                .transition(
+                    ReceiptInventoryCommand::ReconcileBalance {
+                        receipt_id: make_receipt_id(1),
+                        on_chain_balance: make_shares(0),
+                        observed_wallet: REPLACEMENT,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                refusal,
+                ReceiptInventoryError::CustodyDisplaced {
+                    holder,
+                    observed_wallet,
+                    ..
+                } if holder == HOLDER && observed_wallet == REPLACEMENT
+            ));
+        }
+
+        /// A destructive zero reading while custody has never been confirmed
+        /// is refused: a rotated wallet reading zero is indistinguishable
+        /// from a spent receipt, so the operator must bootstrap custody with
+        /// `issuer confirm-custody` before any depletion can apply.
+        #[tokio::test]
+        async fn a_zero_reading_without_confirmed_custody_is_refused() {
+            let mut aggregate = ReceiptInventory::default();
+            aggregate.apply_event(ReceiptInventoryEvent::Discovered {
+                receipt_id: make_receipt_id(1),
+                balance: make_shares(100),
+                block_number: 1,
+                tx_hash: TxHash::ZERO,
+                source: ReceiptSource::External,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            });
+
+            let refusal = aggregate
+                .transition(
+                    ReceiptInventoryCommand::ReconcileBalance {
+                        receipt_id: make_receipt_id(1),
+                        on_chain_balance: make_shares(0),
+                        observed_wallet: REPLACEMENT,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                refusal,
+                ReceiptInventoryError::CustodyUnconfirmed {
+                    observed_wallet,
+                    ..
+                } if observed_wallet == REPLACEMENT
+            ));
+        }
+
+        /// A non-zero reading under unconfirmed custody stays allowed — the
+        /// discovery-era backfill reconciles balances upward before custody
+        /// is ever recorded, and a non-zero reading cannot destroy inventory.
+        #[tokio::test]
+        async fn a_nonzero_reading_without_confirmed_custody_is_applied() {
+            let mut aggregate = ReceiptInventory::default();
+            aggregate.apply_event(ReceiptInventoryEvent::Discovered {
+                receipt_id: make_receipt_id(1),
+                balance: make_shares(100),
+                block_number: 1,
+                tx_hash: TxHash::ZERO,
+                source: ReceiptSource::External,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            });
+
+            let events = aggregate
+                .transition(
+                    ReceiptInventoryCommand::ReconcileBalance {
+                        receipt_id: make_receipt_id(1),
+                        on_chain_balance: make_shares(60),
+                        observed_wallet: REPLACEMENT,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                events.as_slice(),
+                [ReceiptInventoryEvent::BalanceReconciled {
+                    on_chain_balance,
+                    ..
+                }] if *on_chain_balance == make_shares(60)
+            ));
+        }
+
+        /// The periodic reconciler confirms custody every pass. Only the first
+        /// confirmation is a fact worth recording; repeating it would grow the
+        /// event log a pass at a time, which is the RAI-617 failure shape.
+        #[tokio::test]
+        async fn confirming_the_same_holder_twice_emits_one_event() {
+            let mut aggregate = ReceiptInventory::default();
+
+            let events = aggregate
+                .transition(
+                    ReceiptInventoryCommand::ConfirmCustody { holder: HOLDER },
+                    &(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [ReceiptInventoryEvent::CustodyConfirmed { holder }]
+                    if *holder == HOLDER
+            ));
+            for event in events {
+                aggregate.apply_event(event);
+            }
+
+            let repeat = aggregate
+                .transition(
+                    ReceiptInventoryCommand::ConfirmCustody { holder: HOLDER },
+                    &(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                repeat.is_empty(),
+                "re-confirming an unchanged holder must be a no-op, got \
+                 {repeat:?}"
+            );
+        }
+
+        /// A migration is where a rollback's destination comes from: the event
+        /// keeps the outgoing wallet, so reversing the move needs no address
+        /// from anyone.
+        #[tokio::test]
+        async fn a_migration_records_where_custody_came_from() {
+            let mut aggregate = ReceiptInventory::default();
+            let tx_hash = b256!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            );
+
+            let events = aggregate
+                .transition(
+                    ReceiptInventoryCommand::RecordCustodyMigration {
+                        from: HOLDER,
+                        to: REPLACEMENT,
+                        tx_hash,
+                    },
+                    &(),
+                )
+                .await
+                .unwrap();
+            for event in events {
+                aggregate.apply_event(event);
+            }
+
+            assert_eq!(aggregate.custody().holder(), Some(REPLACEMENT));
+            assert_eq!(
+                aggregate.custody().moved_from(),
+                Some(HOLDER),
+                "the rollback destination must be readable off the aggregate"
+            );
+        }
+
+        /// Reconciliation passes after a migration keep confirming the new
+        /// holder; that must not erase where custody came from, or a rollback
+        /// after the first post-cutover pass would have nowhere to go.
+        #[tokio::test]
+        async fn confirming_after_a_migration_keeps_the_origin() {
+            let mut aggregate = ReceiptInventory::default();
+            let tx_hash = b256!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            );
+
+            aggregate.apply_event(ReceiptInventoryEvent::CustodyMigrated {
+                from: HOLDER,
+                to: REPLACEMENT,
+                tx_hash,
+            });
+            aggregate.apply_event(ReceiptInventoryEvent::CustodyConfirmed {
+                holder: REPLACEMENT,
+            });
+
+            assert_eq!(aggregate.custody().moved_from(), Some(HOLDER));
         }
     }
 }

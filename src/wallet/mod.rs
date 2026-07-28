@@ -111,27 +111,30 @@ impl SignerEnv {
             (Some(_), Some(_)) => Err(SignerConfigError::BothConfigured),
             (None, None) => Err(SignerConfigError::NeitherConfigured),
             (Some(key), None) => Ok(SignerConfig::Local(key)),
-            (None, Some(org_id)) => {
-                let api_private_key = TurnkeyApiPrivateKey::new(
-                    self.turnkey
-                        .api_private_key
-                        .ok_or(SignerConfigError::MissingApiPrivateKey)?,
-                );
-                let address = self
-                    .turnkey
-                    .address
-                    .ok_or(SignerConfigError::MissingAddress)?;
-
-                let config = TurnkeyConfig::new(
-                    TurnkeyOrganizationId::new(org_id),
-                    api_private_key,
-                    address,
-                );
-
-                Ok(SignerConfig::Turnkey(config))
-            }
+            (None, Some(org_id)) => signer_config_from_turnkey(
+                org_id,
+                self.turnkey.api_private_key,
+                self.turnkey.address,
+            ),
         }
     }
+}
+
+fn signer_config_from_turnkey(
+    org_id: String,
+    api_private_key: Option<String>,
+    address: Option<Address>,
+) -> Result<SignerConfig, SignerConfigError> {
+    let api_private_key = TurnkeyApiPrivateKey::new(
+        api_private_key.ok_or(SignerConfigError::MissingApiPrivateKey)?,
+    );
+    let address = address.ok_or(SignerConfigError::MissingAddress)?;
+
+    Ok(SignerConfig::Turnkey(TurnkeyConfig::new(
+        TurnkeyOrganizationId::new(org_id),
+        api_private_key,
+        address,
+    )))
 }
 
 impl SignerConfig {
