@@ -2,6 +2,7 @@ pub(crate) mod backfill;
 pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
+pub mod migration;
 pub(crate) mod reconcile;
 mod vault_key;
 pub(crate) mod view;
@@ -632,6 +633,20 @@ pub(crate) struct ReceiptInventory {
 }
 
 impl ReceiptInventory {
+    /// Receipts with shares reserved against an in-flight redemption burn.
+    ///
+    /// Freezing an underlying rejects new mints but lets in-flight redemptions
+    /// complete, so a freeze alone does not prove the wallet is quiescent. Any
+    /// reservation means a burn may still land against these receipts, which is
+    /// what makes moving their custody unsafe.
+    pub(crate) fn reserved_receipts(&self) -> Vec<ReceiptId> {
+        self.receipts
+            .iter()
+            .filter(|(_, metadata)| !metadata.reserved_total().is_zero())
+            .map(|(receipt_id, _)| *receipt_id)
+            .collect()
+    }
+
     pub(crate) fn receipts_with_balance(&self) -> Vec<ReceiptWithBalance> {
         self.receipts
             .iter()
@@ -1429,6 +1444,63 @@ mod tests {
             receipts[0].receipt_info,
             Some(receipt_info),
             "receipt_info should be preserved through command -> event -> state"
+        );
+    }
+
+    /// `reserved_receipts` is the receipt-custody migration's guard against
+    /// moving receipts out from under an in-flight redemption burn, so it has
+    /// to name exactly the reserved ones and nothing else.
+    #[tokio::test]
+    async fn reserved_receipts_names_only_receipts_with_a_live_reservation() {
+        let store = setup_store().await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let key = ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault);
+        let reserved_id = ReceiptId::from(U256::from(1));
+        let untouched_id = ReceiptId::from(U256::from(2));
+        let balance = Shares::new(U256::from(100));
+
+        for receipt_id in [reserved_id, untouched_id] {
+            store
+                .send(
+                    &key,
+                    discover_receipt_cmd(
+                        receipt_id,
+                        balance,
+                        1,
+                        TxHash::repeat_byte(9),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let idle =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
+        assert!(
+            idle.reserved_receipts().is_empty(),
+            "an idle vault has nothing reserved, so a migration may proceed"
+        );
+
+        store
+            .send(
+                &key,
+                ReceiptInventoryCommand::ReserveBurn {
+                    redemption_issuer_request_id: planning_redemption(),
+                    burns: vec![BurnRecord {
+                        receipt_id: reserved_id.inner(),
+                        shares_burned: U256::from(40),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let reserved =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
+        assert_eq!(
+            reserved.reserved_receipts(),
+            vec![reserved_id],
+            "only the receipt with an in-flight burn may block the migration"
         );
     }
 
