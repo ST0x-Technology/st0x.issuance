@@ -333,7 +333,16 @@ const fn tokenization_id_candidate_query() -> &'static str {
 
 /// Finds all mints that need recovery (not in terminal states).
 ///
-/// Returns mints in JournalConfirmed, Minting, MintingFailed, or CallbackPending states.
+/// Returns mints in JournalConfirmed, Minting, MintingFailed, or
+/// CallbackPending states. A `MintingFailed` with a typed classification is
+/// excluded: it is never auto-retried, so returning it would only make the
+/// reconciler re-enqueue the same skipped job every pass (the recovery
+/// driver's `ManualOnly` arm stays as the defense if one slips through).
+/// Classified failures remain operator-visible via [`find_stuck`]. The one
+/// classified EXCEPTION is `NonceReplayUnresolved`: recovery keeps
+/// reconciling it (a widened `Minted`-log re-query, never a resubmission),
+/// so it stays in the recoverable set (SPEC "Recipient Authorization" ->
+/// "Nonce").
 pub(crate) async fn find_all_recoverable_mints(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
@@ -355,7 +364,12 @@ pub(crate) async fn find_all_recoverable_mints(
                         | MintView::Minting { .. }
                         | MintView::MintIntended { .. }
                         | MintView::MintTxSubmitted { .. }
-                        | MintView::MintingFailed { .. }
+                        | MintView::MintingFailed {
+                            classification:
+                                MintFailureClassification::Unclassified
+                                    | MintFailureClassification::NonceReplayUnresolved,
+                            ..
+                        }
                         | MintView::CallbackPending { .. }
                 ))
             ) || result.is_err()
@@ -994,6 +1008,84 @@ mod tests {
         let pool = setup_test_db().await;
         let results = find_all_recoverable_mints(&pool).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    /// A `MintingFailed` carrying a typed classification is never
+    /// auto-retried, so the recoverable query excludes it — otherwise the
+    /// reconciler would re-enqueue the same skipped job every pass. It must
+    /// still surface to the operator via `find_stuck`.
+    #[tokio::test]
+    async fn test_find_all_recoverable_mints_excludes_classified_failures() {
+        let pool = setup_test_db().await;
+        let now = Utc::now();
+        let fields = test_mint_fields();
+        let classified_id = fields.issuer_request_id.clone();
+        insert_mint_view(
+            &pool,
+            &classified_id,
+            &MintView::MintingFailed {
+                issuer_request_id: classified_id.clone(),
+                tokenization_request_id: fields.tokenization_request_id.clone(),
+                quantity: fields.quantity.clone(),
+                underlying: fields.underlying.clone(),
+                token: fields.token.clone(),
+                network: fields.network,
+                client_id: fields.client_id,
+                wallet: fields.wallet,
+                initiated_at: fields.initiated_at,
+                journal_confirmed_at: now,
+                error: "nonce consumed by another mint".to_string(),
+                failed_at: now,
+                classification:
+                    MintFailureClassification::NonceConsumedByOtherMint,
+            },
+        )
+        .await;
+
+        // The one classified exception: an unresolved replay stays in the
+        // recoverable set so the reconciler keeps scheduling its widened
+        // `Minted`-log re-query (never a resubmission).
+        let unresolved_fields = test_mint_fields();
+        let unresolved_id = unresolved_fields.issuer_request_id.clone();
+        insert_mint_view(
+            &pool,
+            &unresolved_id,
+            &MintView::MintingFailed {
+                issuer_request_id: unresolved_id.clone(),
+                tokenization_request_id: unresolved_fields
+                    .tokenization_request_id
+                    .clone(),
+                quantity: unresolved_fields.quantity.clone(),
+                underlying: unresolved_fields.underlying.clone(),
+                token: unresolved_fields.token.clone(),
+                network: unresolved_fields.network,
+                client_id: unresolved_fields.client_id,
+                wallet: unresolved_fields.wallet,
+                initiated_at: unresolved_fields.initiated_at,
+                journal_confirmed_at: now,
+                error: "nonce consumed with no log at the pair".to_string(),
+                failed_at: now,
+                classification:
+                    MintFailureClassification::NonceReplayUnresolved,
+            },
+        )
+        .await;
+
+        let recoverable = find_all_recoverable_mints(&pool).await.unwrap();
+        assert!(
+            !recoverable.iter().any(|(id, _)| id == &classified_id),
+            "a proven classified failure must not be auto-recoverable"
+        );
+        assert!(
+            recoverable.iter().any(|(id, _)| id == &unresolved_id),
+            "an unresolved replay must stay recoverable for reconciliation"
+        );
+
+        let stuck = find_stuck(&pool).await.unwrap();
+        assert!(
+            stuck.iter().any(|(id, _)| id == &classified_id),
+            "the classified failure must stay operator-visible in find_stuck"
+        );
     }
 
     #[tokio::test]

@@ -157,11 +157,19 @@ pub(crate) enum MintCommand {
 
     /// Admin-closes a mint that cannot be automatically recovered.
     ///
-    /// Valid from any non-terminal state. Closed mints are excluded from
-    /// recovery and stuck queries.
+    /// Valid from any non-terminal state EXCEPT `CallbackPending`, which
+    /// already records an on-chain mint in this aggregate's history. Closed
+    /// mints are excluded from recovery and stuck queries.
     CloseMint {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        /// Required exactly when the mint is classified
+        /// `NonceReplayUnresolved`, and must echo its persisted
+        /// authorization nonce: the bot's own chain view is the thing in
+        /// doubt there, so the close records that an operator verified the
+        /// absence against an independent chain view. Rejected on any other
+        /// mint (SPEC "Mint Aggregate" -> `CloseMint`).
+        acknowledged_unresolved_mint_nonce: Option<B256>,
     },
 
     /// Associates the liquidity bot's validated `MintAuthV1` with this mint,

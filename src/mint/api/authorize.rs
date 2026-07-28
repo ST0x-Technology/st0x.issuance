@@ -783,6 +783,7 @@ mod tests {
                 MintCommand::CloseMint {
                     issuer_request_id: issuer_request_id.clone(),
                     reason: "operator close".to_string(),
+                    acknowledged_unresolved_mint_nonce: None,
                 },
             )
             .await
