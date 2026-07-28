@@ -39,6 +39,14 @@ pub enum FireblocksVaultError {
     )]
     TransactionFailed { tx_id: String, status: TransactionStatus },
     #[error(
+        "Fireblocks transaction {tx_id} is still {status:?} after the polling \
+         window — it may yet complete (console approval can take longer). \
+         Approve or reject it in the Fireblocks console, then re-run this \
+         command: the deterministic externalTxId resumes the same transaction \
+         instead of submitting a second one."
+    )]
+    PollTimedOut { tx_id: String, status: TransactionStatus },
+    #[error(
         "Fireblocks transaction {tx_id} did not include a transaction hash"
     )]
     MissingTxHash { tx_id: String },
@@ -72,14 +80,6 @@ pub enum FireblocksVaultError {
          Fireblocks console before retrying"
     )]
     RetryAttemptsExhausted { base_external_tx_id: String, attempts: u32 },
-    #[error(
-        "Fireblocks transaction {tx_id} is still {status:?} after the polling \
-         window — it may yet complete (console approval can take longer). \
-         Approve or reject it in the Fireblocks console, then re-run this \
-         command: the deterministic externalTxId resumes the same transaction \
-         instead of submitting a second one."
-    )]
-    PollTimedOut { tx_id: String, status: TransactionStatus },
 }
 
 /// How [`FireblocksVaultService::submit_contract_call`] obtained its
@@ -524,6 +524,28 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         })?;
 
         parse_tx_hash(&tx_hash_str)
+    }
+
+    /// The read-only provider this service fetches receipts through.
+    pub const fn read_provider(&self) -> &P {
+        &self.read_provider
+    }
+
+    /// Test constructor injecting a client pointed at a mock server.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        client: Client,
+        read_provider: P,
+        chain_id: u64,
+        chain_asset_ids: ChainAssetIds,
+    ) -> Self {
+        Self {
+            client,
+            vault_account_id: "0".to_string(),
+            chain_asset_ids,
+            read_provider,
+            chain_id,
+        }
     }
 
     /// Fetches a transaction receipt from the RPC provider.

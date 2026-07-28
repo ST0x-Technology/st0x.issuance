@@ -74,11 +74,14 @@ pub(crate) enum ReceiptInventoryEvent {
     /// Custody of every tracked receipt moved to a replacement wallet.
     ///
     /// `from` is retained because it is where a rollback returns custody to, so
-    /// reversing a migration needs no address from an operator.
+    /// reversing a migration needs no address from an operator. `tx_hash` is
+    /// absent when the transfer was signed outside this binary (the production
+    /// forward leg is signed by the retiring custodian) and the move was
+    /// verified against on-chain balances after the fact.
     CustodyMigrated {
         from: Address,
         to: Address,
-        tx_hash: TxHash,
+        tx_hash: Option<TxHash>,
     },
 }
 
