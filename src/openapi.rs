@@ -40,6 +40,7 @@ expressed as an OpenAPI scheme."
         st0x_issuance_dto::TokenizedAssetDetailResponse,
         st0x_issuance_dto::TokenizedAssetStatusResponse,
         st0x_issuance_dto::TokenizedAssetStatus,
+        st0x_issuance_dto::VaultModeTag,
         st0x_issuance_dto::AddTokenizedAssetRequest,
         st0x_issuance_dto::AddTokenizedAssetResponse,
         st0x_issuance_dto::UnderlyingSymbol,
@@ -223,6 +224,19 @@ mod tests {
             schemas["MintAuthorizationResponse"]["properties"]["issuer_request_id"]
                 ["type"],
             "string"
+        );
+        assert_eq!(schemas["VaultModeTag"]["type"], "string");
+        assert_eq!(
+            schemas["VaultModeTag"]["enum"],
+            serde_json::json!(["vault_direct", "orchestrator"])
+        );
+        // The parent must actually carry the field: registering the enum
+        // component alone would keep the assertions above green even if a
+        // derive regression dropped `vault_mode` from the status response.
+        assert_eq!(
+            schemas["TokenizedAssetStatusResponse"]["properties"]["vault_mode"]
+                ["$ref"],
+            "#/components/schemas/VaultModeTag"
         );
     }
 }
