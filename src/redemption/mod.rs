@@ -3,6 +3,7 @@ mod event;
 pub(crate) mod view;
 
 pub(crate) mod burn_manager;
+pub(crate) mod force_complete;
 pub(crate) mod journal_manager;
 pub(crate) mod poller;
 pub(crate) mod redeem_call_manager;
@@ -838,23 +839,52 @@ impl Redemption {
             Self::Burning { .. }
                 | Self::BurnIntended { .. }
                 | Self::BurnSubmitted { .. }
+                | Self::Failed { .. }
         ) {
             return Err(match self {
                 Self::Completed { .. } | Self::Closed { .. } => {
                     RedemptionError::AlreadyCompleted { issuer_request_id }
                 }
                 _ => RedemptionError::InvalidState {
-                    expected: "Burning, BurnIntended, or BurnSubmitted"
+                    expected: "Burning, BurnIntended, BurnSubmitted, or \
+                               Failed"
                         .to_string(),
                     found: self.state_name().to_string(),
                 },
             });
         }
-        let acknowledged_unresolved_burn_tx_hash = self
-            .validate_force_complete_burn_hash(
-                burn_tx_hash,
-                acknowledged_unresolved_burn_tx_hash,
-            )?;
+
+        // A legacy `Failed` redemption has no persisted signed transaction to
+        // bind the proving hash against — the burn went out through a
+        // custodian's API, identified only by a backend transaction id the
+        // current backend cannot look up. For that shape the caller's on-chain
+        // verification of the planned burns is the entire proof, so there is
+        // no hash to bind and nothing unresolved to acknowledge. Every state
+        // that does persist a signed transaction keeps the full binding and
+        // acknowledgement guard.
+        let legacy_burn_without_persisted_tx =
+            matches!(self, Self::Failed { .. })
+                && self
+                    .persisted_unresolved_burn_tx()
+                    .filter(|sendable_tx| !sendable_tx.tx.is_empty())
+                    .is_none();
+        let acknowledged_unresolved_burn_tx_hash =
+            if legacy_burn_without_persisted_tx {
+                if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
+                    return Err(
+                    RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                        provided,
+                    },
+                );
+                }
+
+                None
+            } else {
+                self.validate_force_complete_burn_hash(
+                    burn_tx_hash,
+                    acknowledged_unresolved_burn_tx_hash,
+                )?
+            };
 
         Ok(vec![RedemptionEvent::BurnForceCompleted {
             issuer_request_id,
@@ -4135,6 +4165,151 @@ mod tests {
                 RedemptionError::PersistedBurnHashUnavailable
             )
         ));
+    }
+
+    /// The legacy custodian-era shape: the burn was submitted through the
+    /// custodian's API (backend `tx_id`, no locally signed transaction), it
+    /// landed on-chain, and a later recovery pass found the share balance
+    /// already consumed and marked the redemption `Failed`. Nothing was ever
+    /// persisted to bind a hash against, so the admin layer's on-chain
+    /// verification of the planned burns is the proof — the aggregate must
+    /// accept the verified terminalization instead of stranding the
+    /// redemption in `Failed` forever.
+    #[tokio::test]
+    async fn force_complete_terminalizes_a_legacy_failed_burn() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let mut history = burning_given_events(&issuer_request_id);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "Fireblocks transaction polling timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: Some(TxId::Legacy("fb-1417".to_string())),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(3_U256),
+                shares_burned: uint!(40_000000000000000_U256),
+            }],
+        });
+        history.push(RedemptionEvent::RedemptionFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "On-chain balance insufficient for BurnFailed recovery: \
+                     balance=0, required=40000000000000000"
+                .to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: b256!(
+                    "0x5555555555555555555555555555555555555555555555555555555555555555"
+                ),
+                block_number: 33_000_000,
+                reason: "operator verified the landed burn on-chain"
+                    .to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnForceCompleted { .. }]
+        ));
+    }
+
+    /// The legacy shape has no persisted transaction, so there is nothing an
+    /// acknowledgement could refer to — supplying one anyway must be refused
+    /// rather than recorded as a meaningless fact on the terminal event.
+    #[tokio::test]
+    async fn force_complete_of_legacy_failed_burn_refuses_redundant_acknowledgement()
+     {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let mut history = burning_given_events(&issuer_request_id);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "Fireblocks transaction polling timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: Some(TxId::Legacy("fb-1417".to_string())),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(3_U256),
+                shares_burned: uint!(40_000000000000000_U256),
+            }],
+        });
+        history.push(RedemptionEvent::RedemptionFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "On-chain balance insufficient for BurnFailed recovery: \
+                     balance=0, required=40000000000000000"
+                .to_string(),
+            failed_at: Utc::now(),
+        });
+        let provided = B256::random();
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: b256!(
+                    "0x5555555555555555555555555555555555555555555555555555555555555555"
+                ),
+                block_number: 33_000_000,
+                reason: "operator verified the landed burn on-chain"
+                    .to_string(),
+                acknowledged_unresolved_burn_tx_hash: Some(provided),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                provided,
+            }
+        );
+    }
+
+    /// A `Failed` redemption still carrying a persisted signed burn keeps the
+    /// acknowledgement guard: force-completing against a different proving
+    /// transaction must name the persisted hash the operator is stranding.
+    #[tokio::test]
+    async fn force_complete_from_failed_with_unresolved_burn_requires_acknowledgement()
+     {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let persisted_hash = B256::random();
+        let mut history =
+            burn_intended_given_events(&issuer_request_id, persisted_hash);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "confirmation timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: B256::random(),
+                block_number: 33_000_000,
+                reason: "different burn verified on-chain".to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::UnresolvedBurnRequiresAcknowledgement {
+                burn_tx_hash: persisted_hash,
+            }
+        );
     }
 
     #[tokio::test]

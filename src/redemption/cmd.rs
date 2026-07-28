@@ -100,10 +100,12 @@ pub(crate) enum RedemptionCommand {
         acknowledged_unresolved_burn_tx_hash: Option<B256>,
     },
     /// Admin-terminalizes a redemption stuck in
-    /// `Burning`/`BurnIntended`/`BurnSubmitted` whose burn already landed
-    /// on-chain. The admin layer verifies `burn_tx_hash` before issuing this
-    /// command; the aggregate records it as proof and transitions to
-    /// `Completed`.
+    /// `Burning`/`BurnIntended`/`BurnSubmitted`/`Failed` whose burn already
+    /// landed on-chain. The admin layer verifies `burn_tx_hash` before
+    /// issuing this command; the aggregate records it as proof and
+    /// transitions to `Completed`. A legacy `Failed` redemption with no
+    /// persisted signed transaction has no hash to bind, so the caller's
+    /// on-chain verification of the planned burns is the entire proof there.
     ForceCompleteBurn {
         issuer_request_id: IssuerRedemptionRequestId,
         burn_tx_hash: B256,

@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Parser, Subcommand};
 use event_sorcery::{
@@ -32,6 +32,11 @@ use crate::receipt_inventory::migration::{
     recorded_migration_origin, rollback_gas_reserve, verify_rollback_signing,
 };
 use crate::receipt_inventory::{ReceiptInventory, load_inventory};
+use crate::redemption::IssuerRedemptionRequestId;
+use crate::redemption::force_complete::{
+    VerifiedCompletion, ensure_burn_unclaimed, landed_burn_evidence,
+    terminalize_and_settle, verify_landed_burn,
+};
 use crate::underlying::{
     AssetStatus, Underlying, UnderlyingCommand, UnderlyingViewError,
     load_freeze_status,
@@ -117,6 +122,15 @@ enum IssuerCommand {
     /// only live-transaction step, and the full proof of the custodian's own
     /// signing path.
     VerifyCustodians(Box<VerifyCustodiansArgs>),
+    /// Terminalize a Failed redemption whose burn already landed on-chain.
+    /// For legacy custodian-era burns whose backend transaction id the
+    /// current signing backend cannot look up: the operator supplies the
+    /// on-chain transaction hash, and everything else is verified — the
+    /// transaction must be a successful burn on the redemption's vault whose
+    /// per-receipt withdrawals match the persisted burn plan exactly, and no
+    /// other redemption may already claim it. Completes the redemption and
+    /// settles its receipt reservation like a normal burn confirmation.
+    ForceCompleteRedemption(Box<ForceCompleteRedemptionArgs>),
 }
 
 /// Which way the operator intends custody to move. Stated explicitly and
@@ -235,6 +249,60 @@ struct VerifyCustodiansArgs {
 }
 
 #[derive(Args)]
+struct ForceCompleteRedemptionArgs {
+    /// Issuer redemption request id of the Failed redemption.
+    issuer_request_id: IssuerRedemptionRequestId,
+
+    /// On-chain hash of the transaction the operator asserts is this
+    /// redemption's landed burn. Verified against the persisted burn plan
+    /// before anything is recorded.
+    #[arg(long)]
+    burn_tx_hash: B256,
+
+    /// Network the redemption was detected on, cross-checked against the
+    /// event history and the RPC endpoint.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against. Deliberately redundant with `--network`:
+    /// the command refuses unless both name the same chain and the RPC
+    /// reports it, so a destructive terminalization needs two independent
+    /// statements of where it runs.
+    #[arg(long)]
+    chain_id: u64,
+
+    /// Why the redemption is being force-completed; recorded on the terminal
+    /// event for the audit trail.
+    #[arg(long)]
+    reason: String,
+
+    /// Exact persisted signed burn hash the operator has reconciled and
+    /// explicitly acknowledges may still land, when the redemption carries an
+    /// unresolved signed transaction different from `--burn-tx-hash`.
+    #[arg(long)]
+    acknowledged_unresolved_burn_tx_hash: Option<B256>,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
+#[derive(Args)]
 struct ConfirmCustodyArgs {
     /// Underlying symbol, e.g. AMAT. Upper-cased like [`AssetArgs`].
     #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
@@ -315,6 +383,9 @@ impl IssuerCli {
             }
             IssuerCommand::VerifyCustodians(args) => {
                 run_verify_custodians(*args, prompt_confirm).await
+            }
+            IssuerCommand::ForceCompleteRedemption(args) => {
+                run_force_complete_redemption(*args, prompt_confirm).await
             }
         }
     }
@@ -486,6 +557,114 @@ async fn run_verify_custodians(
     }
 
     println!("Both custodian connections verified.");
+
+    Ok(())
+}
+
+/// Verifies an operator-supplied transaction as a Failed redemption's landed
+/// burn, then terminalizes the redemption and settles its receipt
+/// reservation.
+///
+/// The hash is the only thing the operator asserts; the binding is proven,
+/// not trusted: the transaction must be a successful burn on the vault the
+/// redemption's asset resolves to, its per-receipt withdrawals must match the
+/// persisted burn plan exactly, and no other redemption's history may mention
+/// it. The withdrawal owner is recovered from the transaction's own
+/// signature, so a burn by any unrelated wallet cannot match unless it
+/// consumed exactly the receipts this redemption reserved.
+async fn run_force_complete_redemption(
+    args: ForceCompleteRedemptionArgs,
+    confirm: impl Fn(&str) -> io::Result<bool>,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+
+    let evidence =
+        landed_burn_evidence(&admin.pool, &args.issuer_request_id).await?;
+    if evidence.network != args.network {
+        anyhow::bail!(
+            "redemption {} was detected on {}, not --network {}",
+            args.issuer_request_id,
+            evidence.network,
+            args.network
+        );
+    }
+    let vault =
+        find_vault(&admin.pool, &evidence.underlying, &evidence.network)
+            .await?
+            .ok_or_else(|| AssetAdminError::NotFound {
+                underlying: evidence.underlying.clone(),
+            })?;
+
+    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let provider =
+        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+
+    let landed = verify_landed_burn(
+        &provider,
+        vault,
+        args.burn_tx_hash,
+        &evidence.planned_burns,
+    )
+    .await?;
+    ensure_burn_unclaimed(
+        &admin.pool,
+        &args.issuer_request_id,
+        args.burn_tx_hash,
+    )
+    .await?;
+
+    println!(
+        "{} redemption {}: transaction {} at block {} burned {} share(s) of \
+         vault {vault} across {} receipt(s), signed by {}, matching the \
+         persisted burn plan exactly",
+        evidence.underlying,
+        args.issuer_request_id,
+        args.burn_tx_hash,
+        landed.verification.block_number,
+        landed.verification.shares_burned,
+        landed.verification.burns.len(),
+        landed.owner,
+    );
+
+    if !confirm(&format!(
+        "Force-complete redemption {} with this verified burn and settle its \
+         receipt reservation?",
+        args.issuer_request_id
+    ))? {
+        anyhow::bail!("aborted by operator");
+    }
+
+    terminalize_and_settle(
+        &admin.pool,
+        chain_id,
+        vault,
+        &args.issuer_request_id,
+        VerifiedCompletion {
+            burn_tx_hash: args.burn_tx_hash,
+            block_number: landed.verification.block_number,
+            reason: args.reason.clone(),
+            acknowledged_unresolved_burn_tx_hash: args
+                .acknowledged_unresolved_burn_tx_hash,
+        },
+    )
+    .await?;
+
+    println!(
+        "Force-completed redemption {} and settled its reservation.",
+        args.issuer_request_id
+    );
 
     Ok(())
 }
@@ -1270,11 +1449,16 @@ fn parse_confirmation(input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{U256, address, b256};
+    use chrono::Utc;
+    use cqrs_es::DomainEvent;
+    use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::Quantity;
+    use crate::redemption::{BurnRecord, RedemptionEvent};
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -1805,6 +1989,156 @@ mod tests {
         assert!(
             error.to_string().contains("no recorded custody holder"),
             "unobserved custody must demand confirm-custody, got {error}"
+        );
+    }
+
+    /// Seeds a redemption detected on Base, so a force-complete invocation
+    /// naming another network contradicts the event history.
+    async fn seed_detected_redemption_at(
+        database_url: &str,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(database_url)
+            .await
+            .expect("Failed to open database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let events = [
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("AMAT").unwrap(),
+                token: TokenSymbol::new("tAMAT"),
+                network: Network::Base,
+                wallet: address!("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+                quantity: Quantity::new(Decimal::new(4, 2)),
+                tx_hash: b256!(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                ),
+                block_number: 30_000_000,
+                detected_at: Utc::now(),
+            },
+            RedemptionEvent::BurningFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Fireblocks transaction polling timed out".to_string(),
+                failed_at: Utc::now(),
+                tx_id: None,
+                planned_burns: vec![BurnRecord {
+                    receipt_id: U256::from(3),
+                    shares_burned: U256::from(40_000_000_000_000_000_u64),
+                }],
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+                ",
+            )
+            .bind(issuer_request_id.to_string())
+            .bind(i64::try_from(index).unwrap() + 1)
+            .bind(event.event_type())
+            .bind(serde_json::to_string(event).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to seed redemption event");
+        }
+    }
+
+    fn force_complete_args(
+        issuer_request_id: &str,
+        network: &str,
+        chain_id: &str,
+        database_url: &str,
+    ) -> ForceCompleteRedemptionArgs {
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "force-complete-redemption",
+            issuer_request_id,
+            "--burn-tx-hash",
+            "0x5555555555555555555555555555555555555555555555555555555555555555",
+            "--network",
+            network,
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--chain-id",
+            chain_id,
+            "--reason",
+            "operator verified the landed burn on-chain",
+            "--database-url",
+            database_url,
+        ])
+        .expect("arguments parse");
+
+        let IssuerCommand::ForceCompleteRedemption(args) = cli.command else {
+            panic!("expected the force-complete-redemption subcommand")
+        };
+
+        *args
+    }
+
+    /// The two independent statements of where the command runs must agree
+    /// before anything is touched — the database and RPC endpoint are
+    /// unreachable on purpose.
+    #[tokio::test]
+    async fn force_complete_refuses_a_chain_id_that_contradicts_the_network() {
+        let args = force_complete_args(
+            "red-00000001",
+            "base",
+            "1",
+            "sqlite:unreachable.db",
+        );
+
+        let error = run_force_complete_redemption(args, |_| Ok(true))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("--chain-id is 1"),
+            "a contradicting chain id must be refused, got {error}"
+        );
+    }
+
+    /// A force-complete naming a network other than the one the redemption
+    /// was detected on must be refused from the event history alone, before
+    /// any chain access — the RPC endpoint is unreachable on purpose.
+    #[tokio::test]
+    async fn force_complete_refuses_a_network_that_contradicts_the_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("history.db").display()
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_detected_redemption_at(&database_url, &issuer_request_id).await;
+
+        let args = force_complete_args(
+            &issuer_request_id.to_string(),
+            "ethereum",
+            "1",
+            &database_url,
+        );
+
+        let error = run_force_complete_redemption(args, |_| Ok(true))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("was detected on"),
+            "a network contradicting the history must be refused, got {error}"
         );
     }
 
