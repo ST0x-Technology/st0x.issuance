@@ -552,6 +552,17 @@ pub(crate) enum AutomaticRetryDecision {
     Wait(std::time::Duration),
     Exhausted,
     NotRecoverable,
+    /// The failure carries a typed classification — never auto-retried
+    /// (`NonceConsumedByOtherMint` needs manual reconciliation; the
+    /// logic-mismatch halts resolve environment-wide). Only the operator's
+    /// manual recovery may proceed.
+    ManualOnly(MintFailureClassification),
+    /// `NonceReplayUnresolved`: never RESUBMITTED (the nonce is consumed
+    /// either way, a resubmission can only revert) but retried for
+    /// RECONCILIATION — recovery re-runs the `Minted`-log full-match over a
+    /// widened window on its normal schedule, and a later match resolves
+    /// the mint forward (SPEC "Recipient Authorization" -> "Nonce").
+    ReconcileOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,7 +731,9 @@ impl Mint {
         &self,
         now: DateTime<Utc>,
     ) -> AutomaticRetryDecision {
-        let Self::MintingFailed { failed_at, attempts, .. } = self else {
+        let Self::MintingFailed { failed_at, attempts, classification, .. } =
+            self
+        else {
             return match self {
                 Self::JournalConfirmed { .. }
                 | Self::Minting { .. }
@@ -730,6 +743,18 @@ impl Mint {
                 _ => AutomaticRetryDecision::NotRecoverable,
             };
         };
+
+        // Typed classifications are never auto-RESUBMITTED — decided before
+        // any attempt/budget bookkeeping so exhaustion accounting is
+        // untouched (mirrors the burn side's classified-skip). The
+        // inconclusive replay is the one classification recovery keeps
+        // touching: reconciliation-only, never a resubmission.
+        if *classification == MintFailureClassification::NonceReplayUnresolved {
+            return AutomaticRetryDecision::ReconcileOnly;
+        }
+        if *classification != MintFailureClassification::Unclassified {
+            return AutomaticRetryDecision::ManualOnly(*classification);
+        }
 
         if *attempts > Self::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT {
             return AutomaticRetryDecision::Exhausted;
@@ -873,6 +898,44 @@ impl Mint {
     /// authorization — the exact states [`Self::handle_authorize_mint`]
     /// destructures (keep the two in sync). The tokenization-id lookup uses
     /// this to prefer a live mint over stale same-id duplicates.
+    /// Every persisted signed transaction in this mint's history with no
+    /// recorded terminal on-chain outcome, plus whether the history holds a
+    /// submission that persisted NO signed bytes (legacy custodian-era
+    /// submissions) — which can never be proven dead and therefore blocks a
+    /// guarded close (SPEC "Mint Aggregate" -> `CloseMint`). Walks the
+    /// `failed_from` predecessor chain, since a `MintingFailed` (or a
+    /// retrying `Minting`) still carries the transaction that put it there.
+    pub(crate) fn unresolved_persisted_txs(
+        &self,
+    ) -> (Vec<&PreparedMintTx>, bool) {
+        match self {
+            Self::TxIntended { prepared_tx, .. } => (vec![prepared_tx], false),
+            Self::TxSubmitted { prepared_tx, .. } => {
+                prepared_tx.as_ref().map_or_else(
+                    || (Vec::new(), true),
+                    |prepared| (vec![prepared], false),
+                )
+            }
+            Self::MintingFailed { failed_from, .. } => {
+                failed_from.unresolved_persisted_txs()
+            }
+            Self::Minting { retry: Some(context), .. } => {
+                context.failed_from.unresolved_persisted_txs()
+            }
+            _ => (Vec::new(), false),
+        }
+    }
+
+    pub(crate) const fn accepts_mint_authorization(&self) -> bool {
+        matches!(
+            self,
+            Self::Initiated { .. }
+                | Self::JournalConfirmed { .. }
+                | Self::Minting { .. }
+        )
+    }
+
+    /// The recipient authorization delivered by the liquidity bot, if any.
     pub(crate) const fn mint_authorization(
         &self,
     ) -> Option<&MintAuthorization> {
@@ -890,15 +953,6 @@ impl Mint {
             }
             Self::Closed { .. } => None,
         }
-    }
-
-    pub(crate) const fn accepts_mint_authorization(&self) -> bool {
-        matches!(
-            self,
-            Self::Initiated { .. }
-                | Self::JournalConfirmed { .. }
-                | Self::Minting { .. }
-        )
     }
 
     /// Associates the liquidity bot's validated authorization with this mint
@@ -1301,9 +1355,32 @@ impl Mint {
         block_number: u64,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
-            Self::TxSubmitted {
+            Self::Minting {
                 issuer_request_id: expected_id,
                 mint_mode,
+                mint_authorization,
+                quantity,
+                ..
+            }
+            | Self::TxIntended {
+                issuer_request_id: expected_id,
+                mint_mode,
+                mint_authorization,
+                quantity,
+                ..
+            }
+            | Self::TxSubmitted {
+                issuer_request_id: expected_id,
+                mint_mode,
+                mint_authorization,
+                quantity,
+                ..
+            }
+            | Self::MintingFailed {
+                issuer_request_id: expected_id,
+                mint_mode,
+                mint_authorization,
+                quantity,
                 ..
             } => {
                 Self::validate_issuer_request_id(
@@ -1315,6 +1392,34 @@ impl Mint {
                     return Err(MintError::MintModeMismatch {
                         expected: mint_mode.kind(),
                         found: VaultModeKind::Orchestrator,
+                    });
+                }
+
+                // Same defense-in-depth invariants as the confirmation
+                // handler above: the recovery scan's full-match already
+                // compared the log against this mint's request facts, but
+                // the aggregate must not trust its callers — a recovered
+                // record diverging from what this mint was authorized for
+                // must fail loudly rather than become the persisted audit
+                // record.
+                let authorization = mint_authorization
+                    .as_ref()
+                    .ok_or(MintError::MissingMintAuthorization)?;
+                if nonce != authorization.nonce {
+                    return Err(MintError::MintedNonceMismatch {
+                        expected: authorization.nonce,
+                        actual: nonce,
+                    });
+                }
+                let authorized_shares = quantity
+                    .to_u256_with_18_decimals()
+                    .map_err(|error| MintError::QuantityConversion {
+                        message: error.to_string(),
+                    })?;
+                if shares_minted != authorized_shares {
+                    return Err(MintError::MintedSharesMismatch {
+                        expected: authorized_shares,
+                        actual: shares_minted,
                     });
                 }
 
@@ -1376,6 +1481,32 @@ impl Mint {
             Self::Minting { issuer_request_id: expected_id, .. }
             | Self::TxIntended { issuer_request_id: expected_id, .. }
             | Self::TxSubmitted { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintingFailed {
+                    issuer_request_id,
+                    error,
+                    failed_at: Utc::now(),
+                    classification,
+                }])
+            }
+            // The one verdict a later failure may supersede: the
+            // INCONCLUSIVE `NonceReplayUnresolved` upgrades to the proven
+            // `NonceConsumedByOtherMint` once reconciliation's widened scan
+            // actually finds the pair's landing disagreeing on token/amount
+            // (SPEC "Nonce", two outcomes). Every other `MintingFailed`
+            // re-record stays a no-op — a proven or halt verdict is never
+            // silently rewritten.
+            Self::MintingFailed {
+                issuer_request_id: expected_id,
+                classification: MintFailureClassification::NonceReplayUnresolved,
+                ..
+            } if classification
+                == MintFailureClassification::NonceConsumedByOtherMint =>
+            {
                 Self::validate_issuer_request_id(
                     expected_id,
                     &issuer_request_id,
@@ -1489,6 +1620,10 @@ impl Mint {
     /// exists), reported by the `SubmitMintJob` before it re-submitted. Pure —
     /// emits `ExistingMintRecovered`, advancing to `CallbackPending` without
     /// re-minting. Idempotent: a no-op once the mint is already minted.
+    /// Rejects orchestrator-anchored mints: the bot never custodies a receipt
+    /// for them, so a receipt-discovery delivery would be a mis-attribution
+    /// (receipt ingestion filters on bot ownership, but the anchor is the
+    /// authoritative guard).
     fn handle_record_existing_mint(
         &self,
         issuer_request_id: IssuerMintRequestId,
@@ -1498,10 +1633,24 @@ impl Mint {
         block_number: u64,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
-            Self::Minting { issuer_request_id: expected_id, .. }
-            | Self::TxIntended { issuer_request_id: expected_id, .. }
-            | Self::TxSubmitted { issuer_request_id: expected_id, .. }
-            | Self::MintingFailed { issuer_request_id: expected_id, .. } => {
+            Self::Minting {
+                issuer_request_id: expected_id, mint_mode, ..
+            }
+            | Self::TxIntended {
+                issuer_request_id: expected_id,
+                mint_mode,
+                ..
+            }
+            | Self::TxSubmitted {
+                issuer_request_id: expected_id,
+                mint_mode,
+                ..
+            }
+            | Self::MintingFailed {
+                issuer_request_id: expected_id,
+                mint_mode,
+                ..
+            } => {
                 Self::validate_issuer_request_id(
                     expected_id,
                     &issuer_request_id,
@@ -1511,9 +1660,9 @@ impl Mint {
                 // custodies a receipt for an orchestrator mint, so this path
                 // should be unreachable for one — the guard mirrors the
                 // other record handlers as defence in depth.
-                if let Some(VaultMode::Orchestrator { .. }) = self.mint_mode() {
+                if let VaultMode::Orchestrator { .. } = mint_mode {
                     return Err(MintError::MintModeMismatch {
-                        expected: VaultModeKind::Orchestrator,
+                        expected: mint_mode.kind(),
                         found: VaultModeKind::VaultDirect,
                     });
                 }
@@ -2286,16 +2435,31 @@ impl Mint {
             retry: Some(MintRetryContext { attempts, failed_from, tx_hash }),
         };
     }
+
+    /// Admin-closes a mint. Pure — the aggregate has no services, so the
+    /// orchestrator landed-`Minted`-log pre-close check (closing a mint whose
+    /// tokens actually minted on-chain would strand real backed tokens
+    /// unreported to Alpaca) runs in the admin `close_mint` endpoint before
+    /// this command is sent.
     fn handle_close_mint(
         &self,
         issuer_request_id: IssuerMintRequestId,
         reason: String,
         acknowledged_unresolved_mint_tx_hash: Option<B256>,
+        acknowledged_unresolved_mint_nonce: Option<B256>,
     ) -> Result<Vec<MintEvent>, MintError> {
         if matches!(self, Self::Completed { .. } | Self::Closed { .. }) {
             return Err(MintError::NotRecoverable {
                 current_state: self.state_name().to_string(),
             });
+        }
+
+        // `CallbackPending` already records an on-chain mint in this
+        // aggregate's own history — an economically committed mint must
+        // resolve through the success path (the callback), never a close
+        // that would strand real backed tokens unreported.
+        if matches!(self, Self::CallbackPending { .. }) {
+            return Err(MintError::CloseAfterMintRecorded);
         }
 
         // A legacy `TxSubmitted { prepared_tx: None }` carries no prepared
@@ -2309,10 +2473,25 @@ impl Mint {
             .or_else(|| {
                 self.latest_known_tx_id().and_then(|tx_id| tx_id.to_hash())
             });
+        // A typed classification is the aggregate's own adjudication that the
+        // persisted transaction can no longer land (and the admin close path
+        // re-proves the landing question on-chain before sending this
+        // command), so the tx-hash acknowledgement is demanded only for
+        // unclassified failure chains — for `NonceReplayUnresolved` the nonce
+        // acknowledgement below is the required operator claim instead.
+        let classified_terminal = matches!(
+            self,
+            Self::MintingFailed { classification, .. }
+                if !matches!(
+                    classification,
+                    MintFailureClassification::Unclassified
+                )
+        );
         let acknowledged_unresolved_mint_tx_hash = match (
             unresolved_mint_tx_hash,
             acknowledged_unresolved_mint_tx_hash,
         ) {
+            (Some(_), None) if classified_terminal => None,
             (Some(mint_tx_hash), acknowledgement) => {
                 Some(Self::require_unresolved_mint_acknowledgement(
                     mint_tx_hash,
@@ -2329,10 +2508,48 @@ impl Mint {
             (None, None) => None,
         };
 
+        // The nonce acknowledgement is the operator's recorded claim that the
+        // nonce's absence was verified against a chain view OUTSIDE this
+        // bot — meaningful exactly when the bot's own view is the thing in
+        // doubt (`NonceReplayUnresolved`), and rejected anywhere else so it
+        // can never become a general-purpose close override.
+        let unresolved_nonce = match self {
+            Self::MintingFailed {
+                classification: MintFailureClassification::NonceReplayUnresolved,
+                mint_authorization,
+                ..
+            } => mint_authorization
+                .as_ref()
+                .map(|authorization| authorization.nonce),
+            _ => None,
+        };
+        match (unresolved_nonce, acknowledged_unresolved_mint_nonce) {
+            (Some(expected), Some(provided)) if expected != provided => {
+                return Err(MintError::AcknowledgedNonceMismatch {
+                    expected,
+                    provided,
+                });
+            }
+            (Some(expected), None) => {
+                return Err(
+                    MintError::UnresolvedReplayAcknowledgementRequired {
+                        nonce: expected,
+                    },
+                );
+            }
+            (None, Some(provided)) => {
+                return Err(MintError::AcknowledgementNotApplicable {
+                    provided,
+                });
+            }
+            _ => {}
+        }
+
         Ok(vec![MintEvent::MintClosed {
             issuer_request_id,
             reason,
             acknowledged_unresolved_mint_tx_hash,
+            acknowledged_unresolved_mint_nonce,
             closed_at: Utc::now(),
         }])
     }
@@ -2640,10 +2857,12 @@ impl EventSourced for Mint {
                 issuer_request_id,
                 reason,
                 acknowledged_unresolved_mint_tx_hash,
+                acknowledged_unresolved_mint_nonce,
             } => self.handle_close_mint(
                 issuer_request_id,
                 reason,
                 acknowledged_unresolved_mint_tx_hash,
+                acknowledged_unresolved_mint_nonce,
             ),
         }
     }
@@ -2793,6 +3012,9 @@ impl Mint {
                 issuer_request_id,
                 reason,
                 acknowledged_unresolved_mint_tx_hash,
+                // The nonce acknowledgement is audit data on the event; the
+                // `Closed` state carries the lifecycle facts.
+                acknowledged_unresolved_mint_nonce: _,
                 closed_at,
             } => {
                 *self = Self::Closed {
@@ -2828,6 +3050,29 @@ pub(crate) enum MintError {
         "Mint result mode mismatch: the mint's persisted anchor is {expected}, the recorded result is {found}"
     )]
     MintModeMismatch { expected: VaultModeKind, found: VaultModeKind },
+    #[error(
+        "Mint cannot be closed from CallbackPending: an on-chain mint is \
+         already recorded — resolve it through the callback path instead"
+    )]
+    CloseAfterMintRecorded,
+    #[error(
+        "Closing a NonceReplayUnresolved mint requires \
+         acknowledged_unresolved_mint_nonce echoing its persisted nonce \
+         {nonce}: the bot's own chain view is in doubt, so an operator must \
+         verify the absence against an independent chain view first"
+    )]
+    UnresolvedReplayAcknowledgementRequired { nonce: B256 },
+    #[error(
+        "acknowledged_unresolved_mint_nonce {provided} does not echo the \
+         mint's persisted nonce {expected}"
+    )]
+    AcknowledgedNonceMismatch { expected: B256, provided: B256 },
+    #[error(
+        "acknowledged_unresolved_mint_nonce {provided} was supplied but this \
+         mint is not classified NonceReplayUnresolved; the acknowledgement \
+         is not a general-purpose close override"
+    )]
+    AcknowledgementNotApplicable { provided: B256 },
     #[error("Orchestrator mint has no recorded authorization to check against")]
     MissingMintAuthorization,
     #[error(
@@ -3765,6 +4010,265 @@ pub(crate) mod tests {
         events
     }
 
+    /// Terminal mints are un-closeable: `Completed` already reported to
+    /// Alpaca, and `Closed` is already closed. Both must reject with
+    /// `NotRecoverable` rather than record a second terminal event.
+    #[tokio::test]
+    async fn close_mint_rejects_terminal_states() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events_through_completed(&issuer_request_id))
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::NotRecoverable { .. })
+            ),
+            "closing a Completed mint must be rejected, got {error:?}"
+        );
+
+        let mut closed_events = events_through_minting(&issuer_request_id);
+        closed_events.push(MintEvent::MintClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "first close".to_string(),
+            closed_at: Utc::now(),
+            acknowledged_unresolved_mint_tx_hash: None,
+            acknowledged_unresolved_mint_nonce: None,
+        });
+        let error = TestHarness::<Mint>::with(())
+            .given(closed_events)
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "second close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::NotRecoverable { .. })
+            ),
+            "closing an already-Closed mint must be rejected, got {error:?}"
+        );
+    }
+
+    /// `CallbackPending` already records an on-chain mint in this
+    /// aggregate's own history — closing it would strand real backed tokens
+    /// unreported (SPEC "Mint Aggregate" -> `CloseMint`).
+    #[tokio::test]
+    async fn close_mint_rejects_callback_pending() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events =
+            orchestrator_events_through_tx_submitted(&issuer_request_id);
+        events.push(MintEvent::OrchestratorTokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: B256::ZERO,
+            nonce: test_mint_authorization().nonce,
+            shares_minted: uint!(100_000000000000000000_U256),
+            gas_used: 21_000,
+            block_number: 1_000,
+            minted_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::CloseAfterMintRecorded)
+            ),
+            "closing from CallbackPending must be rejected, got {error:?}"
+        );
+    }
+
+    /// The close acknowledgement is scoped to exactly the
+    /// `NonceReplayUnresolved` classification: required there (echoing the
+    /// persisted nonce), rejected everywhere else — never a general-purpose
+    /// close override.
+    #[tokio::test]
+    async fn close_mint_acknowledgement_rules() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let unresolved = orchestrator_minting_failed_events(
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+            MintFailureClassification::NonceReplayUnresolved,
+        );
+        let nonce = test_mint_authorization().nonce;
+
+        let error = TestHarness::<Mint>::with(())
+            .given(unresolved.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::UnresolvedReplayAcknowledgementRequired { .. }
+                )
+            ),
+            "an unresolved mint must demand the acknowledgement, got \
+             {error:?}"
+        );
+
+        let error = TestHarness::<Mint>::with(())
+            .given(unresolved.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: Some(B256::repeat_byte(
+                    0xEE,
+                )),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::AcknowledgedNonceMismatch { .. }
+                )
+            ),
+            "a non-echoing acknowledgement must be rejected, got {error:?}"
+        );
+
+        let events = TestHarness::<Mint>::with(())
+            .given(unresolved)
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator verified absence".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: Some(nonce),
+            })
+            .await
+            .events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [MintEvent::MintClosed {
+                    acknowledged_unresolved_mint_nonce: Some(acknowledged),
+                    ..
+                }] if *acknowledged == nonce
+            ),
+            "the echoing acknowledgement must close and be recorded, got \
+             {events:?}"
+        );
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator close".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: Some(nonce),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::AcknowledgementNotApplicable { .. }
+                )
+            ),
+            "the acknowledgement on any other mint must be rejected, got \
+             {error:?}"
+        );
+    }
+
+    /// Historic `MintClosed` events predate the acknowledgement field; they
+    /// must replay with it absent.
+    #[test]
+    fn mint_closed_without_acknowledgement_replays_as_none() {
+        let historic = serde_json::json!({
+            "MintClosed": {
+                "issuer_request_id": IssuerMintRequestId::random().to_string(),
+                "reason": "operator close",
+                "closed_at": "2025-01-01T00:00:00Z"
+            }
+        });
+
+        let event: MintEvent = serde_json::from_value(historic).unwrap();
+
+        assert!(matches!(
+            event,
+            MintEvent::MintClosed {
+                acknowledged_unresolved_mint_nonce: None,
+                ..
+            }
+        ));
+    }
+
+    /// The close gate's history walk: every persisted signed transaction
+    /// with no terminal outcome is surfaced, following the `failed_from`
+    /// chain, and a byte-less legacy submission flags as unprovable.
+    #[test]
+    fn unresolved_persisted_txs_walk_the_failure_chain() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let mut intended =
+            orchestrator_events_through_minting_authorized(&issuer_request_id);
+        intended.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                7,
+                "ext-walk-1".to_string(),
+            ),
+            intended_at: Utc::now(),
+        });
+        let mint = replay::<Mint>(intended).unwrap().unwrap();
+        let (txs, unprovable) = mint.unresolved_persisted_txs();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].nonce, 7);
+        assert!(!unprovable);
+
+        let failed = orchestrator_minting_failed_events(
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+            MintFailureClassification::Unclassified,
+        );
+        let mint = replay::<Mint>(failed).unwrap().unwrap();
+        let (txs, unprovable) = mint.unresolved_persisted_txs();
+        // The fixture's TxSubmitted persisted no signed bytes (legacy
+        // shape), carried through the failure's `failed_from` chain.
+        assert!(txs.is_empty());
+        assert!(
+            unprovable,
+            "a byte-less submission in the chain must flag as unprovable"
+        );
+
+        let mint = replay::<Mint>(events_through_minting(&issuer_request_id))
+            .unwrap()
+            .unwrap();
+        let (txs, unprovable) = mint.unresolved_persisted_txs();
+        assert!(txs.is_empty());
+        assert!(!unprovable, "no submission history means nothing to prove");
+    }
+
     #[test]
     fn manual_recovery_decision_rejects_nonrecoverable_states() {
         let issuer_request_id = IssuerMintRequestId::random();
@@ -4091,7 +4595,7 @@ pub(crate) mod tests {
         events
     }
 
-    pub(super) fn orchestrator_events_through_tx_submitted(
+    pub(crate) fn orchestrator_events_through_tx_submitted(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
         let mut events =
@@ -6420,6 +6924,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed pre-prepare".to_string(),
                 acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .events();
@@ -6455,6 +6960,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed legacy submitted".to_string(),
                 acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .then_expect_error();
@@ -6477,6 +6983,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed legacy submitted".to_string(),
                 acknowledged_unresolved_mint_tx_hash: Some(wrong_hash),
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .then_expect_error();
@@ -6499,6 +7006,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed legacy submitted".to_string(),
                 acknowledged_unresolved_mint_tx_hash: Some(submitted_hash),
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .events();
@@ -6526,6 +7034,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed intended".to_string(),
                 acknowledged_unresolved_mint_tx_hash: None,
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .then_expect_error();
@@ -6549,6 +7058,7 @@ pub(crate) mod tests {
                 acknowledged_unresolved_mint_tx_hash: Some(b256!(
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 )),
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .then_expect_error();
@@ -6571,6 +7081,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: "operator closed intended".to_string(),
                 acknowledged_unresolved_mint_tx_hash: Some(prepared_hash),
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .events();
@@ -6596,6 +7107,7 @@ pub(crate) mod tests {
                 issuer_request_id,
                 reason: "ack without intent".to_string(),
                 acknowledged_unresolved_mint_tx_hash: Some(unexpected),
+                acknowledged_unresolved_mint_nonce: None,
             })
             .await
             .then_expect_error();
@@ -6824,9 +7336,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A vault-direct confirmation result can never complete an orchestrator
-    /// mint, and vice versa — the record handlers enforce the persisted
-    /// mode anchor.
+    /// A vault-direct result can never complete an orchestrator mint, and
+    /// vice versa — every record handler enforces the persisted mode anchor.
     #[tokio::test]
     async fn record_handlers_reject_cross_mode_results() {
         let issuer_request_id = IssuerMintRequestId::random();
@@ -6872,6 +7383,30 @@ pub(crate) mod tests {
                 LifecycleError::Apply(MintError::MintModeMismatch { .. })
             ),
             "an orchestrator result must not complete a vault-direct mint, \
+             got {error:?}"
+        );
+
+        // Receipt-discovery recovery is vault-direct machinery: the bot never
+        // custodies a receipt for an orchestrator mint, so a delivery here
+        // would be a mis-attribution even though receipt ingestion filters on
+        // bot ownership upstream.
+        let error = TestHarness::<Mint>::with(())
+            .given(orchestrator_events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordExistingMint {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: B256::ZERO,
+                receipt_id: uint!(1_U256),
+                shares_minted: uint!(1_U256),
+                block_number: 1,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::MintModeMismatch { .. })
+            ),
+            "a receipt discovery must not complete an orchestrator mint, \
              got {error:?}"
         );
     }
@@ -7012,6 +7547,53 @@ pub(crate) mod tests {
             .await
             .events();
         assert!(events.is_empty(), "a re-delivered recovery must be a no-op");
+    }
+
+    /// The recovered-mint record carries the same defense-in-depth
+    /// invariants as the confirmation record: a nonce or share total
+    /// diverging from what this mint was authorized for must fail loudly
+    /// instead of becoming the persisted audit record.
+    #[tokio::test]
+    async fn record_orchestrator_mint_recovered_rejects_diverging_facts() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let error = TestHarness::<Mint>::with(())
+            .given(orchestrator_events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordOrchestratorMintRecovered {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: B256::ZERO,
+                nonce: B256::repeat_byte(0xEE),
+                shares_minted: uint!(100_000000000000000000_U256),
+                block_number: 777,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::MintedNonceMismatch { .. })
+            ),
+            "a diverging nonce must be rejected, got {error:?}"
+        );
+
+        let error = TestHarness::<Mint>::with(())
+            .given(orchestrator_events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordOrchestratorMintRecovered {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: B256::ZERO,
+                nonce: test_mint_authorization().nonce,
+                shares_minted: uint!(1_U256),
+                block_number: 777,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::MintedSharesMismatch { .. })
+            ),
+            "diverging shares must be rejected, got {error:?}"
+        );
     }
 
     /// A vault receipt is a vault-direct proof: the bot never custodies a
@@ -7235,6 +7817,118 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::from_value::<MintEvent>(recovered_wire).unwrap(),
             recovered
+        );
+    }
+
+    fn orchestrator_minting_failed_events(
+        issuer_request_id: &IssuerMintRequestId,
+        base: Vec<MintEvent>,
+        classification: MintFailureClassification,
+    ) -> Vec<MintEvent> {
+        let mut events = base;
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "confirmation failed".to_string(),
+            failed_at: Utc::now(),
+            classification,
+        });
+        events
+    }
+
+    /// Typed classifications opt out of the automatic retry schedule before
+    /// any budget bookkeeping; only `Unclassified` stays on it.
+    #[test]
+    fn automatic_retry_decision_manual_only_for_typed_classifications() {
+        for classification in [
+            MintFailureClassification::VaultLogicMismatch,
+            MintFailureClassification::ReceiptLogicMismatch,
+            MintFailureClassification::NonceConsumedByOtherMint,
+        ] {
+            let issuer_request_id = IssuerMintRequestId::random();
+            let mint = replay::<Mint>(orchestrator_minting_failed_events(
+                &issuer_request_id,
+                orchestrator_events_through_tx_submitted(&issuer_request_id),
+                classification,
+            ))
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(
+                mint.automatic_retry_decision(Utc::now()),
+                AutomaticRetryDecision::ManualOnly(classification),
+            );
+        }
+
+        // The inconclusive replay is the one classification recovery keeps
+        // touching: reconciliation-only, never `ManualOnly`, never a
+        // resubmission.
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mint = replay::<Mint>(orchestrator_minting_failed_events(
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+            MintFailureClassification::NonceReplayUnresolved,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mint.automatic_retry_decision(Utc::now()),
+            AutomaticRetryDecision::ReconcileOnly,
+            "an unresolved replay must be reconciliation-only"
+        );
+
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mint = replay::<Mint>(orchestrator_minting_failed_events(
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+            MintFailureClassification::Unclassified,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            !matches!(
+                mint.automatic_retry_decision(Utc::now()),
+                AutomaticRetryDecision::ManualOnly(_)
+            ),
+            "Unclassified must stay on the automatic schedule"
+        );
+
+        // Classification wins over exhaustion, not just over an under-budget
+        // schedule: with the attempt counter already past the automatic
+        // budget, the decision must stay `ManualOnly` — `Exhausted` would
+        // route recovery through the receipt re-check/abandon path instead
+        // of the classified skip.
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events =
+            orchestrator_events_through_tx_submitted(&issuer_request_id);
+        for _ in 0..6 {
+            events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at: Utc::now(),
+                classification: MintFailureClassification::Unclassified,
+            });
+        }
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "nonce consumed by another mint".to_string(),
+            failed_at: Utc::now(),
+            classification: MintFailureClassification::NonceConsumedByOtherMint,
+        });
+        let mint = replay::<Mint>(events).unwrap().unwrap();
+        let Mint::MintingFailed { attempts, .. } = &mint else {
+            panic!("expected MintingFailed, got {mint:?}");
+        };
+        assert!(
+            *attempts > Mint::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT,
+            "the fixture must drive attempts past the automatic budget, got \
+             {attempts}"
+        );
+        assert_eq!(
+            mint.automatic_retry_decision(Utc::now()),
+            AutomaticRetryDecision::ManualOnly(
+                MintFailureClassification::NonceConsumedByOtherMint
+            ),
+            "an exhausted counter must not displace the classified verdict"
         );
     }
 }

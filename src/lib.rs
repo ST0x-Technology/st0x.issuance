@@ -509,6 +509,7 @@ pub async fn initialize_rocket(
         vault_services: network_vault_services,
         configured_networks,
         freeze_scheduler,
+        receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
         shutdown: shutdown_tx,
     }))
 }
@@ -527,6 +528,9 @@ struct RocketState {
     vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
     freeze_scheduler: tokenized_asset::schedule::FreezeScheduler,
+    /// Receipt inventory reads for the admin close-mint safety gate (the
+    /// vault-direct landed check).
+    receipts: Arc<dyn ReceiptService>,
     /// Stops the spawned chain-scanning loops when the server shuts down.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -567,6 +571,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.pool)
         .manage(state.apalis_pool)
         .manage(state.freeze_scheduler)
+        .manage(state.receipts)
         .mount(
             "/",
             routes![
