@@ -37,8 +37,13 @@ use st0x_issuance::test_utils::{
 };
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
+    IpWhitelist, LogLevel, Network, SignerConfig, VaultMode, VaultModeConfig,
 };
+
+/// The internal API key every harness-built config and request header share:
+/// the config value and the `X-API-KEY` header must stay identical, or every
+/// authenticated assertion fails with a 401 that hides the real cause.
+pub const TEST_API_KEY: &str = "test-key-12345678901234567890123456";
 
 pub type TestProviderBuilder = ProviderBuilder<
     Identity,
@@ -297,10 +302,7 @@ pub async fn seed_tokenized_asset_with(
     let response = client
         .post("/tokenized-assets")
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
@@ -482,10 +484,7 @@ pub async fn setup_account(
     let register_response = client
         .post("/accounts")
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
@@ -502,10 +501,7 @@ pub async fn setup_account(
     let link_response = client
         .post("/accounts/connect")
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
@@ -525,10 +521,7 @@ pub async fn setup_account(
     let whitelist_response = client
         .post(format!("/accounts/{}/wallets", link_body.client_id))
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
@@ -611,9 +604,7 @@ pub fn create_config_with_db(
             backfill_start_block: 0,
             receipt_poll_interval: tokio::time::Duration::from_millis(500),
             auth: AuthConfig {
-                issuer_api_key: "test-key-12345678901234567890123456"
-                    .parse()
-                    .expect("Valid API key"),
+                issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
                 alpaca_ip_ranges: IpWhitelist::single(
                     "127.0.0.1/32".parse().expect("Valid IP range"),
                 ),
@@ -715,18 +706,13 @@ pub async fn orchestrator_mint_to(
     orchestrator_address: Address,
     recipient_signer: &PrivateKeySigner,
     amount: U256,
-    nonce_seed: u8,
+    nonce: B256,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
-    let provider = create_provider()
-        .wallet(EthereumWallet::from(bot_signer))
-        .connect(&evm.endpoint)
-        .await?;
+    let provider = bot_provider(evm).await?;
     let orchestrator =
         IST0xOrchestratorV1::new(orchestrator_address, &provider);
 
     let recipient = recipient_signer.address();
-    let nonce = B256::with_last_byte(nonce_seed);
     let digest = orchestrator
         .mintAuthDigest(evm.vault_address, recipient, amount, nonce)
         .call()
@@ -753,11 +739,7 @@ pub async fn approve_orchestrator(
     evm: &LocalEvm,
     orchestrator_address: Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
-    let provider = create_provider()
-        .wallet(EthereumWallet::from(bot_signer))
-        .connect(&evm.endpoint)
-        .await?;
+    let provider = bot_provider(evm).await?;
     let vault =
         OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider);
 
@@ -840,32 +822,41 @@ pub async fn perform_mint_and_confirm_with(
     wallet: Address,
     request: MintFlowRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let MintFlowRequest {
-        client_id,
-        tokenization_request_id,
-        quantity,
-        underlying,
-        token,
-        network,
-    } = request;
+    let issuer_request_id =
+        initiate_mint_request(client, wallet, &request).await?;
+    confirm_mint_journal(
+        client,
+        request.tokenization_request_id,
+        &issuer_request_id,
+    )
+    .await?;
+
+    Ok(issuer_request_id)
+}
+
+/// Drives `POST /inkind/issuance` alone, returning the issuer request id —
+/// orchestrator mint flows deliver the recipient authorization between this
+/// and [`confirm_mint_journal`].
+pub async fn initiate_mint_request(
+    client: &Client,
+    wallet: Address,
+    request: &MintFlowRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mint_response = client
         .post("/inkind/issuance")
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
         .body(
             json!({
-                "tokenization_request_id": tokenization_request_id,
-                "qty": quantity,
-                "underlying_symbol": underlying,
-                "token_symbol": token,
-                "network": network.as_str(),
-                "client_id": client_id,
+                "tokenization_request_id": request.tokenization_request_id,
+                "qty": request.quantity,
+                "underlying_symbol": request.underlying,
+                "token_symbol": request.token,
+                "network": request.network.as_str(),
+                "client_id": request.client_id,
                 "wallet_address": wallet
             })
             .to_string(),
@@ -878,22 +869,27 @@ pub async fn perform_mint_and_confirm_with(
         .into_json()
         .await
         .expect("mint response must contain valid JSON");
-    let issuer_request_id = mint_body.issuer_request_id.to_string();
 
+    Ok(mint_body.issuer_request_id.to_string())
+}
+
+/// Drives `POST /inkind/issuance/confirm` for an initiated mint.
+pub async fn confirm_mint_journal(
+    client: &Client,
+    tokenization_request_id: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let confirm_response = client
         .post("/inkind/issuance/confirm")
         .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
         .remote(
             "127.0.0.1:8000".parse().expect("test client address must parse"),
         )
         .body(
             json!({
                 "tokenization_request_id": tokenization_request_id,
-                "issuer_request_id": mint_body.issuer_request_id,
+                "issuer_request_id": issuer_request_id,
                 "status": "completed"
             })
             .to_string(),
@@ -903,7 +899,7 @@ pub async fn perform_mint_and_confirm_with(
 
     assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
 
-    Ok(issuer_request_id)
+    Ok(())
 }
 
 /// Seeds a `SchemaRegistry` event recording the last-known schema version for
@@ -1049,4 +1045,73 @@ pub fn create_provider() -> TestProviderBuilder {
         .filler(BlobGasFiller)
         .with_simple_nonce_management()
         .filler(ChainIdFiller::default())
+}
+
+/// `amount` whole tokens in 18-decimal share-wei.
+pub fn tokens(amount: u64) -> U256 {
+    U256::from(amount) * U256::from(10u64).pow(U256::from(18u64))
+}
+
+/// A `VaultModeConfig` putting one underlying in orchestrator mode over a
+/// vault-direct default — the single-asset-pilot shape.
+pub fn orchestrator_vault_modes(
+    underlying: &str,
+    orchestrator_address: Address,
+) -> VaultModeConfig {
+    VaultModeConfig::new(
+        HashMap::from([(
+            underlying.to_string(),
+            VaultMode::Orchestrator { address: orchestrator_address },
+        )]),
+        VaultMode::VaultDirect,
+    )
+}
+
+/// A provider signing with the bot wallet's key.
+pub async fn bot_provider(
+    evm: &LocalEvm,
+) -> Result<impl alloy::providers::Provider + Clone, Box<dyn std::error::Error>>
+{
+    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
+    Ok(create_provider()
+        .wallet(EthereumWallet::from(bot_signer))
+        .connect(&evm.endpoint)
+        .await?)
+}
+
+/// Dispatches an authenticated admin `GET`, failing loudly on a non-OK
+/// status or a non-JSON body so a broken endpoint can never read as a
+/// healthy/empty response.
+pub async fn authenticated_get_json(
+    client: &Client,
+    path: &str,
+) -> serde_json::Value {
+    let response = client
+        .get(path)
+        .header(rocket::http::Header::new("X-API-KEY", TEST_API_KEY))
+        .remote(
+            "127.0.0.1:8000".parse().expect("test client address must parse"),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(
+        response.status(),
+        rocket::http::Status::Ok,
+        "{path} must respond OK"
+    );
+    response
+        .into_json()
+        .await
+        .unwrap_or_else(|| panic!("{path} must return a JSON body"))
+}
+
+/// Fetches the current `GET /admin/stuck` entries, failing loudly on an
+/// endpoint error so a broken endpoint can never read as "nothing stuck".
+pub async fn fetch_stuck_entries(client: &Client) -> Vec<serde_json::Value> {
+    let body = authenticated_get_json(client, "/admin/stuck").await;
+
+    body["stuck"]
+        .as_array()
+        .expect("/admin/stuck must contain a stuck array")
+        .clone()
 }

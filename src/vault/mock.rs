@@ -198,6 +198,13 @@ struct OrchestratorMockState {
     /// no full match on-chain.
     #[cfg(test)]
     minted_log: Mutex<Option<OrchestratorMintedLog>>,
+    /// Optional `(orchestrator, to, token)` binding for the configured
+    /// `minted_log`: when set, a query naming a different orchestrator,
+    /// recipient, or token does NOT match — mirroring the address half of
+    /// the real lookup's four-field full-match, which the log's own fields
+    /// (`nonce`, `shares_minted`) cannot express.
+    #[cfg(test)]
+    minted_log_binding: Mutex<Option<(Address, Address, Address)>>,
     /// Override for `nonce_used`; `None` mirrors the chain by deriving from
     /// whether the configured `minted_log` carries the queried nonce.
     #[cfg(test)]
@@ -570,6 +577,7 @@ impl MockVaultService {
         *self.orchestrator.pending_mint_result.lock().unwrap() = None;
         *self.orchestrator.mint_confirm_revert.lock().unwrap() = None;
         *self.orchestrator.minted_log.lock().unwrap() = None;
+        *self.orchestrator.minted_log_binding.lock().unwrap() = None;
         *self.orchestrator.nonce_used.lock().unwrap() = None;
         *self.orchestrator.nonce_used_should_error.lock().unwrap() = false;
         *self.orchestrator.find_minted_log_should_error.lock().unwrap() = false;
@@ -886,7 +894,8 @@ impl MockVaultService {
     }
 
     /// Overrides the `nonce_used` consumed flag, e.g. `true` with no (or a
-    /// non-matching) `minted_log` exercises the consumed-but-unproven path.
+    /// non-matching) `minted_log` to exercise the consumed-by-another-mint
+    /// path through the pre-submit gate.
     #[cfg(test)]
     pub(crate) fn with_nonce_used(self, consumed: bool) -> Self {
         *self.orchestrator.nonce_used.lock().unwrap() = Some(consumed);
@@ -917,6 +926,22 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn with_minted_log(self, log: OrchestratorMintedLog) -> Self {
         *self.orchestrator.minted_log.lock().unwrap() = Some(log);
+        self
+    }
+
+    /// Binds the configured `minted_log` to an `(orchestrator, to, token)`
+    /// triple: a lookup naming any other address misses, so a test can prove
+    /// the production query passes the right recipient and orchestrator —
+    /// not merely the right nonce and amount.
+    #[cfg(test)]
+    pub(crate) fn with_minted_log_binding(
+        self,
+        orchestrator: Address,
+        to: Address,
+        token: Address,
+    ) -> Self {
+        *self.orchestrator.minted_log_binding.lock().unwrap() =
+            Some((orchestrator, to, token));
         self
     }
 
@@ -1905,17 +1930,29 @@ impl VaultService for MockVaultService {
             if *self.orchestrator.find_minted_log_should_error.lock().unwrap() {
                 return Err(VaultError::InvalidReceipt);
             }
-            // Mirror the real scan's three-way verdict on the fields the
-            // stored log carries (it has no `to`/`token`): a stored log
-            // whose nonce equals the query's is the pair's one landing —
-            // matching amount is this mint's (`FullMatch`), a differing
-            // amount proves a different mint consumed the pair
-            // (`Mismatch`) — while a missing or different-nonce log means
-            // nothing was found at the pair (`NotFound`).
+            // Mirror the real scan's three-way verdict. The stored log
+            // carries `nonce`/`shares_minted`; the optional
+            // `(orchestrator, to, token)` binding stands in for the address
+            // fields it lacks. A query naming a different orchestrator or
+            // recipient finds no log at ITS `(to, nonce)` pair —
+            // `NotFound` — while the right pair with a differing `token`
+            // or `amount` is the pair's one landing disagreeing on the
+            // signed facts: the proven `Mismatch`. A missing or
+            // different-nonce log means nothing was found at the pair.
+            let binding = *self.orchestrator.minted_log_binding.lock().unwrap();
             let stored = self.orchestrator.minted_log.lock().unwrap().clone();
             return Ok(match stored {
                 Some(log) if log.nonce == nonce => {
-                    if log.shares_minted == amount {
+                    let pair_matches =
+                        binding.is_none_or(|(orchestrator, to, _)| {
+                            query.orchestrator == orchestrator && query.to == to
+                        });
+                    if !pair_matches {
+                        MintedLogScan::NotFound
+                    } else if binding
+                        .is_none_or(|(_, _, token)| query.token == token)
+                        && log.shares_minted == amount
+                    {
                         MintedLogScan::FullMatch(log)
                     } else {
                         MintedLogScan::Mismatch
