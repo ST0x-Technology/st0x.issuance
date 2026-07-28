@@ -308,7 +308,10 @@ mod tests {
 
     use super::*;
     use crate::config::VaultMode;
-    use crate::mint::{ClientId, Network, Quantity, TokenizationRequestId};
+    use crate::mint::{
+        ClientId, MintFailureClassification, Network, Quantity,
+        TokenizationRequestId,
+    };
 
     async fn migrated_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -737,6 +740,7 @@ mod tests {
                 issuer_request_id: IssuerMintRequestId::random(),
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
+                classification: MintFailureClassification::Unclassified,
             },
             MintEvent::MintCompleted {
                 issuer_request_id: IssuerMintRequestId::random(),

@@ -293,11 +293,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// multicall — the orchestrator asserts 1:1 on-chain and forwards shares
     /// to the recipient. The call uses exactly the signed
     /// `(token, to, amount, nonce)` from the authorization.
-    ///
-    /// Production callers land with the orchestrator mint aggregate arms
-    /// (mirroring how `check_orchestrator_burn_readiness` above awaited its
-    /// caller); the allow is removed then.
-    #[allow(dead_code)]
     async fn prepare_orchestrator_mint_tx(
         &self,
         _params: &OrchestratorMintParams,
@@ -309,7 +304,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// orchestrator's `Minted` event. A mined-but-reverted mint fails with
     /// [`VaultError::OrchestratorReverted`] carrying the decoded typed reason
     /// (`NonceReplayed`, `VaultLogicMismatch`, ...).
-    #[allow(dead_code)]
     async fn confirm_orchestrator_mint(
         &self,
         _tx_id: &TxId,
@@ -346,7 +340,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// is read from the delivered `authorization` itself (never
     /// `query.nonce`), so the validated pair is exactly the one the mint
     /// will consume.
-    #[allow(dead_code)]
     async fn validate_mint_authorization(
         &self,
         _query: MintedLogQuery,
