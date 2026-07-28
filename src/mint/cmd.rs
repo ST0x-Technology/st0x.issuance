@@ -191,6 +191,13 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
         acknowledged_unresolved_mint_tx_hash: Option<B256>,
+        /// Required exactly when the mint is classified
+        /// `NonceReplayUnresolved`, and must echo its persisted
+        /// authorization nonce: the bot's own chain view is the thing in
+        /// doubt there, so the close records that an operator verified the
+        /// absence against an independent chain view. Rejected on any other
+        /// mint (SPEC "Mint Aggregate" -> `CloseMint`).
+        acknowledged_unresolved_mint_nonce: Option<B256>,
     },
 
     /// Associates the liquidity bot's validated `MintAuthV1` with this mint,
