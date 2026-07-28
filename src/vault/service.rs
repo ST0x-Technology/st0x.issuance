@@ -1314,6 +1314,16 @@ impl VaultService for RealBlockchainService {
         }
     }
 
+    async fn nonce_used(
+        &self,
+        orchestrator: Address,
+        to: Address,
+        nonce: B256,
+    ) -> Result<bool, VaultError> {
+        let contract = IST0xOrchestratorV1::new(orchestrator, &self.provider);
+        Ok(contract.nonceUsed(to, nonce).call().await?)
+    }
+
     async fn validate_mint_authorization(
         &self,
         query: MintedLogQuery,

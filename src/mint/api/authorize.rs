@@ -784,6 +784,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     reason: "operator close".to_string(),
                     acknowledged_unresolved_mint_tx_hash: None,
+                    acknowledged_unresolved_mint_nonce: None,
                 },
             )
             .await

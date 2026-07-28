@@ -160,6 +160,14 @@ pub(crate) enum MintEvent {
         #[serde(default)]
         acknowledged_unresolved_mint_tx_hash: Option<B256>,
         closed_at: DateTime<Utc>,
+        /// Present only when closing a `NonceReplayUnresolved` mint: the
+        /// operator's recorded acknowledgement that the nonce's absence was
+        /// verified against a chain view outside this bot, echoing the
+        /// mint's persisted authorization nonce exactly (SPEC "Mint
+        /// Aggregate" -> `CloseMint`). Additive: historic closes replay as
+        /// `None`.
+        #[serde(default)]
+        acknowledged_unresolved_mint_nonce: Option<B256>,
     },
 
     /// Mint transaction submitted to the signing backend (Turnkey or local).
