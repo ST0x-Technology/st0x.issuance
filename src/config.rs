@@ -45,6 +45,37 @@ pub enum VaultMode {
     },
 }
 
+impl VaultMode {
+    #[must_use]
+    pub const fn kind(&self) -> VaultModeKind {
+        match self {
+            Self::VaultDirect => VaultModeKind::VaultDirect,
+            Self::Orchestrator { .. } => VaultModeKind::Orchestrator,
+        }
+    }
+}
+
+/// The backend kind of a [`VaultMode`], without the orchestrator's address
+/// payload — for mode-mismatch errors and logs where only the kind matters
+/// and a free-form string would let call sites invent labels the compiler
+/// cannot check.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+pub enum VaultModeKind {
+    VaultDirect,
+    Orchestrator,
+}
+
+impl std::fmt::Display for VaultModeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VaultDirect => write!(formatter, "VaultDirect"),
+            Self::Orchestrator => write!(formatter, "Orchestrator"),
+        }
+    }
+}
+
 /// Resolved per-asset vault-mode configuration loaded from the optional TOML
 /// config file. Defaults to all-`VaultDirect` when no file is provided.
 #[derive(Debug, Clone, Default)]
