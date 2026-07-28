@@ -51,6 +51,7 @@ let
       cfg = enabled.${name};
       pkg = self.packages.${system}.${cfg.package};
       envSecretsFile = ./secret + "/${name}-${env}.env.age";
+      fireblocksKeyFile = ./secret + "/fireblocks-secret-issuance-${env}.key.age";
       deploymentEnvironment =
         if env == "prod" then
           "production"
@@ -72,9 +73,25 @@ let
         # Decrypt env file — contains all secret env vars
         "${rage} -d -i ${hostKey} ${envSecretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedEnvPath}"
 
+        # Fireblocks RSA key for the receipt-custody migration CLI's forward
+        # leg (FIREBLOCKS_SECRET_PATH). Temporary; leaves with src/fireblocks.
+        # Decrypted to a temp file and renamed only on success, so a failed
+        # decryption can never leave a partial key at the real path.
+        ''
+          fireblocks_key_tmp=$(mktemp ${cfg.decryptedFireblocksKeyPath}.XXXXXX)
+          if ${rage} -d -i ${hostKey} ${fireblocksKeyFile} > "$fireblocks_key_tmp"; then
+            chmod 0440 "$fireblocks_key_tmp"
+            chown root:st0x "$fireblocks_key_tmp"
+            mv "$fireblocks_key_tmp" ${cfg.decryptedFireblocksKeyPath}
+          else
+            rm -f "$fireblocks_key_tmp"
+            exit 1
+          fi
+        ''
+
         # Validate config + secrets before restarting. If validation fails,
         # deploy-rs exits non-zero and rolls back instead of starting bad config.
-        "set -a; . ${cfg.decryptedEnvPath}; set +a; DATABASE_URL=sqlite:///mnt/data/issuance.db ENVIRONMENT=${deploymentEnvironment} ${cfg.profilePath}/bin/validate-config"
+        "set -a; . ${cfg.decryptedEnvPath}; set +a; DATABASE_URL=sqlite:///mnt/data/issuance.db ENVIRONMENT=${deploymentEnvironment} FIREBLOCKS_SECRET_PATH=${cfg.decryptedFireblocksKeyPath} ${cfg.profilePath}/bin/validate-config"
 
         # Chown existing data files so st0x user can open them after a fresh deploy
         "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"

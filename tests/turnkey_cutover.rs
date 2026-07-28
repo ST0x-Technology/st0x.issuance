@@ -105,6 +105,43 @@ async fn wait_for_receipt_in_inventory(
     Err("no receipt ever entered the inventory".into())
 }
 
+/// Waits until the running service has settled a redemption's burn
+/// reservation. `wait_for_burn` only proves the burn landed on-chain; the
+/// service records `BurnSettled` afterwards, and the migration's quiescence
+/// gate refuses while a reservation is live — so stopping the service (or
+/// snapshotting its database) before this wait races the settlement reactor.
+async fn wait_for_settled_burn(
+    database_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
+
+    for _ in 0..100 {
+        let settled: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'ReceiptInventory'
+              AND event_type = 'ReceiptInventoryEvent::BurnSettled'
+            ",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        if settled > 0 {
+            pool.close().await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    pool.close().await;
+    Err("the redemption's burn reservation never settled".into())
+}
+
 async fn snapshot_database(
     source_database_url: &str,
     destination_path: &Path,
@@ -834,6 +871,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
     }
     .run()
     .await?;
+    wait_for_settled_burn(&databases.turnkey_url).await?;
     turnkey_client.terminate().await;
 
     // The reversal. The canary mint left its receipt with the incoming wallet,
