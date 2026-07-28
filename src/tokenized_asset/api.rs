@@ -6,7 +6,7 @@ use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{
     AddTokenizedAssetRequest, AddTokenizedAssetResponse, AssetKey,
     TokenizedAssetDetailResponse, TokenizedAssetResponse,
-    TokenizedAssetStatusResponse, TokenizedAssetsListResponse,
+    TokenizedAssetStatusResponse, TokenizedAssetsListResponse, VaultModeTag,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +18,19 @@ use super::{
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
+use crate::config::{Config, VaultMode};
 use crate::underlying::load_freeze_status;
+
+impl From<VaultMode> for VaultModeTag {
+    fn from(mode: VaultMode) -> Self {
+        match mode {
+            VaultMode::VaultDirect => Self::VaultDirect,
+            // The tag deliberately drops the orchestrator address — the
+            // liquidity bot only needs to know an authorization is required.
+            VaultMode::Orchestrator { .. } => Self::Orchestrator,
+        }
+    }
+}
 
 fn merge_token_listing(
     views: Vec<TokenizedAssetView>,
@@ -141,12 +153,13 @@ pub(crate) async fn get_tokenized_asset(
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool))]
+#[tracing::instrument(skip(_auth, pool, config))]
 #[get("/tokenized-assets/<underlying>/status")]
 pub(crate) async fn get_tokenized_asset_status(
     underlying: &str,
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
 ) -> Result<Json<TokenizedAssetStatusResponse>, Status> {
     let underlying = UnderlyingSymbol::new(underlying)
         .map_err(|_| Status::UnprocessableEntity)?;
@@ -177,7 +190,13 @@ pub(crate) async fn get_tokenized_asset_status(
             Status::InternalServerError
         })?;
 
-    Ok(Json(TokenizedAssetStatusResponse { underlying, status: status.into() }))
+    let vault_mode = config.vault_mode_for(&underlying).into();
+
+    Ok(Json(TokenizedAssetStatusResponse {
+        underlying,
+        status: status.into(),
+        vault_mode,
+    }))
 }
 
 #[tracing::instrument(skip(_auth, pool))]
@@ -311,13 +330,14 @@ mod tests {
     use rocket::routes;
     use serde_json::{Value, json};
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use tracing_test::traced_test;
     use url::Url;
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel};
+    use crate::config::{Config, Environment, LogLevel, VaultModeConfig};
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -1033,7 +1053,11 @@ mod tests {
             before.into_json().await.expect("valid JSON response");
         assert_eq!(
             before_body,
-            json!({ "underlying": "AAPL", "status": "enabled" })
+            json!({
+                "underlying": "AAPL",
+                "status": "enabled",
+                "vault_mode": "vault_direct"
+            })
         );
 
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -1066,7 +1090,11 @@ mod tests {
             after.into_json().await.expect("valid JSON response");
         assert_eq!(
             after_body,
-            json!({ "underlying": "AAPL", "status": "frozen" })
+            json!({
+                "underlying": "AAPL",
+                "status": "frozen",
+                "vault_mode": "vault_direct"
+            })
         );
 
         // Unfreezing must flip the status back to `enabled` — the other half of
@@ -1098,7 +1126,11 @@ mod tests {
             unfrozen.into_json().await.expect("valid JSON response");
         assert_eq!(
             unfrozen_body,
-            json!({ "underlying": "AAPL", "status": "enabled" })
+            json!({
+                "underlying": "AAPL",
+                "status": "enabled",
+                "vault_mode": "vault_direct"
+            })
         );
     }
 
@@ -1200,6 +1232,83 @@ mod tests {
                 "status": "frozen"
             })
         );
+    }
+
+    /// Under a mixed config the status endpoint reports each asset's own
+    /// mode tag: the per-asset orchestrator override for AAPL, the
+    /// vault-direct default for MSFT — the liquidity bot's cue for which
+    /// assets need a `MintAuthV1` before their mints can submit.
+    #[tokio::test]
+    async fn test_get_status_reports_vault_mode_per_asset_under_mixed_config() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+
+        for (underlying, token) in [("AAPL", "tAAPL"), ("MSFT", "tMSFT")] {
+            let underlying = UnderlyingSymbol::new(underlying).unwrap();
+            let key = AssetKey::new(underlying.clone(), Network::Base);
+            store
+                .send(
+                    &key,
+                    TokenizedAssetCommand::Add {
+                        underlying,
+                        token: TokenSymbol::new(token),
+                        network: Network::Base,
+                        vault: address!(
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        ),
+                    },
+                )
+                .await
+                .expect("Failed to add asset");
+        }
+
+        let config = Config {
+            vault_mode_config: VaultModeConfig::new(
+                HashMap::from([(
+                    "AAPL".to_string(),
+                    VaultMode::Orchestrator {
+                        address: address!(
+                            "0xdddddddddddddddddddddddddddddddddddddddd"
+                        ),
+                    },
+                )]),
+                VaultMode::VaultDirect,
+            ),
+            ..test_config()
+        };
+
+        let rocket = rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        for (underlying, expected_mode) in
+            [("AAPL", "orchestrator"), ("MSFT", "vault_direct")]
+        {
+            let response = client
+                .get(format!("/tokenized-assets/{underlying}/status"))
+                .header(internal_api_key())
+                .remote("127.0.0.1:8000".parse().unwrap())
+                .dispatch()
+                .await;
+
+            assert_eq!(response.status(), Status::Ok);
+            let body: Value =
+                response.into_json().await.expect("valid JSON response");
+            assert_eq!(
+                body,
+                json!({
+                    "underlying": underlying,
+                    "status": "enabled",
+                    "vault_mode": expected_mode
+                }),
+                "unexpected status body for {underlying}"
+            );
+        }
     }
 
     #[traced_test]
@@ -1332,7 +1441,14 @@ mod tests {
 
         let body: Value =
             response.into_json().await.expect("valid JSON response");
-        assert_eq!(body, json!({ "underlying": "AAPL", "status": "enabled" }));
+        assert_eq!(
+            body,
+            json!({
+                "underlying": "AAPL",
+                "status": "enabled",
+                "vault_mode": "vault_direct"
+            })
+        );
     }
 
     // The detail endpoint shares `load_asset_by_underlying`, so a non-live
