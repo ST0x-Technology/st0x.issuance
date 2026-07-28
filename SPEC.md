@@ -448,9 +448,18 @@ on-chain transfer through calling Alpaca to burning tokens.
   persisted transaction's nonce, proving it is a mined replacement rather than
   an unrelated burn and ensuring the acknowledged transaction can no longer
   land. This prevents another redemption's same-vault burn from being used as
-  proof. Legacy or pre-intent states without a trustworthy persisted transaction
-  are **not** force-completed; ops use `CloseRedemption` after off-chain
-  reconciliation instead.
+  proof. A `Failed` redemption that still carries a persisted signed burn is
+  held to the same binding and acknowledgement rules. A legacy `Failed`
+  redemption with **no** persisted signed transaction — a custodian-era burn
+  identified only by a backend transaction id the current backend cannot look up
+  — is force-completed offline via `issuer force-complete-redemption`: the
+  operator supplies the on-chain hash, and the CLI proves it is a successful
+  burn on the redemption's vault whose per-receipt withdrawals match the burn
+  plan persisted by the latest `BurningFailed` event exactly, with the owner
+  recovered from the transaction's own signature, and refuses a hash any other
+  redemption's history already mentions. Pre-intent states with no persisted
+  burn plan at all are **not** force-completed; ops use `CloseRedemption` after
+  off-chain reconciliation instead.
 
 **Events:**
 
@@ -2106,6 +2115,7 @@ stateDiagram-v2
     Failed --> Failed: MarkFailed (re-classify failure)
     Failed --> Detected: Reprocess (pre-Alpaca)
     Failed --> Burning: ResumeBurn (post-Alpaca)
+    Failed --> Completed: ForceCompleteBurn (admin, verified on-chain)
     Failed --> Closed: CloseRedemption (admin)
     Failed --> [*]
     Completed --> [*]
