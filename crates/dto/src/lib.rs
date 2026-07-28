@@ -131,6 +131,14 @@ pub enum Network {
     /// the staging sandbox mint/redeem validation confirms it against live
     /// Alpaca before any production cutover.
     Ethereum,
+    /// HyperEVM, Hyperliquid's EVM layer (chain 999).
+    ///
+    /// Not yet listed in Alpaca's published `TokenizationNetwork` enum
+    /// (<https://docs.alpaca.markets/reference/posttokenizationredeem>), so
+    /// the `"hyperevm"` wire value must be confirmed against live Alpaca
+    /// before ITN mint/redeem traffic names this network.
+    #[serde(rename = "hyperevm")]
+    HyperEvm,
 }
 
 impl Network {
@@ -140,6 +148,23 @@ impl Network {
         match self {
             Self::Base => "base",
             Self::Ethereum => "ethereum",
+            Self::HyperEvm => "hyperevm",
+        }
+    }
+
+    /// The canonical chain id this network denotes.
+    ///
+    /// Exists so configuration can reject a network label bound to a chain it
+    /// does not name. Without it, `CHAIN_BASE_CHAIN_ID` pointed at a testnet
+    /// yields a running `Network::Base` runtime on the wrong chain — and since
+    /// the receipt inventory is keyed by chain id, that silently orphans every
+    /// receipt aggregate the network already had.
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        match self {
+            Self::Base => 8453,
+            Self::Ethereum => 1,
+            Self::HyperEvm => 999,
         }
     }
 }
@@ -163,6 +188,7 @@ impl FromStr for Network {
         match value {
             "base" => Ok(Self::Base),
             "ethereum" => Ok(Self::Ethereum),
+            "hyperevm" => Ok(Self::HyperEvm),
             other => {
                 Err(NetworkParseError::Unsupported { value: other.to_string() })
             }
