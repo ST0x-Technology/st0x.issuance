@@ -1058,8 +1058,9 @@ mod tests {
     };
     use crate::mint::tests::VAULT;
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, MintFailureClassification,
+        Network, Quantity, TokenSymbol, TokenizationRequestId,
+        UnderlyingSymbol,
     };
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::log_count_at;
@@ -1199,6 +1200,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             error: "terminal signer failure".to_string(),
             failed_at,
+            classification: MintFailureClassification::Unclassified,
         });
 
         events
@@ -1684,6 +1686,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         let fixture = MintRecoveryFixture::new().await;
@@ -1728,6 +1731,7 @@ mod tests {
                 issuer_request_id: lookup_failure_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         fixture
@@ -1771,6 +1775,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         let fixture = MintRecoveryFixture::new().await;

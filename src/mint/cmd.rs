@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
+use super::event::MintFailureClassification;
 use super::{
     ClientId, IssuerMintRequestId, MintExternalTxId, Network, Quantity,
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
@@ -93,6 +94,43 @@ pub(crate) enum MintCommand {
     RecordMintFailed {
         issuer_request_id: IssuerMintRequestId,
         error: String,
+        /// Typed cause when one was decoded; typed classifications are never
+        /// auto-retried. Deliberately NOT `#[serde(default)]` (see
+        /// `Initiate::mint_mode`): commands have no historical payloads, and
+        /// a silently defaulted `Unclassified` would re-enable automatic
+        /// retries for a deterministic failure.
+        classification: MintFailureClassification,
+    },
+
+    /// Records the outcome of a successful orchestrator mint confirmation
+    /// performed by a durable `ConfirmMintJob`. Pure: produces
+    /// `OrchestratorTokensMinted` from the payload, no I/O. Idempotent — a
+    /// no-op if the mint already advanced past `TxSubmitted`. The handler
+    /// rejects vault-direct mints — an orchestrator result can never complete
+    /// a vault-direct mint, or vice versa.
+    RecordOrchestratorTokensMinted {
+        issuer_request_id: IssuerMintRequestId,
+        /// The signing-backend transaction the report belongs to; a mismatch
+        /// against the stored submission is rejected.
+        tx_id: TxId,
+        tx_hash: B256,
+        nonce: B256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+    },
+
+    /// Records an already-landed orchestrator mint discovered by the
+    /// `Minted`-log lookup after a `NonceReplayed` revert, full-matched on
+    /// `(to, nonce, token, amount)`. Pure: produces
+    /// `OrchestratorMintRecovered`. Idempotent — a no-op once the mint has
+    /// advanced past `TxSubmitted`.
+    RecordOrchestratorMintRecovered {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        nonce: B256,
+        shares_minted: U256,
+        block_number: u64,
     },
 
     /// Retries a failed mint by transitioning `MintingFailed` -> `Minting`,

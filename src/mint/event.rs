@@ -11,6 +11,68 @@ use super::{
     TokenizationRequestId, UnderlyingSymbol,
 };
 
+/// Typed classification of an on-chain mint failure, persisted on
+/// `MintingFailed`. Mirrors the burn side's `BurnFailureClassification`:
+/// typed classifications are never auto-retried, and the halted-orchestrator
+/// cases are surfaced distinctly from ordinary mint failures.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+pub(crate) enum MintFailureClassification {
+    /// No typed cause was decoded — retryable on the automatic schedule.
+    #[default]
+    Unclassified,
+    /// `vaultLogicIsExpected()` mismatch — the orchestrator is halted
+    /// pending upgrade; resolves environment-wide, never per-mint.
+    VaultLogicMismatch,
+    /// The orchestrator's receipt-logic version lock tripped — halted like
+    /// `VaultLogicMismatch`.
+    ReceiptLogicMismatch,
+    /// Assigned by recovery's full-match check (not decoded from a revert):
+    /// a `Minted` log at the `(to, nonce)` pair WAS found and its token or
+    /// amount disagrees with this mint's — affirmative proof a different
+    /// mint consumed the pair, so this mint can never land. Manual
+    /// reconciliation only.
+    NonceConsumedByOtherMint,
+    /// Assigned by recovery's full-match check (not decoded from a revert):
+    /// `nonceUsed(to, nonce)` reports the nonce consumed but NO `Minted`
+    /// log at the pair was found at all. The two cannot both be true of a
+    /// healthy chain view, so the lookup itself is untrusted (window too
+    /// narrow, RPC error, indexer lag) — an unknown outcome, never proof:
+    /// this mint may well have landed. Non-retryable for SUBMISSION (the
+    /// nonce is consumed either way) but retryable for RECONCILIATION:
+    /// recovery re-runs the log query over a widened window, and a later
+    /// full match resolves the mint forward (SPEC "Recipient Authorization"
+    /// -> "Nonce").
+    NonceReplayUnresolved,
+    /// `BadRecipientSignature()` revert — the recipient signature did not
+    /// recover to `to`. Deterministic for the stored authorization: only
+    /// `CloseMint` plus a fresh `Initiate` with a new authorization resolves
+    /// it (see SPEC "Failure States").
+    BadRecipientSignature,
+    /// `RecipientCallbackRejected(recipient)` revert — an `IMintRecipient`
+    /// contract refused the mint via its `authorizeMint` callback.
+    /// Deterministic like `BadRecipientSignature`.
+    RecipientCallbackRejected,
+    /// `VaultAmountMismatch(expected, actual)` revert — the orchestrator's
+    /// on-chain 1:1 assertion failed (e.g. a share-ratio rebase mid-flight).
+    /// Alert-and-investigate; the same aggregate resumes via admin reprocess
+    /// once the ratio is restored (see SPEC "Failure States").
+    VaultAmountMismatch,
+}
+
+impl MintFailureClassification {
+    /// Whether this failure is an orchestrator-wide halt
+    /// (`vaultLogicIsExpected()` / receipt-logic version lock). Per SPEC
+    /// ("Failure States"), a halt resolves environment-wide by upgrade,
+    /// never per-mint, so it must not advance the mint's automatic-retry
+    /// attempt counter — otherwise every in-flight mint would burn its whole
+    /// budget waiting out one halt.
+    pub(crate) const fn is_environment_halt(self) -> bool {
+        matches!(self, Self::VaultLogicMismatch | Self::ReceiptLogicMismatch)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum MintEvent {
     Initiated {
@@ -65,6 +127,13 @@ pub(crate) enum MintEvent {
         issuer_request_id: IssuerMintRequestId,
         error: String,
         failed_at: DateTime<Utc>,
+        /// Typed failure classification. Absent for pre-orchestrator events,
+        /// which replay as `Unclassified`. Typed classifications are never
+        /// auto-retried: `NonceConsumedByOtherMint` needs manual
+        /// reconciliation and the logic-mismatch halts resolve
+        /// environment-wide.
+        #[serde(default)]
+        classification: MintFailureClassification,
     },
     MintCompleted {
         issuer_request_id: IssuerMintRequestId,
@@ -120,6 +189,35 @@ pub(crate) enum MintEvent {
         mint_authorization: MintAuthorization,
         received_at: DateTime<Utc>,
     },
+
+    /// Orchestrator-mode mint succeeded on-chain (the counterpart of
+    /// `TokensMinted`), parsed from the orchestrator's `Minted` event.
+    /// Carries the consumed authorization `nonce` in place of vault-direct's
+    /// `receipt_id` — the orchestrator, not the bot, holds receipt custody,
+    /// so there is no bot-side receipt to record or register.
+    OrchestratorTokensMinted {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        /// `Minted.nonce` — the authorization nonce this mint consumed.
+        nonce: B256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    },
+
+    /// An orchestrator-mode mint that already landed on-chain, discovered by
+    /// recovery's `Minted`-log lookup full-matching
+    /// `(to, nonce, token, amount)` after a `NonceReplayed` revert. Carries
+    /// no `gas_used` — a bare log does not expose it.
+    OrchestratorMintRecovered {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        nonce: B256,
+        shares_minted: U256,
+        block_number: u64,
+        recovered_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
@@ -157,6 +255,12 @@ impl DomainEvent for MintEvent {
             }
             Self::MintAuthorizationReceived { .. } => {
                 "MintEvent::MintAuthorizationReceived".to_string()
+            }
+            Self::OrchestratorTokensMinted { .. } => {
+                "MintEvent::OrchestratorTokensMinted".to_string()
+            }
+            Self::OrchestratorMintRecovered { .. } => {
+                "MintEvent::OrchestratorMintRecovered".to_string()
             }
         }
     }
