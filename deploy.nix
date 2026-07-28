@@ -68,11 +68,14 @@ let
           throw "Unsupported environment '${env}'";
     in
     activate.custom pkg (
-      builtins.concatStringsSep " && " [
-        # pipefail makes the rage | install pipes fail if rage exits non-zero,
-        # preventing an empty credential file from being written and the service
-        # restarted with empty creds.
-        "set -o pipefail"
+      # Newline-joined under `set -e`, NOT " && ": the multi-line steps below
+      # end with newlines, and an "&&"-join would emit a line starting with
+      # "&&", which bash rejects at parse time. `set -e` keeps the same
+      # fail-fast semantics; pipefail makes the rage | install pipes fail if
+      # rage exits non-zero, preventing an empty credential file from being
+      # written and the service restarted with empty creds.
+      builtins.concatStringsSep "\n" [
+        "set -euo pipefail"
         "systemctl stop ${name} || true"
         "rm -f ${cfg.markerFile}"
         "mkdir -p /run/st0x /run/agenix"

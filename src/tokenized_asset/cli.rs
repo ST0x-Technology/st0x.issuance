@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use super::UnderlyingSymbol;
 use super::view::{
     TokenizedAssetViewError, find_vault, underlying_has_listing,
 };
+use super::{TokenizedAsset, UnderlyingSymbol};
 use crate::Network;
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::config::{
@@ -1332,6 +1332,15 @@ impl AssetAdmin {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
+        // The server heals `tokenized_asset_view` at startup, but this CLI
+        // runs while the service is deliberately stopped — and production
+        // carried the view empty for weeks without the running service's
+        // read paths noticing. Building the listing store runs the same
+        // catch-up, so every CLI read of the view sees the listings the
+        // event log actually holds.
+        let (_listing_store, _listing_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
+
         let (store, _projection) =
             StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
@@ -1462,6 +1471,7 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        TokenizedAssetEvent,
     };
 
     const TEST_SIGNER_KEY: &str =
@@ -1989,6 +1999,69 @@ mod tests {
         assert!(
             error.to_string().contains("no recorded custody holder"),
             "unobserved custody must demand confirm-custody, got {error}"
+        );
+    }
+
+    /// Production carried `tokenized_asset_view` empty for six weeks: a
+    /// migration dropped and recreated the table, and only the running
+    /// server's startup healed views — so listings written by an earlier
+    /// binary exist as events with no view rows, and this CLI (which runs
+    /// while the service is deliberately stopped) read an empty view.
+    /// Connecting must heal the listing view from the event log.
+    #[tokio::test]
+    async fn connect_heals_an_empty_listing_view_from_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("empty-view.db").display()
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let underlying = UnderlyingSymbol::new("AMAT").unwrap();
+        let event = TokenizedAssetEvent::Added {
+            underlying: underlying.clone(),
+            token: TokenSymbol::new("tAMAT"),
+            network: Network::Base,
+            vault: TEST_VAULT,
+            added_at: Utc::now(),
+        };
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('TokenizedAsset', ?, 1, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(AssetKey::new(underlying.clone(), Network::Base).to_string())
+        .bind(event.event_type())
+        .bind(serde_json::to_string(&event).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let admin = AssetAdmin::connect(&database_url, 1).await.unwrap();
+
+        let vault =
+            find_vault(&admin.pool, &underlying, &Network::Base).await.unwrap();
+        assert_eq!(
+            vault,
+            Some(TEST_VAULT),
+            "a listing present only in the event log must be readable after \
+             connect"
         );
     }
 
