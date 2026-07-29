@@ -26,6 +26,7 @@ use crate::fireblocks::auth_probe::probe_auth_pair;
 use crate::fireblocks::{
     Environment, FireblocksEnv, FireblocksVaultService, fetch_vault_address,
 };
+use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
     CorroboratedRecipient, MigrationOutcome, VaultIdentity,
     confirm_custody_holder, migrate_vault_receipts,
@@ -1378,9 +1379,16 @@ impl AssetAdmin {
         // The server heals `tokenized_asset_view` at startup, but this CLI
         // runs while the service is deliberately stopped — and production
         // carried the view empty for weeks without the running service's
-        // read paths noticing. Building the listing store runs the same
-        // catch-up, so every CLI read of the view sees the listings the
+        // read paths noticing. Run the same startup hygiene the server does
+        // (schema reconciliation clears snapshots and stale canonical
+        // projections on a version change) before the builds, so a CLI run
+        // after a schema bump cannot advance the recorded version while
+        // leaving incompatible view rows behind; the builds then run the
+        // same catch-up, so every CLI read of the view sees the listings the
         // event log actually holds.
+        prepare_event_sourced_startup::<TokenizedAsset>(&pool).await?;
+        prepare_event_sourced_startup::<Underlying>(&pool).await?;
+
         let (_listing_store, _listing_projection) =
             StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
