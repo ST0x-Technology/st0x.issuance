@@ -311,6 +311,12 @@ pub(crate) enum Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         closed_at: DateTime<Utc>,
+        /// Hash of the still-unresolved signed burn the operator acknowledged
+        /// when closing, carried through the closure so a later
+        /// force-complete against a different proving transaction must
+        /// re-acknowledge the transaction that may still land.
+        #[serde(default)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     },
     BurnIntended {
         metadata: RedemptionMetadata,
@@ -840,14 +846,15 @@ impl Redemption {
                 | Self::BurnIntended { .. }
                 | Self::BurnSubmitted { .. }
                 | Self::Failed { .. }
+                | Self::Closed { .. }
         ) {
             return Err(match self {
-                Self::Completed { .. } | Self::Closed { .. } => {
+                Self::Completed { .. } => {
                     RedemptionError::AlreadyCompleted { issuer_request_id }
                 }
                 _ => RedemptionError::InvalidState {
-                    expected: "Burning, BurnIntended, BurnSubmitted, or \
-                               Failed"
+                    expected: "Burning, BurnIntended, BurnSubmitted, \
+                               Failed, or Closed"
                         .to_string(),
                     found: self.state_name().to_string(),
                 },
@@ -861,30 +868,70 @@ impl Redemption {
         // verification of the planned burns is the entire proof, so there is
         // no hash to bind and nothing unresolved to acknowledge. Every state
         // that does persist a signed transaction keeps the full binding and
-        // acknowledgement guard.
-        let legacy_burn_without_persisted_tx =
-            matches!(self, Self::Failed { .. })
-                && self
-                    .persisted_unresolved_burn_tx()
-                    .filter(|sendable_tx| !sendable_tx.tx.is_empty())
-                    .is_none();
-        let acknowledged_unresolved_burn_tx_hash =
-            if legacy_burn_without_persisted_tx {
+        // acknowledgement guard. `Closed` joins the legacy shape only when
+        // its closure acknowledged no unresolved transaction: an admin close
+        // drops the persisted transaction (and never settles the
+        // reservation), but a closure that DID acknowledge a still-mineable
+        // burn carries that hash forward, and force-completing against a
+        // different proving transaction must re-acknowledge it — otherwise
+        // the acknowledged transaction could still land and double-burn.
+        let acknowledged_unresolved_burn_tx_hash = match self {
+            Self::Closed {
+                acknowledged_unresolved_burn_tx_hash: Some(unresolved),
+                ..
+            } => {
+                if *unresolved == burn_tx_hash {
+                    if let Some(provided) = acknowledged_unresolved_burn_tx_hash
+                    {
+                        return Err(
+                            RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                                provided,
+                            },
+                        );
+                    }
+
+                    None
+                } else {
+                    Some(Self::require_unresolved_burn_acknowledgement(
+                        *unresolved,
+                        acknowledged_unresolved_burn_tx_hash,
+                    )?)
+                }
+            }
+            Self::Closed {
+                acknowledged_unresolved_burn_tx_hash: None, ..
+            } => {
                 if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
                     return Err(
-                    RedemptionError::RedundantUnresolvedBurnAcknowledgement {
-                        provided,
-                    },
-                );
+                        RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                            provided,
+                        },
+                    );
                 }
 
                 None
-            } else {
-                self.validate_force_complete_burn_hash(
-                    burn_tx_hash,
-                    acknowledged_unresolved_burn_tx_hash,
-                )?
-            };
+            }
+            Self::Failed { .. }
+                if self
+                    .persisted_unresolved_burn_tx()
+                    .filter(|sendable_tx| !sendable_tx.tx.is_empty())
+                    .is_none() =>
+            {
+                if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
+                    return Err(
+                        RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                            provided,
+                        },
+                    );
+                }
+
+                None
+            }
+            _ => self.validate_force_complete_burn_hash(
+                burn_tx_hash,
+                acknowledged_unresolved_burn_tx_hash,
+            )?,
+        };
 
         Ok(vec![RedemptionEvent::BurnForceCompleted {
             issuer_request_id,
@@ -2038,9 +2085,14 @@ impl Redemption {
                 issuer_request_id,
                 reason,
                 closed_at,
-                ..
+                acknowledged_unresolved_burn_tx_hash,
             } => {
-                *self = Self::Closed { issuer_request_id, reason, closed_at };
+                *self = Self::Closed {
+                    issuer_request_id,
+                    reason,
+                    closed_at,
+                    acknowledged_unresolved_burn_tx_hash,
+                };
             }
             RedemptionEvent::BurnForceCompleted {
                 issuer_request_id,
@@ -4218,6 +4270,65 @@ mod tests {
         ));
     }
 
+    /// The legacy shape above, wedged one step further: an operator closed
+    /// the `Failed` redemption through the admin API (which does not settle
+    /// the burn reservation) before the force-complete path learned the
+    /// legacy shape. The verified landed burn is the same; a `Closed`
+    /// aggregate must accept the terminalization so the reservation can
+    /// settle instead of stranding the vault's custody migration forever.
+    #[tokio::test]
+    async fn force_complete_terminalizes_a_closed_legacy_burn() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let mut history = burning_given_events(&issuer_request_id);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "Fireblocks API error: error in reqwest-middleware: \
+                    error sending request"
+                .to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(3_U256),
+                shares_burned: uint!(40_000000000000000_U256),
+            }],
+        });
+        history.push(RedemptionEvent::RedemptionFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "On-chain balance insufficient for BurnFailed recovery: \
+                     balance=0, required=40000000000000000"
+                .to_string(),
+            failed_at: Utc::now(),
+        });
+        history.push(RedemptionEvent::RedemptionClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "Burn verified on-chain; closed by admin because \
+                     force-complete rejected the Failed state"
+                .to_string(),
+            closed_at: Utc::now(),
+            acknowledged_unresolved_burn_tx_hash: None,
+        });
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: b256!(
+                    "0xfda15f8e5fb2b87e83bf115ea41c521bb251cc3ae875ac91f3e38f003c9a09ee"
+                ),
+                block_number: 48_929_042,
+                reason: "operator verified the landed burn on-chain"
+                    .to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnForceCompleted { .. }]
+        ));
+    }
+
     /// The legacy shape has no persisted transaction, so there is nothing an
     /// acknowledgement could refer to — supplying one anyway must be refused
     /// rather than recorded as a meaningless fact on the terminal event.
@@ -4287,6 +4398,56 @@ mod tests {
             failed_at: Utc::now(),
             tx_id: None,
             planned_burns: vec![],
+        });
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: B256::random(),
+                block_number: 33_000_000,
+                reason: "different burn verified on-chain".to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::UnresolvedBurnRequiresAcknowledgement {
+                burn_tx_hash: persisted_hash,
+            }
+        );
+    }
+
+    /// A redemption closed while still carrying an acknowledged, potentially
+    /// still-mineable signed burn keeps the acknowledgement guard through the
+    /// closure: force-completing against a different proving transaction must
+    /// re-name the hash the operator is stranding, or the original
+    /// transaction could land later and double-burn.
+    #[tokio::test]
+    async fn force_complete_of_closed_redemption_with_unresolved_burn_requires_acknowledgement()
+     {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let persisted_hash = B256::random();
+        let mut history =
+            burn_intended_given_events(&issuer_request_id, persisted_hash);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "confirmation timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+        history.push(RedemptionEvent::RedemptionClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "closed by admin with the unresolved burn acknowledged"
+                .to_string(),
+            closed_at: Utc::now(),
+            acknowledged_unresolved_burn_tx_hash: Some(persisted_hash),
         });
 
         let error = TestHarness::<Redemption>::with(mock_services())
