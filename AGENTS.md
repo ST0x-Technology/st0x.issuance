@@ -348,16 +348,15 @@ depleted. Quiescence gates on in-flight mints/redemptions, never on freeze
 **Mint Flow:**
 
 1. AP requests mint -> Alpaca calls `/inkind/issuance`
-2. We validate and respond with `issuer_request_id` (Command: `InitiateMint`,
-   Event: `MintInitiated`)
+2. Validate and respond with `issuer_request_id`: `Initiate` -> `Initiated`
 3. Alpaca journals shares from AP to our custodian account
-4. Alpaca confirms journal -> `/inkind/issuance/confirm` (Command:
-   `ConfirmJournal`, Events: `JournalConfirmed`, `MintingStarted`)
-5. We prepare and persist the exact signed mint multicall (Command:
-   `PrepareMint`, Event: `MintTxIntended`)
-6. We broadcast and confirm it (Commands: `SubmitMint`, `ConfirmMint`; Events:
-   `MintTxSubmitted`, `TokensMinted`)
-7. We call Alpaca's callback (Command: `SendCallback`, Event: `MintCompleted`)
+4. Alpaca confirms: `ConfirmJournal`, `Deposit` -> `JournalConfirmed`,
+   `MintingStarted`
+5. `SubmitMintJob` prepares/persists the signed tx: `RecordTxIntended` ->
+   `MintTxIntended`
+6. Jobs broadcast/confirm: `RecordTxSubmitted`, `RecordTokensMinted` ->
+   `MintTxSubmitted`, `TokensMinted`
+7. `SendCallbackJob` calls Alpaca: `RecordCallbackSent` -> `MintCompleted`
 
 **Redemption Flow:**
 
