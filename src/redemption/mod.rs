@@ -311,12 +311,14 @@ pub(crate) enum Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         closed_at: DateTime<Utc>,
-        /// Hash of the still-unresolved signed burn the operator acknowledged
-        /// when closing, carried through the closure so a later
-        /// force-complete against a different proving transaction must
-        /// re-acknowledge the transaction that may still land.
+        /// The still-unresolved signed burn the pre-close state carried,
+        /// retained through the closure (the close event records at most an
+        /// acknowledged hash, and pre-acknowledgement closures recorded
+        /// nothing). A later force-complete against a different proving
+        /// transaction must re-acknowledge this transaction — it may still
+        /// land and double-burn.
         #[serde(default)]
-        acknowledged_unresolved_burn_tx_hash: Option<B256>,
+        unresolved_burn_tx: Option<SendableTxWithHash>,
     },
     BurnIntended {
         metadata: RedemptionMetadata,
@@ -864,74 +866,38 @@ impl Redemption {
         // A legacy `Failed` redemption has no persisted signed transaction to
         // bind the proving hash against — the burn went out through a
         // custodian's API, identified only by a backend transaction id the
-        // current backend cannot look up. For that shape the caller's on-chain
-        // verification of the planned burns is the entire proof, so there is
-        // no hash to bind and nothing unresolved to acknowledge. Every state
-        // that does persist a signed transaction keeps the full binding and
-        // acknowledgement guard. `Closed` joins the legacy shape only when
-        // its closure acknowledged no unresolved transaction: an admin close
-        // drops the persisted transaction (and never settles the
-        // reservation), but a closure that DID acknowledge a still-mineable
-        // burn carries that hash forward, and force-completing against a
-        // different proving transaction must re-acknowledge it — otherwise
-        // the acknowledged transaction could still land and double-burn.
-        let acknowledged_unresolved_burn_tx_hash = match self {
-            Self::Closed {
-                acknowledged_unresolved_burn_tx_hash: Some(unresolved),
-                ..
-            } => {
-                if *unresolved == burn_tx_hash {
-                    if let Some(provided) = acknowledged_unresolved_burn_tx_hash
-                    {
-                        return Err(
-                            RedemptionError::RedundantUnresolvedBurnAcknowledgement {
-                                provided,
-                            },
-                        );
-                    }
-
-                    None
-                } else {
-                    Some(Self::require_unresolved_burn_acknowledgement(
-                        *unresolved,
-                        acknowledged_unresolved_burn_tx_hash,
-                    )?)
-                }
-            }
-            Self::Closed {
-                acknowledged_unresolved_burn_tx_hash: None, ..
-            } => {
-                if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
-                    return Err(
-                        RedemptionError::RedundantUnresolvedBurnAcknowledgement {
-                            provided,
-                        },
-                    );
-                }
-
-                None
-            }
-            Self::Failed { .. }
-                if self
+        // current backend cannot look up. For that shape the caller's
+        // on-chain verification of the planned burns is the entire proof, so
+        // there is no hash to bind and nothing unresolved to acknowledge.
+        // `Closed` joins the same split: its state retains whatever signed
+        // burn survived to the moment of closure (recorded acknowledgement or
+        // not — pre-acknowledgement closures recorded nothing), so a closure
+        // that still carries one keeps the full binding and acknowledgement
+        // guard, and only a closure of a custodian-era burn with nothing
+        // persisted goes through as legacy.
+        let legacy_burn_without_persisted_tx =
+            matches!(self, Self::Failed { .. } | Self::Closed { .. })
+                && self
                     .persisted_unresolved_burn_tx()
                     .filter(|sendable_tx| !sendable_tx.tx.is_empty())
-                    .is_none() =>
-            {
+                    .is_none();
+        let acknowledged_unresolved_burn_tx_hash =
+            if legacy_burn_without_persisted_tx {
                 if let Some(provided) = acknowledged_unresolved_burn_tx_hash {
                     return Err(
-                        RedemptionError::RedundantUnresolvedBurnAcknowledgement {
-                            provided,
-                        },
-                    );
+                    RedemptionError::RedundantUnresolvedBurnAcknowledgement {
+                        provided,
+                    },
+                );
                 }
 
                 None
-            }
-            _ => self.validate_force_complete_burn_hash(
-                burn_tx_hash,
-                acknowledged_unresolved_burn_tx_hash,
-            )?,
-        };
+            } else {
+                self.validate_force_complete_burn_hash(
+                    burn_tx_hash,
+                    acknowledged_unresolved_burn_tx_hash,
+                )?
+            };
 
         Ok(vec![RedemptionEvent::BurnForceCompleted {
             issuer_request_id,
@@ -1111,7 +1077,8 @@ impl Redemption {
             Self::BurnIntended { sendable_tx, .. }
             | Self::BurnSubmitted { sendable_tx, .. } => Some(sendable_tx),
             Self::Burning { prior_burn_tx, .. } => prior_burn_tx.as_ref(),
-            Self::Failed { unresolved_burn_tx, .. } => {
+            Self::Failed { unresolved_burn_tx, .. }
+            | Self::Closed { unresolved_burn_tx, .. } => {
                 unresolved_burn_tx.as_ref()
             }
             _ => None,
@@ -1484,7 +1451,12 @@ impl EventSourced for Redemption {
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 5;
+    // 6: `Closed` gained `acknowledged_unresolved_burn_tx_hash`. Snapshots
+    // serialized under 5 would deserialize the field as `None` even when the
+    // closure acknowledged a still-mineable burn, silently dropping the
+    // re-acknowledgement guard; the bump clears them so the state rebuilds
+    // from events, which carry the hash.
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -1603,10 +1575,17 @@ impl EventSourced for Redemption {
                     found: "Uninitialized".to_string(),
                 })
             }
-            RedemptionCommand::RecordBurnFailure { .. }
-            | RedemptionCommand::ForceCompleteBurn { .. } => {
+            RedemptionCommand::RecordBurnFailure { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "Burning, BurnIntended, or BurnSubmitted"
+                        .to_string(),
+                    found: "Uninitialized".to_string(),
+                })
+            }
+            RedemptionCommand::ForceCompleteBurn { .. } => {
+                Err(RedemptionError::InvalidState {
+                    expected: "Burning, BurnIntended, BurnSubmitted, \
+                               Failed, or Closed"
                         .to_string(),
                     found: "Uninitialized".to_string(),
                 })
@@ -2085,13 +2064,21 @@ impl Redemption {
                 issuer_request_id,
                 reason,
                 closed_at,
-                acknowledged_unresolved_burn_tx_hash,
+                ..
             } => {
+                // The close event records at most an acknowledged hash, and
+                // pre-acknowledgement closures recorded nothing — the
+                // pre-close state is the only reliable carrier of a signed
+                // burn that may still land, so retain it through the closure.
+                let unresolved_burn_tx = self
+                    .persisted_unresolved_burn_tx()
+                    .filter(|sendable_tx| !sendable_tx.tx.is_empty())
+                    .cloned();
                 *self = Self::Closed {
                     issuer_request_id,
                     reason,
                     closed_at,
-                    acknowledged_unresolved_burn_tx_hash,
+                    unresolved_burn_tx,
                 };
             }
             RedemptionEvent::BurnForceCompleted {
@@ -4423,6 +4410,56 @@ mod tests {
         );
     }
 
+    /// The pre-#260 closure shape: `CloseRedemption` accepted persisted-tx
+    /// states without recording any acknowledgement, so historical
+    /// `RedemptionClosed` events replay with the acknowledgement field
+    /// defaulted to `None` while a still-mineable signed burn survives in
+    /// the pre-close history. The guard must key on that retained
+    /// transaction, not on the recorded acknowledgement.
+    #[tokio::test]
+    async fn force_complete_of_pre_acknowledgement_closure_requires_acknowledgement()
+     {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let persisted_hash = B256::random();
+        let mut history =
+            burn_intended_given_events(&issuer_request_id, persisted_hash);
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "confirmation timed out".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+        history.push(RedemptionEvent::RedemptionClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "closed by a pre-acknowledgement admin build".to_string(),
+            closed_at: Utc::now(),
+            acknowledged_unresolved_burn_tx_hash: None,
+        });
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: B256::random(),
+                block_number: 33_000_000,
+                reason: "different burn verified on-chain".to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::UnresolvedBurnRequiresAcknowledgement {
+                burn_tx_hash: persisted_hash,
+            }
+        );
+    }
+
     /// A redemption closed while still carrying an acknowledged, potentially
     /// still-mineable signed burn keeps the acknowledgement guard through the
     /// closure: force-completing against a different proving transaction must
@@ -4687,7 +4724,9 @@ mod tests {
         assert_eq!(
             error,
             RedemptionError::InvalidState {
-                expected: "Burning, BurnIntended, or BurnSubmitted".to_string(),
+                expected: "Burning, BurnIntended, BurnSubmitted, Failed, or \
+                           Closed"
+                    .to_string(),
                 found: "Uninitialized".to_string(),
             }
         );

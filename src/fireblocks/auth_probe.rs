@@ -31,7 +31,7 @@ pub struct AuthProbeReport {
 pub enum AuthProbeError {
     #[error("failed to build the probe JWT: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
-    #[error("probe request failed before receiving a response: {0}")]
+    #[error("probe HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("system clock error: {0}")]
     Clock(#[from] std::time::SystemTimeError),
@@ -119,7 +119,8 @@ pub async fn probe_auth(
 ///
 /// # Errors
 ///
-/// Returns an error if either probe fails before receiving a response.
+/// Returns an error if either probe fails to send its request or to read
+/// the response body.
 pub async fn probe_auth_pair(
     base_url: &str,
     config: &FireblocksConfig,
