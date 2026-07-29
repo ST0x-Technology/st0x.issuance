@@ -22,8 +22,9 @@ use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
     setup_tracing,
 };
+use crate::fireblocks::auth_probe::probe_auth_pair;
 use crate::fireblocks::{
-    FireblocksEnv, FireblocksVaultService, fetch_vault_address,
+    Environment, FireblocksEnv, FireblocksVaultService, fetch_vault_address,
 };
 use crate::receipt_inventory::migration::{
     CorroboratedRecipient, MigrationOutcome, VaultIdentity,
@@ -131,6 +132,22 @@ enum IssuerCommand {
     /// other redemption may already claim it. Completes the redemption and
     /// settles its receipt reservation like a normal burn confirmation.
     ForceCompleteRedemption(Box<ForceCompleteRedemptionArgs>),
+    /// A/B-probe Fireblocks API authentication and print the raw responses.
+    ///
+    /// Sends the same authenticated vault-address GET twice, varying only the
+    /// JWT expiry window: once compliant with Fireblocks' documented
+    /// `exp < iat + 30s` bound, once with the SDK's out-of-spec `iat + 55`.
+    /// Prints each response's status and verbatim body — the diagnostic the
+    /// SDK swallows on 401. A split verdict proves the platform enforces the
+    /// documented bound; identical rejections carry the server's own error
+    /// code for diagnosis. Submits nothing and reads only the vault address.
+    FireblocksAuthProbe(Box<FireblocksAuthProbeArgs>),
+}
+
+#[derive(Args)]
+struct FireblocksAuthProbeArgs {
+    #[clap(flatten)]
+    fireblocks: FireblocksEnv,
 }
 
 /// Which way the operator intends custody to move. Stated explicitly and
@@ -386,6 +403,9 @@ impl IssuerCli {
             }
             IssuerCommand::ForceCompleteRedemption(args) => {
                 run_force_complete_redemption(*args, prompt_confirm).await
+            }
+            IssuerCommand::FireblocksAuthProbe(args) => {
+                run_fireblocks_auth_probe(*args).await
             }
         }
     }
@@ -753,6 +773,29 @@ async fn run_fireblocks_smoke<P: Provider + Clone>(
     }
 
     println!("Fireblocks smoke transfer completed (moved nothing): {tx_hash}");
+
+    Ok(())
+}
+
+/// Runs the authentication A/B probe against the environment's API host and
+/// prints each attempt's status and verbatim body.
+async fn run_fireblocks_auth_probe(
+    args: FireblocksAuthProbeArgs,
+) -> anyhow::Result<()> {
+    let config = args.fireblocks.into_config()?;
+    let base_url = match config.environment {
+        Environment::Production => "https://api.fireblocks.io",
+        Environment::Sandbox => "https://sandbox-api.fireblocks.io",
+    };
+
+    println!("Probing {base_url} with the service's credential pair");
+    for report in probe_auth_pair(base_url, &config).await? {
+        println!(
+            "exp = iat + {}s -> HTTP {}",
+            report.expiry_seconds, report.status
+        );
+        println!("{}", report.body);
+    }
 
     Ok(())
 }

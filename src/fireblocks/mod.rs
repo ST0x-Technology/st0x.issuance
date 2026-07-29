@@ -13,6 +13,7 @@
 //! Temporary: leaves together with `migrate-receipts` once every vault has
 //! migrated.
 
+pub mod auth_probe;
 mod config;
 pub mod vault_service;
 
