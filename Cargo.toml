@@ -78,6 +78,9 @@ apalis-sqlite = "=1.0.0-rc.8"
 apalis-core = "=1.0.0-rc.9"
 apalis-codec = "=0.1.0-rc.9"
 fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", branch = "fix/confirming-not-terminal", version = "2025.10.17" }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+sha2 = "0.11.0"
+rand = "0.8"
 
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"
