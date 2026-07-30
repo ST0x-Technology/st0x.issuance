@@ -785,23 +785,28 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 
 The custody subcommands are listing-scoped and therefore take `--network`, plus
 `--rpc-url` (the service's own `RPC_URL`) and `--chain-id` (cross-checked
-against the chain that endpoint reports). `migrate-receipts` and
-`verify-custodians` require both custodians' configurations — the `TURNKEY_*`
-group and the `FIREBLOCKS_*` group the retired integration used — all from the
-service's own environment.
+against the chain that endpoint reports). `verify-custodians` requires both
+custodians' configurations — the `TURNKEY_*` group and the `FIREBLOCKS_*` group
+the retired integration used. `migrate-receipts` always requires Turnkey and
+selects the retiring wallet's control explicitly with
+`--outgoing-wallet-control fireblocks-raw` (the default) or
+`--outgoing-wallet-control local-private-key`. The latter is an emergency-only
+path requiring `CUSTODY_MIGRATION_PRIVATE_KEY`; it makes no Fireblocks API call.
 
 **No wallet address is ever an argument.** An ERC-1155 transfer to a wrong
 address is final — no counterparty, no recovery, and the receipts back tokens
 that are still outstanding — so every address is derived, never typed: the
-Fireblocks wallet from the Fireblocks API (`fetch_vault_address`), the Turnkey
-wallet from `TURNKEY_ADDRESS` (the exact value the service runs with after the
-cutover), and the direction from the inventory's recorded custody. Custody at
-the Fireblocks wallet → forward transfer, submitted through the Fireblocks API
-as a `CONTRACT_CALL` via the whitelisted Receipt contract with a deterministic
-`externalTxId` (a retried run resumes the original transaction instead of
-double-submitting), polled to a terminal status. Custody at the Turnkey wallet →
-rollback, signed by Turnkey back to the API-derived Fireblocks wallet.
-Unobserved custody → refuse and demand `confirm-custody`.
+retiring wallet from the Fireblocks API or the emergency private key, the
+Turnkey wallet from `TURNKEY_ADDRESS` (the exact value the service runs with
+after the cutover), and the direction from the inventory's recorded custody. The
+derived retiring wallet must equal the recorded custody holder (forward) or
+recorded migration origin (rollback) before anything is signed. Custody at the
+retiring wallet → forward transfer, built locally and either RAW-signed through
+Fireblocks or signed directly by the explicitly selected emergency key, then
+broadcast through the configured RPC. Custody at the Turnkey wallet → rollback,
+signed by Turnkey back to the corroborated recorded origin. The private key is
+never logged, formatted into an error, or persisted. Unobserved custody → refuse
+and demand `confirm-custody`.
 
 **Ownership verification is the check, not address comparison.** The engine
 requires the holder to hold exactly every tracked balance on-chain before

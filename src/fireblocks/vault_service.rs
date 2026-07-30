@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, Bytes, TxHash};
+use alloy::primitives::{
+    Address, B256, Bytes, Signature, SignatureError, TxHash, U256,
+};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -80,6 +82,26 @@ pub enum FireblocksVaultError {
          Fireblocks console before retrying"
     )]
     RetryAttemptsExhausted { base_external_tx_id: String, attempts: u32 },
+    #[error(
+        "Fireblocks RAW signing transaction {tx_id} completed without a \
+         signed message signature"
+    )]
+    MissingSignature { tx_id: String },
+    #[error(
+        "Fireblocks RAW signature for transaction {tx_id} is missing its r, \
+         s, or v component"
+    )]
+    IncompleteSignature { tx_id: String },
+    #[error("invalid hex in a Fireblocks RAW signature component: {0}")]
+    SignatureComponent(#[from] alloy::primitives::ruint::ParseError),
+    #[error("failed to recover signer address from RAW signature: {0}")]
+    SignatureRecovery(#[from] SignatureError),
+    #[error(
+        "Fireblocks RAW signature recovers to {recovered}, expected \
+         {expected} -- the vault account signed with an unexpected key or the \
+         response is corrupted; do NOT broadcast"
+    )]
+    RawSignerMismatch { expected: Address, recovered: Address },
 }
 
 /// How [`FireblocksVaultService::submit_contract_call`] obtained its
@@ -163,15 +185,15 @@ async fn vault_address_via(
     Ok(address_str.parse::<Address>()?)
 }
 
-/// Vault service implementation that uses Fireblocks CONTRACT_CALL operation.
+/// Narrow Fireblocks client for migration-time RAW signing and the legacy
+/// CONTRACT_CALL smoke path.
 ///
-/// Unlike the RAW signing approach (which only signs hashes), CONTRACT_CALL
-/// enables Fireblocks TAP policies to enforce contract/method whitelisting.
-/// Fireblocks handles transaction building, signing, and broadcasting.
+/// RAW returns only a signature over a caller-built hash. CONTRACT_CALL lets
+/// Fireblocks build and broadcast through its transaction engine and remains
+/// only for the optional whitelisted-contract smoke test.
 ///
-/// The service holds a read-only RPC provider solely for
-/// [`FireblocksVaultService::fetch_receipt`] — the retired mint/burn view
-/// calls did not survive into this slice.
+/// The service holds a read-only RPC provider for receipt verification; the
+/// retired mint/burn view calls did not survive into this slice.
 pub struct FireblocksVaultService<P> {
     client: Client,
     vault_account_id: String,
@@ -417,6 +439,211 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         }
     }
 
+    /// Signs a 32-byte transaction hash with the vault account's secp256k1
+    /// key via a RAW signing operation and polls to completion, walking to a
+    /// fresh `externalTxId` when a recovered previous attempt turns out
+    /// terminally failed — the same id discipline as
+    /// [`Self::submit_contract_call_to_completion`].
+    ///
+    /// RAW signing never touches Fireblocks' transaction engine
+    /// (build/broadcast/node infrastructure): the caller builds and
+    /// broadcasts the transaction itself and Fireblocks only produces the
+    /// signature. The returned signature is verified to recover to
+    /// `expected_signer` before it is handed back, so success is proof the
+    /// vault key signed the exact hash — never broadcast on an unverified
+    /// signature.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::submit_contract_call_to_completion`], plus a completed
+    /// signing operation that carries no signature, a malformed signature
+    /// component, or a signature that recovers to the wrong address.
+    pub async fn sign_raw_to_completion(
+        &self,
+        sighash: B256,
+        expected_signer: Address,
+        note: &str,
+        base_external_tx_id: &str,
+    ) -> Result<Signature, FireblocksVaultError> {
+        for attempt in 0..MAX_SUBMISSION_ATTEMPTS {
+            let external_tx_id = if attempt == 0 {
+                base_external_tx_id.to_string()
+            } else {
+                format!("{base_external_tx_id}-retry-{attempt}")
+            };
+
+            let submission =
+                self.submit_raw_signing(sighash, note, &external_tx_id).await?;
+
+            match self
+                .wait_for_signature(
+                    submission.tx_id(),
+                    sighash,
+                    expected_signer,
+                )
+                .await
+            {
+                Ok(signature) => return Ok(signature),
+                Err(FireblocksVaultError::TransactionFailed {
+                    tx_id,
+                    status,
+                }) if matches!(submission, Submission::Recovered { .. }) => {
+                    warn!(target: "fireblocks",
+                        %external_tx_id,
+                        fireblocks_tx_id = %tx_id,
+                        ?status,
+                        "Recovered RAW signing transaction from a previous \
+                         attempt is terminally failed and its externalTxId \
+                         is spent; submitting under a fresh retry id"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(FireblocksVaultError::RetryAttemptsExhausted {
+            base_external_tx_id: base_external_tx_id.to_string(),
+            attempts: MAX_SUBMISSION_ATTEMPTS,
+        })
+    }
+
+    /// Submits a single RAW signing transaction under `external_tx_id`,
+    /// reporting whether the id created a fresh transaction or recovered one
+    /// a previous run already claimed.
+    async fn submit_raw_signing(
+        &self,
+        sighash: B256,
+        note: &str,
+        external_tx_id: &str,
+    ) -> Result<Submission, FireblocksVaultError> {
+        let asset_id = self.chain_asset_ids.get(self.chain_id).ok_or(
+            FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
+        )?;
+
+        let tx_request = build_raw_signing_request(
+            asset_id.as_str(),
+            &self.vault_account_id,
+            sighash,
+            note,
+            external_tx_id,
+        );
+
+        let params = CreateTransactionParams::builder()
+            .transaction_request(tx_request)
+            .build();
+
+        let create_response =
+            self.client.transactions_api().create_transaction(params).await;
+
+        match create_response {
+            Ok(response) => response
+                .id
+                .map(|tx_id| Submission::Created { tx_id })
+                .ok_or(FireblocksVaultError::MissingTransactionId),
+            Err(ref err) if is_duplicate_external_tx_id_error(err) => {
+                warn!(target: "fireblocks",
+                    %external_tx_id,
+                    original_error = ?err,
+                    "Duplicate externalTxId — looking up existing RAW \
+                     signing transaction"
+                );
+
+                self.recover_by_external_tx_id(external_tx_id)
+                    .await
+                    .map(|tx_id| Submission::Recovered { tx_id })
+            }
+            Err(err) => {
+                warn!(target: "fireblocks", error = ?err,
+                    %external_tx_id,
+                    "Fireblocks RAW signing create_transaction failed"
+                );
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Polls a RAW signing transaction to completion and extracts its
+    /// verified signature.
+    async fn wait_for_signature(
+        &self,
+        tx_id: &str,
+        sighash: B256,
+        expected_signer: Address,
+    ) -> Result<Signature, FireblocksVaultError> {
+        debug!(target: "fireblocks", fireblocks_tx_id = %tx_id, "Polling Fireblocks RAW signing transaction...");
+
+        let result = self
+            .client
+            .poll_transaction(
+                tx_id,
+                Duration::from_secs(600),
+                Duration::from_millis(500),
+                |tx| {
+                    debug!(target: "fireblocks", fireblocks_tx_id = %tx_id,
+                        status = ?tx.status,
+                        "Polling Fireblocks transaction"
+                    );
+                },
+            )
+            .await?;
+
+        if result.status != TransactionStatus::Completed {
+            if is_still_pending(result.status) {
+                warn!(target: "fireblocks", fireblocks_tx_id = %tx_id,
+                    status = ?result.status,
+                    "Polling timed out but the signing operation may still \
+                     complete"
+                );
+
+                return Err(FireblocksVaultError::PollTimedOut {
+                    tx_id: tx_id.to_string(),
+                    status: result.status,
+                });
+            }
+
+            return Err(FireblocksVaultError::TransactionFailed {
+                tx_id: tx_id.to_string(),
+                status: result.status,
+            });
+        }
+
+        let signature = result
+            .signed_messages
+            .as_ref()
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.signature.as_ref())
+            .ok_or_else(|| FireblocksVaultError::MissingSignature {
+                tx_id: tx_id.to_string(),
+            })?;
+
+        let (Some(r_hex), Some(s_hex), Some(v)) =
+            (&signature.r, &signature.s, signature.v)
+        else {
+            return Err(FireblocksVaultError::IncompleteSignature {
+                tx_id: tx_id.to_string(),
+            });
+        };
+
+        let r = U256::from_str_radix(r_hex.trim_start_matches("0x"), 16)?;
+        let s = U256::from_str_radix(s_hex.trim_start_matches("0x"), 16)?;
+        let odd_y_parity = matches!(
+            v,
+            fireblocks_sdk::models::signed_message_signature::V::Variant1
+        );
+
+        let signature = Signature::new(r, s, odd_y_parity);
+        let recovered = signature.recover_address_from_prehash(&sighash)?;
+
+        if recovered != expected_signer {
+            return Err(FireblocksVaultError::RawSignerMismatch {
+                expected: expected_signer,
+                recovered,
+            });
+        }
+
+        Ok(signature)
+    }
+
     /// Recovers a Fireblocks transaction ID by looking up the `externalTxId`.
     ///
     /// Called when `create_transaction` returns a duplicate `externalTxId`
@@ -562,6 +789,71 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or(FireblocksVaultError::MissingReceipt { tx_hash })
+    }
+}
+
+/// Builds a Fireblocks RAW signing transaction request for a 32-byte
+/// prehashed message.
+///
+/// No destination and no amount: the operation only produces a secp256k1
+/// signature over `sighash` with the vault account's key for the given
+/// asset — nothing is built or broadcast on the Fireblocks side.
+fn build_raw_signing_request(
+    asset_id: &str,
+    vault_account_id: &str,
+    sighash: B256,
+    note: &str,
+    external_tx_id: &str,
+) -> models::TransactionRequest {
+    let raw_message_data = models::ExtraParametersRawMessageData {
+        messages: Some(vec![models::UnsignedMessage::new(alloy::hex::encode(
+            sighash,
+        ))]),
+        algorithm: Some(
+            models::extra_parameters_raw_message_data::Algorithm::MpcEcdsaSecp256K1,
+        ),
+    };
+
+    models::TransactionRequest {
+        operation: Some(models::TransactionOperation::Raw),
+        asset_id: Some(asset_id.to_string()),
+        source: Some(models::SourceTransferPeerPath {
+            r#type: models::TransferPeerPathType::VaultAccount,
+            id: Some(vault_account_id.to_string()),
+            sub_type: None,
+            name: None,
+            wallet_id: None,
+            is_collateral: None,
+        }),
+        destination: None,
+        amount: None,
+        extra_parameters: Some(models::ExtraParameters {
+            contract_call_data: None,
+            raw_message_data: Some(raw_message_data),
+            inputs_selection: None,
+            node_controls: None,
+            program_call_data: None,
+        }),
+        external_tx_id: Some(external_tx_id.to_string()),
+        note: Some(note.to_string()),
+        fee_level: None,
+        destinations: None,
+        treat_as_gross_amount: None,
+        force_sweep: None,
+        fee: None,
+        priority_fee: None,
+        fail_on_low_fee: None,
+        max_fee: None,
+        gas_limit: None,
+        gas_price: None,
+        network_fee: None,
+        replace_tx_by_hash: None,
+        customer_ref_id: None,
+        auto_staking: None,
+        network_staking: None,
+        cpu_staking: None,
+        use_gasless: None,
+        travel_rule_message: None,
     }
 }
 
@@ -1483,6 +1775,178 @@ mod tests {
         assert!(
             !is_duplicate_external_tx_id_error(&err),
             "Non-ResponseError should not be detected as duplicate"
+        );
+    }
+
+    fn mock_raw_signing_creation<'a>(
+        server: &'a MockServer,
+        sighash: B256,
+        tx_id: &str,
+    ) -> httpmock::Mock<'a> {
+        let response = serde_json::json!({ "id": tx_id });
+        server.mock(move |when, then| {
+            when.method("POST")
+                .path("/transactions")
+                .body_includes(r#""operation":"RAW""#)
+                .body_includes(alloy::hex::encode(sighash));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(response);
+        })
+    }
+
+    /// RAW signing must return the signature Fireblocks produced, verified to
+    /// recover to the expected signer. The mock replays a real secp256k1
+    /// signature (numeric `v`, as production sends it) so recovery is
+    /// exercised for real, not stubbed.
+    #[tokio::test]
+    async fn sign_raw_returns_signature_recovering_to_expected_signer() {
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let sighash = B256::random();
+        let signature = signer.sign_hash_sync(&sighash).unwrap();
+
+        let server = MockServer::start();
+        let create_mock =
+            mock_raw_signing_creation(&server, sighash, "raw-tx-1");
+
+        let poll_body = serde_json::json!({
+            "id": "raw-tx-1",
+            "status": "COMPLETED",
+            "signedMessages": [{
+                "signature": {
+                    "r": format!("{:064x}", signature.r()),
+                    "s": format!("{:064x}", signature.s()),
+                    "v": u8::from(signature.v()),
+                }
+            }]
+        });
+        let poll_mock = server.mock(|when, then| {
+            when.method("GET").path("/transactions/raw-tx-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(poll_body);
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let returned = service
+            .sign_raw_to_completion(
+                sighash,
+                signer.address(),
+                "raw signing test",
+                "raw-ext-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            returned.recover_address_from_prehash(&sighash).unwrap(),
+            signer.address(),
+            "returned signature must recover to the vault wallet address"
+        );
+        create_mock.assert();
+        assert!(
+            poll_mock.calls() >= 1,
+            "the signing operation must have been polled"
+        );
+    }
+
+    /// A signature that recovers to any address other than the expected
+    /// signer must never be handed back to a caller that would broadcast it.
+    #[tokio::test]
+    async fn sign_raw_rejects_signature_from_wrong_signer() {
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let expected = Address::random();
+        let sighash = B256::random();
+        let signature = signer.sign_hash_sync(&sighash).unwrap();
+
+        let server = MockServer::start();
+        mock_raw_signing_creation(&server, sighash, "raw-tx-2");
+
+        let poll_body = serde_json::json!({
+            "id": "raw-tx-2",
+            "status": "COMPLETED",
+            "signedMessages": [{
+                "signature": {
+                    "r": format!("{:064x}", signature.r()),
+                    "s": format!("{:064x}", signature.s()),
+                    "v": u8::from(signature.v()),
+                }
+            }]
+        });
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/raw-tx-2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(poll_body);
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service
+            .sign_raw_to_completion(
+                sighash,
+                expected,
+                "raw signing test",
+                "raw-ext-2",
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                FireblocksVaultError::RawSignerMismatch {
+                    expected: reported_expected,
+                    recovered,
+                } if reported_expected == expected
+                    && recovered == signer.address()
+            ),
+            "a wrong-signer signature must be rejected before any broadcast"
+        );
+    }
+
+    /// A completed RAW signing operation with no signature payload is a
+    /// malformed response, not a success.
+    #[tokio::test]
+    async fn sign_raw_completed_without_signature_is_an_error() {
+        let sighash = B256::random();
+
+        let server = MockServer::start();
+        mock_raw_signing_creation(&server, sighash, "raw-tx-3");
+
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/raw-tx-3");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "raw-tx-3",
+                    "status": "COMPLETED",
+                }));
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service
+            .sign_raw_to_completion(
+                sighash,
+                Address::random(),
+                "raw signing test",
+                "raw-ext-3",
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                FireblocksVaultError::MissingSignature { tx_id } if tx_id == "raw-tx-3"
+            ),
+            "completed RAW op without a signature must surface MissingSignature"
         );
     }
 }

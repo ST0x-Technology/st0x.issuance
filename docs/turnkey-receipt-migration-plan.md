@@ -1,13 +1,14 @@
 # Plan: migrating deposit receipts to the Turnkey wallet
 
-Status: the migration CLI executes the live move end to end. The narrow
-Fireblocks client was restored (submit `CONTRACT_CALL`, poll to terminal,
-whitelist resolution, vault-address lookup), so `issuer migrate-receipts`
-submits the forward transfer through the Fireblocks API itself and signs the
-rollback with Turnkey. Every wallet address is derived — from the Fireblocks
-API, the Turnkey configuration, or on-chain state — never typed. What remains
-before the window is the Fireblocks-side authorization (whitelisting + TAP rule,
-RAI-1546/RAI-1544) and the preflights below.
+Status: the migration CLI executes the live move end to end. By default it
+builds the forward transaction locally, obtains only its signature through a
+Fireblocks `RAW` operation, and broadcasts through the configured RPC, bypassing
+Fireblocks' transaction engine. If Fireblocks RAW signing is also unavailable,
+`--outgoing-wallet-control local-private-key` signs directly with the
+emergency-only `CUSTODY_MIGRATION_PRIVATE_KEY` and makes no Fireblocks API call.
+Rollback is always signed by Turnkey. Every wallet address is derived — from the
+selected retiring-wallet control, the Turnkey configuration, or recorded custody
+— never typed.
 
 ## What this unblocks
 
@@ -88,14 +89,33 @@ every remaining asset would begin reverting mid-migration. The automation must
 read `isCertificationExpired()` immediately before each submission and abort
 cleanly rather than retry into a wall.
 
-## Custodian authorisation: the Fireblocks policy changes
+## Custodian authorisation and emergency control
 
-The full Fireblocks integration was deleted with the Turnkey switch; the narrow
-client restored for this migration (`src/fireblocks/`) submits `CONTRACT_CALL`
-operations to an `ExternalWallet` destination resolved from the whitelisted
-contract wallet list, and `resolve_contract_wallet` rejects any address not
-already whitelisted. The vault was the only call target historically; the
-Receipt contract was never one. That is the gap the authorization work closes.
+The default path requires the Fireblocks workspace to permit a `RAW` operation
+for the retiring vault account. The CLI builds the exact EIP-1559 receipt
+transfer, asks Fireblocks to sign its hash, verifies the returned signature
+recovers to the recorded custody holder, and broadcasts the signed envelope
+through the configured RPC. It does not use Fireblocks' transaction-building,
+node, or broadcast infrastructure.
+
+The contract-whitelisting and TAP material below documents the older
+`CONTRACT_CALL` route. `verify-custodians` still resolves that whitelist (and
+`--smoke` submits through it), so invoke that optional preflight only when the
+legacy route is configured. It is not required by either `migrate-receipts`
+forward mode.
+
+The last-resort path is explicit:
+
+Select `--outgoing-wallet-control local-private-key` and provide
+`CUSTODY_MIGRATION_PRIVATE_KEY` through the process environment.
+
+Enter it with a non-echoing prompt, never in an argument or inline shell
+assignment: those are visible in process listings or shell history. The key is
+parsed into a valid secp256k1 signer, redacted from debug output, never logged
+or persisted, and its derived address must equal recorded custody before the CLI
+signs. This path bypasses Fireblocks entirely; use it only under the team's
+emergency key-handling procedure and remove it from the process environment as
+soon as the migration command exits.
 
 ### Step 1: whitelist each Receipt contract
 
@@ -165,14 +185,12 @@ restriction is available in this workspace tier, which the public rule schema
 does not appear to express; and remove the rule and the whitelisting once the
 migration completes, since this grant has no ongoing purpose after cutover.
 
-### The shortcut worth asking about first
+### The active default
 
-If the workspace policy still permits RAW operations for that vault account, the
-transfer can be signed without whitelisting the Receipt contract or adding any
-rule. The workspace was originally configured for RAW signing. Establishing
-whether that permission survives is a single question to the workspace
-administrator and, if the answer is yes, removes both steps above from the
-critical path.
+The workspace's `RAW` permission is now the default migration route. Confirm it
+for the vault account before the window. If that path fails, the explicit local
+private-key mode above is the final fallback; it does not silently activate from
+the mere presence of a key.
 
 ## Which receipts to move
 
@@ -200,40 +218,39 @@ event, one outcome, no partially migrated vault.
 ## How the CLI executes the move
 
 The forward transfer is signed by the retiring custodian: ERC-1155 only lets the
-holder move its own balance, and the holder is the Fireblocks wallet. The narrow
-Fireblocks client restored for this purpose submits the batch as a
-`CONTRACT_CALL` through the whitelisted Receipt contract (so TAP policy
-applies), with a deterministic `externalTxId` so a crashed or retried run
-resumes the original transaction instead of double-submitting, and polls it to a
-terminal status — waiting through any console approvals. The rollback is signed
-by Turnkey directly.
+holder move its own balance, and the holder is the Fireblocks wallet. Both
+forward modes build the same batch locally and broadcast through the configured
+RPC. `fireblocks-raw` obtains the signature through the Fireblocks API;
+`local-private-key` signs directly. The rollback is signed by Turnkey.
 
 `issuer migrate-receipts <UNDERLYING> --network base --direction <forward|rollback>
---chain-id 8453`
-requires both custodians' configurations and decides direction from the
-inventory's recorded custody; the stated `--direction` must agree with that
-resolution, so a re-run after a recorded forward move refuses instead of
-silently rolling back:
+--chain-id 8453 --outgoing-wallet-control <fireblocks-raw|local-private-key>`
+always requires Turnkey and decides direction from the inventory's recorded
+custody; the stated `--direction` must agree with that resolution, so a re-run
+after a recorded forward move refuses instead of silently rolling back. The
+default `fireblocks-raw` mode requires `FIREBLOCKS_*`; the emergency mode
+requires `CUSTODY_MIGRATION_PRIVATE_KEY` instead:
 
-- **Custody at the Fireblocks wallet** → forward: every gate runs in-binary
+- **Custody at the retiring wallet** → forward: every gate runs in-binary
   (quiescence, exact inventory/chain agreement, certification and owner-freeze
   re-read, per-identifier post-condition deltas measured as the recipient's
-  gain), and the transfer is submitted via Fireblocks. The engine's holder is
-  the wallet the Fireblocks API says this configuration controls — a wrong
-  workspace or vault account holds none of the tracked receipts and the
-  exact-balance check refuses before anything is submitted. Ownership
-  verification is the check; no addresses are compared, and none are typed.
+  gain). The retiring wallet derived from the selected control must equal the
+  recorded holder before signing. Ownership verification is the check; no
+  address is typed.
 - **Custody at the Turnkey wallet** → rollback: Turnkey signs the same batch
-  back to the Fireblocks wallet, fetched from the Fireblocks API. Same gates.
+  back to the recorded migration origin, independently corroborated by the
+  selected outgoing-wallet control. Same gates.
 - A move already completed (e.g. executed manually in the Fireblocks console, or
   a re-run after a lost terminal) is detected — source empty, recipient holding
   every tracked balance — and recorded instead of transferred again.
 
-Configuration comes entirely from the service's own environment: `RPC_URL`,
-`DATABASE_URL`, the `TURNKEY_*` group, and the `FIREBLOCKS_*` group the old
-service already uses. The production secret file carries **both** custodians'
-variable sets; each binary reads only its own, so which binary runs is the only
-signer selector and no env edit happens mid-window.
+Configuration comes from `RPC_URL`, `DATABASE_URL`, and the `TURNKEY_*` group.
+The default forward mode additionally uses the `FIREBLOCKS_*` group the old
+service already used. The emergency mode instead reads
+`CUSTODY_MIGRATION_PRIVATE_KEY` for this command only; unset it immediately
+afterward. `--outgoing-wallet-control` is the explicit selector (defaulting to
+`fireblocks-raw`) — the CLI never falls back from Fireblocks to a local key
+automatically.
 
 Quiescence is enforced in-binary and is deliberately **not** a freeze check: the
 `Underlying` freeze means "corporate action in progress" — a different fact with
@@ -309,21 +326,26 @@ because they gate everything after them.
    vault — production history predates custody tracking, and an unarmed guard
    treats a zero balance as "spent". Run it for **all** vaults before any
    service starts against a rotated wallet, not just the rehearsal asset.
-2. **`issuer verify-custodians <UNDERLYING> --network base --chain-id 8453`**.
-   Proves both custodian connections before the forward move can become a
-   one-way door: authenticates against Fireblocks and resolves the whitelisted
-   Receipt contract (the authorization work, proven present), and signs the
-   exact rollback-shaped transaction with Turnkey **without broadcasting it**
-   (credentials, organization, address, and signing policy, proven against the
-   real transaction shape). Also reports both wallets' gas and refuses if the
-   Turnkey wallet holds none.
-3. **`--smoke`** on `verify-custodians` additionally submits a zero-amount
-   transfer of one receipt id through the full Fireblocks path — whitelisting,
-   TAP rule, signing, the vault's authorization gates — while moving nothing. A
-   zero-amount transfer cannot create the inventory divergence a real dust
-   transfer would (the migration refuses whenever tracked and on-chain balances
-   disagree, so **never** smoke-test with a non-zero amount). This is the
-   strongest Fireblocks-side proof available before the real batch.
+2. **Optional legacy preflight:**
+   `issuer verify-custodians <UNDERLYING>
+   --network base --chain-id 8453`.
+   Run this only when the Receipt contract is whitelisted. It authenticates
+   against Fireblocks, resolves that whitelist, and signs the exact
+   rollback-shaped transaction with Turnkey **without broadcasting it**. It also
+   reports both wallets' gas and requires Turnkey to hold at least 0.001 ETH
+   (1,000,000 gas at 1 gwei). `migrate-receipts` independently repeats the
+   Turnkey rollback proof and gas check immediately before every forward move,
+   so skipping this legacy preflight removes no forward safety gate. This
+   command does not exercise Fireblocks RAW signing; the first forward migration
+   does.
+3. **Optional legacy smoke:** `--smoke` on `verify-custodians` additionally
+   submits a zero-amount transfer of one receipt id through the full Fireblocks
+   path — whitelisting, TAP rule, signing, the vault's authorization gates —
+   while moving nothing. A zero-amount transfer cannot create the inventory
+   divergence a real dust transfer would (the migration refuses whenever tracked
+   and on-chain balances disagree, so **never** smoke-test with a non-zero
+   amount). This proves only the legacy `CONTRACT_CALL` route; Fireblocks RAW is
+   first exercised by the forward migration itself.
 
 ## Two passes, not one
 
@@ -358,10 +380,10 @@ between the rehearsal's rollback and the real cutover**. Every other asset is
 untouched (aggregates are per-vault, and startup reconciliation tolerates a
 failing vault). Keep AMAT's rebalancing paused for that day.
 
-**Between the passes — remaining authorization.** Fireblocks authorization for
-every other receipt token (RAI-1544), one authorization type at a time across
-all tokens if that is how it goes fastest. This is a prerequisite for the real
-pass, not a cutover pass of its own.
+**Between the passes — optional legacy authorization.** Whitelisting every other
+receipt token (RAI-1544) is needed only if retaining the `CONTRACT_CALL`
+smoke/fallback route. Fireblocks RAW and local-private-key do not use those
+destination entries.
 
 **Pass 2 — the real cutover.** After **regular market close** — not after
 extended hours — run the sequence for every asset, no planned rollback. Regular
@@ -427,13 +449,30 @@ to AMAT and ends with the mandatory rollback.
    (`cast call <receipt-contract> 'balanceOf(address,uint256)(uint256)'
    <wallet> <receipt_id>`)
    — step 6 compares against exactly these readings.
-5. **Move custody.**
-   `issuer migrate-receipts <UNDERLYING> --network base --direction forward
-   --chain-id 8453`
-   with the service environment loaded. The transfer submits through Fireblocks
-   and may wait on console approvals; the command polls it to completion and
-   verifies per-identifier post-conditions (the recipient's **gain**, not its
-   absolute balance) before reporting success.
+5. **Move custody.** Use the default Fireblocks RAW path first:
+
+   ```text
+   issuer migrate-receipts <UNDERLYING> --network base --direction forward \
+     --chain-id 8453 --outgoing-wallet-control fireblocks-raw
+   ```
+
+   It asks Fireblocks only to sign, broadcasts through `RPC_URL`, and verifies
+   per-identifier post-conditions (the recipient's **gain**, not its absolute
+   balance) before reporting success. If RAW signing itself is unavailable, use
+   the last-resort path with the key supplied through the environment:
+
+   ```bash
+   read -rsp 'Custody migration private key: ' \
+     CUSTODY_MIGRATION_PRIVATE_KEY && echo
+   export CUSTODY_MIGRATION_PRIVATE_KEY
+   issuer migrate-receipts <UNDERLYING> --network base --direction forward \
+     --chain-id 8453 --outgoing-wallet-control local-private-key
+   unset CUSTODY_MIGRATION_PRIVATE_KEY
+   ```
+
+   The input is neither echoed nor placed in shell history. Unset it immediately
+   after the command exits. The CLI derives its address and refuses unless it is
+   exactly the recorded custody holder.
 6. **Verify custody against the export.** Re-run the step-4 `cast call`
    readings: the Fireblocks wallet holds none of the migrated receipts; the
    Turnkey wallet's gain matches the step-4 readings exactly.
@@ -460,8 +499,8 @@ to AMAT and ends with the mandatory rollback.
    window is open again, so the stray-deploy gap from step 3 must stay closed),
    then run the same `migrate-receipts` with `--direction rollback` (custody is
    at Turnkey, so it rolls back to the recorded Fireblocks origin, cross-checked
-   against the Fireblocks API), and verify custody returned with the step-4
-   `cast call` readings.
+   through the selected outgoing-wallet control), and verify custody returned
+   with the step-4 `cast call` readings.
 
    **Restoring the old Fireblocks service is a CI re-deploy, not a restart**:
    the step-0 deploy replaced the per-service profile, so the old binary is no
@@ -480,12 +519,14 @@ to AMAT and ends with the mandatory rollback.
 ## Rolling back
 
 Rollback is the same command: with custody recorded at the Turnkey wallet, the
-CLI signs the batch with Turnkey back to the recorded migration origin, which
-must equal the wallet the configured Fireblocks workspace resolves — a wrong
-workspace is refused before anything is signed. No address is typed; ownership
-verification before (Turnkey holds exactly every tracked balance) and after (the
-Fireblocks wallet's gain matches) is the check. The rollback moves **everything
-tracked**, including receipts the Turnkey service minted during its window.
+CLI signs the batch with Turnkey back to the recorded migration origin. The
+selected outgoing-wallet control independently derives that origin: the
+Fireblocks API in `fireblocks-raw` mode or the emergency key in
+`local-private-key` mode. A mismatch is refused before anything is signed. No
+address is typed; ownership verification before (Turnkey holds exactly every
+tracked balance) and after (the retiring wallet's gain matches) is the check.
+The rollback moves **everything tracked**, including receipts the Turnkey
+service minted during its window.
 
 The asymmetry is in the custodian: the inbound leg needs a **Turnkey policy
 permitting the reverse transfer** (RAI-1545, in place) — and `verify-custodians`
@@ -505,18 +546,22 @@ Every failure below leaves a recoverable state; custody is only ever at one of
 two custodian-controlled wallets, and whichever wallet holds the receipts
 determines which service may run.
 
-- **Fireblocks rejects the transfer (policy, whitelisting, approvals).** Nothing
-  moved. Fix with Alastair and retry. If the wait is long enough to warrant
-  resuming service, restoring the Fireblocks-era binary is a CI re-deploy of the
-  previous released tag (see step 9) — the new artifact is what is installed on
-  the host.
+- **Fireblocks RAW signing is rejected or unavailable.** Nothing moved. Fix the
+  RAW policy/API path and retry, or explicitly switch to `local-private-key`
+  under the emergency key-handling procedure. There is no automatic fallback. If
+  the wait is long enough to warrant resuming service, restoring the
+  Fireblocks-era binary is a CI re-deploy of the previous released tag (see
+  step 9) — the new artifact is what is installed on the host.
+- **The emergency private key does not derive the recorded custody holder.**
+  Nothing is signed. Stop and verify the key source; never override the address
+  check or type a replacement destination.
 - **The transfer reverts on-chain** (certification expired, owner freeze on the
   vault). Nothing moved; the command names the gate. Certification renewal is
   with whoever holds `CERTIFY`.
-- **The operator loses the terminal mid-transfer.** Re-run the same command: the
-  deterministic `externalTxId` makes Fireblocks return the original transaction
-  instead of accepting a second one, and a completed move is detected and
-  recorded rather than re-transferred.
+- **The operator loses the terminal mid-transfer.** Re-run the same mode. A
+  completed move is detected from balances and recorded rather than
+  re-transferred. If a same-nonce transaction is still pending, preserve its
+  evidence and reconcile it before changing signing modes.
 - **The canary redemption or mint fails on Turnkey.** Roll back and resume
   Fireblocks **on the same database**. Never restore the pre-window backup once
   a Turnkey-backed write exists.

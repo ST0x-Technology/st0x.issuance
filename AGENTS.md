@@ -333,15 +333,15 @@ Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 `wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
 
 **Receipt custody migration (`receipt_inventory/migration.rs` +
-`src/fireblocks/`, temporary):** rotating the signer strands the vault's
-receipts at the old address. **Stop the service before `migrate-receipts`.** No
-wallet address is an argument: Fireblocks wallet from its API, Turnkey wallet
-from `TURNKEY_ADDRESS`, direction from recorded custody; forward submits via the
-restored narrow Fireblocks client, rollback signs with Turnkey. Ownership
-verification (exact balances before, per-identifier gain after) is the check.
-Custody is aggregate state: a rotated wallet reading zero is refused, not
-depleted. Quiescence gates on in-flight mints/redemptions, never on freeze
-(freeze = corporate action). See `docs/turnkey-receipt-migration-plan.md`.
+`src/fireblocks/`, temporary):** signer rotation strands vault receipts. **Stop
+the service before `migrate-receipts`.** Addresses are derived: outgoing from
+Fireblocks RAW (default) or emergency `CUSTODY_MIGRATION_PRIVATE_KEY`, incoming
+from `TURNKEY_ADDRESS`; direction comes from recorded custody. The outgoing
+address must match custody before signing. Forward builds locally/broadcasts via
+RPC; rollback uses Turnkey. Exact balances before and per-ID gain after prove
+ownership. Wrong-wallet zeroes are refused, not depleted. Quiescence gates on
+in-flight mints/redemptions, never freeze. See
+`docs/turnkey-receipt-migration-plan.md`.
 
 ### Core Flows
 

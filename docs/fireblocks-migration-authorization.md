@@ -17,9 +17,9 @@ safeBatchTransferFrom(fireblocksWallet, turnkeyWallet, ids[], amounts[], "")
 ```
 
 called on the vault's **Receipt** contract (an ERC-1155). It moves no native
-value. It is not a transfer of a Fireblocks-held asset, so it does not fit the
-ordinary "send funds to a whitelisted address" flow. In Fireblocks terms it is a
-**contract call**.
+value. On-chain it is a contract call. Fireblocks can authorize it either as a
+managed `CONTRACT_CALL` or, as the implemented default, as a `RAW` signature
+over a transaction the CLI builds and broadcasts itself.
 
 Note the target: the **Receipt contract, not the vault contract**. They are
 different addresses. The Receipt address is obtained per vault by calling the
@@ -27,7 +27,7 @@ vault's `receipt()` view function. The bot has only ever called the vault
 contract, which is why the Receipt contract is not whitelisted today and why
 this work is needed at all.
 
-## Two routes, and why the choice is not free
+## Three routes, and why the choice is not free
 
 ### Route A: contract call to a whitelisted contract
 
@@ -51,24 +51,30 @@ to contract calls. If the workspace policy still permits `RAW` for this vault
 account, the transfer can be signed without whitelisting the Receipt contract
 and without a new contract-call rule.
 
-**This does not make the migration free.** Route B removes the Fireblocks
-whitelisting and policy work; it does not remove the engineering work, because
-the raw-signing code was deleted along with the rest of the Fireblocks
-integration. Either route needs code re-added on our side. Route B is worth
-asking about only because it removes an approval cycle from the critical path,
-not because it removes effort.
-
-Route B also leaves the entire transaction pipeline client-side: `RAW` only
-returns a signature over a hash, so our code would have to build the exact
-`safeBatchTransferFrom` transaction, have Fireblocks sign its hash, assemble the
-signed transaction, and broadcast it through an RPC. The Receipt contract has no
-meta-transaction path, so the transaction must genuinely originate from the
-Fireblocks wallet — nothing about submission can be delegated.
+Route B is the implemented default. It leaves the transaction pipeline
+client-side: `RAW` only returns a signature over a hash, so the CLI builds the
+exact `safeBatchTransferFrom` transaction, has Fireblocks sign its hash,
+verifies the signature recovers to the recorded custody holder, assembles the
+signed transaction, and broadcasts it through an RPC. The Receipt contract has
+no meta-transaction path, so the transaction genuinely originates from the
+Fireblocks wallet — nothing about submission is delegated.
 
 Also relevant if a raw rule is being written: `RAW` rule types are an exception
 that "should not include a destination limitation", and the rule's
 `rawMessageSigning` object takes a mandatory `derivationPath` and an optional
 `algorithm`.
+
+### Route C: emergency local private key
+
+If Fireblocks RAW signing is unavailable as well, `migrate-receipts` supports
+`--outgoing-wallet-control local-private-key` with
+`CUSTODY_MIGRATION_PRIVATE_KEY`. This path makes no Fireblocks API call: it
+parses the key into a valid secp256k1 signer, derives its address, refuses
+unless that address equals recorded custody, signs locally, and broadcasts
+through the configured RPC. The key is never logged or persisted. Enter it with
+a non-echoing shell prompt, export it for the process, and unset it immediately
+after the one-shot command; never put it in an argument or inline assignment.
+This is an operational last resort, not a silent fallback.
 
 ## Route A, step by step
 

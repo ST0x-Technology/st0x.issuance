@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::signers::local::PrivateKeySigner;
 use clap::{Args, Parser, Subcommand};
 use event_sorcery::{
     AggregateError, LifecycleError, ReconcileError, Store, StoreBuilder,
@@ -85,11 +86,11 @@ enum IssuerCommand {
     /// Move a vault's deposit receipts between the Fireblocks wallet and the
     /// Turnkey wallet, with the direction resolved from recorded custody.
     ///
-    /// Custody at the Fireblocks wallet runs the forward leg, submitted
-    /// through the Fireblocks API (console approval may be required); custody
-    /// at the Turnkey wallet runs the rollback, signed by Turnkey back to the
-    /// API-derived Fireblocks wallet. Both custodians' configurations are
-    /// required and no wallet address is ever typed.
+    /// Custody at the retiring wallet runs the forward leg, signed either by
+    /// Fireblocks RAW signing (default) or an explicitly selected emergency
+    /// local key; custody at the Turnkey wallet runs the rollback, signed by
+    /// Turnkey back to the independently corroborated recorded origin. No
+    /// wallet address is ever typed.
     ///
     /// Temporary, for the Turnkey cutover: the issuer burns against receipts
     /// held by its own signing address, so rotating the signing backend strands
@@ -162,6 +163,46 @@ enum MigrationDirection {
     Rollback,
 }
 
+/// How the retiring custody wallet is controlled during a migration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum OutgoingWalletControl {
+    /// Build locally, RAW-sign through Fireblocks, and broadcast through RPC.
+    #[default]
+    FireblocksRaw,
+    /// Last resort: sign directly with `CUSTODY_MIGRATION_PRIVATE_KEY`.
+    LocalPrivateKey,
+}
+
+#[derive(Clone)]
+struct CustodyMigrationPrivateKey(B256);
+
+impl std::fmt::Debug for CustodyMigrationPrivateKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl CustodyMigrationPrivateKey {
+    fn parse(value: &str) -> Result<Self, CustodyMigrationPrivateKeyError> {
+        let key: B256 =
+            value.parse().map_err(|_| CustodyMigrationPrivateKeyError)?;
+        PrivateKeySigner::from_bytes(&key)
+            .map_err(|_| CustodyMigrationPrivateKeyError)?;
+
+        Ok(Self(key))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid custody migration private key")]
+struct CustodyMigrationPrivateKeyError;
+
+#[derive(Debug)]
+enum ResolvedOutgoingWalletControl {
+    FireblocksRaw(crate::fireblocks::FireblocksConfig),
+    LocalPrivateKey(CustodyMigrationPrivateKey),
+}
+
 impl std::fmt::Display for MigrationDirection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -185,6 +226,11 @@ struct MigrateReceiptsArgs {
     /// recorded custody state resolves to the other one.
     #[arg(long, value_enum)]
     direction: MigrationDirection,
+
+    /// How to control the retiring wallet. The private-key mode is an explicit
+    /// last resort that bypasses Fireblocks entirely.
+    #[arg(long, value_enum, default_value = "fireblocks-raw")]
+    outgoing_wallet_control: OutgoingWalletControl,
 
     /// RPC endpoint for the network — the service's own `RPC_URL`.
     #[arg(long, env = "RPC_URL")]
@@ -810,6 +856,22 @@ async fn run_migrate_receipts(
     args: MigrateReceiptsArgs,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
+    let emergency_key = match std::env::var("CUSTODY_MIGRATION_PRIVATE_KEY") {
+        Ok(key) => Some(key),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "CUSTODY_MIGRATION_PRIVATE_KEY must be valid Unicode hex"
+        ),
+    };
+
+    run_migrate_receipts_with_key(args, emergency_key.as_deref(), confirm).await
+}
+
+async fn run_migrate_receipts_with_key(
+    args: MigrateReceiptsArgs,
+    emergency_key: Option<&str>,
+    confirm: impl Fn(&str) -> io::Result<bool>,
+) -> anyhow::Result<()> {
     // Checked first, before any database or network work: a network paired with
     // a chain it does not name is answerable from the arguments alone, and
     // every later step — vault resolution, the inventory key, the prompt the
@@ -836,10 +898,10 @@ async fn run_migrate_receipts(
             underlying: args.underlying.clone(),
         })?;
 
-    // No wallet is an argument. Both custodians' configurations are required:
-    // the forward transfer is signed by Fireblocks through its API, the
-    // rollback by Turnkey, and which one runs is resolved from the inventory's
-    // recorded custody — never from the operator's intent alone.
+    // No wallet is an argument. Turnkey always supplies the incoming address
+    // and rollback signer. The retiring wallet comes from the explicitly
+    // selected control (Fireblocks RAW or emergency local key), and direction
+    // comes from recorded custody — never from operator intent alone.
     let signer = args.signer.clone().into_config()?;
     let SignerConfig::Turnkey(turnkey_config) = signer else {
         anyhow::bail!(
@@ -849,6 +911,8 @@ async fn run_migrate_receipts(
         );
     };
     let turnkey = turnkey_config.settings.address;
+    let outgoing_control =
+        resolve_outgoing_wallet_control(&args, emergency_key)?;
 
     let recorded =
         recorded_custody_holder(&admin.pool, args.chain_id, vault).await?;
@@ -866,18 +930,20 @@ async fn run_migrate_receipts(
                 &admin,
                 vault,
                 &turnkey_config,
+                &outgoing_control,
                 confirm,
             )
             .await
         }
         Some(holder) => {
             require_direction(args.direction, MigrationDirection::Forward)?;
-            run_forward_via_fireblocks(
+            run_forward_transfer(
                 &args,
                 &admin,
                 vault,
                 holder,
                 &turnkey_config,
+                &outgoing_control,
                 confirm,
             )
             .await
@@ -892,6 +958,61 @@ async fn run_migrate_receipts(
 /// is recorded, custody sits at Turnkey and a mechanical re-run of the same
 /// command would resolve to a rollback. Requiring the direction to be stated
 /// turns that surprise into a refusal before any prompt or network work.
+fn resolve_outgoing_wallet_control(
+    args: &MigrateReceiptsArgs,
+    emergency_key: Option<&str>,
+) -> anyhow::Result<ResolvedOutgoingWalletControl> {
+    match (args.outgoing_wallet_control, emergency_key) {
+        (OutgoingWalletControl::FireblocksRaw, Some(_)) => anyhow::bail!(
+            "CUSTODY_MIGRATION_PRIVATE_KEY was supplied, but \
+             --outgoing-wallet-control is fireblocks-raw; select \
+             local-private-key explicitly or remove the emergency key"
+        ),
+        (OutgoingWalletControl::FireblocksRaw, None) => {
+            Ok(ResolvedOutgoingWalletControl::FireblocksRaw(
+                args.fireblocks.clone().into_config()?,
+            ))
+        }
+        (OutgoingWalletControl::LocalPrivateKey, Some(key)) => {
+            Ok(ResolvedOutgoingWalletControl::LocalPrivateKey(
+                CustodyMigrationPrivateKey::parse(key)?,
+            ))
+        }
+        (OutgoingWalletControl::LocalPrivateKey, None) => anyhow::bail!(
+            "CUSTODY_MIGRATION_PRIVATE_KEY is required when \
+             --outgoing-wallet-control is local-private-key"
+        ),
+    }
+}
+
+fn require_outgoing_wallet_matches(
+    recorded: Address,
+    derived: Address,
+) -> anyhow::Result<()> {
+    if recorded != derived {
+        anyhow::bail!(
+            "recorded retiring-wallet custody is {recorded}, but the selected \
+             outgoing-wallet control derives {derived}; refusing before \
+             signing. Check the selected backend and its configuration"
+        );
+    }
+
+    Ok(())
+}
+
+async fn derive_outgoing_wallet(
+    control: &ResolvedOutgoingWalletControl,
+) -> anyhow::Result<Address> {
+    match control {
+        ResolvedOutgoingWalletControl::FireblocksRaw(config) => {
+            Ok(fetch_vault_address(config).await?)
+        }
+        ResolvedOutgoingWalletControl::LocalPrivateKey(key) => {
+            Ok(SignerConfig::Local(key.0).address()?)
+        }
+    }
+}
+
 fn require_direction(
     stated: MigrationDirection,
     resolved: MigrationDirection,
@@ -908,27 +1029,26 @@ fn require_direction(
     Ok(())
 }
 
-/// The rollback: Turnkey signs custody back to the Fireblocks wallet, fetched
-/// from the Fireblocks API — the same derivation the forward leg uses — and
-/// cross-checked against the origin recorded by the forward move, so a wrong
-/// Fireblocks workspace cannot redirect the rollback. No address is typed
-/// anywhere, and the migration engine's ownership checks are the
-/// verification: the source must hold exactly every tracked balance before,
-/// and the recipient's gain must match exactly after.
+/// The rollback: Turnkey signs custody back to the recorded origin, which is
+/// independently derived through the selected outgoing-wallet control. A wrong
+/// Fireblocks workspace or emergency key therefore cannot redirect rollback.
+/// No address is typed anywhere, and the migration engine's ownership checks
+/// are the verification: the source must hold exactly every tracked balance
+/// before, and the recipient's gain must match exactly after.
 async fn run_rollback_transfer(
     args: &MigrateReceiptsArgs,
     admin: &AssetAdmin,
     vault: Address,
     turnkey_config: &TurnkeyConfig,
+    outgoing_control: &ResolvedOutgoingWalletControl,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     let turnkey = turnkey_config.settings.address;
-    let fireblocks_config = args.fireblocks.clone().into_config()?;
-    let fireblocks_wallet = fetch_vault_address(&fireblocks_config).await?;
+    let outgoing_wallet = derive_outgoing_wallet(outgoing_control).await?;
     let recorded_origin =
         recorded_migration_origin(&admin.pool, args.chain_id, vault).await?;
     let recipient =
-        Recipient::for_rollback(recorded_origin, fireblocks_wallet, turnkey)?;
+        Recipient::for_rollback(recorded_origin, outgoing_wallet, turnkey)?;
 
     println!(
         "{} on {} (chain {}) vault {vault}: rolling receipt custody back from \
@@ -968,29 +1088,35 @@ async fn run_rollback_transfer(
     Ok(())
 }
 
-/// The forward leg: the transfer is signed by the retiring custodian, so it is
-/// submitted through the Fireblocks API and may wait on approvals in the
-/// Fireblocks console. Every migration gate still runs in this binary; only
-/// the signing happens at the custodian.
+/// The forward leg: build the exact transfer in this binary, then sign it
+/// either through Fireblocks RAW signing or directly with the explicitly
+/// selected emergency key. Both paths broadcast through the configured RPC and
+/// run the same migration gates and post-condition checks.
 ///
-/// Re-running after a completed move records it instead of transferring again,
-/// which is also how a transfer executed manually in the console gets onto the
-/// record a rollback later depends on.
-async fn run_forward_via_fireblocks(
+/// Re-running after a completed move records it instead of transferring again.
+async fn run_forward_transfer(
     args: &MigrateReceiptsArgs,
     admin: &AssetAdmin,
     vault: Address,
     holder: Address,
     turnkey_config: &TurnkeyConfig,
+    outgoing_control: &ResolvedOutgoingWalletControl,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     let turnkey = turnkey_config.settings.address;
-    let fireblocks_config = args.fireblocks.clone().into_config()?;
     let recipient = Recipient::for_holder(turnkey, holder)?;
+    let signing_description = match outgoing_control {
+        ResolvedOutgoingWalletControl::FireblocksRaw(_) => {
+            "Fireblocks RAW signing"
+        }
+        ResolvedOutgoingWalletControl::LocalPrivateKey(_) => {
+            "the emergency local private key"
+        }
+    };
 
     println!(
         "{} on {} (chain {}) vault {vault}: moving receipt custody from \
-         {holder} to {recipient} via Fireblocks",
+         {holder} to {recipient} via {signing_description}",
         args.underlying, args.network, args.chain_id
     );
 
@@ -1000,9 +1126,9 @@ async fn run_forward_via_fireblocks(
     // receipts as depletions and drops them from the aggregate. The prompt
     // deliberately runs before any network call, so declining costs nothing.
     if !confirm(&format!(
-        "The issuer service MUST be stopped before this runs. Submit the \
-         transfer through Fireblocks (console approval may be required) and \
-         move {} receipt custody from {holder} to {recipient}?",
+        "The issuer service MUST be stopped before this runs. Sign with \
+         {signing_description} and move {} receipt custody from {holder} to \
+         {recipient}?",
         args.underlying
     ))? {
         anyhow::bail!("aborted by operator");
@@ -1011,23 +1137,8 @@ async fn run_forward_via_fireblocks(
     let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
     let provider =
         ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
-
-    // The wallet the configured Fireblocks workspace actually controls. The
-    // recorded holder must be that wallet: anything else means the
-    // configuration points at a different workspace or vault account than
-    // the one holding custody, and the transfer this command would submit
-    // could never move the recorded holder's receipts. Checked before any
-    // submission, so a mismatch is a clean refusal.
-    let fireblocks_wallet = fetch_vault_address(&fireblocks_config).await?;
-
-    if holder != fireblocks_wallet {
-        anyhow::bail!(
-            "recorded custody holder {holder} is not the wallet the \
-             configured Fireblocks workspace controls ({fireblocks_wallet}); \
-             refusing to submit a transfer that cannot move the recorded \
-             holder's receipts. Check FIREBLOCKS_* configuration."
-        );
-    }
+    let outgoing_wallet = derive_outgoing_wallet(outgoing_control).await?;
+    require_outgoing_wallet_matches(holder, outgoing_wallet)?;
 
     // The forward transfer is a one-way door unless Turnkey can sign the way
     // back. Re-proven here, immediately before the irreversible submission,
@@ -1042,7 +1153,7 @@ async fn run_forward_via_fireblocks(
         &provider,
         &resolved.wallet,
         VaultIdentity { chain_id, vault, underlying: &args.underlying },
-        fireblocks_wallet,
+        outgoing_wallet,
     )
     .await?;
     println!(
@@ -1054,16 +1165,39 @@ async fn run_forward_via_fireblocks(
 
     let recipient =
         CorroboratedRecipient::verify(&provider, recipient.address()).await?;
+    let identity =
+        VaultIdentity { chain_id, vault, underlying: &args.underlying };
+    let outcome = match outgoing_control {
+        ResolvedOutgoingWalletControl::FireblocksRaw(fireblocks_config) => {
+            migrate_vault_receipts_via_fireblocks(
+                &admin.pool,
+                provider,
+                fireblocks_config,
+                identity,
+                outgoing_wallet,
+                recipient,
+            )
+            .await?
+        }
+        ResolvedOutgoingWalletControl::LocalPrivateKey(key) => {
+            let resolved =
+                crate::wallet::local::resolve_local_signer(&key.0, chain_id)?;
+            let signing_provider = ProviderBuilder::new()
+                .with_chain_id(chain_id)
+                .wallet(resolved.wallet)
+                .connect(args.rpc_url.as_str())
+                .await?;
 
-    let outcome = migrate_vault_receipts_via_fireblocks(
-        &admin.pool,
-        provider,
-        &fireblocks_config,
-        VaultIdentity { chain_id, vault, underlying: &args.underlying },
-        fireblocks_wallet,
-        recipient,
-    )
-    .await?;
+            migrate_vault_receipts(
+                &admin.pool,
+                signing_provider,
+                identity,
+                outgoing_wallet,
+                recipient,
+            )
+            .await?
+        }
+    };
     report_outcome(&outcome, recipient.address(), vault);
 
     Ok(())
@@ -1172,24 +1306,22 @@ impl Recipient {
     }
 
     /// The rollback destination: the recorded migration origin, cross-checked
-    /// against the wallet the configured Fireblocks workspace resolves. The
-    /// two are derived independently — one from the inventory's custody
-    /// history, one from the custodian's API — and a mismatch means the
-    /// operator is running against the wrong Fireblocks workspace: rolling
-    /// back there would move custody to a wallet this vault's receipts never
-    /// came from.
+    /// against the wallet derived through the selected outgoing-wallet
+    /// control. The two are independent — one from custody history, one from
+    /// Fireblocks or the emergency key — so a wrong control cannot redirect
+    /// rollback to a wallet this vault's receipts never came from.
     fn for_rollback(
         recorded_origin: Address,
-        fireblocks_wallet: Address,
+        derived_outgoing_wallet: Address,
         holder: Address,
     ) -> anyhow::Result<Self> {
-        if fireblocks_wallet != recorded_origin {
+        if derived_outgoing_wallet != recorded_origin {
             anyhow::bail!(
-                "the configured Fireblocks workspace resolves wallet \
-                 {fireblocks_wallet}, but custody was recorded as moved from \
-                 {recorded_origin}; refusing to roll back to a wallet this \
-                 vault's custody never came from — check the FIREBLOCKS_* \
-                 configuration"
+                "the selected outgoing-wallet control derives \
+                 {derived_outgoing_wallet}, but custody was recorded as moved \
+                 from {recorded_origin}; refusing to roll back to a wallet \
+                 this vault's custody never came from — check the selected \
+                 backend and its configuration"
             );
         }
 
@@ -1942,6 +2074,144 @@ mod tests {
         *args
     }
 
+    #[test]
+    fn cli_does_not_accept_the_emergency_key_in_process_arguments() {
+        let parsed = IssuerCli::try_parse_from([
+            "issuer",
+            "migrate-receipts",
+            "AMAT",
+            "--network",
+            "base",
+            "--direction",
+            "forward",
+            "--outgoing-wallet-control",
+            "local-private-key",
+            "--custody-migration-private-key",
+            TEST_SIGNER_KEY,
+            "--chain-id",
+            "8453",
+            "--turnkey-org-id",
+            "org-id",
+            "--turnkey-api-private-key",
+            "api-key",
+            "--turnkey-address",
+            "0x00000000000000000000000000000000000000cc",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+        ]);
+
+        let Err(error) = parsed else {
+            panic!(
+                "private key input must be environment-only, never an argv \
+                 option"
+            )
+        };
+
+        assert!(
+            !error.to_string().contains(TEST_SIGNER_KEY),
+            "argument errors must never echo private key material"
+        );
+    }
+
+    #[test]
+    fn custody_migration_private_key_rejects_an_invalid_signer_value() {
+        let invalid = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        let error = CustodyMigrationPrivateKey::parse(invalid).unwrap_err();
+
+        assert_eq!(error.to_string(), "invalid custody migration private key");
+        assert!(
+            !error.to_string().contains(invalid),
+            "parse errors must never echo private key material"
+        );
+    }
+
+    #[test]
+    fn local_private_key_control_requires_the_emergency_key() {
+        let mut args = turnkey_migrate_args(
+            "forward",
+            "8453",
+            "sqlite:unused.db",
+            "unused-fireblocks-secret",
+        );
+        args.outgoing_wallet_control = OutgoingWalletControl::LocalPrivateKey;
+
+        let error = resolve_outgoing_wallet_control(&args, None).unwrap_err();
+
+        assert!(
+            error.to_string().contains("CUSTODY_MIGRATION_PRIVATE_KEY"),
+            "the explicit local mode must name its missing key, got {error}"
+        );
+    }
+
+    #[test]
+    fn fireblocks_raw_control_refuses_an_unused_emergency_key() {
+        let args = turnkey_migrate_args(
+            "forward",
+            "8453",
+            "sqlite:unused.db",
+            "unused-fireblocks-secret",
+        );
+        let error =
+            resolve_outgoing_wallet_control(&args, Some(TEST_SIGNER_KEY))
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("local-private-key"),
+            "a supplied emergency key must not be silently ignored, got {error}"
+        );
+        assert!(
+            !error.to_string().contains(TEST_SIGNER_KEY),
+            "configuration errors must never expose the private key"
+        );
+    }
+
+    #[test]
+    fn local_private_key_control_derives_the_retiring_wallet_and_redacts_key() {
+        let mut args = turnkey_migrate_args(
+            "forward",
+            "8453",
+            "sqlite:unused.db",
+            "unused-fireblocks-secret",
+        );
+        args.outgoing_wallet_control = OutgoingWalletControl::LocalPrivateKey;
+
+        let control =
+            resolve_outgoing_wallet_control(&args, Some(TEST_SIGNER_KEY))
+                .unwrap();
+        let ResolvedOutgoingWalletControl::LocalPrivateKey(key) = control
+        else {
+            panic!("the explicit local mode must resolve a local key")
+        };
+
+        let derived = SignerConfig::Local(key.0).address().unwrap();
+        assert_eq!(
+            derived,
+            address!("0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"),
+            "the fallback must derive the retiring wallet from the key"
+        );
+        assert_eq!(
+            format!("{key:?}"),
+            "[REDACTED]",
+            "debug output must never expose the private key"
+        );
+    }
+
+    #[test]
+    fn a_local_private_key_must_match_recorded_custody() {
+        let recorded = address!("0x00000000000000000000000000000000000000bb");
+        let derived = address!("0x00000000000000000000000000000000000000cc");
+
+        let error =
+            require_outgoing_wallet_matches(recorded, derived).unwrap_err();
+
+        assert!(
+            error.to_string().contains(&recorded.to_string())
+                && error.to_string().contains(&derived.to_string()),
+            "the refusal must name both public wallet addresses, got {error}"
+        );
+    }
+
     /// A declined confirmation must abort before any network call. The
     /// unreachable `--rpc-url` is the assertion: if the prompt were bypassed,
     /// or the chain-id round-trip still ran first, this would fail on the
@@ -1972,8 +2242,9 @@ mod tests {
             secret.to_str().unwrap(),
         );
 
-        let error =
-            run_migrate_receipts(args, |_| Ok(false)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(args, None, |_| Ok(false))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("aborted by operator"),
@@ -1981,9 +2252,67 @@ mod tests {
         );
     }
 
-    /// The forward transfer is signed by the custodian through its API and the
-    /// rollback by Turnkey; a local key can do neither, so the command refuses
-    /// it outright instead of offering a transfer path production never has.
+    /// The emergency local-key mode must not require Fireblocks credentials:
+    /// the key itself derives and controls the recorded holder. Declining the
+    /// prompt must therefore abort before the deliberately unreachable RPC,
+    /// proving dispatch reached the local path without touching Fireblocks.
+    #[tokio::test]
+    async fn local_private_key_control_bypasses_fireblocks_before_confirmation()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("local-fallback.db").display()
+        );
+        seed_listing_at(&database_url, "AMAT").await;
+        let local_key =
+            CustodyMigrationPrivateKey::parse(TEST_SIGNER_KEY).unwrap();
+        let holder = SignerConfig::Local(local_key.0).address().unwrap();
+        seed_custody_at(&database_url, holder).await;
+
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "migrate-receipts",
+            "AMAT",
+            "--network",
+            "base",
+            "--direction",
+            "forward",
+            "--outgoing-wallet-control",
+            "local-private-key",
+            "--chain-id",
+            "8453",
+            "--turnkey-org-id",
+            "org-id",
+            "--turnkey-api-private-key",
+            "api-key",
+            "--turnkey-address",
+            "0x00000000000000000000000000000000000000cc",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--database-url",
+            &database_url,
+        ])
+        .expect("arguments parse");
+        let IssuerCommand::MigrateReceipts(args) = cli.command else {
+            panic!("expected the migrate-receipts subcommand")
+        };
+
+        let error =
+            run_migrate_receipts_with_key(*args, Some(TEST_SIGNER_KEY), |_| {
+                Ok(false)
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("aborted by operator"),
+            "local control must bypass Fireblocks and reach its prompt, got {error}"
+        );
+    }
+
+    /// Turnkey remains mandatory: it is both the forward destination and the
+    /// rollback signer, regardless of how the retiring wallet signs forward.
     #[tokio::test]
     async fn migrate_receipts_refuses_a_non_turnkey_signer() {
         let directory = tempfile::tempdir().unwrap();
@@ -2016,8 +2345,9 @@ mod tests {
             panic!("expected the migrate-receipts subcommand")
         };
 
-        let error =
-            run_migrate_receipts(*args, |_| Ok(true)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(*args, None, |_| Ok(true))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("Turnkey signer configuration"),
@@ -2045,7 +2375,9 @@ mod tests {
             secret.to_str().unwrap(),
         );
 
-        let error = run_migrate_receipts(args, |_| Ok(true)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(args, None, |_| Ok(true))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("no recorded custody holder"),
@@ -2295,7 +2627,9 @@ mod tests {
             secret.to_str().unwrap(),
         );
 
-        let error = run_migrate_receipts(args, |_| Ok(true)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(args, None, |_| Ok(true))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("Fireblocks"),
@@ -2332,7 +2666,9 @@ mod tests {
             secret.to_str().unwrap(),
         );
 
-        let error = run_migrate_receipts(args, |_| Ok(true)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(args, None, |_| Ok(true))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("resolves this command to a rollback"),
@@ -2363,7 +2699,9 @@ mod tests {
             secret.to_str().unwrap(),
         );
 
-        let error = run_migrate_receipts(args, |_| Ok(true)).await.unwrap_err();
+        let error = run_migrate_receipts_with_key(args, None, |_| Ok(true))
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("84532")
