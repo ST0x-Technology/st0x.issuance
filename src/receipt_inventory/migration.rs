@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use event_sorcery::StoreBuilder;
 use itertools::izip;
 use sqlx::{Pool, Sqlite};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -227,10 +228,10 @@ pub(crate) enum SourceCustody {
     /// The outgoing wallet still holds the tracked receipts, so there is a
     /// migration to perform.
     Holds(MigratableHoldings),
-    /// The outgoing wallet holds nothing and the incoming wallet holds at
-    /// least the tracked balances: a completed migration seen a second time.
-    /// See [`already_migrated_or_divergent`] for why "at least" rather than
-    /// "exactly".
+    /// Every tracked identifier has already reached the incoming wallet (it
+    /// holds at least each tracked balance, since a fresh run cannot know
+    /// what the recipient held before the migration): a completed migration
+    /// seen a second time.
     AlreadyMigrated { receipts: usize },
 }
 
@@ -337,10 +338,9 @@ pub(crate) enum MigrationRefusal {
     },
 
     #[error(
-        "vault {vault} is empty at the outgoing wallet but receipt \
-         {receipt_id} sits at {at_recipient} with the incoming wallet, not \
-         the tracked {tracked}; custody is in a state this migration cannot \
-         explain"
+        "receipt {receipt_id} of vault {vault} left the outgoing wallet but \
+         the incoming wallet holds {at_recipient}, not the tracked \
+         {tracked}; custody is in a state this migration cannot explain"
     )]
     RecipientBalanceMismatch {
         vault: Address,
@@ -425,6 +425,25 @@ pub(crate) enum ReceiptCustodyError {
 
     #[error("custody transfer {tx_hash} has no receipt after confirmation")]
     MissingReceipt { tx_hash: B256 },
+
+    #[error(
+        "vault {vault} produced an empty transfer batch; nothing was \
+         submitted"
+    )]
+    NothingToTransfer { vault: Address },
+
+    #[error(
+        "vault {vault} certification lapsed partway through the chunked \
+         migration; re-certify, then re-run — completed chunks resume"
+    )]
+    CertificationLapsed { vault: Address },
+
+    #[error(
+        "vault {vault} owner froze a transfer party until {until} partway \
+         through the chunked migration; re-run once the freeze lifts — \
+         completed chunks resume"
+    )]
+    OwnerFroze { vault: Address, until: U256 },
 }
 
 /// A recipient balance that fell over a transfer that should only have raised
@@ -1194,69 +1213,18 @@ pub(crate) async fn reconcile_holdings(
         });
     }
 
-    if !tracked.is_empty() && onchain.iter().all(Shares::is_zero) {
-        return already_migrated_or_divergent(
-            custody,
-            vault,
-            recipient,
-            tracked,
-            &receipt_ids,
-        )
-        .await;
-    }
-
-    let agreed = izip!(tracked, &onchain)
-        .map(|(held, onchain)| {
-            if held.balance == *onchain {
-                Ok(*held)
-            } else {
-                Err(MigrationRefusal::InventoryDivergence {
-                    vault,
-                    receipt_id: held.receipt_id,
-                    tracked: held.balance,
-                    onchain: *onchain,
-                })
-            }
-        })
-        .collect::<Result<Vec<_>, MigrationRefusal>>()?;
-
-    // A zero balance is nothing to move. Keeping it would put an identifier in
-    // the batch that transfers nothing and cannot be verified as having moved.
-    let holdings: Vec<ReceiptHolding> =
-        agreed.into_iter().filter(|held| !held.balance.is_zero()).collect();
-
-    debug!(
-        target: "receipt_inventory",
-        %vault,
-        %holder,
-        tracked = tracked.len(),
-        migratable = holdings.len(),
-        "Reconciled receipt holdings against the chain"
-    );
-
-    Ok(SourceCustody::Holds(MigratableHoldings {
-        chain_id,
-        vault,
-        holder,
-        holdings,
-        migration_ordinal,
-    }))
-}
-
-/// Distinguishes "this migration already ran" from "our inventory is wrong".
-///
-/// Reached only when the source holds nothing for every tracked identifier. If
-/// the recipient holds at least what we tracked, custody moved; anything less
-/// is an inventory we cannot trust.
-async fn already_migrated_or_divergent(
-    custody: &(impl ReceiptCustody + Sync),
-    vault: Address,
-    recipient: Address,
-    tracked: &[ReceiptHolding],
-    receipt_ids: &[ReceiptId],
-) -> Result<SourceCustody, MigrationRefusal> {
+    // Classification is per identifier so a failure between transfer chunks
+    // resumes: a chunked transfer can leave some identifiers already with the
+    // recipient while the rest still sit with the holder, and an all-or-
+    // nothing agreement check would refuse that state as divergence forever.
+    //
+    // The recipient side is read unconditionally so all three balance views
+    // zip positionally, with the length verified once up front. `>=`, not
+    // `==`, on the recipient side: a fresh run cannot know what the
+    // recipient held before the migration, and the forward path deliberately
+    // allows a recipient with a pre-existing balance.
     let at_recipient =
-        custody.held_balances(vault, recipient, receipt_ids).await?;
+        custody.held_balances(vault, recipient, &receipt_ids).await?;
 
     if at_recipient.len() != receipt_ids.len() {
         return Err(MigrationRefusal::BalanceCountMismatch {
@@ -1266,24 +1234,72 @@ async fn already_migrated_or_divergent(
         });
     }
 
-    // `>=`, not `==`: a fresh run cannot know what the recipient held before
-    // the migration, and the forward path deliberately allows a recipient with
-    // a pre-existing balance. Requiring equality here would make every such
-    // migration un-rerunnable, reporting a mismatch for custody that did move.
-    // Combined with a source holding zero for every identifier, "the recipient
-    // holds at least what we tracked" is the strongest claim available.
-    for (held, at_recipient) in izip!(tracked, &at_recipient) {
-        if *at_recipient < held.balance {
+    let mut unmoved: Vec<ReceiptHolding> = Vec::new();
+    let mut migrated: usize = 0;
+    for (held, onchain, moved_to_recipient) in
+        izip!(tracked, &onchain, &at_recipient)
+    {
+        if *onchain == held.balance {
+            // A zero tracked balance is nothing to move. Keeping it would
+            // put an identifier in the batch that transfers nothing and
+            // cannot be verified as having moved.
+            if !held.balance.is_zero() {
+                unmoved.push(*held);
+            }
+            continue;
+        }
+
+        // Reached only on disagreement. A zero tracked balance against a
+        // nonzero on-chain one, or a partial on-chain balance, is an
+        // inventory we cannot trust — not something to skip or resume.
+        if held.balance.is_zero() || !onchain.is_zero() {
+            return Err(MigrationRefusal::InventoryDivergence {
+                vault,
+                receipt_id: held.receipt_id,
+                tracked: held.balance,
+                onchain: *onchain,
+            });
+        }
+
+        if *moved_to_recipient < held.balance {
             return Err(MigrationRefusal::RecipientBalanceMismatch {
                 vault,
                 receipt_id: held.receipt_id,
                 tracked: held.balance,
-                at_recipient: *at_recipient,
+                at_recipient: *moved_to_recipient,
             });
         }
+
+        migrated += 1;
     }
 
-    Ok(SourceCustody::AlreadyMigrated { receipts: tracked.len() })
+    if unmoved.is_empty() && !tracked.is_empty() {
+        return Ok(SourceCustody::AlreadyMigrated { receipts: migrated });
+    }
+
+    // Canonical order, independent of the inventory's backing map: chunk
+    // membership and every chunk's deterministic externalTxId are derived
+    // positionally from this sequence, so a rerun after a crash must
+    // enumerate the same remaining identifiers in the same order to resume
+    // its in-flight Fireblocks transactions instead of duplicating them.
+    unmoved.sort_by_key(|held| held.receipt_id.inner());
+
+    debug!(
+        target: "receipt_inventory",
+        %vault,
+        %holder,
+        tracked = tracked.len(),
+        migratable = unmoved.len(),
+        "Reconciled receipt holdings against the chain"
+    );
+
+    Ok(SourceCustody::Holds(MigratableHoldings {
+        chain_id,
+        vault,
+        holder,
+        holdings: unmoved,
+        migration_ordinal,
+    }))
 }
 
 /// Moves one vault's receipts to the incoming wallet.
@@ -1663,7 +1679,32 @@ pub(crate) struct FireblocksReceiptCustody<P> {
     client: FireblocksVaultService<P>,
     receipt_contract: Address,
     chain_id: u64,
+    max_receipts_per_transfer: NonZeroUsize,
 }
+
+/// Upper bound on receipts per CONTRACT_CALL submitted through Fireblocks.
+///
+/// Fireblocks' transaction engine assigns its own gas limit to a
+/// CONTRACT_CALL, and on large `safeBatchTransferFrom` batches that limit
+/// exceeds Base's block gas limit, failing the transaction before it can
+/// broadcast. Chunking keeps every submitted transfer small enough for a
+/// sane engine gas limit; [`reconcile_holdings`]' per-identifier
+/// classification makes a failure between chunks resumable.
+///
+/// The bound is empirical, not a documented Fireblocks limit: 240 receipts
+/// is the only observed failure and batches up to 14 are proven to pass, so
+/// the cap sits exactly at the proven bound rather than guessing anything
+/// between — correctness does not depend on its value, only how many
+/// transactions a large vault takes. Never change it between a failed run
+/// and its re-run:
+/// chunk boundaries derive from this value, so a resume under a different
+/// cap computes different externalTxIds and submits fresh transactions
+/// instead of resuming any still-pending ones (safe on-chain — an
+/// overlapping duplicate reverts on insufficient balance — but noisy and
+/// operator-confusing). Change it only once no Fireblocks transaction for
+/// the vault is pending.
+const MAX_RECEIPTS_PER_ENGINE_TRANSFER: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(13);
 
 impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
     pub(crate) async fn resolve(
@@ -1690,6 +1731,7 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
             client,
             receipt_contract,
             chain_id,
+            max_receipts_per_transfer: MAX_RECEIPTS_PER_ENGINE_TRANSFER,
         })
     }
 }
@@ -1727,73 +1769,128 @@ impl<P: Provider + Clone + Send + Sync> ReceiptCustody
         let receipt =
             Receipt::new(self.receipt_contract, &self.onchain.provider);
         let (ids, amounts) = holdings.batch_arguments();
-        let external_tx_id = migration_external_tx_id(
-            self.chain_id,
-            permit.vault(),
-            permit.to(),
-            &ids,
-            &amounts,
-            holdings.migration_ordinal(),
-        );
-        let calldata = receipt
-            .safeBatchTransferFrom(
-                permit.from(),
-                permit.to(),
-                ids,
-                amounts,
-                Bytes::new(),
-            )
-            .calldata()
-            .clone();
         let note = format!(
             "receipt custody migration: vault {} -> {}",
             permit.vault(),
             permit.to()
         );
+        let chunk_size = self.max_receipts_per_transfer.get();
+        let chunk_count = ids.len().div_ceil(chunk_size);
 
-        // Submission walks to a fresh `-retry-N` id when a previous attempt's
-        // transaction failed terminally: Fireblocks spends an externalTxId
-        // forever, so fix-and-retry after a TAP rejection or an expired
-        // certification must not resume the corpse.
-        //
-        // Logged before the await: completion can block through console
-        // approvals for minutes, and if this process dies or times out the
-        // operator needs the id to look the transaction up.
         info!(target: "receipt_inventory",
             vault = %permit.vault(),
             receipt_contract = %self.receipt_contract,
-            %external_tx_id,
+            receipts = ids.len(),
+            chunks = chunk_count,
             "submitting custody transfer to Fireblocks"
         );
-        let tx_hash = self
-            .client
-            .submit_contract_call_to_completion(
-                self.receipt_contract,
-                &calldata,
-                &note,
-                &external_tx_id,
-            )
-            .await
-            .map_err(Box::new)?;
 
-        // Fireblocks can report `Completed` while the EVM transaction itself
-        // reverted; a reverted transfer moved nothing, so it is a definitive
-        // failure rather than a hash to report as success.
-        let confirmed = self
-            .onchain
-            .provider
-            .get_transaction_receipt(tx_hash)
-            .await?
-            .ok_or(ReceiptCustodyError::MissingReceipt { tx_hash })?;
+        // Each chunk is a CONTRACT_CALL of its own, kept under the
+        // per-transfer cap so Fireblocks' engine never assigns it a gas limit
+        // above the network's block gas limit (which fails the transaction
+        // before it can broadcast). A chunk is revert-checked before the next
+        // one goes out; a failure between chunks is resumable because
+        // `reconcile_holdings` classifies custody per identifier on rerun.
+        let mut last_landed: Option<B256> = None;
+        for (chunk_index, (chunk_ids, chunk_amounts)) in
+            izip!(ids.chunks(chunk_size), amounts.chunks(chunk_size))
+                .enumerate()
+        {
+            // Certification is maintained outside this service and can lapse
+            // while earlier chunks confirm; re-read before every chunk so a
+            // transfer the vault would refuse is never submitted on stale
+            // permission. The first chunk's permission was just checked by
+            // the caller, but the read is cheap and uniformity beats a
+            // special case.
+            match self
+                .onchain
+                .transfer_permission(permit.vault(), permit.from(), permit.to())
+                .await?
+            {
+                TransferPermission::Permitted(_) => {}
+                TransferPermission::CertificationExpired => {
+                    return Err(ReceiptCustodyError::CertificationLapsed {
+                        vault: permit.vault(),
+                    });
+                }
+                TransferPermission::OwnerFrozen { until } => {
+                    return Err(ReceiptCustodyError::OwnerFroze {
+                        vault: permit.vault(),
+                        until,
+                    });
+                }
+            }
 
-        if !confirmed.status() {
-            return Err(ReceiptCustodyError::Reverted {
-                vault: permit.vault(),
-                tx_hash,
-            });
+            // Deterministic over this chunk's own content: a crashed or
+            // retried run resumes the chunk's original Fireblocks
+            // transaction instead of submitting a second transfer. Submission
+            // walks to a fresh `-retry-N` id when a previous attempt failed
+            // terminally, since Fireblocks spends an externalTxId forever.
+            let external_tx_id = migration_external_tx_id(
+                self.chain_id,
+                permit.vault(),
+                permit.to(),
+                chunk_ids,
+                chunk_amounts,
+                holdings.migration_ordinal(),
+            );
+            let calldata = receipt
+                .safeBatchTransferFrom(
+                    permit.from(),
+                    permit.to(),
+                    chunk_ids.to_vec(),
+                    chunk_amounts.to_vec(),
+                    Bytes::new(),
+                )
+                .calldata()
+                .clone();
+
+            // Logged before the await: completion can block through console
+            // approvals for minutes, and if this process dies or times out
+            // the operator needs the id to look the transaction up.
+            debug!(target: "receipt_inventory",
+                vault = %permit.vault(),
+                %external_tx_id,
+                chunk = chunk_index + 1,
+                chunks = chunk_count,
+                chunk_receipts = chunk_ids.len(),
+                "submitting custody transfer chunk to Fireblocks"
+            );
+            let tx_hash = self
+                .client
+                .submit_contract_call_to_completion(
+                    self.receipt_contract,
+                    &calldata,
+                    &note,
+                    &external_tx_id,
+                )
+                .await
+                .map_err(Box::new)?;
+
+            // Fireblocks can report `Completed` while the EVM transaction
+            // itself reverted; a reverted transfer moved nothing, so it is a
+            // definitive failure rather than a hash to report as success —
+            // and no further chunk goes out on top of it.
+            let confirmed = self
+                .onchain
+                .provider
+                .get_transaction_receipt(tx_hash)
+                .await?
+                .ok_or(ReceiptCustodyError::MissingReceipt { tx_hash })?;
+
+            if !confirmed.status() {
+                return Err(ReceiptCustodyError::Reverted {
+                    vault: permit.vault(),
+                    tx_hash,
+                });
+            }
+
+            last_landed = Some(tx_hash);
         }
 
-        Ok(tx_hash)
+        last_landed.ok_or(ReceiptCustodyError::NothingToTransfer {
+            vault: permit.vault(),
+        })
     }
 }
 
@@ -2182,6 +2279,81 @@ mod tests {
             holdings.holdings().len(),
             1,
             "a zero balance is nothing to move and must not enter the batch"
+        );
+    }
+
+    /// A failure between transfer chunks leaves some identifiers already with
+    /// the recipient and the rest still with the holder. A rerun must resume
+    /// the remainder rather than refuse the moved identifiers as divergence.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconcile_resumes_a_partially_migrated_vault() {
+        let custody = FakeCustody::with_balances(&[
+            (OUTGOING, 1, 100),
+            (INCOMING, 2, 250),
+        ]);
+        let tracked =
+            [FakeCustody::holding(1, 100), FakeCustody::holding(2, 250)];
+
+        let holdings =
+            holdings_of(reconcile(&custody, &tracked).await.unwrap());
+
+        assert_eq!(
+            holdings.holdings().len(),
+            1,
+            "only the identifier still with the holder is left to migrate"
+        );
+        let (ids, amounts) = holdings.batch_arguments();
+        assert_eq!(ids, vec![U256::from(1)]);
+        assert_eq!(amounts, vec![U256::from(100)]);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Reconciled receipt holdings against the chain", "migratable=1"]
+        ));
+    }
+
+    /// A zero tracked balance means the wallet should hold nothing for that
+    /// identifier; an on-chain balance appearing there is an inventory that
+    /// cannot be trusted, not something to silently skip.
+    #[tokio::test]
+    async fn reconcile_refuses_an_untracked_onchain_balance() {
+        let custody = FakeCustody::at_source(&[(1, 100), (2, 70)]);
+        let tracked =
+            [FakeCustody::holding(1, 100), FakeCustody::holding(2, 0)];
+
+        let refusal = reconcile(&custody, &tracked).await.unwrap_err();
+
+        assert!(
+            matches!(
+                refusal,
+                MigrationRefusal::InventoryDivergence {
+                    tracked, onchain, ..
+                } if tracked == Shares::ZERO
+                    && onchain == Shares::new(U256::from(70))
+            ),
+            "an untracked on-chain balance must refuse, got {refusal:?}"
+        );
+    }
+
+    /// An identifier the holder no longer holds whose balance never reached
+    /// the recipient is untraceable custody, not a resumable move.
+    #[tokio::test]
+    async fn reconcile_refuses_a_vanished_identifier() {
+        let custody = FakeCustody::with_balances(&[(OUTGOING, 1, 100)]);
+        let tracked =
+            [FakeCustody::holding(1, 100), FakeCustody::holding(2, 250)];
+
+        let refusal = reconcile(&custody, &tracked).await.unwrap_err();
+
+        assert!(
+            matches!(
+                refusal,
+                MigrationRefusal::RecipientBalanceMismatch {
+                    tracked, at_recipient, ..
+                } if tracked == Shares::new(U256::from(250))
+                    && at_recipient == Shares::ZERO
+            ),
+            "a vanished balance must refuse, got {refusal:?}"
         );
     }
 
@@ -3100,6 +3272,7 @@ mod tests {
                 ),
                 receipt_contract,
                 chain_id: ANVIL_CHAIN_ID,
+                max_receipts_per_transfer: MAX_RECEIPTS_PER_ENGINE_TRANSFER,
             };
 
             let returned =
@@ -3115,6 +3288,477 @@ mod tests {
                 1,
                 "exactly one CONTRACT_CALL must be submitted"
             );
+        }
+
+        /// Deposits `count` receipts of `shares` each into the vault,
+        /// returning the receipt identifiers the Deposit events reported.
+        async fn deposit_receipts<P: Provider>(
+            vault: &crate::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance<P>,
+            holder: Address,
+            shares: U256,
+            count: usize,
+        ) -> Vec<U256> {
+            let mut receipt_ids = Vec::new();
+            for _ in 0..count {
+                let deposited = vault
+                    .deposit(
+                        shares,
+                        holder,
+                        U256::from(10).pow(U256::from(18)),
+                        Bytes::new(),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .get_receipt()
+                    .await
+                    .unwrap();
+                let receipt_id = deposited
+                    .inner
+                    .logs()
+                    .iter()
+                    .find_map(|log| {
+                        crate::bindings::OffchainAssetReceiptVault::Deposit::decode_log(
+                            &log.inner,
+                        )
+                        .ok()
+                    })
+                    .expect("deposit must emit a Deposit event")
+                    .id;
+                receipt_ids.push(receipt_id);
+            }
+            receipt_ids
+        }
+
+        /// Mocks one engine CONTRACT_CALL round trip: a create matched on the
+        /// chunk's externalTxId returning `fb_id`, and its poll reporting
+        /// `COMPLETED` with `tx_hash`. Returns the create mock so the test
+        /// can assert the submission happened.
+        fn mock_engine_completion<'a>(
+            server: &'a MockServer,
+            external_tx_id: &str,
+            fb_id: &str,
+            tx_hash: B256,
+        ) -> httpmock::Mock<'a> {
+            let poll_body = serde_json::json!({
+                "id": fb_id,
+                "status": "COMPLETED",
+                "txHash": format!("{tx_hash:#x}"),
+            });
+            let poll_path = format!("/transactions/{fb_id}");
+            let create_body = serde_json::json!({ "id": fb_id });
+            let external = external_tx_id.to_string();
+            server.mock(move |when, then| {
+                when.method("GET").path(poll_path.clone());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(poll_body);
+            });
+            server.mock(move |when, then| {
+                when.method("POST")
+                    .path("/transactions")
+                    .body_includes(external.clone());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(create_body);
+            })
+        }
+
+        /// A batch above the per-transfer cap must be submitted as several
+        /// CONTRACT_CALLs, each under its own deterministic externalTxId and
+        /// each revert-checked, with the last landed hash reported. One
+        /// oversized submission is exactly what Fireblocks' engine rejects
+        /// with a gas limit above the network's block gas limit.
+        #[traced_test]
+        #[tokio::test]
+        async fn transfer_custody_chunks_batches_above_the_transfer_cap() {
+            let evm = LocalEvm::new().await.unwrap();
+            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+            evm.grant_certify_role(evm.wallet_address).await.unwrap();
+            evm.certify_vault(U256::MAX).await.unwrap();
+
+            let holder = evm.wallet_address;
+            let recipient = Address::random();
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect(&evm.endpoint)
+                .await
+                .unwrap();
+
+            let vault = crate::bindings::OffchainAssetReceiptVault::new(
+                evm.vault_address,
+                &provider,
+            );
+            let shares = U256::from(10) * U256::from(10).pow(U256::from(18));
+            let receipt_ids = deposit_receipts(&vault, holder, shares, 3).await;
+            let receipt_contract =
+                Address::from(vault.receipt().call().await.unwrap().0);
+
+            let onchain = OnchainReceiptCustody::resolve(
+                provider.clone(),
+                evm.vault_address,
+            )
+            .await
+            .unwrap();
+            let tracked: Vec<ReceiptHolding> = receipt_ids
+                .iter()
+                .map(|receipt_id| ReceiptHolding {
+                    receipt_id: ReceiptId::from(*receipt_id),
+                    balance: Shares::from(shares),
+                })
+                .collect();
+            let SourceCustody::Holds(holdings) = reconcile_holdings(
+                &onchain,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                holder,
+                recipient,
+                &tracked,
+                0,
+            )
+            .await
+            .unwrap() else {
+                panic!("the holder must still own the receipts")
+            };
+            let TransferPermission::Permitted(permit) = onchain
+                .transfer_permission(evm.vault_address, holder, recipient)
+                .await
+                .unwrap()
+            else {
+                panic!("a certified vault must permit the transfer")
+            };
+
+            // The "custodian" lands each chunk on-chain up front; the mocked
+            // Fireblocks API then reports each chunk's transaction as its
+            // completed CONTRACT_CALL, exactly as production does.
+            let receipt_instance = Receipt::new(receipt_contract, &provider);
+            let first_chunk = receipt_instance
+                .safeBatchTransferFrom(
+                    holder,
+                    recipient,
+                    vec![receipt_ids[0], receipt_ids[1]],
+                    vec![shares, shares],
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap()
+                .transaction_hash;
+            let second_chunk = receipt_instance
+                .safeBatchTransferFrom(
+                    holder,
+                    recipient,
+                    vec![receipt_ids[2]],
+                    vec![shares],
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap()
+                .transaction_hash;
+
+            let first_id = migration_external_tx_id(
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                recipient,
+                &[receipt_ids[0], receipt_ids[1]],
+                &[shares, shares],
+                0,
+            );
+            let second_id = migration_external_tx_id(
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                recipient,
+                &[receipt_ids[2]],
+                &[shares],
+                0,
+            );
+
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method("GET").path("/contracts");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!([
+                        {
+                            "id": "contract-wallet-123",
+                            "name": "Receipt",
+                            "assets": [
+                                {
+                                    "id": "TESTCHAIN_ETH",
+                                    "address": receipt_contract
+                                        .to_string()
+                                        .to_lowercase()
+                                }
+                            ]
+                        }
+                    ]));
+            });
+            let first_create = mock_engine_completion(
+                &server,
+                &first_id,
+                "fb-chunk-1",
+                first_chunk,
+            );
+            let second_create = mock_engine_completion(
+                &server,
+                &second_id,
+                "fb-chunk-2",
+                second_chunk,
+            );
+
+            let custody = FireblocksReceiptCustody {
+                onchain,
+                client: FireblocksVaultService::for_tests(
+                    mock_client(&server),
+                    provider.clone(),
+                    ANVIL_CHAIN_ID,
+                    parse_chain_asset_ids(&format!(
+                        "{ANVIL_CHAIN_ID}:TESTCHAIN_ETH"
+                    ))
+                    .unwrap(),
+                ),
+                receipt_contract,
+                chain_id: ANVIL_CHAIN_ID,
+                max_receipts_per_transfer: NonZeroUsize::MIN.saturating_add(1),
+            };
+
+            let returned =
+                custody.transfer_custody(&permit, &holdings).await.unwrap();
+
+            assert_eq!(
+                returned, second_chunk,
+                "the reported hash must be the last landed chunk"
+            );
+            first_create.assert();
+            second_create.assert();
+            assert!(logs_contain_at!(
+                tracing::Level::INFO,
+                &["submitting custody transfer to Fireblocks", "chunks=2"]
+            ));
+            assert!(logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["submitting custody transfer chunk to Fireblocks", "chunk=1"]
+            ));
+        }
+
+        /// A chunk whose transaction reverted must stop the loop: no later
+        /// chunk may be submitted on top of a definitively failed transfer.
+        #[traced_test]
+        #[tokio::test]
+        async fn a_reverted_chunk_halts_the_remaining_chunks() {
+            let evm = LocalEvm::new().await.unwrap();
+            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+            evm.grant_certify_role(evm.wallet_address).await.unwrap();
+            evm.certify_vault(U256::MAX).await.unwrap();
+
+            let holder = evm.wallet_address;
+            let recipient = Address::random();
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer))
+                .connect(&evm.endpoint)
+                .await
+                .unwrap();
+
+            let vault = crate::bindings::OffchainAssetReceiptVault::new(
+                evm.vault_address,
+                &provider,
+            );
+            let shares = U256::from(10) * U256::from(10).pow(U256::from(18));
+            let receipt_ids = deposit_receipts(&vault, holder, shares, 3).await;
+            let receipt_contract =
+                Address::from(vault.receipt().call().await.unwrap().0);
+
+            let onchain = OnchainReceiptCustody::resolve(
+                provider.clone(),
+                evm.vault_address,
+            )
+            .await
+            .unwrap();
+            let tracked: Vec<ReceiptHolding> = receipt_ids
+                .iter()
+                .map(|receipt_id| ReceiptHolding {
+                    receipt_id: ReceiptId::from(*receipt_id),
+                    balance: Shares::from(shares),
+                })
+                .collect();
+            let SourceCustody::Holds(holdings) = reconcile_holdings(
+                &onchain,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                holder,
+                recipient,
+                &tracked,
+                0,
+            )
+            .await
+            .unwrap() else {
+                panic!("the holder must still own the receipts")
+            };
+            let TransferPermission::Permitted(permit) = onchain
+                .transfer_permission(evm.vault_address, holder, recipient)
+                .await
+                .unwrap()
+            else {
+                panic!("a certified vault must permit the transfer")
+            };
+
+            // Chunk 1 lands successfully; chunk 2's reported transaction is
+            // an oversized transfer that lands reverted (the explicit gas
+            // limit skips estimation, which would otherwise refuse to
+            // broadcast it).
+            let receipt_instance = Receipt::new(receipt_contract, &provider);
+            let first_chunk = receipt_instance
+                .safeBatchTransferFrom(
+                    holder,
+                    recipient,
+                    vec![receipt_ids[0]],
+                    vec![shares],
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap()
+                .transaction_hash;
+            let reverted = receipt_instance
+                .safeBatchTransferFrom(
+                    holder,
+                    recipient,
+                    vec![receipt_ids[1]],
+                    vec![shares + U256::from(1)],
+                    Bytes::new(),
+                )
+                .gas(1_000_000)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            assert!(
+                !reverted.status(),
+                "the oversized transfer must land reverted"
+            );
+            let reverted_hash = reverted.transaction_hash;
+
+            let first_id = migration_external_tx_id(
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                recipient,
+                &[receipt_ids[0]],
+                &[shares],
+                0,
+            );
+            let second_id = migration_external_tx_id(
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                recipient,
+                &[receipt_ids[1]],
+                &[shares],
+                0,
+            );
+            let third_id = migration_external_tx_id(
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                recipient,
+                &[receipt_ids[2]],
+                &[shares],
+                0,
+            );
+
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method("GET").path("/contracts");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!([
+                        {
+                            "id": "contract-wallet-123",
+                            "name": "Receipt",
+                            "assets": [
+                                {
+                                    "id": "TESTCHAIN_ETH",
+                                    "address": receipt_contract
+                                        .to_string()
+                                        .to_lowercase()
+                                }
+                            ]
+                        }
+                    ]));
+            });
+            mock_engine_completion(
+                &server,
+                &first_id,
+                "fb-halt-1",
+                first_chunk,
+            );
+            mock_engine_completion(
+                &server,
+                &second_id,
+                "fb-halt-2",
+                reverted_hash,
+            );
+            let third_create = mock_engine_completion(
+                &server,
+                &third_id,
+                "fb-halt-3",
+                first_chunk,
+            );
+
+            let custody = FireblocksReceiptCustody {
+                onchain,
+                client: FireblocksVaultService::for_tests(
+                    mock_client(&server),
+                    provider.clone(),
+                    ANVIL_CHAIN_ID,
+                    parse_chain_asset_ids(&format!(
+                        "{ANVIL_CHAIN_ID}:TESTCHAIN_ETH"
+                    ))
+                    .unwrap(),
+                ),
+                receipt_contract,
+                chain_id: ANVIL_CHAIN_ID,
+                max_receipts_per_transfer: NonZeroUsize::MIN,
+            };
+
+            let error =
+                custody.transfer_custody(&permit, &holdings).await.unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    ReceiptCustodyError::Reverted { tx_hash, .. }
+                        if tx_hash == reverted_hash
+                ),
+                "the reverted chunk must fail closed naming its hash, got \
+                 {error}"
+            );
+            assert_eq!(
+                third_create.calls_async().await,
+                0,
+                "no chunk may be submitted after a reverted one"
+            );
+            assert!(logs_contain_at!(
+                tracing::Level::INFO,
+                &["submitting custody transfer to Fireblocks", "chunks=3"]
+            ));
+            assert!(logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["submitting custody transfer chunk to Fireblocks", "chunk=2"]
+            ));
         }
 
         /// Fireblocks `Completed` is not proof the EVM transaction succeeded:
@@ -3277,6 +3921,7 @@ mod tests {
                 ),
                 receipt_contract,
                 chain_id: ANVIL_CHAIN_ID,
+                max_receipts_per_transfer: MAX_RECEIPTS_PER_ENGINE_TRANSFER,
             };
 
             let error =

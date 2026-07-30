@@ -2309,7 +2309,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "fireblocks-sdk"
 version = "2025.10.17"
-source = "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix%2Fconfirming-not-terminal#18227211082342818efaf6a1b58c89c65a6f17cd"
+source = "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix%2Fconfirming-not-terminal#7b9d5abd5f39138448c54fc751dc72a35710429a"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1451,11 +1451,11 @@ impl EventSourced for Redemption {
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    // 6: `Closed` gained `acknowledged_unresolved_burn_tx_hash`. Snapshots
-    // serialized under 5 would deserialize the field as `None` even when the
-    // closure acknowledged a still-mineable burn, silently dropping the
-    // re-acknowledgement guard; the bump clears them so the state rebuilds
-    // from events, which carry the hash.
+    // 6: `Closed` gained `unresolved_burn_tx`. Snapshots serialized under 5
+    // would deserialize the field as `None` even when a still-mineable burn
+    // survived the closure, silently dropping the re-acknowledgement guard;
+    // the bump clears them so the state rebuilds from events, which carry
+    // the retained transaction.
     const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
