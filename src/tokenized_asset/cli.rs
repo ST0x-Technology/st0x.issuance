@@ -1029,29 +1029,13 @@ async fn run_forward_via_fireblocks(
         );
     }
 
-    // The forward transfer is a one-way door unless Turnkey can sign the way
-    // back. Re-proven here, immediately before the irreversible submission,
-    // rather than trusted from an earlier `verify-custodians` run that may be
-    // stale or skipped: the exact rollback-shaped transaction — every tracked
-    // receipt back from the Turnkey wallet to the current holder — is signed
-    // without being broadcast, and the Turnkey wallet must hold the rollback
-    // gas reserve.
-    let resolved = resolve_turnkey_signer(turnkey_config, chain_id)?;
-    let proof = verify_rollback_signing(
-        &admin.pool,
-        &provider,
-        &resolved.wallet,
-        VaultIdentity { chain_id, vault, underlying: &args.underlying },
-        fireblocks_wallet,
-    )
-    .await?;
-    println!(
-        "Turnkey rollback re-proven: signed the return of {} receipt(s) to \
-         {} without broadcasting",
-        proof.receipts, proof.destination
-    );
-    require_rollback_gas(proof.turnkey_gas, turnkey)?;
-
+    // No rollback re-proof: the migration is decided one-way. Fireblocks is
+    // being retired, and Turnkey's signing policy does not cover
+    // rollback-shaped receipt transfers for every vault — gating the forward
+    // move on proving a return path nobody intends to use only blocks the
+    // cutover. Moving receipts out of the Turnkey wallet again (a future
+    // rotation) requires a Turnkey policy change first; `verify-custodians`
+    // retains the proof as a diagnostic.
     let recipient =
         CorroboratedRecipient::verify(&provider, recipient.address()).await?;
 
