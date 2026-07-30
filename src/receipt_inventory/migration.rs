@@ -19,11 +19,14 @@
 //! stop the service or serialize against it. The order is stop the service,
 //! migrate, swap the signer configuration, start again.
 
+use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::BlockId;
+use alloy::eips::eip2718::Encodable2718;
+use alloy::eips::eip2930::AccessList;
 use alloy::network::{
     Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder,
 };
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::providers::{PendingTransactionError, Provider};
 use alloy::rpc::types::TransactionRequest;
 use async_trait::async_trait;
@@ -1692,6 +1695,77 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
             chain_id,
         })
     }
+
+    /// The forward leg: build the transfer locally, have Fireblocks RAW-sign
+    /// its hash, and broadcast through this binary's own provider — never
+    /// touching Fireblocks' transaction engine (which strands or rejects
+    /// CONTRACT_CALLs during engine-side incidents).
+    ///
+    /// Idempotency differs from the engine path: nothing here deduplicates by
+    /// `externalTxId` at broadcast time. Safety instead comes from the chain
+    /// itself — the nonce is fetched at build time, so a duplicate broadcast
+    /// of the same signed bytes is a no-op, and a rerun after a landed
+    /// transfer fails the migration's exact-balances precondition before
+    /// anything is signed.
+    async fn raw_signed_transfer(
+        &self,
+        from: Address,
+        calldata: &Bytes,
+        note: &str,
+        external_tx_id: &str,
+    ) -> Result<B256, ReceiptCustodyError> {
+        let provider = &self.onchain.provider;
+
+        let nonce = provider.get_transaction_count(from).await?;
+        let fees = provider.estimate_eip1559_fees().await?;
+        let gas_request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(self.receipt_contract)
+            .with_input(calldata.clone());
+        let gas_estimate = provider.estimate_gas(gas_request).await?;
+        // Head-of-block estimation can undershoot the state the transaction
+        // actually executes against; a 30% margin keeps a shifted storage
+        // layout from reverting the transfer with an out-of-gas.
+        let gas_limit = gas_estimate.saturating_mul(130) / 100;
+
+        let transaction = TxEip1559 {
+            chain_id: self.chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            to: TxKind::Call(self.receipt_contract),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: calldata.clone(),
+        };
+
+        let sighash = transaction.signature_hash();
+
+        info!(target: "receipt_inventory",
+            %external_tx_id,
+            %sighash,
+            nonce,
+            gas_limit,
+            "requesting Fireblocks RAW signature for the custody transfer"
+        );
+
+        // The client refuses to hand back a signature that does not recover
+        // to `from`, so a broadcast below can never spend from an unexpected
+        // address.
+        let signature = self
+            .client
+            .sign_raw_to_completion(sighash, from, note, external_tx_id)
+            .await
+            .map_err(Box::new)?;
+
+        let envelope = TxEnvelope::Eip1559(transaction.into_signed(signature));
+        let encoded = envelope.encoded_2718();
+
+        let pending = provider.send_raw_transaction(&encoded).await?;
+
+        Ok(*pending.tx_hash())
+    }
 }
 
 #[async_trait]
@@ -1763,18 +1837,16 @@ impl<P: Provider + Clone + Send + Sync> ReceiptCustody
             vault = %permit.vault(),
             receipt_contract = %self.receipt_contract,
             %external_tx_id,
-            "submitting custody transfer to Fireblocks"
+            "submitting custody transfer for Fireblocks RAW signing"
         );
         let tx_hash = self
-            .client
-            .submit_contract_call_to_completion(
-                self.receipt_contract,
+            .raw_signed_transfer(
+                permit.from(),
                 &calldata,
                 &note,
                 &external_tx_id,
             )
-            .await
-            .map_err(Box::new)?;
+            .await?;
 
         // Fireblocks can report `Completed` while the EVM transaction itself
         // reverted; a reverted transfer moved nothing, so it is a definitive
@@ -2947,8 +3019,14 @@ mod tests {
                 .unwrap()
         }
 
+        /// A transfer that would revert must fail closed before anything is
+        /// signed or broadcast: gas estimation runs against the state the
+        /// transfer would execute in, so a holder whose receipts were swept
+        /// away between the permit and the submission produces an error and
+        /// moves nothing.
         #[tokio::test]
-        async fn transfer_custody_returns_the_hash_of_a_landed_transfer() {
+        async fn transfer_custody_fails_closed_when_the_transfer_would_revert()
+        {
             let evm = LocalEvm::new().await.unwrap();
             evm.grant_deposit_role(evm.wallet_address).await.unwrap();
             evm.grant_certify_role(evm.wallet_address).await.unwrap();
@@ -2997,8 +3075,6 @@ mod tests {
             let receipt_contract =
                 Address::from(vault.receipt().call().await.unwrap().0);
 
-            // Holdings and permit are established while the holder still owns
-            // the receipts, exactly as the engine does before submitting.
             let onchain = OnchainReceiptCustody::resolve(
                 provider.clone(),
                 evm.vault_address,
@@ -3030,14 +3106,16 @@ mod tests {
                 panic!("a certified vault must permit the transfer")
             };
 
-            // The "custodian" executes the batch on-chain; the mocked
-            // Fireblocks API then reports that transaction as the completed
-            // CONTRACT_CALL, exactly as production does once approvals clear.
+            // The holder's receipts are swept to a bystander after the
+            // permit is established, so the migration's transfer would
+            // revert with an insufficient balance — the state drift the
+            // fail-closed behavior exists for.
             let receipt_instance = Receipt::new(receipt_contract, &provider);
-            let landed = receipt_instance
+            let bystander = Address::random();
+            receipt_instance
                 .safeBatchTransferFrom(
                     holder,
-                    recipient,
+                    bystander,
                     vec![receipt_id],
                     vec![shares],
                     Bytes::new(),
@@ -3048,221 +3126,10 @@ mod tests {
                 .get_receipt()
                 .await
                 .unwrap();
-            let landed_hash = landed.transaction_hash;
 
+            // No Fireblocks interaction is expected: the failure must occur
+            // before anything is signed, so the mock server has no routes.
             let server = MockServer::start();
-            server.mock(|when, then| {
-                when.method("GET").path("/contracts");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!([
-                        {
-                            "id": "contract-wallet-123",
-                            "name": "Receipt",
-                            "assets": [
-                                {
-                                    "id": "TESTCHAIN_ETH",
-                                    "address": receipt_contract
-                                        .to_string()
-                                        .to_lowercase()
-                                }
-                            ]
-                        }
-                    ]));
-            });
-            let create_mock = server.mock(|when, then| {
-                when.method("POST").path("/transactions");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({ "id": "fb-tx-1" }));
-            });
-            server.mock(|when, then| {
-                when.method("GET").path("/transactions/fb-tx-1");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({
-                        "id": "fb-tx-1",
-                        "status": "COMPLETED",
-                        "txHash": format!("{landed_hash:#x}"),
-                    }));
-            });
-
-            let custody = FireblocksReceiptCustody {
-                onchain,
-                client: FireblocksVaultService::for_tests(
-                    mock_client(&server),
-                    provider.clone(),
-                    ANVIL_CHAIN_ID,
-                    parse_chain_asset_ids(&format!(
-                        "{ANVIL_CHAIN_ID}:TESTCHAIN_ETH"
-                    ))
-                    .unwrap(),
-                ),
-                receipt_contract,
-                chain_id: ANVIL_CHAIN_ID,
-            };
-
-            let returned =
-                custody.transfer_custody(&permit, &holdings).await.unwrap();
-
-            assert_eq!(
-                returned, landed_hash,
-                "the custody impl must report the hash of the transfer that \
-                 actually landed"
-            );
-            assert_eq!(
-                create_mock.calls_async().await,
-                1,
-                "exactly one CONTRACT_CALL must be submitted"
-            );
-        }
-
-        /// Fireblocks `Completed` is not proof the EVM transaction succeeded:
-        /// a reverted transfer moved nothing and must fail closed rather than
-        /// report the hash as a success.
-        #[tokio::test]
-        async fn transfer_custody_fails_closed_on_a_reverted_transfer() {
-            let evm = LocalEvm::new().await.unwrap();
-            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
-            evm.grant_certify_role(evm.wallet_address).await.unwrap();
-            evm.certify_vault(U256::MAX).await.unwrap();
-
-            let holder = evm.wallet_address;
-            let recipient = Address::random();
-            let signer =
-                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
-            let provider = ProviderBuilder::new()
-                .wallet(EthereumWallet::from(signer))
-                .connect(&evm.endpoint)
-                .await
-                .unwrap();
-
-            let vault = crate::bindings::OffchainAssetReceiptVault::new(
-                evm.vault_address,
-                &provider,
-            );
-            let shares = U256::from(40) * U256::from(10).pow(U256::from(18));
-            let deposited = vault
-                .deposit(
-                    shares,
-                    holder,
-                    U256::from(10).pow(U256::from(18)),
-                    Bytes::new(),
-                )
-                .send()
-                .await
-                .unwrap()
-                .get_receipt()
-                .await
-                .unwrap();
-            let receipt_id = deposited
-                .inner
-                .logs()
-                .iter()
-                .find_map(|log| {
-                    crate::bindings::OffchainAssetReceiptVault::Deposit::decode_log(
-                        &log.inner,
-                    )
-                    .ok()
-                })
-                .expect("deposit must emit a Deposit event")
-                .id;
-            let receipt_contract =
-                Address::from(vault.receipt().call().await.unwrap().0);
-
-            let onchain = OnchainReceiptCustody::resolve(
-                provider.clone(),
-                evm.vault_address,
-            )
-            .await
-            .unwrap();
-            let tracked = [ReceiptHolding {
-                receipt_id: ReceiptId::from(receipt_id),
-                balance: Shares::from(shares),
-            }];
-            let SourceCustody::Holds(holdings) = reconcile_holdings(
-                &onchain,
-                ANVIL_CHAIN_ID,
-                evm.vault_address,
-                holder,
-                recipient,
-                &tracked,
-                0,
-            )
-            .await
-            .unwrap() else {
-                panic!("the holder must still own the receipts")
-            };
-            let TransferPermission::Permitted(permit) = onchain
-                .transfer_permission(evm.vault_address, holder, recipient)
-                .await
-                .unwrap()
-            else {
-                panic!("a certified vault must permit the transfer")
-            };
-
-            // A transfer of more than the tracked balance lands but reverts;
-            // the explicit gas limit skips estimation, which would otherwise
-            // refuse to broadcast it. The mocked Fireblocks API then reports
-            // exactly this reverted transaction as `Completed`.
-            let receipt_instance = Receipt::new(receipt_contract, &provider);
-            let reverted = receipt_instance
-                .safeBatchTransferFrom(
-                    holder,
-                    recipient,
-                    vec![receipt_id],
-                    vec![shares + U256::from(1)],
-                    Bytes::new(),
-                )
-                .gas(1_000_000)
-                .send()
-                .await
-                .unwrap()
-                .get_receipt()
-                .await
-                .unwrap();
-            assert!(
-                !reverted.status(),
-                "the oversized transfer must land reverted"
-            );
-            let reverted_hash = reverted.transaction_hash;
-
-            let server = MockServer::start();
-            server.mock(|when, then| {
-                when.method("GET").path("/contracts");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!([
-                        {
-                            "id": "contract-wallet-123",
-                            "name": "Receipt",
-                            "assets": [
-                                {
-                                    "id": "TESTCHAIN_ETH",
-                                    "address": receipt_contract
-                                        .to_string()
-                                        .to_lowercase()
-                                }
-                            ]
-                        }
-                    ]));
-            });
-            server.mock(|when, then| {
-                when.method("POST").path("/transactions");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({ "id": "fb-tx-1" }));
-            });
-            server.mock(|when, then| {
-                when.method("GET").path("/transactions/fb-tx-1");
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({
-                        "id": "fb-tx-1",
-                        "status": "COMPLETED",
-                        "txHash": format!("{reverted_hash:#x}"),
-                    }));
-            });
 
             let custody = FireblocksReceiptCustody {
                 onchain,
@@ -3283,22 +3150,231 @@ mod tests {
                 custody.transfer_custody(&permit, &holdings).await.unwrap_err();
 
             assert!(
-                matches!(
-                    error,
-                    ReceiptCustodyError::Reverted { tx_hash, .. }
-                        if tx_hash == reverted_hash
-                ),
-                "a reverted transfer must fail closed naming the reverted \
-                 hash, got: {error}"
+                matches!(error, ReceiptCustodyError::Rpc(_)),
+                "a transfer that would revert must fail at gas estimation \
+                 before signing, got: {error}"
             );
+            assert_eq!(
+                receipt_instance
+                    .balanceOf(recipient, receipt_id)
+                    .call()
+                    .await
+                    .unwrap(),
+                U256::ZERO,
+                "the failed migration must have moved nothing to the recipient"
+            );
+        }
+
+        /// The `Raw` forward leg end to end against a real chain: the code
+        /// builds the transfer, the mocked Fireblocks RAW-signs exactly the
+        /// hash it was asked to sign (with the holder's key, as the real MPC
+        /// signs with the vault wallet's key), and the code broadcasts the
+        /// assembled transaction itself — the receipts must land with the
+        /// recipient and the reported hash must be the landed transaction.
+        /// No whitelist resolution and no engine CONTRACT_CALL is involved.
+        #[tokio::test]
+        async fn transfer_custody_raw_signs_broadcasts_and_lands_the_transfer()
+        {
+            use std::sync::{Arc, Mutex};
+
+            use alloy::signers::SignerSync;
+
+            let evm = LocalEvm::new().await.unwrap();
+            evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+            evm.grant_certify_role(evm.wallet_address).await.unwrap();
+            evm.certify_vault(U256::MAX).await.unwrap();
+
+            let holder = evm.wallet_address;
+            let recipient = Address::random();
+            let signer =
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+            let provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(signer.clone()))
+                .connect(&evm.endpoint)
+                .await
+                .unwrap();
+
+            let vault = crate::bindings::OffchainAssetReceiptVault::new(
+                evm.vault_address,
+                &provider,
+            );
+            let shares = U256::from(40) * U256::from(10).pow(U256::from(18));
+            let deposited = vault
+                .deposit(
+                    shares,
+                    holder,
+                    U256::from(10).pow(U256::from(18)),
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            let receipt_id = deposited
+                .inner
+                .logs()
+                .iter()
+                .find_map(|log| {
+                    crate::bindings::OffchainAssetReceiptVault::Deposit::decode_log(
+                        &log.inner,
+                    )
+                    .ok()
+                })
+                .expect("deposit must emit a Deposit event")
+                .id;
+            let receipt_contract =
+                Address::from(vault.receipt().call().await.unwrap().0);
+
+            let onchain = OnchainReceiptCustody::resolve(
+                provider.clone(),
+                evm.vault_address,
+            )
+            .await
+            .unwrap();
+            let tracked = [ReceiptHolding {
+                receipt_id: ReceiptId::from(receipt_id),
+                balance: Shares::from(shares),
+            }];
+            let SourceCustody::Holds(holdings) = reconcile_holdings(
+                &onchain,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                holder,
+                recipient,
+                &tracked,
+                0,
+            )
+            .await
+            .unwrap() else {
+                panic!("the holder must still own the receipts")
+            };
+            let TransferPermission::Permitted(permit) = onchain
+                .transfer_permission(evm.vault_address, holder, recipient)
+                .await
+                .unwrap()
+            else {
+                panic!("a certified vault must permit the transfer")
+            };
+
+            // The mocked Fireblocks signs whatever hash the code submits, the
+            // way the real MPC does — so the test proves the code builds,
+            // requests, assembles, and broadcasts the SAME transaction.
+            let server = MockServer::start();
+            let signature_slot: Arc<
+                Mutex<Option<alloy::primitives::Signature>>,
+            > = Arc::new(Mutex::new(None));
+
+            let post_slot = Arc::clone(&signature_slot);
+            let post_signer = signer.clone();
+            let create_mock = server.mock(move |when, then| {
+                when.method("POST")
+                    .path("/transactions")
+                    .body_includes(r#""operation":"RAW""#);
+                then.respond_with(move |req: &httpmock::HttpMockRequest| {
+                    let body: serde_json::Value =
+                        serde_json::from_str(&req.body_string()).unwrap();
+                    let content =
+                        body["extraParameters"]["rawMessageData"]["messages"]
+                            [0]["content"]
+                            .as_str()
+                            .unwrap();
+                    let sighash =
+                        B256::from_slice(&alloy::hex::decode(content).unwrap());
+                    let signature =
+                        post_signer.sign_hash_sync(&sighash).unwrap();
+                    *post_slot.lock().unwrap() = Some(signature);
+
+                    httpmock::HttpMockResponse::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(
+                            serde_json::json!({ "id": "raw-fb-1" }).to_string(),
+                        )
+                        .build()
+                });
+            });
+
+            let poll_slot = Arc::clone(&signature_slot);
+            server.mock(move |when, then| {
+                when.method("GET").path("/transactions/raw-fb-1");
+                then.respond_with(move |_req: &httpmock::HttpMockRequest| {
+                    let signature = poll_slot
+                        .lock()
+                        .unwrap()
+                        .expect("the signing request must arrive first");
+
+                    httpmock::HttpMockResponse::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(
+                            serde_json::json!({
+                                "id": "raw-fb-1",
+                                "status": "COMPLETED",
+                                "signedMessages": [{
+                                    "signature": {
+                                        "r": format!("{:064x}", signature.r()),
+                                        "s": format!("{:064x}", signature.s()),
+                                        "v": u8::from(signature.v()),
+                                    }
+                                }]
+                            })
+                            .to_string(),
+                        )
+                        .build()
+                });
+            });
+
+            let custody = FireblocksReceiptCustody {
+                onchain,
+                client: FireblocksVaultService::for_tests(
+                    mock_client(&server),
+                    provider.clone(),
+                    ANVIL_CHAIN_ID,
+                    parse_chain_asset_ids(&format!(
+                        "{ANVIL_CHAIN_ID}:TESTCHAIN_ETH"
+                    ))
+                    .unwrap(),
+                ),
+                receipt_contract,
+                chain_id: ANVIL_CHAIN_ID,
+            };
+
+            let returned =
+                custody.transfer_custody(&permit, &holdings).await.unwrap();
+
+            let receipt_instance = Receipt::new(receipt_contract, &provider);
             assert_eq!(
                 receipt_instance
                     .balanceOf(holder, receipt_id)
                     .call()
                     .await
                     .unwrap(),
+                U256::ZERO,
+                "the holder must have handed over the full balance"
+            );
+            assert_eq!(
+                receipt_instance
+                    .balanceOf(recipient, receipt_id)
+                    .call()
+                    .await
+                    .unwrap(),
                 shares,
-                "the reverted transfer must have moved nothing"
+                "the recipient must hold the full migrated balance"
+            );
+
+            let landed = provider
+                .get_transaction_receipt(returned)
+                .await
+                .unwrap()
+                .expect("the reported hash must be a real landed transaction");
+            assert!(landed.status(), "the landed transfer must have succeeded");
+
+            assert_eq!(
+                create_mock.calls_async().await,
+                1,
+                "exactly one RAW signing operation must be submitted"
             );
         }
     }

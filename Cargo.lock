@@ -2309,7 +2309,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "fireblocks-sdk"
 version = "2025.10.17"
-source = "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix%2Fconfirming-not-terminal#18227211082342818efaf6a1b58c89c65a6f17cd"
+source = "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix%2Fconfirming-not-terminal#d75e5da13a870d04ceb715d539746b4b72f796b5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7217,7 +7217,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
