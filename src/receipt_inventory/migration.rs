@@ -1704,6 +1704,16 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
     /// of the same signed bytes is a no-op, and a rerun after a landed
     /// transfer fails the migration's exact-balances precondition before
     /// anything is signed.
+    ///
+    /// The signing operation's `externalTxId` is salted with the sighash:
+    /// a crash between signing and broadcast leaves a completed Fireblocks
+    /// signing operation holding a signature over a transaction that will
+    /// never be rebuilt bit-identically (the rebuild fetches a fresh nonce
+    /// and fees). An unsalted id would recover that stale signature forever
+    /// — it can never recover to `from` against the new sighash — wedging
+    /// the migration under an id no retry walk frees. With the salt, an
+    /// identical rebuild re-attaches to its own signature and a changed
+    /// rebuild gets a fresh id.
     async fn raw_signed_transfer(
         &self,
         from: Address,
@@ -1738,9 +1748,11 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
         };
 
         let sighash = transaction.signature_hash();
+        let signing_external_tx_id =
+            format!("{external_tx_id}-{:.16}", alloy::hex::encode(sighash));
 
         info!(target: "receipt_inventory",
-            %external_tx_id,
+            external_tx_id = %signing_external_tx_id,
             %sighash,
             nonce,
             gas_limit,
@@ -1752,7 +1764,7 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
         // address.
         let signature = self
             .client
-            .sign_raw_to_completion(sighash, from, note, external_tx_id)
+            .sign_raw_to_completion(sighash, from, note, &signing_external_tx_id)
             .await
             .map_err(Box::new)?;
 
@@ -1761,7 +1773,17 @@ impl<P: Provider + Clone> FireblocksReceiptCustody<P> {
 
         let pending = provider.send_raw_transaction(&encoded).await?;
 
-        Ok(*pending.tx_hash())
+        // `send_raw_transaction` returns as soon as the node accepts the
+        // transaction into its pool; on a real chain the transfer is mined
+        // seconds later. The caller's revert check reads the receipt, so the
+        // broadcast must be awaited to inclusion here — otherwise a healthy
+        // in-flight transfer is misreported as missing.
+        let confirmed = pending
+            .with_timeout(Some(Duration::from_secs(120)))
+            .get_receipt()
+            .await?;
+
+        Ok(confirmed.transaction_hash)
     }
 }
 

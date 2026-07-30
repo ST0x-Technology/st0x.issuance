@@ -12,6 +12,7 @@ use fireblocks_sdk::apis::transactions_api::{
     GetTransactionByExternalIdError, GetTransactionByExternalIdParams,
 };
 use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
+use fireblocks_sdk::models::signed_message_signature::V as SignatureParity;
 use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::{debug, warn};
@@ -626,10 +627,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
 
         let r = U256::from_str_radix(r_hex.trim_start_matches("0x"), 16)?;
         let s = U256::from_str_radix(s_hex.trim_start_matches("0x"), 16)?;
-        let odd_y_parity = matches!(
-            v,
-            fireblocks_sdk::models::signed_message_signature::V::Variant1
-        );
+        let odd_y_parity = matches!(v, SignatureParity::Variant1);
 
         let signature = Signature::new(r, s, odd_y_parity);
         let recovered = signature.recover_address_from_prehash(&sighash)?;
@@ -1947,6 +1945,162 @@ mod tests {
                 FireblocksVaultError::MissingSignature { tx_id } if tx_id == "raw-tx-3"
             ),
             "completed RAW op without a signature must surface MissingSignature"
+        );
+    }
+
+    /// The RAW path carries the same fix-and-retry discipline as the
+    /// CONTRACT_CALL path: a terminally failed prior signing attempt spends
+    /// its externalTxId, so the walk recovers the corpse under the base id,
+    /// recognizes the terminal failure, and signs fresh under `-retry-1`.
+    #[tokio::test]
+    async fn raw_signing_walks_a_terminally_failed_attempt_to_a_fresh_id() {
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let sighash = B256::random();
+        let signature = signer.sign_hash_sync(&sighash).unwrap();
+
+        let server = MockServer::start();
+        // The base id is spent by a previous run.
+        let base_create = server.mock(|when, then| {
+            when.method("POST")
+                .path("/transactions")
+                .body_includes(r#""externalTxId":"raw-walk-1""#);
+            then.status(409)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "message":
+                        "Transaction with this externalTxId already exists",
+                    "code": 1438
+                }));
+        });
+        // The retry id is free and the fresh signing completes.
+        let retry_create = server.mock(|when, then| {
+            when.method("POST")
+                .path("/transactions")
+                .body_includes(r#""externalTxId":"raw-walk-1-retry-1""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "id": "raw-fresh-1" }));
+        });
+        // Recovery under the base id finds the terminally failed corpse.
+        server.mock(|when, then| {
+            when.method("GET").path_includes("raw-walk-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "raw-dead-1",
+                    "status": "FAILED"
+                }));
+        });
+        server.mock(|when, then| {
+            when.method("GET").path_includes("raw-dead-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "raw-dead-1",
+                    "status": "FAILED"
+                }));
+        });
+        let fresh_poll = serde_json::json!({
+            "id": "raw-fresh-1",
+            "status": "COMPLETED",
+            "signedMessages": [{
+                "signature": {
+                    "r": format!("{:064x}", signature.r()),
+                    "s": format!("{:064x}", signature.s()),
+                    "v": u8::from(signature.v()),
+                }
+            }]
+        });
+        server.mock(|when, then| {
+            when.method("GET").path_includes("raw-fresh-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(fresh_poll);
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let returned = service
+            .sign_raw_to_completion(
+                sighash,
+                signer.address(),
+                "note",
+                "raw-walk-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            returned.recover_address_from_prehash(&sighash).unwrap(),
+            signer.address(),
+            "the retry-walked signature must recover to the expected signer"
+        );
+        base_create.assert();
+        retry_create.assert();
+    }
+
+    /// When every candidate id resolves to a terminally failed prior
+    /// attempt, the walk must stop with RetryAttemptsExhausted instead of
+    /// spinning forever or resuming a corpse.
+    #[tokio::test]
+    async fn raw_signing_exhausts_retry_ids_on_persistent_terminal_failures() {
+        let sighash = B256::random();
+
+        let server = MockServer::start();
+        // Every submission attempt reports the id as spent.
+        server.mock(|when, then| {
+            when.method("POST").path("/transactions");
+            then.status(409)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "message":
+                        "Transaction with this externalTxId already exists",
+                    "code": 1438
+                }));
+        });
+        // Every recovery finds a terminally failed corpse.
+        server.mock(|when, then| {
+            when.method("GET").path_includes("raw-exhaust");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "raw-corpse",
+                    "status": "FAILED"
+                }));
+        });
+        server.mock(|when, then| {
+            when.method("GET").path_includes("raw-corpse");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "raw-corpse",
+                    "status": "FAILED"
+                }));
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service
+            .sign_raw_to_completion(
+                sighash,
+                Address::random(),
+                "note",
+                "raw-exhaust",
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                FireblocksVaultError::RetryAttemptsExhausted {
+                    base_external_tx_id,
+                    attempts: MAX_SUBMISSION_ATTEMPTS,
+                } if base_external_tx_id == "raw-exhaust"
+            ),
+            "persistent terminal failures must exhaust the id walk"
         );
     }
 }

@@ -856,20 +856,22 @@ async fn run_migrate_receipts(
     args: MigrateReceiptsArgs,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
+    // Parsed at the process boundary: past this point the key exists only as
+    // the validated newtype, never as a raw string.
     let emergency_key = match std::env::var("CUSTODY_MIGRATION_PRIVATE_KEY") {
-        Ok(key) => Some(key),
+        Ok(key) => Some(CustodyMigrationPrivateKey::parse(&key)?),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
             "CUSTODY_MIGRATION_PRIVATE_KEY must be valid Unicode hex"
         ),
     };
 
-    run_migrate_receipts_with_key(args, emergency_key.as_deref(), confirm).await
+    run_migrate_receipts_with_key(args, emergency_key, confirm).await
 }
 
 async fn run_migrate_receipts_with_key(
     args: MigrateReceiptsArgs,
-    emergency_key: Option<&str>,
+    emergency_key: Option<CustodyMigrationPrivateKey>,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     // Checked first, before any database or network work: a network paired with
@@ -960,7 +962,7 @@ async fn run_migrate_receipts_with_key(
 /// turns that surprise into a refusal before any prompt or network work.
 fn resolve_outgoing_wallet_control(
     args: &MigrateReceiptsArgs,
-    emergency_key: Option<&str>,
+    emergency_key: Option<CustodyMigrationPrivateKey>,
 ) -> anyhow::Result<ResolvedOutgoingWalletControl> {
     match (args.outgoing_wallet_control, emergency_key) {
         (OutgoingWalletControl::FireblocksRaw, Some(_)) => anyhow::bail!(
@@ -974,9 +976,7 @@ fn resolve_outgoing_wallet_control(
             ))
         }
         (OutgoingWalletControl::LocalPrivateKey, Some(key)) => {
-            Ok(ResolvedOutgoingWalletControl::LocalPrivateKey(
-                CustodyMigrationPrivateKey::parse(key)?,
-            ))
+            Ok(ResolvedOutgoingWalletControl::LocalPrivateKey(key))
         }
         (OutgoingWalletControl::LocalPrivateKey, None) => anyhow::bail!(
             "CUSTODY_MIGRATION_PRIVATE_KEY is required when \
@@ -2152,9 +2152,11 @@ mod tests {
             "sqlite:unused.db",
             "unused-fireblocks-secret",
         );
-        let error =
-            resolve_outgoing_wallet_control(&args, Some(TEST_SIGNER_KEY))
-                .unwrap_err();
+        let error = resolve_outgoing_wallet_control(
+            &args,
+            Some(CustodyMigrationPrivateKey::parse(TEST_SIGNER_KEY).unwrap()),
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("local-private-key"),
@@ -2176,9 +2178,11 @@ mod tests {
         );
         args.outgoing_wallet_control = OutgoingWalletControl::LocalPrivateKey;
 
-        let control =
-            resolve_outgoing_wallet_control(&args, Some(TEST_SIGNER_KEY))
-                .unwrap();
+        let control = resolve_outgoing_wallet_control(
+            &args,
+            Some(CustodyMigrationPrivateKey::parse(TEST_SIGNER_KEY).unwrap()),
+        )
+        .unwrap();
         let ResolvedOutgoingWalletControl::LocalPrivateKey(key) = control
         else {
             panic!("the explicit local mode must resolve a local key")
@@ -2298,12 +2302,13 @@ mod tests {
             panic!("expected the migrate-receipts subcommand")
         };
 
-        let error =
-            run_migrate_receipts_with_key(*args, Some(TEST_SIGNER_KEY), |_| {
-                Ok(false)
-            })
-            .await
-            .unwrap_err();
+        let error = run_migrate_receipts_with_key(
+            *args,
+            Some(CustodyMigrationPrivateKey::parse(TEST_SIGNER_KEY).unwrap()),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("aborted by operator"),
@@ -2674,6 +2679,73 @@ mod tests {
             error.to_string().contains("resolves this command to a rollback"),
             "a forward-stated re-run over rolled custody must refuse, got \
              {error}"
+        );
+    }
+
+    /// The emergency key derives its own address, and custody recorded at a
+    /// different wallet must refuse before anything is signed: a wrong
+    /// exported key cannot quietly sign a transfer it could never execute.
+    #[tokio::test]
+    async fn local_key_forward_refuses_a_mismatched_custody_holder() {
+        use crate::test_utils::LocalEvm;
+
+        let evm = LocalEvm::with_chain_id(8453).await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("mismatched-holder.db").display()
+        );
+        seed_listing_at(&database_url, "AMAT").await;
+        // Recorded custody sits with a wallet the emergency key does not
+        // control (and not the Turnkey wallet, so dispatch picks the forward
+        // leg).
+        seed_custody_at(&database_url, Address::random()).await;
+
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "migrate-receipts",
+            "AMAT",
+            "--network",
+            "base",
+            "--direction",
+            "forward",
+            "--outgoing-wallet-control",
+            "local-private-key",
+            "--chain-id",
+            "8453",
+            "--turnkey-org-id",
+            "org-id",
+            "--turnkey-api-private-key",
+            "api-key",
+            "--turnkey-address",
+            "0x00000000000000000000000000000000000000cc",
+            "--fireblocks-api-user-id",
+            "fb-user",
+            "--fireblocks-secret-path",
+            "/nonexistent",
+            "--rpc-url",
+            &evm.endpoint,
+            "--database-url",
+            &database_url,
+        ])
+        .expect("arguments parse");
+        let IssuerCommand::MigrateReceipts(args) = cli.command else {
+            panic!("expected the migrate-receipts subcommand")
+        };
+
+        let error = run_migrate_receipts_with_key(
+            *args,
+            Some(CustodyMigrationPrivateKey::parse(TEST_SIGNER_KEY).unwrap()),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("refusing before signing"),
+            "a key that does not control the recorded holder must refuse \
+             before signing, got {error}"
         );
     }
 
