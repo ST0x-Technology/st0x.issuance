@@ -495,7 +495,9 @@ impl Mint {
             .map_or(AutomaticRetryDecision::Ready, AutomaticRetryDecision::Wait)
     }
 
-    pub(crate) fn manual_recovery_decision(&self) -> ManualRecoveryDecision {
+    pub(crate) const fn manual_recovery_decision(
+        &self,
+    ) -> ManualRecoveryDecision {
         match self {
             Self::Completed { .. } | Self::Closed { .. } => {
                 ManualRecoveryDecision::AlreadyTerminal
@@ -503,14 +505,10 @@ impl Mint {
             Self::Initiated { .. } | Self::JournalRejected { .. } => {
                 ManualRecoveryDecision::Unrecoverable
             }
-            Self::MintingFailed { .. }
-                if matches!(
-                    self.automatic_retry_decision(Utc::now()),
-                    AutomaticRetryDecision::Exhausted
-                ) =>
-            {
-                ManualRecoveryDecision::Unrecoverable
-            }
+            // MintingFailed stays eligible even when automatic retries are
+            // exhausted: the cap bounds UNATTENDED retrying, while a manual
+            // reprocess is the operator explicitly authorizing one more
+            // attempt (driven directly, not through the capped loop).
             Self::JournalConfirmed { .. }
             | Self::Minting { .. }
             | Self::TxIntended { .. }
@@ -822,6 +820,68 @@ impl Mint {
                     expected_id,
                     &issuer_request_id,
                 )?;
+
+                Ok(vec![MintEvent::MintRetryStarted {
+                    issuer_request_id,
+                    tx_hash: None,
+                    started_at: Utc::now(),
+                }])
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Mints initiated before this instant (2026-07-31T00:00:00Z) predate the
+    /// current job-based submit flow and cannot prove from state alone that a
+    /// `Minting`-predecessor failure never broadcast a transaction — a mined
+    /// legacy transaction whose receipt was later redeemed leaves no trace in
+    /// inventory. Under the current flow a broadcast from `Minting` is
+    /// impossible: `SubmitMintJob` signs, persists `MintTxIntended`, and only
+    /// then broadcasts, so any crash mid-submission lands in `TxIntended` or
+    /// `TxSubmitted`, never `Minting`.
+    const MANUAL_RETRY_PROVENANCE_SINCE_EPOCH: i64 = 1_785_456_000;
+
+    /// The operator-authorized retry, gated on failure provenance where the
+    /// aggregate state is authoritative (unlike the admin endpoint, which
+    /// loads a snapshot that may be stale by execution time).
+    ///
+    /// A `Minting` predecessor on a modern-flow mint proves the failure
+    /// happened at prepare or signing, before any transaction was persisted
+    /// or broadcast, so a fresh submission cannot double-mint. A `TxIntended`
+    /// or `TxSubmitted` predecessor holds a transaction that may still mine;
+    /// the automatic retry path handles those by REUSING the persisted signed
+    /// transaction, and this command refuses them rather than submit fresh
+    /// bytes over an unresolved prior attempt. Pre-cutover mints are refused
+    /// outright — their provenance cannot be proven from event history.
+    fn handle_manual_retry_mint(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::MintingFailed {
+                issuer_request_id: expected_id,
+                failed_from,
+                initiated_at,
+                ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                if initiated_at.timestamp()
+                    < Self::MANUAL_RETRY_PROVENANCE_SINCE_EPOCH
+                {
+                    return Err(MintError::PreProvenanceCutoverMint {
+                        initiated_at: *initiated_at,
+                    });
+                }
+
+                if !matches!(failed_from.as_ref(), Self::Minting { .. }) {
+                    return Err(MintError::AmbiguousRetryPredecessor {
+                        predecessor: failed_from.state_name().to_string(),
+                    });
+                }
 
                 Ok(vec![MintEvent::MintRetryStarted {
                     issuer_request_id,
@@ -1541,7 +1601,8 @@ impl EventSourced for Mint {
                 })
             }
             MintCommand::RecordMintFailed { .. }
-            | MintCommand::RetryMint { .. } => Ok(vec![]),
+            | MintCommand::RetryMint { .. }
+            | MintCommand::ManualRetryMint { .. } => Ok(vec![]),
             MintCommand::CloseMint { .. } => Err(MintError::NotRecoverable {
                 current_state: "Uninitialized".to_string(),
             }),
@@ -1631,6 +1692,9 @@ impl EventSourced for Mint {
             }
             MintCommand::RetryMint { issuer_request_id } => {
                 self.handle_retry_mint(issuer_request_id)
+            }
+            MintCommand::ManualRetryMint { issuer_request_id } => {
+                self.handle_manual_retry_mint(issuer_request_id)
             }
             MintCommand::RecordExistingMint {
                 issuer_request_id,
@@ -1794,6 +1858,19 @@ pub(crate) enum MintError {
     RetryNotDue { retry_at: DateTime<Utc> },
     #[error("Automatic mint retries exhausted after {attempts} attempts")]
     AutomaticRetriesExhausted { attempts: u32 },
+    #[error(
+        "the mint's failure chain contains a prepared or submitted \
+         transaction ({predecessor}); a fresh manual submission could \
+         double-mint — refuse and investigate the prior transaction instead"
+    )]
+    AmbiguousRetryPredecessor { predecessor: String },
+    #[error(
+        "the mint was initiated at {initiated_at}, before the job-based \
+         submit flow whose event history proves a Minting-predecessor \
+         failure never broadcast; a fresh manual submission could \
+         double-mint — verify the mint against on-chain history instead"
+    )]
+    PreProvenanceCutoverMint { initiated_at: DateTime<Utc> },
     #[error("Retry delay out of range")]
     RetryDelayOutOfRange,
     #[error(
@@ -2032,9 +2109,75 @@ pub(crate) mod tests {
             completed.manual_recovery_decision(),
             ManualRecoveryDecision::AlreadyTerminal
         );
+        // Exhaustion caps AUTOMATIC retries only: a manual reprocess is the
+        // operator explicitly authorizing another attempt, so an exhausted
+        // MintingFailed stays eligible for manual recovery.
         assert_eq!(
             exhausted.manual_recovery_decision(),
-            ManualRecoveryDecision::Unrecoverable
+            ManualRecoveryDecision::Eligible
+        );
+    }
+
+    /// A modern-flow mint that failed at prepare (a `Minting` predecessor,
+    /// so provably no transaction was ever persisted or broadcast) is the
+    /// case the manual retry exists for.
+    #[tokio::test]
+    async fn manual_retry_starts_a_retry_for_a_modern_prepare_failure() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "signing rejected".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let emitted = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::ManualRetryMint {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            emitted.as_slice(),
+            [MintEvent::MintRetryStarted { .. }]
+        ));
+    }
+
+    /// A mint initiated before the job-based submit flow cannot prove its
+    /// `Minting`-predecessor failure never broadcast a transaction, so the
+    /// manual retry refuses it.
+    #[tokio::test]
+    async fn manual_retry_refuses_a_pre_cutover_mint() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        let MintEvent::Initiated { initiated_at, .. } = &mut events[0] else {
+            panic!("first event must be Initiated");
+        };
+        *initiated_at = Utc::now() - chrono::Duration::days(90);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "signing rejected".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::ManualRetryMint {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::PreProvenanceCutoverMint { .. }
+                )
+            ),
+            "a pre-cutover mint must be refused, got {error:?}"
         );
     }
 

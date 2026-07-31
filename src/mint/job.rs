@@ -34,6 +34,7 @@ use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
 };
+use crate::redemption::has_unresolved_burn_intent;
 use crate::tokenized_asset::Network;
 use crate::vault::{
     NetworkVaultServices, ReceiptInformation, TxId, UnconfiguredNetworkError,
@@ -178,6 +179,11 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     Some(&self.issuer_request_id),
                 )
                 .await?
+                    // A persisted-but-unresolved burn transaction from the
+                    // same wallet may still land; signing a mint over it
+                    // risks a nonce conflict, so wait like the burn path
+                    // waits for unresolved mint intents.
+                    || has_unresolved_burn_intent(&ctx.pool, None).await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),
@@ -267,6 +273,7 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     Some(&self.issuer_request_id),
                 )
                 .await?
+                    || has_unresolved_burn_intent(&ctx.pool, None).await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),
