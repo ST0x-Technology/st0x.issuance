@@ -640,6 +640,31 @@ impl TxSigner<Signature> for TracingTurnkeySigner {
     }
 }
 
+/// Builds an `EthereumWallet` whose Turnkey signer talks to `base_url`
+/// instead of the real API, with a throwaway P-256 key. For tests outside
+/// this module that need a Turnkey-shaped signing refusal (e.g. a
+/// signing-policy denial) without exposing the private client machinery.
+#[cfg(test)]
+pub(crate) fn test_wallet_against(
+    base_url: String,
+    address: Address,
+    chain_id: u64,
+) -> EthereumWallet {
+    let client = TracingTurnkeyClient::for_base_url(
+        base_url,
+        TurnkeyP256ApiKey::generate(),
+    )
+    .expect("mock Turnkey client must build");
+
+    TurnkeyWallet::from_client(
+        client,
+        TurnkeyOrganizationId::new("org-test".to_string()),
+        address,
+        chain_id,
+    )
+    .wallet
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::consensus::{Signed, TxEip1559, TxLegacy};
