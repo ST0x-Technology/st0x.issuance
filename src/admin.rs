@@ -21,7 +21,7 @@ use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
     MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
-    recovery::enqueue_scheduled_mint_recovery,
+    recovery::{enqueue_scheduled_mint_recovery, manually_retry_failed_mint},
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1162,23 +1162,43 @@ pub(crate) async fn reprocess_mint(
     }
     let current_state = mint.state_name().to_string();
 
-    // Manual reprocess enqueues a durable recovery job — the same path the
-    // automatic startup re-scan and the periodic reconciler use. It frees any
-    // terminal recovery job for this mint and re-drives it through the per-state
-    // jobs to completion.
-    enqueue_scheduled_mint_recovery(
-        pool.inner(),
-        apalis_pool.inner(),
-        issuer_request_id,
-    )
-    .await
-    .map_err(|error| {
-        error!(target: "admin", aggregate_id = aggregate_id,
-            error = %error,
-            "Failed to enqueue scheduled mint recovery"
-        );
-        Status::InternalServerError
-    })?;
+    // A failed mint is retried DIRECTLY — RetryMint plus a fresh submit job —
+    // because the scheduled-recovery loop enforces the automatic retry budget
+    // and would abandon an exhausted mint instead of retrying it. Every other
+    // eligible state enqueues the durable recovery job, the same path the
+    // automatic startup re-scan and the periodic reconciler use.
+    if matches!(&mint, Mint::MintingFailed { .. }) {
+        manually_retry_failed_mint(
+            store.inner(),
+            pool.inner(),
+            vault_services.inner(),
+            apalis_pool.inner(),
+            &issuer_request_id,
+            &mint,
+        )
+        .await
+        .map_err(|error| {
+            error!(target: "admin", aggregate_id = aggregate_id,
+                error = %error,
+                "Failed to drive manual mint retry"
+            );
+            Status::InternalServerError
+        })?;
+    } else {
+        enqueue_scheduled_mint_recovery(
+            pool.inner(),
+            apalis_pool.inner(),
+            issuer_request_id,
+        )
+        .await
+        .map_err(|error| {
+            error!(target: "admin", aggregate_id = aggregate_id,
+                error = %error,
+                "Failed to enqueue scheduled mint recovery"
+            );
+            Status::InternalServerError
+        })?;
+    }
 
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,

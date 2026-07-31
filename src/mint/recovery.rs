@@ -228,6 +228,75 @@ pub(crate) async fn enqueue_scheduled_mint_recovery(
     push_mint_recovery_job(apalis_pool, issuer_request_id).await
 }
 
+/// Drives one operator-authorized retry of a `MintingFailed` mint, bypassing
+/// the capped scheduled-recovery loop entirely.
+///
+/// The automatic retry budget bounds UNATTENDED retrying; it must not lock an
+/// operator out of a mint whose external blocker (e.g. a signing policy) has
+/// since been fixed. This sends `ManualRetryMint` — whose handler enforces
+/// the double-mint provenance gate atomically against the CURRENT aggregate
+/// state, refusing any failure chain containing a prepared or submitted
+/// transaction — and enqueues a fresh `SubmitMintJob`, whose normal
+/// submit -> confirm -> callback chain completes the mint (its first step
+/// records an already-existing on-chain receipt instead of re-submitting).
+/// Each call authorizes exactly one attempt: a mint that fails again parks
+/// in `MintingFailed` until the operator reprocesses once more.
+pub(crate) async fn manually_retry_failed_mint(
+    mint_store: &Arc<Store<Mint>>,
+    pool: &Pool<Sqlite>,
+    vault_services: &NetworkVaultServices,
+    apalis_pool: &SqlitePool,
+    issuer_request_id: &IssuerMintRequestId,
+    mint: &Mint,
+) -> Result<(), anyhow::Error> {
+    let Mint::MintingFailed { underlying, network, .. } = mint else {
+        anyhow::bail!(
+            "manual retry requires a MintingFailed mint; current state is {}",
+            mint.state_name()
+        );
+    };
+    let network = *network;
+
+    let address =
+        find_vault(pool, underlying, &network).await?.ok_or_else(|| {
+            anyhow::anyhow!("no vault found for {underlying} on {network}")
+        })?;
+    let chain_id = vault_services.chain_id(network)?;
+
+    mint_store
+        .send(
+            issuer_request_id,
+            MintCommand::ManualRetryMint {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await?;
+
+    info!(target: "mint", issuer_request_id = %issuer_request_id,
+        %underlying, %network,
+        "Manually retrying failed mint past the automatic budget"
+    );
+
+    release_terminal_job(
+        pool,
+        job_type::<SubmitMintJob>(),
+        &issuer_request_id.to_string(),
+    )
+    .await?;
+    JobQueue::<SubmitMintJob>::new(apalis_pool)
+        .push_with_idempotency_key(
+            SubmitMintJob {
+                issuer_request_id: issuer_request_id.clone(),
+                vault: address,
+                chain_id,
+            },
+            issuer_request_id.to_string(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Pushes a [`MintRecoveryJob`] for the mint, retrying transient enqueue
 /// failures with a bounded backoff. The idempotency key makes the insert a
 /// no-op when ANY job already exists for the mint — including a TERMINAL
@@ -1057,8 +1126,8 @@ mod tests {
     };
     use crate::mint::tests::VAULT;
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, MintExternalTxId, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::log_count_at;
@@ -1974,6 +2043,164 @@ mod tests {
             lock_at.is_none() && lock_by.is_none(),
             "the reset must clear the lock columns, got lock_at={lock_at:?} \
              lock_by={lock_by:?}"
+        );
+    }
+
+    /// A prepare-stage failure (no transaction ever signed or broadcast) is
+    /// the unambiguous case: the manual retry must transition the mint back
+    /// to `Minting` and enqueue a fresh `SubmitMintJob`.
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_retry_drives_a_prepare_failed_mint_to_a_fresh_submit() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Turnkey HTTP response was not successful: 403"
+                        .to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        manually_retry_failed_mint(
+            &harness.mint_store,
+            &harness.pool,
+            &network_vault_services(harness.vault.clone()),
+            &harness.apalis_pool,
+            &issuer_request_id,
+            &mint,
+        )
+        .await
+        .unwrap();
+
+        let retried =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert_eq!(retried.state_name(), "Minting");
+
+        let queued: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE
+                job_type = ?
+                AND idempotency_key = ?
+            ",
+        )
+        .bind(job_type::<SubmitMintJob>())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            queued, 1,
+            "the manual retry must enqueue exactly one fresh submit job"
+        );
+
+        let test =
+            "manual_retry_drives_a_prepare_failed_mint_to_a_fresh_submit";
+        assert_eq!(
+            log_count_at!(
+                Level::INFO,
+                &[
+                    test,
+                    "Manually retrying failed mint past the automatic budget"
+                ]
+            ),
+            1
+        );
+    }
+
+    /// A failure chain that contains a prepared or submitted transaction is
+    /// ambiguous — the prior transaction may still mine — so the manual
+    /// retry must refuse rather than risk a double mint.
+    #[tokio::test]
+    async fn manual_retry_refuses_a_chain_with_a_submitted_transaction() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordTxSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    external_tx_id: MintExternalTxId::from_string(format!(
+                        "mint-{issuer_request_id}"
+                    )),
+                    tx_id: TxId::Legacy("fb-ambiguous".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "confirmation timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        let error = manually_retry_failed_mint(
+            &harness.mint_store,
+            &harness.pool,
+            &network_vault_services(harness.vault.clone()),
+            &harness.apalis_pool,
+            &issuer_request_id,
+            &mint,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("could double-mint"),
+            "expected the double-mint refusal, got: {error}"
+        );
+        assert_eq!(
+            harness
+                .mint_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state_name(),
+            "MintingFailed",
+            "a refused manual retry must not advance the mint"
         );
     }
 }
