@@ -1072,17 +1072,14 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 - `issuer approve-orchestrator <UNDERLYING>` — executes the asset's one-time
   unlimited ERC-20 approval (bot wallet → orchestrator, on the vault share
   token) through the Turnkey signer, after verifying the configured address
-  answers as an orchestrator. Idempotent: an already-unlimited allowance sends
-  nothing.
+  answers as an orchestrator. Idempotent — an already-unlimited allowance sends
+  nothing — and success is re-verified by an on-chain allowance read, never
+  inferred from the receipt.
 - `issuer verify-orchestrator-signing <UNDERLYING>` — signs, WITHOUT
   broadcasting, one transaction per shape the Turnkey signing policy must allow
   before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
   `receipt.safeBatchTransferFrom`), so a policy gap surfaces as a named signing
   refusal instead of during the pilot's first live mint.
-
-The orchestrator onboarding subcommands take the orchestrator address from the
-TOML vault-mode config (`--config`) — never typed — and require the Turnkey
-signer configuration from the service's own environment.
 
 The custody subcommands are listing-scoped and therefore take `--network`, plus
 `--rpc-url` (the service's own `RPC_URL`) and `--chain-id` (cross-checked
@@ -1090,6 +1087,14 @@ against the chain that endpoint reports). `migrate-receipts` and
 `verify-custodians` require both custodians' configurations — the `TURNKEY_*`
 group and the `FIREBLOCKS_*` group the retired integration used — all from the
 service's own environment.
+
+The orchestrator onboarding subcommands (`orchestrator-preflight`,
+`approve-orchestrator`, `verify-orchestrator-signing`) take the same network
+flags plus `--config` (the TOML configuration file; its `[orchestrator].address`
+is the only source of the orchestrator address — never typed) and require the
+`TURNKEY_*` group: the readiness facts they verify or establish are keyed to the
+Turnkey bot wallet, so a local-key signer is refused. See
+`docs/runbooks/orchestrator-onboarding.md` for the ordered procedure.
 
 **No wallet address is ever an argument.** An ERC-1155 transfer to a wrong
 address is final — no counterparty, no recovery, and the receipts back tokens
