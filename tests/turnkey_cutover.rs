@@ -41,7 +41,13 @@ struct CutoverDatabases {
 }
 
 struct PreCutoverMint {
+    issuer_request_id: String,
     client_id: String,
+    shares: U256,
+}
+
+struct PostCutoverMint {
+    issuer_request_id: String,
     shares: U256,
 }
 
@@ -142,6 +148,49 @@ async fn wait_for_settled_burn(
     Err("the redemption's burn reservation never settled".into())
 }
 
+/// Waits until the expected mint is terminal in the event store.
+///
+/// The callback mock observes the external request before `SendCallbackJob`
+/// records `MintCompleted`. Stopping the service or running the migration after
+/// the mock fires can therefore race the event commit and make a completed mint
+/// appear in-flight to the quiescence gate.
+async fn wait_for_completed_mint(
+    database_url: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
+
+    for _ in 0..100 {
+        let completed: bool = sqlx::query_scalar(
+            "
+            SELECT EXISTS (
+                SELECT 1
+                FROM events
+                WHERE aggregate_type = 'Mint'
+                  AND aggregate_id = ?
+                  AND event_type = 'MintEvent::MintCompleted'
+            )
+            ",
+        )
+        .bind(issuer_request_id)
+        .fetch_one(&pool)
+        .await?;
+
+        if completed {
+            pool.close().await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    pool.close().await;
+    Err(format!("mint {issuer_request_id} never completed").into())
+}
+
 async fn snapshot_database(
     source_database_url: &str,
     destination_path: &Path,
@@ -168,7 +217,7 @@ async fn mint_before_cutover(
     mint_callback_mock: &Mock<'_>,
 ) -> Result<PreCutoverMint, Box<dyn std::error::Error>> {
     let account = harness::setup_account(client, user_wallet).await;
-    harness::perform_mint_and_confirm(
+    let issuer_request_id = harness::perform_mint_and_confirm(
         client,
         user_wallet,
         &account.client_id.to_string(),
@@ -190,6 +239,7 @@ async fn mint_before_cutover(
     harness::wait_for_mock_hits(mint_callback_mock, 1).await?;
 
     Ok(PreCutoverMint {
+        issuer_request_id,
         client_id: account.client_id.to_string(),
         shares: minted_shares,
     })
@@ -200,8 +250,8 @@ async fn mint_after_cutover(
     user_wallet: Address,
     client_id: &str,
     mint_callback_mock: &Mock<'_>,
-) -> Result<U256, Box<dyn std::error::Error>> {
-    harness::perform_mint_and_confirm(
+) -> Result<PostCutoverMint, Box<dyn std::error::Error>> {
+    let issuer_request_id = harness::perform_mint_and_confirm(
         client,
         user_wallet,
         client_id,
@@ -211,7 +261,10 @@ async fn mint_after_cutover(
     .await?;
     harness::wait_for_mock_hits(mint_callback_mock, 2).await?;
 
-    Ok(U256::from(25) * U256::from(10).pow(U256::from(18)))
+    Ok(PostCutoverMint {
+        issuer_request_id,
+        shares: U256::from(25) * U256::from(10).pow(U256::from(18)),
+    })
 }
 
 struct PostCutoverCanaries<'context, 'server> {
@@ -231,7 +284,7 @@ impl PostCutoverCanaries<'_, '_> {
     /// pre-cutover receipt, which is the actual proof that custody moved and
     /// the inventory reconciled against the new holder. The canary mint only
     /// proves the new signer can sign fresh work, so it runs second.
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(&self) -> Result<PostCutoverMint, Box<dyn std::error::Error>> {
         let user_provider = create_provider()
             .wallet(EthereumWallet::from(self.user_signer.clone()))
             .connect(&self.evm.endpoint)
@@ -257,7 +310,7 @@ impl PostCutoverCanaries<'_, '_> {
             "the canary redemption must consume every pre-cutover share"
         );
 
-        let canary_shares = mint_after_cutover(
+        let canary_mint = mint_after_cutover(
             self.client,
             self.user_wallet,
             &self.pre_cutover_mint.client_id,
@@ -266,11 +319,11 @@ impl PostCutoverCanaries<'_, '_> {
         .await?;
         assert_eq!(
             user_vault.balanceOf(self.user_wallet).call().await?,
-            canary_shares,
+            canary_mint.shares,
             "the new wallet must complete exactly one canary mint"
         );
 
-        Ok(())
+        Ok(canary_mint)
     }
 }
 
@@ -493,6 +546,11 @@ async fn test_wallet_cutover_redeems_pre_cutover_receipt_after_restart()
         "the old wallet must custody the historical mint receipt before cutover"
     );
 
+    wait_for_completed_mint(
+        &databases.fireblocks_url,
+        &pre_cutover_mint.issuer_request_id,
+    )
+    .await?;
     fireblocks_client.terminate().await;
     // Process exit kills the old service's detached workers in production. A
     // consistent snapshot gives the replacement service the same persisted
@@ -837,6 +895,11 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
         &mint_callback_mock,
     )
     .await?;
+    wait_for_completed_mint(
+        &databases.fireblocks_url,
+        &pre_cutover_mint.issuer_request_id,
+    )
+    .await?;
     fireblocks_client.terminate().await;
 
     // Forward cutover. The migration runs against the same database the
@@ -863,7 +926,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
     turnkey_config.signer = SignerConfig::Local(turnkey_private_key);
     let turnkey_client = start_service(turnkey_config).await?;
 
-    PostCutoverCanaries {
+    let canary_mint = PostCutoverCanaries {
         client: &turnkey_client,
         evm: &evm,
         user_signer: &user_signer,
@@ -877,6 +940,11 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
     .run()
     .await?;
     wait_for_settled_burn(&databases.turnkey_url).await?;
+    wait_for_completed_mint(
+        &databases.turnkey_url,
+        &canary_mint.issuer_request_id,
+    )
+    .await?;
     turnkey_client.terminate().await;
 
     // The reversal. The canary mint left its receipt with the incoming wallet,
@@ -1053,6 +1121,11 @@ async fn test_cutover_without_receipt_transfer_cannot_burn_historical_shares()
             fireblocks_wallet,
         )
         .await?;
+    wait_for_completed_mint(
+        &databases.fireblocks_url,
+        &pre_cutover_mint.issuer_request_id,
+    )
+    .await?;
     fireblocks_client.terminate().await;
     snapshot_database(&databases.fireblocks_url, &databases.turnkey_path)
         .await?;
