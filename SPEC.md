@@ -691,6 +691,9 @@ pre-multichain store keyed by bare `UnderlyingSymbol`.
 - `underlying`, `token`: Symbol identifiers
 - `network`: Blockchain network
 - `vault`: On-chain vault contract address
+- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
+  rejected; the asset stays supported, newly detected redemptions are held
+  before the Alpaca call, and redemptions already past it still complete)
 - `added_at`: Timestamp
 
 **Commands:**
@@ -762,17 +765,25 @@ Enabled ⇄ Frozen
    Unfreeze: Frozen  -> Enabled
 ```
 
-**Freeze invariant — frozen is not de-listed.** Freezing only gates _new_ mints:
-`POST /inkind/issuance` rejects a frozen asset with a distinct `AssetFrozen`
-error (separate from `AssetNotAvailable`), so the rejection is observable and
-not conflated with de-listing. A frozen asset stays in `list_enabled_assets()`,
-so in-flight redemption detection (`src/redemption/`) keeps working — issuance
-reacts to on-chain transfers and has no "reject redemption" point. Preventing
-_new_ redemptions of a frozen asset is the liquidity rebalance guard's job,
-which reads the per-asset status endpoint (see "Tokenized Assets Data
-Endpoint"). This issuance-side freeze plus the liquidity guard form the single
-dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze is
-involved here (that is separate, heavier supply-control work and out of scope).
+**Freeze invariant — frozen is not de-listed.** Freezing gates _new_ mints and
+holds _new_ redemptions at the supply boundary: `POST /inkind/issuance` rejects
+a frozen asset with a distinct `AssetFrozen` error (separate from
+`AssetNotAvailable`), so the rejection is observable and not conflated with
+de-listing. A frozen asset stays in `list_enabled_assets()`, so in-flight
+redemption detection (`src/redemption/`) keeps working — issuance reacts to
+on-chain transfers and has no "reject redemption" point. A redemption detected
+during a freeze window is **held, never dropped**: the `RedeemCallManager` reads
+the asset's freeze status in-process before the Alpaca redeem call and
+dispatches `Hold` instead of calling Alpaca, so on-chain supply stays equal to
+Alpaca's snapshot; held redemptions resume in order on unfreeze. A redemption
+already past the Alpaca call completes — holding the burn after Alpaca has
+decremented would leave on-chain supply above the Alpaca count, the exact
+divergence the freeze prevents. Issuance is the supply authority and this hold
+is the authoritative lock; the liquidity bot's guards (the rebalance trigger's
+RAI-1038 gate and its redemption send-guard) are the agent declining to send —
+defense-in-depth that keeps the bot's own funds out of the wallet mid-freeze,
+not the lock itself. No on-chain wrapper-contract freeze is involved here (that
+is separate, heavier supply-control work and out of scope).
 
 The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
 in M1 and automatically by the dividend scheduler in M3 — the same command path

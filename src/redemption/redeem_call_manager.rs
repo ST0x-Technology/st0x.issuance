@@ -14,7 +14,7 @@ use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets,
+    TokenizedAssetViewError, list_enabled_assets, load_asset_by_underlying,
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
@@ -125,9 +125,11 @@ impl RedeemCallManager {
             return Ok(());
         };
 
-        let Redemption::Detected { metadata } = &aggregate else {
+        let (Redemption::Detected { metadata }
+        | Redemption::Held { metadata, .. }) = &aggregate
+        else {
             debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                "Redemption no longer in Detected state, skipping"
+                "Redemption no longer in Detected or Held state, skipping"
             );
             return Ok(());
         };
@@ -152,6 +154,38 @@ impl RedeemCallManager {
             client_id,
         )
         .await?;
+
+        Ok(())
+    }
+
+    /// Parks a redemption whose asset is frozen: dispatches `Hold` from
+    /// `Detected` (the command is idempotent from `Held`, so a redemption the
+    /// resume driver re-visits mid-freeze stays parked without erroring).
+    async fn hold_frozen_redemption(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        aggregate: &Redemption,
+    ) -> Result<(), RedeemCallManagerError> {
+        if matches!(aggregate, Redemption::Held { .. }) {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Redemption already held; asset still frozen"
+            );
+            return Ok(());
+        }
+
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Hold {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await?;
+
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            "Held redemption before the Alpaca call: asset is frozen for a \
+             dividend; it will resume after unfreeze"
+        );
 
         Ok(())
     }
@@ -203,11 +237,31 @@ impl RedeemCallManager {
         aggregate: &Redemption,
         client_id: ClientId,
     ) -> Result<(), RedeemCallManagerError> {
-        let Redemption::Detected { metadata } = aggregate else {
+        let (Redemption::Detected { metadata }
+        | Redemption::Held { metadata, .. }) = aggregate
+        else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
                 current_state: aggregate.state_name().to_string(),
             });
         };
+
+        // The freeze gate sits at the single point between detection and the
+        // Alpaca redeem call. Before that call neither side has moved (Alpaca
+        // has not decremented, nothing burned), so holding here keeps on-chain
+        // supply equal to Alpaca's snapshot — the freeze invariant. Reading
+        // the tokenized-asset view fails closed: any error propagates before
+        // Alpaca is called.
+        let asset = load_asset_by_underlying(&self.pool, &metadata.underlying)
+            .await?
+            .ok_or_else(|| RedeemCallManagerError::AssetNotFound {
+                underlying: metadata.underlying.clone(),
+            })?;
+
+        if asset.status.is_frozen() {
+            return self
+                .hold_frozen_redemption(issuer_request_id, aggregate)
+                .await;
+        }
 
         // Truncate to 9 decimals for Alpaca - they don't support 18 decimal precision
         let (alpaca_quantity, dust_quantity) =
@@ -580,19 +634,26 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_handle_redemption_detected_with_success() {
-        let (store, pool) = setup_test_store().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let aggregate = create_test_redemption_in_detected_state(
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let client_id = ClientId::new();
 
@@ -605,12 +666,16 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+        result.unwrap();
 
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
-        let updated_aggregate =
-            store.load(&issuer_request_id).await.unwrap().unwrap();
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
@@ -735,20 +800,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
-        let (store, pool) = setup_test_store().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock =
             Arc::new(MockAlpacaService::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let aggregate = create_test_redemption_in_detected_state(
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let client_id = ClientId::new();
 
@@ -768,8 +840,12 @@ mod tests {
 
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
-        let updated_aggregate =
-            store.load(&issuer_request_id).await.unwrap().unwrap();
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -784,6 +860,166 @@ mod tests {
             tracing::Level::WARN,
             &["Alpaca redeem API call failed"]
         ));
+    }
+
+    // The freeze gate: a detected redemption of a frozen asset is parked in
+    // Held before the Alpaca call — the one point where neither side has
+    // moved — and never dropped.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_handle_redemption_detected_holds_frozen_asset() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness
+            .asset_store
+            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+                ClientId::new(),
+                Network::Base,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            0,
+            "Alpaca must not be called for a frozen asset"
+        );
+
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(updated_aggregate, Redemption::Held { .. }),
+            "Expected Held state, got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption before the Alpaca call", "frozen"]
+        ));
+    }
+
+    // Re-visiting a Held redemption while the asset is still frozen is a
+    // no-op (the Hold command is idempotent), and once the asset unfreezes
+    // the same chokepoint resumes it: Held -> AlpacaCalled.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_held_redemption_stays_held_then_resumes_after_unfreeze() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness
+            .asset_store
+            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+
+        let process_redemption = |aggregate: Redemption| {
+            let manager = &manager;
+            let issuer_request_id = &issuer_request_id;
+            async move {
+                manager
+                    .handle_redemption_detected(
+                        &test_alpaca_account(),
+                        issuer_request_id,
+                        &aggregate,
+                        ClientId::new(),
+                        Network::Base,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        process_redemption(detected).await;
+
+        // Second pass while still frozen: stays Held, no Alpaca call, no error.
+        let held = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(held, Redemption::Held { .. }));
+        process_redemption(held).await;
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+
+        harness
+            .asset_store
+            .send(&underlying, TokenizedAssetCommand::Unfreeze)
+            .await
+            .expect("Failed to unfreeze asset");
+
+        let held = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        process_redemption(held).await;
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            1,
+            "Alpaca must be called once the asset unfreezes"
+        );
+
+        let resumed = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(resumed, Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled after unfreeze, got {resumed:?}"
+        );
     }
 
     #[tokio::test]
