@@ -309,29 +309,6 @@ pub(crate) struct PreparedMintTx {
 }
 
 impl PreparedMintTx {
-    /// Verifies that the redundant persisted identity fields describe the
-    /// exact signed envelope bytes.
-    pub(crate) fn validate(&self) -> Result<(), VaultError> {
-        let envelope = TxEnvelope::decode_2718_exact(&self.tx)?;
-        let decoded_hash = *envelope.tx_hash();
-        if decoded_hash != self.hash {
-            return Err(VaultError::PreparedMintHashMismatch {
-                expected: self.hash,
-                decoded: decoded_hash,
-            });
-        }
-
-        let decoded_nonce = envelope.nonce();
-        if decoded_nonce != self.nonce {
-            return Err(VaultError::PreparedMintNonceMismatch {
-                expected: self.nonce,
-                decoded: decoded_nonce,
-            });
-        }
-
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn valid_for_test(nonce: u64, external_tx_id: String) -> Self {
         let transaction = TxLegacy {
@@ -353,6 +330,29 @@ impl PreparedMintTx {
             signed_at: Utc::now(),
             external_tx_id,
         }
+    }
+
+    /// Verifies that the redundant persisted identity fields describe the
+    /// exact signed envelope bytes.
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+        let envelope = TxEnvelope::decode_2718_exact(&self.tx)?;
+        let decoded_hash = *envelope.tx_hash();
+        if decoded_hash != self.hash {
+            return Err(VaultError::PreparedMintHashMismatch {
+                expected: self.hash,
+                decoded: decoded_hash,
+            });
+        }
+
+        let decoded_nonce = envelope.nonce();
+        if decoded_nonce != self.nonce {
+            return Err(VaultError::PreparedMintNonceMismatch {
+                expected: self.nonce,
+                decoded: decoded_nonce,
+            });
+        }
+
+        Ok(())
     }
 }
 
