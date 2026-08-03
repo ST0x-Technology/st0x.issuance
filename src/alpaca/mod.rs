@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -61,33 +61,6 @@ pub(crate) trait AlpacaService: Send + Sync {
         &self,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaError>;
-
-    /// Lists dividend corporate-action announcements whose ex-date falls in
-    /// `[since, until]` (both inclusive).
-    ///
-    /// Calls `GET /v1/corporate_actions/announcements` filtered to
-    /// `ca_types=dividend` / `date_type=ex_date`. Alpaca caps the date range
-    /// at 90 days; callers must keep `until - since` within that span.
-    async fn list_dividend_announcements(
-        &self,
-        since: NaiveDate,
-        until: NaiveDate,
-    ) -> Result<Vec<DividendAnnouncement>, AlpacaError>;
-}
-
-/// A dividend corporate-action announcement from Alpaca's announcements API.
-///
-/// Only the fields the freeze scheduler consumes are modeled; the wire object
-/// carries more (record/payable dates, cash per share, rates). For a cash
-/// dividend the initiating and target symbols are the same company, so
-/// `initiating_symbol` — the field Alpaca's `symbol` query filter matches — is
-/// the asset the dividend applies to.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(crate) struct DividendAnnouncement {
-    pub(crate) initiating_symbol: UnderlyingSymbol,
-    /// Nullable upstream: an announcement can be ingested before its ex-date
-    /// is set.
-    pub(crate) ex_date: Option<NaiveDate>,
 }
 
 /// Request payload for Alpaca's mint callback endpoint.
