@@ -134,6 +134,16 @@ pub(crate) enum RedemptionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    /// Redemption of a frozen asset parked before the Alpaca redeem call.
+    /// Held is a deferral, never a drop — the tokens are already committed
+    /// on-chain, so the redemption resumes (`Held -> AlpacaCalled`, reusing
+    /// the existing `AlpacaCalled` event) once the asset unfreezes. Detection
+    /// metadata stays in the aggregate from `Detected`, so this event carries
+    /// only the hold timestamp.
+    RedemptionHeld {
+        issuer_request_id: IssuerRedemptionRequestId,
+        held_at: DateTime<Utc>,
+    },
     AlpacaJournalCompleted {
         issuer_request_id: IssuerRedemptionRequestId,
         alpaca_journal_completed_at: DateTime<Utc>,
@@ -288,6 +298,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::AlpacaCallFailed { .. } => {
                 "RedemptionEvent::AlpacaCallFailed".to_string()
+            }
+            Self::RedemptionHeld { .. } => {
+                "RedemptionEvent::RedemptionHeld".to_string()
             }
             Self::AlpacaJournalCompleted { .. } => {
                 "RedemptionEvent::AlpacaJournalCompleted".to_string()

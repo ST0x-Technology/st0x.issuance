@@ -31,6 +31,14 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
     },
+    /// Parks a redemption of a frozen asset before the Alpaca redeem call.
+    /// Valid from `Detected` (produces `RedemptionHeld`) and idempotent from
+    /// `Held` (no event) so concurrent guard paths cannot race each other.
+    /// The redemption is deferred, never dropped — the resume driver re-runs
+    /// detection handling once the asset unfreezes.
+    Hold {
+        issuer_request_id: IssuerRedemptionRequestId,
+    },
     ConfirmAlpacaComplete {
         issuer_request_id: IssuerRedemptionRequestId,
     },

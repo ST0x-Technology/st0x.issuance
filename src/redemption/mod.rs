@@ -255,6 +255,16 @@ pub(crate) enum Redemption {
     Detected {
         metadata: RedemptionMetadata,
     },
+    /// Parked before the Alpaca redeem call because the asset was frozen at
+    /// detection handling time. Neither side has moved yet (Alpaca has not
+    /// decremented, nothing burned), so on-chain supply still equals the
+    /// Alpaca count — the freeze invariant. Carries the detection metadata so
+    /// resuming needs no re-supply; `Held -> AlpacaCalled` reuses the
+    /// existing `AlpacaCalled` event.
+    Held {
+        metadata: RedemptionMetadata,
+        held_at: DateTime<Utc>,
+    },
     AlpacaCalled {
         metadata: RedemptionMetadata,
         tokenization_request_id: TokenizationRequestId,
@@ -393,6 +403,7 @@ impl Redemption {
     pub(crate) const fn metadata(&self) -> Option<&RedemptionMetadata> {
         match self {
             Self::Detected { metadata }
+            | Self::Held { metadata, .. }
             | Self::AlpacaCalled { metadata, .. }
             | Self::Burning { metadata, .. }
             | Self::BurnSubmitted { metadata, .. }
@@ -418,6 +429,7 @@ impl Redemption {
     pub(crate) const fn state_name(&self) -> &'static str {
         match self {
             Self::Detected { .. } => "Detected",
+            Self::Held { .. } => "Held",
             Self::AlpacaCalled { .. } => "AlpacaCalled",
             Self::Burning { .. } => "Burning",
             Self::BurnSubmitted { .. } => "BurnSubmitted",
@@ -435,9 +447,12 @@ impl Redemption {
         alpaca_quantity: Quantity,
         dust_quantity: Quantity,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if !matches!(self, Self::Detected { .. }) {
+        // `Held` resumes through the same event: the audit trail is
+        // `Detected -> RedemptionHeld -> AlpacaCalled`, no second resume
+        // event needed.
+        if !matches!(self, Self::Detected { .. } | Self::Held { .. }) {
             return Err(RedemptionError::InvalidState {
-                expected: "Detected".to_string(),
+                expected: "Detected or Held".to_string(),
                 found: self.state_name().to_string(),
             });
         }
@@ -456,9 +471,9 @@ impl Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if !matches!(self, Self::Detected { .. }) {
+        if !matches!(self, Self::Detected { .. } | Self::Held { .. }) {
             return Err(RedemptionError::InvalidState {
-                expected: "Detected".to_string(),
+                expected: "Detected or Held".to_string(),
                 found: self.state_name().to_string(),
             });
         }
@@ -478,13 +493,14 @@ impl Redemption {
         if !matches!(
             self,
             Self::Detected { .. }
+                | Self::Held { .. }
                 | Self::AlpacaCalled { .. }
                 | Self::Burning { .. }
                 | Self::BurnSubmitted { .. }
                 | Self::Failed { .. }
         ) {
             return Err(RedemptionError::InvalidState {
-                expected: "Detected, AlpacaCalled, Burning, or Failed"
+                expected: "Detected, Held, AlpacaCalled, Burning, or Failed"
                     .to_string(),
                 found: self.state_name().to_string(),
             });
@@ -495,6 +511,28 @@ impl Redemption {
             reason,
             failed_at: Utc::now(),
         }])
+    }
+
+    /// Parks a redemption of a frozen asset before the Alpaca redeem call.
+    /// Idempotent from `Held` (no event) so the live path and a recovery
+    /// sweep racing each other cannot fail the second dispatch.
+    fn handle_hold(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match self {
+            Self::Detected { .. } => {
+                Ok(vec![RedemptionEvent::RedemptionHeld {
+                    issuer_request_id,
+                    held_at: Utc::now(),
+                }])
+            }
+            Self::Held { .. } => Ok(vec![]),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "Detected or Held".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
     }
 
     /// Submits the burn transaction to the signing backend.
@@ -944,11 +982,12 @@ impl Redemption {
         dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     ) {
-        let Self::Detected { metadata } = self else {
+        let (Self::Detected { metadata } | Self::Held { metadata, .. }) = self
+        else {
             warn!(
                 issuer_request_id = %issuer_request_id,
                 current_state = %self.state_name(),
-                "AlpacaCalled event received in wrong state, expected Detected"
+                "AlpacaCalled event received in wrong state, expected Detected or Held"
             );
             return;
         };
@@ -960,6 +999,23 @@ impl Redemption {
             dust_quantity,
             called_at,
         };
+    }
+
+    fn apply_held(
+        &mut self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        held_at: DateTime<Utc>,
+    ) {
+        let Self::Detected { metadata } = self else {
+            warn!(
+                issuer_request_id = %issuer_request_id,
+                current_state = %self.state_name(),
+                "RedemptionHeld event received in wrong state, expected Detected"
+            );
+            return;
+        };
+
+        *self = Self::Held { metadata: metadata.clone(), held_at };
     }
 
     fn apply_alpaca_journal_completed(
@@ -1505,7 +1561,8 @@ impl EventSourced for Redemption {
                 detected_at: Utc::now(),
             }]),
             RedemptionCommand::RecordAlpacaCall { .. }
-            | RedemptionCommand::RecordAlpacaFailure { .. } => {
+            | RedemptionCommand::RecordAlpacaFailure { .. }
+            | RedemptionCommand::Hold { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "Detected".to_string(),
                     found: "Uninitialized".to_string(),
@@ -1602,6 +1659,9 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 error,
             } => self.handle_record_alpaca_failure(issuer_request_id, error),
+            RedemptionCommand::Hold { issuer_request_id } => {
+                self.handle_hold(issuer_request_id)
+            }
             RedemptionCommand::ConfirmAlpacaComplete { issuer_request_id } => {
                 self.handle_confirm_alpaca_complete(issuer_request_id)
             }
@@ -1803,6 +1863,9 @@ impl Redemption {
             | RedemptionEvent::RedemptionFailed { .. }
             | RedemptionEvent::BurningFailed { .. } => {
                 self.apply_failure_event(event);
+            }
+            RedemptionEvent::RedemptionHeld { issuer_request_id, held_at } => {
+                self.apply_held(issuer_request_id, *held_at);
             }
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id,
@@ -2595,6 +2658,200 @@ mod tests {
                 found: "Uninitialized".to_string(),
             }
         );
+    }
+
+    fn detected_event(
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> RedemptionEvent {
+        RedemptionEvent::Detected {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: Quantity::new(Decimal::from(100)),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            block_number: 12345,
+            detected_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hold_from_detected_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![detected_event(&issuer_request_id)])
+            .when(RedemptionCommand::Hold {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::RedemptionHeld {
+            issuer_request_id: event_id,
+            held_at,
+        } = &events[0]
+        else {
+            panic!("Expected RedemptionHeld event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert!(held_at.timestamp() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_hold_from_held_state_is_idempotent() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                detected_event(&issuer_request_id),
+                RedemptionEvent::RedemptionHeld {
+                    issuer_request_id: issuer_request_id.clone(),
+                    held_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Hold {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "Hold from Held must be a no-op, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hold_from_alpaca_called_state_fails() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                detected_event(&issuer_request_id),
+                RedemptionEvent::AlpacaCalled {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-tok-held",
+                    ),
+                    alpaca_quantity: Quantity::new(Decimal::from(100)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                    called_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Hold {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::InvalidState {
+                expected: "Detected or Held".to_string(),
+                found: "AlpacaCalled".to_string(),
+            }
+        );
+    }
+
+    // `Held -> AlpacaCalled` reuses the existing `AlpacaCalled` event: the
+    // audit trail is Detected -> RedemptionHeld -> AlpacaCalled with no
+    // separate resume event.
+    #[tokio::test]
+    async fn test_record_alpaca_call_from_held_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id = TokenizationRequestId::new("alp-tok-hld");
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                detected_event(&issuer_request_id),
+                RedemptionEvent::RedemptionHeld {
+                    issuer_request_id: issuer_request_id.clone(),
+                    held_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::AlpacaCalled {
+            issuer_request_id: event_id,
+            tokenization_request_id: event_tok_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected AlpacaCalled event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_tok_id, &tokenization_request_id);
+    }
+
+    #[tokio::test]
+    async fn test_record_alpaca_failure_from_held_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                detected_event(&issuer_request_id),
+                RedemptionEvent::RedemptionHeld {
+                    issuer_request_id: issuer_request_id.clone(),
+                    held_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "API timeout".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], RedemptionEvent::AlpacaCallFailed { .. }),
+            "Expected AlpacaCallFailed event, got {:?}",
+            &events[0]
+        );
+    }
+
+    #[test]
+    fn test_apply_held_transitions_to_held_and_keeps_metadata() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let held_at = Utc::now();
+
+        let redemption = replay::<Redemption>(vec![
+            detected_event(&issuer_request_id),
+            RedemptionEvent::RedemptionHeld {
+                issuer_request_id: issuer_request_id.clone(),
+                held_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        let Redemption::Held { metadata, held_at: state_held_at } = redemption
+        else {
+            panic!("Expected Held state, got {redemption:?}");
+        };
+
+        assert_eq!(metadata.issuer_request_id, issuer_request_id);
+        assert_eq!(metadata.underlying, UnderlyingSymbol::new("AAPL"));
+        assert_eq!(state_held_at, held_at);
     }
 
     #[tokio::test]
