@@ -29,7 +29,7 @@ use crate::fireblocks::{
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
     CorroboratedRecipient, MigrationOutcome, VaultIdentity,
-    confirm_custody_holder, migrate_vault_receipts,
+    confirm_custody_holder, ensure_holder_quiescent, migrate_vault_receipts,
     migrate_vault_receipts_via_fireblocks, recorded_custody_holder,
     recorded_migration_origin, rollback_gas_reserve, verify_rollback_signing,
 };
@@ -428,12 +428,15 @@ async fn sweep_legacy_receipt_contract<P: Provider + Clone>(
             // somewhere it should not have.
             let at_recipient =
                 receipt.balanceOf(TURNKEY_RECIPIENT, receipt_id).call().await?;
+            // The destination may have held this receipt before the sweep.
+            // Drained source custody is corroborated when it holds at least the
+            // swept amount, matching the migration path's rerun semantics.
             anyhow::ensure!(
-                at_recipient == expected,
+                at_recipient >= expected,
                 "{}: id {receipt_id} is gone from the legacy wallet but \
-                 {TURNKEY_RECIPIENT} holds {at_recipient}, not the expected \
-                 {expected} — it was NOT swept here; investigate before \
-                 rerunning",
+                 {TURNKEY_RECIPIENT} holds {at_recipient}, less than the \
+                 expected swept amount {expected} — it was NOT fully swept \
+                 here; investigate before rerunning",
                 sweep.label
             );
             continue;
@@ -470,6 +473,12 @@ async fn sweep_legacy_receipt_contract<P: Provider + Clone>(
         )
         .calldata()
         .clone();
+
+    // The retiring wallet may have a broadcast-but-unmined transaction from
+    // an earlier attempt or another process; submitting over it would create
+    // a second in-flight transfer without knowing the first one's outcome.
+    // Same guard as every custody-transfer submission path.
+    ensure_holder_quiescent(provider, LEGACY_HOLDER).await?;
 
     let external_tx_id = format!("{}-a{attempt}", sweep.external_tx_id);
     let tx_hash = service
@@ -549,6 +558,11 @@ async fn sweep_stranded_tcoin<P: Provider + Clone>(
     let recipient_before = vault.balanceOf(LIQUIDITY_BOT).call().await?;
 
     let calldata = vault.transfer(LIQUIDITY_BOT, expected).calldata().clone();
+
+    // Same guard as the receipt sweeps: never submit over an in-flight
+    // transaction from the retiring wallet.
+    ensure_holder_quiescent(provider, LEGACY_HOLDER).await?;
+
     let external_tx_id = format!("legacy-sweep-stranded-tcoin-a{attempt}");
     let tx_hash = service
         .submit_contract_call_to_completion(

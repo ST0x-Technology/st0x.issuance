@@ -27,35 +27,38 @@ use crate::redemption::burn_manager::{
     extract_tx_hash, is_pending_burn_confirmation, should_release_reserved_burn,
 };
 
-pub(crate) async fn has_unresolved_burn_intent(
+/// Returns whether any signed transaction on the same signer network — a
+/// burn or a mint — is still awaiting its terminal outcome, excluding at
+/// most this redemption's own reservation.
+///
+/// Reads the trigger-maintained `active_signer_intents` table rather than
+/// re-deriving the answer from event streams: the triggers update the table
+/// in the same transaction that appends the intent event, so the table is
+/// the single source of truth and cannot drift from the reserve/release
+/// rules the migration encodes. Because the table is keyed by network, an
+/// outstanding Mint intent blocks a burn on the same nonce domain too —
+/// both flows sign with the same key.
+pub(crate) async fn has_unresolved_signer_intent(
     pool: &Pool<Sqlite>,
+    network: Network,
     excluding: Option<&IssuerRedemptionRequestId>,
 ) -> Result<bool, sqlx::Error> {
+    // `None` collapses to "" rather than a NULL bind: `aggregate_id = NULL`
+    // is NULL in SQL, `NOT NULL` is NULL, and a NULL predicate silently
+    // excludes EVERY row — the empty string matches no aggregate_id, which
+    // is the intended "exclude nothing".
     let excluding = excluding.map(ToString::to_string).unwrap_or_default();
     let exists = sqlx::query_scalar::<_, bool>(
         "
         SELECT EXISTS (
             SELECT 1
-            FROM events AS intent
-            WHERE intent.aggregate_type = 'Redemption'
-              AND intent.event_type = 'RedemptionEvent::BurnIntended'
-              AND intent.aggregate_id != ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM events AS later
-                  WHERE later.aggregate_type = intent.aggregate_type
-                    AND later.aggregate_id = intent.aggregate_id
-                    AND later.sequence > intent.sequence
-                    AND later.event_type NOT IN (
-                        'RedemptionEvent::BurnRecoveryAttempted',
-                        'RedemptionEvent::BurnPreparationRecoveryAttempted',
-                        'RedemptionEvent::BurnRecoveryExhausted',
-                        'RedemptionEvent::BurnPreparationRecoveryExhausted'
-                    )
-              )
+            FROM active_signer_intents
+            WHERE network = ?
+              AND NOT (aggregate_type = 'Redemption' AND aggregate_id = ?)
         )
         ",
     )
+    .bind(network.as_str())
     .bind(excluding)
     .fetch_one(pool)
     .await?;
@@ -2199,7 +2202,7 @@ mod tests {
         BurnExternalTxId, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionError, RedemptionEvent, RedemptionMetadata,
-        RedemptionServices, TokensBurnedData, has_unresolved_burn_intent,
+        RedemptionServices, TokensBurnedData, has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
@@ -2231,10 +2234,15 @@ mod tests {
             .expect("migrations should run");
         let aggregate_id = IssuerRedemptionRequestId::random().to_string();
 
-        for (sequence, event_type) in [
-            (1, "RedemptionEvent::BurnIntended"),
-            (2, "RedemptionEvent::BurnRecoveryAttempted"),
-            (3, "RedemptionEvent::BurnRecoveryExhausted"),
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+            (3, "RedemptionEvent::BurnRecoveryAttempted", "{}"),
+            (4, "RedemptionEvent::BurnRecoveryExhausted", "{}"),
         ] {
             sqlx::query(
                 "
@@ -2247,22 +2255,338 @@ mod tests {
                     payload,
                     metadata
                 )
-                VALUES ('Redemption', ?, ?, ?, '1.0', '{}', '{}')
+                VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
                 ",
             )
             .bind(&aggregate_id)
             .bind(sequence)
             .bind(event_type)
+            .bind(payload)
             .execute(&pool)
             .await
             .expect("test event should insert");
         }
 
         assert!(
-            has_unresolved_burn_intent(&pool, None)
+            has_unresolved_signer_intent(&pool, Network::Base, None)
                 .await
                 .expect("intent query should succeed"),
-            "recovery bookkeeping must not permit another wallet transaction"
+            "recovery bookkeeping must keep the same network's gate closed"
+        );
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Ethereum, None)
+                .await
+                .expect("intent query should succeed"),
+            "an intent on Base must not block an independent Ethereum signer"
+        );
+
+        let orphaned = sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Redemption',
+                'orphaned-intent',
+                1,
+                'RedemptionEvent::BurnIntended',
+                '1.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await;
+
+        let orphaned_error = orphaned
+            .expect_err(
+                "an intent with no origin metadata must be rejected atomically",
+            )
+            .to_string();
+        assert!(
+            orphaned_error.contains("requires one Detected event"),
+            "the validation trigger must name the missing origin, got: \
+             {orphaned_error}"
+        );
+    }
+
+    async fn insert_redemption_event(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A failed burn submission may still have broadcast the signed
+    /// transaction, so BurningFailed must keep the network's reservation —
+    /// mirroring the mint side, where MintingFailed never releases. The same
+    /// holds for RedemptionFailed, Reprocessed (operator requeue without a
+    /// terminal on-chain outcome), the post-reprocess Alpaca* events that
+    /// follow once the aggregate returns to Detected, and BurnResumed, which
+    /// re-enters Burning before the replacement intent re-reserves. Only a
+    /// real terminal outcome (TokensBurned or RedemptionClosed) frees the
+    /// nonce domain.
+    #[tokio::test]
+    async fn failed_and_resumed_burns_keep_the_signer_reservation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+        let aggregate_id = IssuerRedemptionRequestId::random().to_string();
+
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+            // The ambiguous recover_single_burn_failed path emits
+            // BurningFailed then RedemptionFailed; neither may release.
+            (3, "RedemptionEvent::BurningFailed", "{}"),
+            (4, "RedemptionEvent::RedemptionFailed", "{}"),
+            // Reprocessed requeues without a terminal on-chain outcome;
+            // apply_reprocessed returns the aggregate to Detected, so the
+            // next event is AlpacaCalled (or sibling Alpaca*).
+            (5, "RedemptionEvent::Reprocessed", "{}"),
+            (6, "RedemptionEvent::AlpacaCalled", "{}"),
+            (7, "RedemptionEvent::BurnResumed", "{}"),
+        ] {
+            insert_redemption_event(
+                &pool,
+                &aggregate_id,
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test event should insert");
+        }
+
+        assert!(
+            has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "a failed/reprocessed/AlpacaCalled/resumed burn may have \
+             broadcast its tx and must keep the gate closed"
+        );
+
+        insert_redemption_event(
+            &pool,
+            &aggregate_id,
+            8,
+            "RedemptionEvent::RedemptionClosed",
+            "{}",
+        )
+        .await
+        .expect("the close event should insert");
+
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "closing the redemption must release the signer reservation"
+        );
+    }
+
+    /// The burn reserve trigger must reject a competing same-network intent
+    /// with the explicit reservation message — mirroring the mint-side
+    /// regression test, so a burn-trigger-only regression back to the
+    /// implicit PK violation (misreported upstream as a same-aggregate
+    /// conflict) cannot slip through.
+    #[tokio::test]
+    async fn competing_burn_intent_raises_the_explicit_reservation_error() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+
+        for (aggregate_id, sequence, event_type, payload) in [
+            (
+                "burn-first",
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            ("burn-first", 2, "RedemptionEvent::BurnIntended", "{}"),
+            (
+                "burn-second",
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+        ] {
+            insert_redemption_event(
+                &pool,
+                aggregate_id,
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test history should insert");
+        }
+
+        let competing_error = insert_redemption_event(
+            &pool,
+            "burn-second",
+            2,
+            "RedemptionEvent::BurnIntended",
+            "{}",
+        )
+        .await
+        .expect_err("a competing same-network burn intent must be rejected")
+        .to_string();
+        assert!(
+            competing_error.contains("signer network already reserved"),
+            "the burn-side rejection must carry the explicit reservation \
+             message, got: {competing_error}"
+        );
+    }
+
+    /// The migration backfill must reconstruct a reservation for an
+    /// unresolved historical burn, defaulting pre-network Detected events to
+    /// Base for wire compatibility.
+    #[tokio::test]
+    async fn signer_intent_migration_backfills_unresolved_burns() {
+        const INIT: &str =
+            include_str!("../../migrations/20251016210348_init.sql");
+        const GUARD: &str = include_str!(
+            "../../migrations/20260801095000_enforce_active_signer_intents.sql"
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::raw_sql(INIT).execute(&pool).await.expect("init schema");
+
+        for (sequence, event_type, payload) in [
+            (1, "RedemptionEvent::Detected", r#"{"Detected":{}}"#),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+            (3, "RedemptionEvent::BurningFailed", "{}"),
+        ] {
+            insert_redemption_event(
+                &pool,
+                "legacy-burn",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("historical event should insert");
+        }
+
+        sqlx::raw_sql(GUARD).execute(&pool).await.expect("backfill");
+
+        let active: (String, String, String) = sqlx::query_as(
+            "SELECT network, aggregate_type, aggregate_id \
+             FROM active_signer_intents",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the unresolved burn must be backfilled");
+        assert_eq!(
+            active,
+            (
+                "base".to_string(),
+                "Redemption".to_string(),
+                "legacy-burn".to_string(),
+            )
+        );
+    }
+
+    /// The core double-signing hazard the table exists to prevent: TWO
+    /// historical aggregates left unresolved burns on the same network. The
+    /// backfill must abort on the PRIMARY KEY rather than pick a winner —
+    /// remediation is resolving one aggregate, never guessing.
+    #[tokio::test]
+    async fn signer_intent_migration_aborts_on_conflicting_unresolved_burns() {
+        const INIT: &str =
+            include_str!("../../migrations/20251016210348_init.sql");
+        const GUARD: &str = include_str!(
+            "../../migrations/20260801095000_enforce_active_signer_intents.sql"
+        );
+
+        let conflicted = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::raw_sql(INIT).execute(&conflicted).await.expect("init schema");
+        for aggregate_id in ["first-unresolved", "second-unresolved"] {
+            insert_redemption_event(
+                &conflicted,
+                aggregate_id,
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            )
+            .await
+            .expect("historical Detected should insert");
+            insert_redemption_event(
+                &conflicted,
+                aggregate_id,
+                2,
+                "RedemptionEvent::BurnIntended",
+                "{}",
+            )
+            .await
+            .expect("historical BurnIntended should insert");
+        }
+        let conflicted_error = sqlx::raw_sql(GUARD)
+            .execute(&conflicted)
+            .await
+            .expect_err(
+                "migration must abort on two unresolved burns sharing a \
+                 network instead of silently choosing one",
+            )
+            .to_string();
+        assert!(
+            conflicted_error.contains("UNIQUE constraint failed"),
+            "the historical conflict must abort on the network PRIMARY KEY \
+             specifically, got: {conflicted_error}"
         );
     }
 

@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use event_sorcery::StoreBuilder;
 use itertools::izip;
 use sqlx::{Pool, Sqlite};
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -411,6 +412,27 @@ pub(crate) enum ReceiptCustodyError {
     )]
     PermitHolderMismatch { permitted: Address, holdings: Address },
 
+    #[error(
+        "wallet {holder} has pending transactions (latest nonce {latest_nonce}, \
+         pending nonce {pending_nonce}); refusing a custody transfer until \
+         they settle or drop"
+    )]
+    PendingWalletTransactions {
+        holder: Address,
+        latest_nonce: LatestNonce,
+        pending_nonce: PendingNonce,
+    },
+
+    #[error(
+        "wallet {holder} returned pending nonce {pending_nonce} below latest \
+         nonce {latest_nonce}"
+    )]
+    InvalidNonceOrder {
+        holder: Address,
+        latest_nonce: LatestNonce,
+        pending_nonce: PendingNonce,
+    },
+
     #[error("custody transfer {tx_hash} reverted on vault {vault}")]
     Reverted { vault: Address, tx_hash: B256 },
 
@@ -444,6 +466,30 @@ pub(crate) enum ReceiptCustodyError {
          completed chunks resume"
     )]
     OwnerFroze { vault: Address, until: U256 },
+}
+
+/// A wallet's nonce per `eth_getTransactionCount(holder, "latest")` — the
+/// highest mined nonce. Kept distinct from [`PendingNonce`] so the two nonce
+/// views can't be swapped at a call site without a type error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LatestNonce(u64);
+
+impl fmt::Display for LatestNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// A wallet's nonce per `eth_getTransactionCount(holder, "pending")` — mined
+/// plus mempool-visible. Kept distinct from [`LatestNonce`] so the two nonce
+/// views can't be swapped at a call site without a type error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingNonce(u64);
+
+impl fmt::Display for PendingNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
 }
 
 /// A recipient balance that fell over a transfer that should only have raised
@@ -1273,7 +1319,11 @@ pub(crate) async fn reconcile_holdings(
         migrated += 1;
     }
 
-    if unmoved.is_empty() && !tracked.is_empty() {
+    // Only positive tracked balances corroborated at the recipient prove a
+    // completed migration. An inventory containing only zero balances has
+    // nothing to move, but it is not evidence that any custody transfer ever
+    // happened and must not record a false migration history entry.
+    if unmoved.is_empty() && migrated > 0 {
         return Ok(SourceCustody::AlreadyMigrated { receipts: migrated });
     }
 
@@ -1313,6 +1363,9 @@ pub(crate) async fn migrate_vault_custody(
     recipient: Address,
 ) -> Result<MigrationOutcome, MigrationRefusal> {
     let vault = holdings.vault();
+    if holdings.holdings().is_empty() {
+        return Err(ReceiptCustodyError::NothingToTransfer { vault }.into());
+    }
 
     let permit = match custody
         .transfer_permission(vault, holdings.holder(), recipient)
@@ -1457,6 +1510,57 @@ async fn verify_custody_moved(
             expected,
         })
         .into());
+    }
+
+    Ok(())
+}
+
+/// Reads both nonce views for `holder` and rejects a non-quiescent wallet —
+/// the single entry point for the read+check pair, so every submission path
+/// (custody transfers, chunked Fireblocks calls, the legacy-receipt sweeps)
+/// applies the identical guard.
+///
+/// Relies on `eth_getTransactionCount(holder, "pending")` reflecting the
+/// node's actual mempool contents for `holder` — i.e. that it is >= the
+/// `"latest"` count, with equality meaning no in-flight transaction. This has
+/// not been confirmed against Base's, Ethereum's, or HyperEVM's RPC providers
+/// specifically. If a provider instead aliases `"pending"` to `"latest"` (or
+/// otherwise ignores mempool contents), the two views always agree and this
+/// guard silently never blocks, even with a genuinely in-flight transaction
+/// from `holder` — allowing the double-submission this guard exists to
+/// prevent.
+pub(crate) async fn ensure_holder_quiescent<HolderProvider: Provider>(
+    provider: &HolderProvider,
+    holder: Address,
+) -> Result<(), ReceiptCustodyError> {
+    let (latest_count, pending_count) = tokio::try_join!(
+        provider.get_transaction_count(holder).latest(),
+        provider.get_transaction_count(holder).pending(),
+    )?;
+    let latest_nonce = LatestNonce(latest_count);
+    let pending_nonce = PendingNonce(pending_count);
+    ensure_wallet_nonce_quiescent(holder, latest_nonce, pending_nonce)
+}
+
+/// Rejects a wallet whose `pending` and `latest` nonce views disagree.
+const fn ensure_wallet_nonce_quiescent(
+    holder: Address,
+    latest_nonce: LatestNonce,
+    pending_nonce: PendingNonce,
+) -> Result<(), ReceiptCustodyError> {
+    if pending_nonce.0 < latest_nonce.0 {
+        return Err(ReceiptCustodyError::InvalidNonceOrder {
+            holder,
+            latest_nonce,
+            pending_nonce,
+        });
+    }
+    if pending_nonce.0 > latest_nonce.0 {
+        return Err(ReceiptCustodyError::PendingWalletTransactions {
+            holder,
+            latest_nonce,
+            pending_nonce,
+        });
     }
 
     Ok(())
@@ -1624,6 +1728,14 @@ impl<P: Provider + Clone + Send + Sync> ReceiptCustody
     ) -> Result<B256, ReceiptCustodyError> {
         self.check_vault(permit.vault())?;
         ensure_permit_covers(permit, holdings)?;
+
+        // A previous rollback may have been broadcast just before this CLI
+        // crashed. While its transaction remains pending, re-submitting would
+        // create a second attempt without knowing the first one's outcome.
+        // Once it drops, both nonce views converge and retrying the identical
+        // transfer is safe; once it mines, the next reconciliation observes
+        // moved custody and never reaches this submission path.
+        ensure_holder_quiescent(&self.provider, permit.from()).await?;
 
         let receipt = Receipt::new(self.receipt_contract, &self.provider);
         let (ids, amounts) = holdings.batch_arguments();
@@ -1796,6 +1908,15 @@ impl<P: Provider + Clone + Send + Sync> ReceiptCustody
             izip!(ids.chunks(chunk_size), amounts.chunks(chunk_size))
                 .enumerate()
         {
+            // The retiring Fireblocks wallet may be used outside this process.
+            // Re-read both nonce views immediately before EVERY chunk: an
+            // interleaved pending transaction means this migration no longer
+            // owns a quiescent nonce domain and must stop before asking
+            // Fireblocks for another CONTRACT_CALL. Exact retries remain
+            // resumable through the deterministic externalTxId below.
+            ensure_holder_quiescent(&self.onchain.provider, permit.from())
+                .await?;
+
             // Certification is maintained outside this service and can lapse
             // while earlier chunks confirm; re-read before every chunk so a
             // transfer the vault would refuse is never submitted on stale
@@ -2282,6 +2403,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn zero_only_inventory_is_not_reported_as_already_migrated() {
+        let custody =
+            FakeCustody::with_balances(&[(OUTGOING, 1, 0), (INCOMING, 1, 0)]);
+        let tracked = [FakeCustody::holding(1, 0)];
+
+        let source = reconcile(&custody, &tracked).await.unwrap();
+        let SourceCustody::Holds(holdings) = source else {
+            panic!(
+                "zero balances cannot prove a completed migration, got {source:?}"
+            );
+        };
+
+        assert!(
+            holdings.holdings().is_empty(),
+            "zero balances must not enter a transfer batch"
+        );
+    }
+
     /// A failure between transfer chunks leaves some identifiers already with
     /// the recipient and the rest still with the holder. A rerun must resume
     /// the remainder rather than refuse the moved identifiers as divergence.
@@ -2594,6 +2734,44 @@ mod tests {
             "the refusal must name the recipient balance it actually read, \
              got {refusal:?}"
         );
+    }
+
+    #[test]
+    fn a_pending_wallet_transaction_blocks_a_second_custody_submission() {
+        let error = ensure_wallet_nonce_quiescent(
+            OUTGOING,
+            LatestNonce(7),
+            PendingNonce(8),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiptCustodyError::PendingWalletTransactions {
+                holder: OUTGOING,
+                latest_nonce: LatestNonce(7),
+                pending_nonce: PendingNonce(8),
+            }
+        ));
+        ensure_wallet_nonce_quiescent(
+            OUTGOING,
+            LatestNonce(8),
+            PendingNonce(8),
+        )
+        .unwrap();
+        assert!(matches!(
+            ensure_wallet_nonce_quiescent(
+                OUTGOING,
+                LatestNonce(9),
+                PendingNonce(8)
+            )
+            .unwrap_err(),
+            ReceiptCustodyError::InvalidNonceOrder {
+                holder: OUTGOING,
+                latest_nonce: LatestNonce(9),
+                pending_nonce: PendingNonce(8),
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3392,7 +3570,9 @@ mod tests {
                 &provider,
             );
             let shares = U256::from(10) * U256::from(10).pow(U256::from(18));
-            let receipt_ids = deposit_receipts(&vault, holder, shares, 3).await;
+            let mut receipt_ids =
+                deposit_receipts(&vault, holder, shares, 3).await;
+            receipt_ids.sort_unstable();
             let receipt_contract =
                 Address::from(vault.receipt().call().await.unwrap().0);
 
@@ -3402,8 +3582,12 @@ mod tests {
             )
             .await
             .unwrap();
+            // Deliberately oppose canonical receipt-id order: the chunks and
+            // their deterministic externalTxIds must follow reconciliation's
+            // sort, not the inventory fixture's iteration order.
             let tracked: Vec<ReceiptHolding> = receipt_ids
                 .iter()
+                .rev()
                 .map(|receipt_id| ReceiptHolding {
                     receipt_id: ReceiptId::from(*receipt_id),
                     balance: Shares::from(shares),
@@ -3538,8 +3722,8 @@ mod tests {
                 returned, second_chunk,
                 "the reported hash must be the last landed chunk"
             );
-            first_create.assert();
-            second_create.assert();
+            first_create.assert_calls(1);
+            second_create.assert_calls(1);
             assert!(logs_contain_at!(
                 tracing::Level::INFO,
                 &["submitting custody transfer to Fireblocks", "chunks=2"]
@@ -3575,7 +3759,9 @@ mod tests {
                 &provider,
             );
             let shares = U256::from(10) * U256::from(10).pow(U256::from(18));
-            let receipt_ids = deposit_receipts(&vault, holder, shares, 3).await;
+            let mut receipt_ids =
+                deposit_receipts(&vault, holder, shares, 3).await;
+            receipt_ids.sort_unstable();
             let receipt_contract =
                 Address::from(vault.receipt().call().await.unwrap().0);
 
@@ -3587,6 +3773,7 @@ mod tests {
             .unwrap();
             let tracked: Vec<ReceiptHolding> = receipt_ids
                 .iter()
+                .rev()
                 .map(|receipt_id| ReceiptHolding {
                     receipt_id: ReceiptId::from(*receipt_id),
                     balance: Shares::from(shares),

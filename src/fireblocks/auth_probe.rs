@@ -14,7 +14,7 @@ use rand::Rng;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use super::config::FireblocksConfig;
 
@@ -27,6 +27,7 @@ pub struct AuthProbeReport {
     pub body: String,
 }
 
+/// Errors produced while constructing or executing an authentication probe.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthProbeError {
     #[error("failed to build the probe JWT: {0}")]
@@ -34,9 +35,36 @@ pub enum AuthProbeError {
     #[error("probe HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("system clock error: {0}")]
-    Clock(#[from] std::time::SystemTimeError),
+    SystemTime(#[from] SystemTimeError),
+    #[error("probe JWT expiry must be positive, got {expiry_seconds}")]
+    InvalidExpiry { expiry_seconds: u64 },
+    #[error(
+        "probe JWT expiry overflows: iat {issued_at} + {expiry_seconds} seconds"
+    )]
+    ExpiryOverflow { issued_at: u64, expiry_seconds: u64 },
     #[error("failed to format the body hash: {0}")]
     Fmt(#[from] std::fmt::Error),
+}
+
+/// Probe JWT expiry window in seconds, positive by construction: existence
+/// of a value proves the zero case was already rejected, so `probe_auth`
+/// cannot be handed a token that expires at issuance.
+#[derive(Debug, Clone, Copy)]
+pub struct PositiveExpirySeconds(u64);
+
+impl PositiveExpirySeconds {
+    /// # Errors
+    ///
+    /// Returns [`AuthProbeError::InvalidExpiry`] for a zero expiry — a token
+    /// that expires at issuance can never authenticate.
+    pub const fn new(seconds: u64) -> Result<Self, AuthProbeError> {
+        if seconds == 0 {
+            return Err(AuthProbeError::InvalidExpiry {
+                expiry_seconds: seconds,
+            });
+        }
+        Ok(Self(seconds))
+    }
 }
 
 /// The JWT claims Fireblocks authenticates, mirroring the SDK's shape
@@ -67,9 +95,13 @@ pub async fn probe_auth(
     api_user_id: &str,
     rsa_key_pem: &[u8],
     uri_path: &str,
-    expiry_seconds: u64,
+    expiry_seconds: PositiveExpirySeconds,
 ) -> Result<AuthProbeReport, AuthProbeError> {
+    let PositiveExpirySeconds(expiry_seconds) = expiry_seconds;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let expires_at = now.checked_add(expiry_seconds).ok_or(
+        AuthProbeError::ExpiryOverflow { issued_at: now, expiry_seconds },
+    )?;
 
     let body_hash = {
         let mut digest = Sha256::new();
@@ -85,7 +117,7 @@ pub async fn probe_auth(
         uri: uri_path,
         nonce: rand::thread_rng().r#gen(),
         iat: now,
-        exp: now + expiry_seconds,
+        exp: expires_at,
         sub: api_user_id,
         body_hash,
     };
@@ -139,7 +171,7 @@ pub async fn probe_auth_pair(
                 config.api_user_id.as_str(),
                 &config.secret,
                 &uri_path,
-                expiry_seconds,
+                PositiveExpirySeconds::new(expiry_seconds)?,
             )
             .await?,
         );
@@ -235,7 +267,7 @@ mod tests {
             "api-user-test",
             &private_pem,
             "/v1/vault/accounts/0/ETH-TEST",
-            29,
+            PositiveExpirySeconds::new(29).unwrap(),
         )
         .await
         .unwrap();
@@ -259,6 +291,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn probe_rejects_invalid_expiry_without_signing_or_sending() {
+        let zero = PositiveExpirySeconds::new(0).unwrap_err();
+        assert!(matches!(
+            zero,
+            AuthProbeError::InvalidExpiry { expiry_seconds: 0 }
+        ));
+
+        let overflow = probe_auth(
+            "http://127.0.0.1:1",
+            "api-user-test",
+            b"not-a-key",
+            "/v1/probe",
+            PositiveExpirySeconds::new(u64::MAX).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            overflow,
+            AuthProbeError::ExpiryOverflow { expiry_seconds: u64::MAX, .. }
+        ));
+    }
+
     /// The SDK swallows non-2xx bodies; the probe exists to surface them.
     /// A 401 with a diagnostic body must come back verbatim as a report,
     /// not as an error.
@@ -278,7 +333,7 @@ mod tests {
             "api-user-test",
             &private_pem,
             "/v1/vault/accounts/0/ETH-TEST",
-            55,
+            PositiveExpirySeconds::new(55).unwrap(),
         )
         .await
         .unwrap();

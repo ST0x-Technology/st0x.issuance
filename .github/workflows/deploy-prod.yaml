@@ -1,24 +1,10 @@
 name: Deploy to Production
 
-# TEMPORARY BREAK-GLASS VARIANT — exists only on this hotfix branch, never
-# merges to main. Deploys a tag NOT on main during the custody-migration
-# window, triple-bound (tag == dispatch branch HEAD == pasted SHA), pinned to
-# one actor and this one branch. The service profile alone is deployed.
-run-name: "BREAK GLASS prod: ${{ inputs.tag }} by ${{ github.actor }}"
-
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Unique tag pointing at this branch's HEAD"
-        required: true
-        type: string
-      break_glass:
-        description: "Deploy a commit not on main"
-        required: true
-        type: boolean
-      confirm_sha:
-        description: "Paste the full 40-character commit SHA"
+        description: "Git tag to deploy (must be on main)"
         required: true
         type: string
 
@@ -27,10 +13,6 @@ permissions:
 
 jobs:
   deploy:
-    if: >-
-      github.actor == '0xgleb' &&
-      github.ref == 'refs/heads/fix/window-bypass-activation-and-listing-view' &&
-      inputs.break_glass
     environment: production
     concurrency:
       group: deploy-prod
@@ -47,12 +29,11 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Verify exact break-glass revision
+      - name: Verify tag is on main
         env:
           DEPLOY_TAG: ${{ inputs.tag }}
-          CONFIRM_SHA: ${{ inputs.confirm_sha }}
         run: |
-          git fetch --tags origin main
+          git fetch --tags origin '+refs/heads/main:refs/remotes/origin/main'
           if ! git rev-parse -q --verify "refs/tags/$DEPLOY_TAG" >/dev/null; then
             echo "ERROR: '$DEPLOY_TAG' is not an existing tag" >&2
             exit 1
@@ -63,16 +44,8 @@ jobs:
             echo "ERROR: checked-out commit does not match tag $DEPLOY_TAG" >&2
             exit 1
           fi
-          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
-            echo "ERROR: tag does not match dispatch branch HEAD" >&2
-            exit 1
-          fi
-          if [ "$CONFIRM_SHA" != "$tag_commit" ]; then
-            echo "ERROR: confirmation SHA mismatch" >&2
-            exit 1
-          fi
-          if git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "ERROR: commit is on main - use the normal deploy path" >&2
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "ERROR: tag $DEPLOY_TAG is not on main" >&2
             exit 1
           fi
 
@@ -125,8 +98,8 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      - name: Deploy issuance service only
-        run: nix run .#prodDeployService -- st0x-issuance
+      - name: Deploy all profiles
+        run: nix run .#prodDeployAll
 
       - name: Cleanup SSH
         if: always()

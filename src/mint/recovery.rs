@@ -228,6 +228,20 @@ pub(crate) async fn enqueue_scheduled_mint_recovery(
     push_mint_recovery_job(apalis_pool, issuer_request_id).await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManualRetryOutcome {
+    Enqueued,
+    /// Another caller already moved the aggregate out of `MintingFailed`; this
+    /// command emitted no event, so this caller must not mutate queue state.
+    AlreadyHandled,
+    /// The domain transition committed, but immediate queue dispatch failed.
+    /// The periodic mint reconciler will discover the recoverable `Minting`
+    /// state and retry dispatch without another operator command.
+    DeferredToRecovery {
+        error: String,
+    },
+}
+
 /// Drives one operator-authorized retry of a `MintingFailed` mint, bypassing
 /// the capped scheduled-recovery loop entirely.
 ///
@@ -248,7 +262,7 @@ pub(crate) async fn manually_retry_failed_mint(
     apalis_pool: &SqlitePool,
     issuer_request_id: &IssuerMintRequestId,
     mint: &Mint,
-) -> Result<(), anyhow::Error> {
+) -> Result<ManualRetryOutcome, anyhow::Error> {
     let Mint::MintingFailed { underlying, network, .. } = mint else {
         anyhow::bail!(
             "manual retry requires a MintingFailed mint; current state is {}",
@@ -263,38 +277,88 @@ pub(crate) async fn manually_retry_failed_mint(
         })?;
     let chain_id = vault_services.chain_id(network)?;
 
+    let manual_retry_id = Uuid::new_v4();
     mint_store
         .send(
             issuer_request_id,
             MintCommand::ManualRetryMint {
                 issuer_request_id: issuer_request_id.clone(),
+                manual_retry_id,
             },
         )
         .await?;
+
+    let retry_committed = sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM events
+            WHERE aggregate_type = 'Mint'
+              AND aggregate_id = ?
+              AND event_type = 'MintEvent::MintRetryStarted'
+              AND json_extract(
+                  payload,
+                  '$.MintRetryStarted.manual_retry_id'
+              ) = ?
+        )
+        ",
+    )
+    .bind(issuer_request_id.to_string())
+    .bind(manual_retry_id.to_string())
+    .fetch_one(pool)
+    .await?;
+    if !retry_committed {
+        info!(target: "mint", issuer_request_id = %issuer_request_id,
+            %manual_retry_id,
+            "Manual retry was already handled; leaving queue state unchanged"
+        );
+        return Ok(ManualRetryOutcome::AlreadyHandled);
+    }
 
     info!(target: "mint", issuer_request_id = %issuer_request_id,
         %underlying, %network,
         "Manually retrying failed mint past the automatic budget"
     );
 
-    release_terminal_job(
-        pool,
-        job_type::<SubmitMintJob>(),
-        &issuer_request_id.to_string(),
-    )
-    .await?;
-    JobQueue::<SubmitMintJob>::new(apalis_pool)
-        .push_with_idempotency_key(
-            SubmitMintJob {
-                issuer_request_id: issuer_request_id.clone(),
-                vault: address,
-                chain_id,
-            },
-            issuer_request_id.to_string(),
+    let dispatch = async {
+        release_terminal_job(
+            pool,
+            job_type::<SubmitMintJob>(),
+            &issuer_request_id.to_string(),
         )
         .await?;
+        JobQueue::<SubmitMintJob>::new(apalis_pool)
+            .push_with_idempotency_key(
+                SubmitMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: address,
+                    chain_id,
+                },
+                issuer_request_id.to_string(),
+            )
+            .await?;
 
-    Ok(())
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    match dispatch {
+        Ok(()) => Ok(ManualRetryOutcome::Enqueued),
+        Err(error) => {
+            // ManualRetryMint has already committed. Reporting a hard failure
+            // would invite the operator to repeat a command whose effect was
+            // accepted. Surface partial success instead; the periodic
+            // reconciler re-drives every recoverable Minting state and its
+            // enqueue path releases terminal submit-job keys before pushing.
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Manual retry committed; deferring queue dispatch to reconciler"
+            );
+            Ok(ManualRetryOutcome::DeferredToRecovery {
+                error: error.to_string(),
+            })
+        }
+    }
 }
 
 /// Pushes a [`MintRecoveryJob`] for the mint, retrying transient enqueue
@@ -2081,7 +2145,7 @@ mod tests {
 
         let mint =
             harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        manually_retry_failed_mint(
+        let outcome = manually_retry_failed_mint(
             &harness.mint_store,
             &harness.pool,
             &network_vault_services(harness.vault.clone()),
@@ -2092,6 +2156,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(outcome, ManualRetryOutcome::Enqueued);
         let retried =
             harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert_eq!(retried.state_name(), "Minting");
@@ -2126,6 +2191,194 @@ mod tests {
                 ]
             ),
             1
+        );
+    }
+
+    /// Once `ManualRetryMint` commits, an immediate queue failure is partial
+    /// success rather than a failed operator command: the durable state is now
+    /// recoverable and the periodic reconciler owns retrying its dispatch.
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_retry_reports_deferred_dispatch_after_the_transition_commits()
+     {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "prepare failed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+
+        sqlx::query("DROP TABLE Jobs").execute(&harness.pool).await.unwrap();
+
+        let outcome = manually_retry_failed_mint(
+            &harness.mint_store,
+            &harness.pool,
+            &network_vault_services(harness.vault.clone()),
+            &harness.apalis_pool,
+            &issuer_request_id,
+            &mint,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                ManualRetryOutcome::DeferredToRecovery { ref error }
+                    if error.contains("Jobs")
+            ),
+            "the committed retry must expose deferred dispatch, got {outcome:?}"
+        );
+        assert_eq!(
+            harness
+                .mint_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state_name(),
+            "Minting",
+            "the operator command committed before queue dispatch failed"
+        );
+
+        let test = "manual_retry_reports_deferred_dispatch_after_the_transition_commits";
+        assert!(
+            log_count_at!(
+                Level::WARN,
+                &[
+                    test,
+                    "Manual retry committed; deferring queue dispatch to \
+                     reconciler"
+                ]
+            ) >= 1,
+            "a committed retry whose dispatch fails must log the deferral \
+             for operators"
+        );
+    }
+
+    /// A stale endpoint snapshot must not release and recreate queue state when
+    /// another request already committed the manual retry transition.
+    #[traced_test]
+    #[tokio::test]
+    async fn stale_manual_retry_does_not_resurrect_a_terminal_submit_job() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "prepare failed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let stale =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+
+        JobQueue::<SubmitMintJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                SubmitMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: VAULT,
+                    chain_id: Network::Base.chain_id(),
+                },
+                issuer_request_id.to_string(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Done' WHERE job_type = ? \
+             AND idempotency_key = ?",
+        )
+        .bind(job_type::<SubmitMintJob>())
+        .bind(issuer_request_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        harness
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::ManualRetryMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    manual_retry_id: Uuid::new_v4(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = manually_retry_failed_mint(
+            &harness.mint_store,
+            &harness.pool,
+            &network_vault_services(harness.vault.clone()),
+            &harness.apalis_pool,
+            &issuer_request_id,
+            &stale,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ManualRetryOutcome::AlreadyHandled);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM Jobs WHERE job_type = ? AND idempotency_key = ?",
+        )
+        .bind(job_type::<SubmitMintJob>())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "Done",
+            "a no-op retry command must not resurrect terminal queue state"
+        );
+
+        let test =
+            "stale_manual_retry_does_not_resurrect_a_terminal_submit_job";
+        assert!(
+            log_count_at!(
+                Level::INFO,
+                &[
+                    test,
+                    "Manual retry was already handled; leaving queue state \
+                     unchanged"
+                ]
+            ) >= 1,
+            "a stale retry that lost the commit race must log the no-op \
+             outcome for operators"
         );
     }
 
