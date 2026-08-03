@@ -1444,7 +1444,12 @@ fn stuck_redemption_entry(
             history.tx_id,
         ),
         RedemptionView::Held {
-            underlying, quantity, tx_hash, held_at, ..
+            underlying,
+            quantity,
+            network,
+            tx_hash,
+            held_at,
+            ..
         } => (
             None,
             "Held".to_string(),
@@ -1452,6 +1457,7 @@ fn stuck_redemption_entry(
             held_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             history.tx_id,
         ),

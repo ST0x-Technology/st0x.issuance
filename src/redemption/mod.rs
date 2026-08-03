@@ -233,7 +233,7 @@ pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent, TokensBurnedData};
 pub(crate) use view::{
     RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
-    find_stuck,
+    find_held, find_stuck,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2665,8 +2665,9 @@ mod tests {
     ) -> RedemptionEvent {
         RedemptionEvent::Detected {
             issuer_request_id: issuer_request_id.clone(),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: Quantity::new(Decimal::from(100)),
             tx_hash: b256!(
@@ -2850,7 +2851,7 @@ mod tests {
         };
 
         assert_eq!(metadata.issuer_request_id, issuer_request_id);
-        assert_eq!(metadata.underlying, UnderlyingSymbol::new("AAPL"));
+        assert_eq!(metadata.underlying, UnderlyingSymbol::new("AAPL").unwrap());
         assert_eq!(state_held_at, held_at);
     }
 

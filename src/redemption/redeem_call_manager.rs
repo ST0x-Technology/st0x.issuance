@@ -1,22 +1,49 @@
 use alloy::primitives::Address;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
+use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-    RedemptionViewError, find_detected,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionView,
+    RedemptionViewError, find_detected, find_held,
 };
 use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets, load_asset_by_underlying,
+    TokenizedAssetViewError, list_enabled_assets,
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
+use crate::underlying::{UnderlyingViewError, load_freeze_status};
+
+/// Interval between held-redemption drain passes.
+///
+/// Unfreeze has no event signal this manager can react to (manual CLI today,
+/// scheduled automation in V1), so a periodic poll is the robust resume
+/// driver. The held state is event-sourced, so the reconciler also survives
+/// restarts. Freeze windows span hours-to-days, so 60s adds negligible
+/// latency while keeping the view query cheap.
+const HELD_DRAIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawns the periodic reconciler that resumes held redemptions once their
+/// asset unfreezes. Spawn AFTER startup recovery completes so a drain pass
+/// cannot race the recovery sweep over the same aggregates.
+pub(crate) fn spawn_held_redemption_reconciler(
+    manager: Arc<RedeemCallManager>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HELD_DRAIN_INTERVAL);
+        loop {
+            ticker.tick().await;
+            manager.drain_held_redemptions().await;
+        }
+    });
+}
 
 pub(crate) struct RedeemCallManager {
     alpaca_service: Arc<dyn AlpacaService>,
@@ -111,6 +138,69 @@ impl RedeemCallManager {
             auto_failed,
             failed,
             "Detected redemption recovery complete"
+        );
+    }
+
+    /// Drains held redemptions in detection order. Each candidate re-runs the
+    /// detection handler, which re-checks the freeze status: a still-frozen
+    /// (or re-frozen mid-drain) asset re-holds safely; a now-enabled asset
+    /// resumes with the Alpaca call.
+    pub(crate) async fn drain_held_redemptions(&self) {
+        let held_redemptions = match find_held(&self.pool).await {
+            Ok(redemptions) => redemptions,
+            Err(err) => {
+                error!(target: "redemption", error = %err, "Failed to query for held redemptions");
+                return;
+            }
+        };
+
+        if held_redemptions.is_empty() {
+            debug!(target: "redemption", "No held redemptions to drain");
+            return;
+        }
+
+        // Detection order: the tokens reached the wallet in this order, so
+        // they resume in it — no held redemption can be starved by a later one.
+        let ordered = held_redemptions
+            .into_iter()
+            .filter_map(|(issuer_request_id, view)| match view {
+                RedemptionView::Held { detected_at, .. } => {
+                    Some((detected_at, issuer_request_id))
+                }
+                _ => None,
+            })
+            .sorted_by_key(|(detected_at, _)| *detected_at)
+            .collect::<Vec<_>>();
+
+        debug!(target: "redemption", count = ordered.len(),
+            "Draining held redemptions"
+        );
+
+        let mut resumed = 0u32;
+        let mut still_held = 0u32;
+        let mut failed = 0u32;
+
+        for (_, issuer_request_id) in &ordered {
+            match self.recover_single_detected(issuer_request_id).await {
+                Ok(()) => match self.store.load(issuer_request_id).await {
+                    Ok(Some(Redemption::Held { .. })) => still_held += 1,
+                    _ => resumed += 1,
+                },
+                Err(err) => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Failed to drain held redemption"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        info!(target: "redemption", total = ordered.len(),
+            resumed,
+            still_held,
+            failed,
+            "Held redemption drain complete"
         );
     }
 
@@ -248,16 +338,15 @@ impl RedeemCallManager {
         // The freeze gate sits at the single point between detection and the
         // Alpaca redeem call. Before that call neither side has moved (Alpaca
         // has not decremented, nothing burned), so holding here keeps on-chain
-        // supply equal to Alpaca's snapshot — the freeze invariant. Reading
-        // the tokenized-asset view fails closed: any error propagates before
-        // Alpaca is called.
-        let asset = load_asset_by_underlying(&self.pool, &metadata.underlying)
-            .await?
-            .ok_or_else(|| RedeemCallManagerError::AssetNotFound {
-                underlying: metadata.underlying.clone(),
-            })?;
+        // supply equal to Alpaca's snapshot — the freeze invariant. The
+        // corporate-action freeze is underlying-scoped, so one freeze holds
+        // redemptions of that underlying on every network. Reading the
+        // underlying view fails closed: any error propagates before Alpaca is
+        // called.
+        let status =
+            load_freeze_status(&self.pool, &metadata.underlying).await?;
 
-        if asset.status.is_frozen() {
+        if status.is_frozen() {
             return self
                 .hold_frozen_redemption(issuer_request_id, aggregate)
                 .await;
@@ -368,6 +457,8 @@ pub(crate) enum RedeemCallManagerError {
     AccountNotLinked { wallet: Address },
     #[error("Asset view error: {0}")]
     AssetView(#[from] TokenizedAssetViewError),
+    #[error("Underlying view error: {0}")]
+    UnderlyingView(#[from] UnderlyingViewError),
     #[error(
         "Asset not found for underlying: {underlying} on network: {network}"
     )]
@@ -419,6 +510,7 @@ mod tests {
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
+    use crate::underlying::{Underlying, UnderlyingCommand};
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
@@ -436,6 +528,7 @@ mod tests {
         redemption_store: Arc<Store<Redemption>>,
         account_store: Arc<Store<Account>>,
         asset_store: Arc<Store<TokenizedAsset>>,
+        underlying_store: Arc<Store<Underlying>>,
     }
 
     impl TestHarness {
@@ -475,7 +568,19 @@ mod tests {
                     .await
                     .expect("Failed to build tokenized asset store");
 
-            Self { pool, redemption_store, account_store, asset_store }
+            let (underlying_store, _underlying_projection) =
+                StoreBuilder::<Underlying>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build underlying store");
+
+            Self {
+                pool,
+                redemption_store,
+                account_store,
+                asset_store,
+                underlying_store,
+            }
         }
 
         async fn register_and_link_account(
@@ -530,6 +635,32 @@ mod tests {
                 )
                 .await
                 .expect("Failed to add asset");
+        }
+
+        /// Freezes the underlying for a corporate action. The freeze is
+        /// underlying-scoped, so it covers every network's listing.
+        async fn freeze_underlying(&self, underlying: &UnderlyingSymbol) {
+            self.underlying_store
+                .send(
+                    underlying,
+                    UnderlyingCommand::Freeze {
+                        underlying: underlying.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to freeze underlying");
+        }
+
+        async fn unfreeze_underlying(&self, underlying: &UnderlyingSymbol) {
+            self.underlying_store
+                .send(
+                    underlying,
+                    UnderlyingCommand::Unfreeze {
+                        underlying: underlying.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to unfreeze underlying");
         }
 
         async fn detect_redemption(
@@ -640,13 +771,18 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
         let aggregate = harness
             .redemption_store
@@ -807,13 +943,18 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
         let aggregate = harness
             .redemption_store
@@ -874,18 +1015,19 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         harness.add_asset(&underlying, &Network::Base).await;
-        harness
-            .asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
-            .await
-            .expect("Failed to freeze asset");
+        harness.freeze_underlying(&underlying).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
         let aggregate = harness
             .redemption_store
@@ -900,7 +1042,6 @@ mod tests {
                 &issuer_request_id,
                 &aggregate,
                 ClientId::new(),
-                Network::Base,
             )
             .await
             .unwrap();
@@ -940,18 +1081,19 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         harness.add_asset(&underlying, &Network::Base).await;
-        harness
-            .asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
-            .await
-            .expect("Failed to freeze asset");
+        harness.freeze_underlying(&underlying).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
-            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
             .await;
 
         let process_redemption = |aggregate: Redemption| {
@@ -964,7 +1106,6 @@ mod tests {
                         issuer_request_id,
                         &aggregate,
                         ClientId::new(),
-                        Network::Base,
                     )
                     .await
                     .unwrap();
@@ -990,11 +1131,7 @@ mod tests {
         process_redemption(held).await;
         assert_eq!(alpaca_service_mock.get_call_count(), 0);
 
-        harness
-            .asset_store
-            .send(&underlying, TokenizedAssetCommand::Unfreeze)
-            .await
-            .expect("Failed to unfreeze asset");
+        harness.unfreeze_underlying(&underlying).await;
 
         let held = harness
             .redemption_store
@@ -1395,6 +1532,109 @@ mod tests {
             tracing::Level::INFO,
             &["Detected redemption recovery complete", "auto_failed=1"]
         ));
+    }
+
+    // The periodic drain: held redemptions stay parked while frozen and
+    // resume (in detection order) once the asset unfreezes.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_drain_held_redemptions_resumes_after_unfreeze() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &AlpacaAccountNumber("acc-drain".to_string()),
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &detected,
+                client_id,
+            )
+            .await
+            .unwrap();
+
+        // Still frozen: the drain re-holds, no Alpaca call.
+        manager.drain_held_redemptions().await;
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        let after_frozen_drain = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(after_frozen_drain, Redemption::Held { .. }));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption drain complete", "still_held=1"]
+        ));
+
+        harness.unfreeze_underlying(&underlying).await;
+
+        manager.drain_held_redemptions().await;
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            1,
+            "The drain must call Alpaca once the asset unfreezes"
+        );
+        let resumed = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(resumed, Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled after drain, got {resumed:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption drain complete", "resumed=1"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_drain_held_redemptions_noop_when_none_held() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        manager.drain_held_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
     }
 
     #[tokio::test]
