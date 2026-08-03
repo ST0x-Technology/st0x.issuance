@@ -686,6 +686,7 @@ mod tests {
                 alpaca_service.clone(),
                 store.clone(),
                 pool.clone(),
+                Arc::new(crate::notifications::NoopLifecycleNotifier),
             ),
         );
         let journal_manager =

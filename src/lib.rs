@@ -340,6 +340,7 @@ pub async fn initialize_rocket_with_notifications(
         &receipt_inventory_store,
         &pool,
         bot_wallet,
+        lifecycle_notifier.clone(),
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
@@ -789,12 +790,14 @@ fn setup_redemption_managers(
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_store.clone(),
         pool.clone(),
+        lifecycle_notifier,
     ));
     let journal = Arc::new(JournalManager::new(
         alpaca_service,
