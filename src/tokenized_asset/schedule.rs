@@ -16,7 +16,7 @@
 //! infrastructure failure never permanently blocks a window. Acquiring or
 //! releasing the same hold twice is a no-op.
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,10 @@ use tracing::{error, warn};
 use super::UnderlyingSymbol;
 use super::view::{TokenizedAssetViewError, underlying_has_listing};
 use crate::jobs::{Job, JobQueue, QueuePushError, ScheduledTask, job_type};
+use crate::notifications::{
+    FreezeTransitionKind, LifecycleNotification, LifecycleNotifier,
+    SendLifecycleNotification,
+};
 use crate::underlying::{
     FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
 };
@@ -48,6 +52,45 @@ impl FreezeTransition {
             Self::Unfreeze => "unfreeze",
         }
     }
+
+    const fn lifecycle_kind(self) -> FreezeTransitionKind {
+        match self {
+            Self::Freeze => FreezeTransitionKind::Freeze,
+            Self::Unfreeze => FreezeTransitionKind::Unfreeze,
+        }
+    }
+
+    fn changes(
+        self,
+        underlying: Option<&Underlying>,
+        hold_id: &FreezeHoldId,
+        transitioned_at: DateTime<Utc>,
+    ) -> bool {
+        match (self, underlying) {
+            (Self::Freeze, None) => !hold_id.is_expired_at(transitioned_at),
+            (Self::Freeze, Some(underlying)) => {
+                !hold_id.is_expired_at(transitioned_at)
+                    && underlying.freeze_status()
+                        == crate::underlying::AssetStatus::Enabled
+            }
+            (Self::Unfreeze, Some(underlying)) => {
+                underlying.has_only_freeze_hold(hold_id)
+            }
+            (Self::Unfreeze, None) => false,
+        }
+    }
+
+    const fn applied_notification(
+        self,
+        underlying: UnderlyingSymbol,
+    ) -> LifecycleNotification {
+        match self {
+            Self::Freeze => LifecycleNotification::FreezeApplied { underlying },
+            Self::Unfreeze => {
+                LifecycleNotification::UnfreezeApplied { underlying }
+            }
+        }
+    }
 }
 
 /// Durable job applying one scheduled freeze transition to one asset.
@@ -64,6 +107,7 @@ pub(crate) struct ApplyFreezeTransition {
 /// Runtime dependencies for [`ApplyFreezeTransition::perform`].
 pub(crate) struct FreezeScheduleCtx {
     pub(crate) underlying_store: Arc<Store<Underlying>>,
+    pub(crate) notifier: Arc<dyn LifecycleNotifier>,
 }
 
 /// Error surfaced by a freeze-transition job. Command dispatch is the only
@@ -88,7 +132,28 @@ impl Job<FreezeScheduleCtx> for ApplyFreezeTransition {
         &self,
         ctx: &FreezeScheduleCtx,
     ) -> Result<Self::Output, Self::Error> {
+        let current = match ctx.underlying_store.load(&self.underlying).await {
+            Ok(current) => current,
+            Err(source) => {
+                ctx.notifier
+                    .notify(&LifecycleNotification::FreezeTransitionFailed {
+                        underlying: self.underlying.clone(),
+                        transition: self.transition.lifecycle_kind(),
+                    })
+                    .await;
+                return Err(FreezeTransitionError {
+                    underlying: self.underlying.clone(),
+                    transition: self.transition,
+                    source: Box::new(source),
+                });
+            }
+        };
         let transitioned_at = Utc::now();
+        let changes_state = self.transition.changes(
+            current.as_ref(),
+            &self.hold_id,
+            transitioned_at,
+        );
         let command = match self.transition {
             FreezeTransition::Freeze => UnderlyingCommand::AcquireFreezeHold {
                 underlying: self.underlying.clone(),
@@ -104,22 +169,40 @@ impl Job<FreezeScheduleCtx> for ApplyFreezeTransition {
             }
         };
 
-        ctx.underlying_store.send(&self.underlying, command).await.map_err(
-            |source| {
-                warn!(target: "asset", underlying = %self.underlying,
-                    transition = ?self.transition,
-                    scheduled_for = %self.scheduled_for,
-                    error = %source,
-                    "Scheduled freeze transition dispatch failed; apalis \
-                     will retry until its attempt budget is exhausted"
-                );
-                FreezeTransitionError {
+        if let Err(source) =
+            ctx.underlying_store.send(&self.underlying, command).await
+        {
+            warn!(target: "asset", underlying = %self.underlying,
+                transition = ?self.transition,
+                scheduled_for = %self.scheduled_for,
+                error = %source,
+                "Scheduled freeze transition dispatch failed; apalis will \
+                 retry until its attempt budget is exhausted"
+            );
+            ctx.notifier
+                .notify(&LifecycleNotification::FreezeTransitionFailed {
                     underlying: self.underlying.clone(),
-                    transition: self.transition,
-                    source: Box::new(source),
-                }
-            },
-        )
+                    transition: self.transition.lifecycle_kind(),
+                })
+                .await;
+            return Err(FreezeTransitionError {
+                underlying: self.underlying.clone(),
+                transition: self.transition,
+                source: Box::new(source),
+            });
+        }
+
+        if changes_state {
+            ctx.notifier
+                .notify(
+                    &self
+                        .transition
+                        .applied_notification(self.underlying.clone()),
+                )
+                .await;
+        }
+
+        Ok(())
     }
 }
 
@@ -161,6 +244,7 @@ pub(crate) enum FreezeScheduleError {
 #[derive(Clone)]
 pub(crate) struct FreezeScheduler {
     queue: JobQueue<ApplyFreezeTransition>,
+    notification_queue: JobQueue<SendLifecycleNotification>,
     /// Event-store pool for the terminal-row release; both pools address the
     /// same SQLite file (see `crate::jobs`).
     pool: Pool<Sqlite>,
@@ -171,7 +255,11 @@ impl FreezeScheduler {
         apalis_pool: &apalis_sqlite::SqlitePool,
         pool: Pool<Sqlite>,
     ) -> Self {
-        Self { queue: JobQueue::new(apalis_pool), pool }
+        Self {
+            queue: JobQueue::new(apalis_pool),
+            notification_queue: JobQueue::new(apalis_pool),
+            pool,
+        }
     }
 
     /// Arms one freeze window for `underlying`: acquire its hold at `freeze_at`
@@ -272,6 +360,35 @@ impl FreezeScheduler {
                     run_after: unfreeze_delay,
                 },
             ])
+            .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn notify_corporate_action_scheduled(
+        &mut self,
+        underlying: &UnderlyingSymbol,
+        ex_date: NaiveDate,
+        freeze_at: DateTime<Utc>,
+        unfreeze_at: DateTime<Utc>,
+    ) -> Result<(), FreezeScheduleError> {
+        self.notification_queue
+            .push_with_idempotency_key(
+                SendLifecycleNotification {
+                    notification:
+                        LifecycleNotification::CorporateActionScheduled {
+                            underlying: underlying.clone(),
+                            ex_date,
+                            freeze_at,
+                            unfreeze_at,
+                        },
+                },
+                format!(
+                    "notify:corporate-action:{underlying}:{ex_date}:{}:{}",
+                    freeze_at.timestamp(),
+                    unfreeze_at.timestamp()
+                ),
+            )
             .await?;
 
         Ok(())
@@ -441,6 +558,7 @@ pub(crate) async fn vacuum_terminal_freeze_schedule_jobs(
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use event_sorcery::StoreBuilder;
+    use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -451,6 +569,10 @@ mod tests {
     };
     use crate::jobs::{Job, job_type};
     use crate::mint::test_utils::TestHarness;
+    use crate::notifications::{
+        CapturingLifecycleNotifier, FreezeTransitionKind,
+        LifecycleNotification, SendLifecycleNotification,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::UnderlyingSymbol;
     use crate::underlying::{
@@ -485,10 +607,12 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let ctx = FreezeScheduleCtx { underlying_store };
         let freeze_at = Utc::now();
         let unfreeze_at = freeze_at + ChronoDuration::hours(1);
         let hold_id = hold_id(freeze_at, unfreeze_at);
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let ctx =
+            FreezeScheduleCtx { underlying_store, notifier: notifier.clone() };
 
         let freeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
@@ -533,6 +657,15 @@ mod tests {
             Level::DEBUG,
             &["Freeze hold already absent", underlying.as_str()]
         ));
+        assert_eq!(
+            notifier.notifications(),
+            vec![
+                LifecycleNotification::FreezeApplied {
+                    underlying: underlying.clone(),
+                },
+                LifecycleNotification::UnfreezeApplied { underlying },
+            ]
+        );
     }
 
     // A symbol that was never listed must be rejected before any job is
@@ -567,6 +700,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perform_notifies_when_the_transition_fails() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(harness.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let ctx =
+            FreezeScheduleCtx { underlying_store, notifier: notifier.clone() };
+        harness.pool.close().await;
+        let freeze = ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: hold_id(Utc::now(), Utc::now() + ChronoDuration::hours(1)),
+            transition: FreezeTransition::Freeze,
+            scheduled_for: Utc::now(),
+        };
+
+        freeze.perform(&ctx).await.unwrap_err();
+
+        assert_eq!(
+            notifier.notifications(),
+            vec![LifecycleNotification::FreezeTransitionFailed {
+                underlying,
+                transition: FreezeTransitionKind::Freeze,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn overlapping_windows_remain_frozen_until_the_last_window_releases()
     {
         let harness = TestHarness::new().await;
@@ -577,7 +741,9 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let ctx = FreezeScheduleCtx { underlying_store };
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let ctx =
+            FreezeScheduleCtx { underlying_store, notifier: notifier.clone() };
         let now = Utc::now();
         let first_hold = hold_id(
             now + ChronoDuration::hours(1),
@@ -628,6 +794,15 @@ mod tests {
             load_freeze_status(&pool, &underlying).await.unwrap(),
             AssetStatus::Enabled
         );
+        assert_eq!(
+            notifier.notifications(),
+            vec![
+                LifecycleNotification::FreezeApplied {
+                    underlying: underlying.clone(),
+                },
+                LifecycleNotification::UnfreezeApplied { underlying },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -641,7 +816,9 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let ctx = FreezeScheduleCtx { underlying_store };
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let ctx =
+            FreezeScheduleCtx { underlying_store, notifier: notifier.clone() };
         let now = Utc::now();
         let expired_hold = hold_id(
             now - ChronoDuration::hours(2),
@@ -662,6 +839,7 @@ mod tests {
             load_freeze_status(&pool, &underlying).await.unwrap(),
             AssetStatus::Enabled
         );
+        assert!(notifier.notifications().is_empty());
     }
 
     #[tokio::test]
@@ -674,7 +852,10 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let ctx = FreezeScheduleCtx { underlying_store };
+        let ctx = FreezeScheduleCtx {
+            underlying_store,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
         let freeze_at = Utc::now();
         let unfreeze_at = freeze_at + ChronoDuration::hours(1);
         let hold_id = hold_id(freeze_at, unfreeze_at);
@@ -851,14 +1032,36 @@ mod tests {
             .await
             .unwrap();
         scheduler
+            .notify_corporate_action_scheduled(
+                &underlying,
+                freeze_at.date_naive(),
+                freeze_at,
+                unfreeze_at,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .notify_corporate_action_scheduled(
+                &underlying,
+                freeze_at.date_naive(),
+                freeze_at,
+                unfreeze_at,
+            )
+            .await
+            .unwrap();
+        scheduler
             .schedule_window(&underlying, freeze_at, unfreeze_at, now)
             .await
             .unwrap();
 
         let window_jobs: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key LIKE ?",
+            "
+            SELECT COUNT(*) FROM Jobs
+            WHERE idempotency_key LIKE ? OR idempotency_key LIKE ?
+            ",
         )
-        .bind("%:AAPL:%")
+        .bind("freeze:%")
+        .bind("unfreeze:%")
         .fetch_one(&harness.pool)
         .await
         .unwrap();
@@ -867,6 +1070,14 @@ mod tests {
             "re-arming the same window must dedup to one freeze and one \
              unfreeze job"
         );
+
+        let notification_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(notification_jobs, 1);
     }
 
     // A window whose job died terminally (e.g. exhausted retries after an

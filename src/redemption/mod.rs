@@ -69,14 +69,15 @@ pub(crate) async fn has_unresolved_burn_intent(
 /// 4 bytes formatted as `"red-{hex}"`; keep parsing/serializing them so
 /// historical aggregates remain operable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum IssuerRedemptionRequestId {
+#[non_exhaustive]
+pub enum IssuerRedemptionRequestId {
     Full(TxHash),
     Legacy(FixedBytes<4>),
 }
 
 impl IssuerRedemptionRequestId {
     #[must_use]
-    pub(crate) const fn new(tx_hash: TxHash) -> Self {
+    pub const fn new(tx_hash: TxHash) -> Self {
         Self::Full(tx_hash)
     }
 
@@ -113,7 +114,8 @@ impl std::str::FromStr for IssuerRedemptionRequestId {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum IssuerRedemptionRequestIdParseError {
+#[non_exhaustive]
+pub enum IssuerRedemptionRequestIdParseError {
     #[error("invalid hex: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error(transparent)]
