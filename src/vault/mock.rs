@@ -693,6 +693,17 @@ impl MockVaultService {
     pub(crate) fn set_prepared_tx(&self, sendable_tx: SendableTxWithHash) {
         *self.prepared_tx.lock().unwrap() = Some(sendable_tx);
     }
+
+    /// Configures `confirm_orchestrator_burn` to fail with
+    /// `VaultError::OrchestratorReverted` carrying the given typed reason.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_confirm_revert(
+        self,
+        reason: OrchestratorRevertReason,
+    ) -> Self {
+        *self.orchestrator.confirm_revert.lock().unwrap() = Some(reason);
+        self
+    }
 }
 
 const MOCK_MINT_TX_HASH: alloy::primitives::B256 =

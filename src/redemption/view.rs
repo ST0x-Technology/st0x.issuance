@@ -439,7 +439,14 @@ impl RedemptionView {
                 block_number,
                 burned_at,
                 ..
-            }) => Self::Completed {
+            })
+            | RedemptionEvent::OrchestratorTokensBurned {
+                issuer_request_id,
+                tx_hash,
+                block_number,
+                burned_at,
+                ..
+            } => Self::Completed {
                 issuer_request_id: issuer_request_id.clone(),
                 burn_tx_hash: *tx_hash,
                 block_number: *block_number,
@@ -457,10 +464,11 @@ impl RedemptionView {
                 block_number: *block_number,
                 completed_at: *recovered_at,
             },
-            // View stays in Burning — BurnTxSubmitted and BurnIntended is an internal
-            // detail that doesn't change the query-facing state.
+            // View stays in Burning — BurnIntended and the submission events
+            // are internal details that don't change the query-facing state.
             RedemptionEvent::BurnIntended { .. }
             | RedemptionEvent::BurnTxSubmitted { .. }
+            | RedemptionEvent::OrchestratorBurnSubmitted { .. }
             | RedemptionEvent::BurnRecoveryAttempted { .. }
             | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
             | RedemptionEvent::BurnRecoveryExhausted { .. }

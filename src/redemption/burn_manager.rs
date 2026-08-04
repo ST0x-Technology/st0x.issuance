@@ -11,9 +11,9 @@ use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
 use super::{
-    BurnExternalTxId, BurnRecoveryAction, IssuerRedemptionRequestId,
-    Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
-    next_burn_retry_external_tx_id_from_history,
+    BurnExternalTxId, BurnParams, BurnRecoveryAction,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+    RedemptionEvent, next_burn_retry_external_tx_id_from_history,
 };
 use crate::mint::{QuantityConversionError, has_unresolved_mint_intent};
 use crate::receipt_inventory::{
@@ -881,6 +881,7 @@ impl BurnManager {
                     message: err,
                     release_reservation,
                     tx_id: None,
+                    classification: BurnFailureClassification::Unclassified,
                 }))
             }
             Err(AggregateError::UserError(LifecycleError::Apply(
@@ -983,22 +984,15 @@ impl BurnManager {
             return Ok(RecoveryOutcome::SkippedManualIntervention);
         }
 
-        let burns = planned_burns
-            .iter()
-            .map(|burn| MultiBurnEntry {
-                receipt_id: burn.receipt_id,
-                burn_shares: burn.shares_burned,
-                receipt_info: None,
-                receipt_info_bytes: None,
-            })
-            .collect::<Vec<_>>();
         let command = match status {
             BurnTxStatus::StillMineable => RedemptionCommand::BurnTokens {
                 issuer_request_id: issuer_request_id.clone(),
-                vault,
-                burns,
-                dust_shares: sendable_tx.dust_shares,
-                owner: self.bot_wallet,
+                params: BurnParams::VaultDirect {
+                    vault,
+                    burns: planned_to_burn_entries(planned_burns),
+                    dust_shares: sendable_tx.dust_shares,
+                    owner: self.bot_wallet,
+                },
                 external_tx_id,
             },
             BurnTxStatus::ProvablyDead => RedemptionCommand::ReplaceDeadBurn {
@@ -1014,39 +1008,7 @@ impl BurnManager {
         self.store.send(issuer_request_id, command).await?;
 
         if status == BurnTxStatus::ProvablyDead {
-            let Some(Redemption::BurnIntended {
-                planned_burns,
-                sendable_tx,
-                external_tx_id,
-                ..
-            }) = self.store.load(issuer_request_id).await?
-            else {
-                return Err(BurnManagerError::InvalidAggregateState {
-                    current_state: "expected replacement BurnIntended"
-                        .to_string(),
-                });
-            };
-            let replacement_burns = planned_burns
-                .iter()
-                .map(|burn| MultiBurnEntry {
-                    receipt_id: burn.receipt_id,
-                    burn_shares: burn.shares_burned,
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                })
-                .collect();
-            self.store
-                .send(
-                    issuer_request_id,
-                    RedemptionCommand::BurnTokens {
-                        issuer_request_id: issuer_request_id.clone(),
-                        vault,
-                        burns: replacement_burns,
-                        dust_shares: sendable_tx.dust_shares,
-                        owner: self.bot_wallet,
-                        external_tx_id,
-                    },
-                )
+            self.submit_replacement_after_dead_burn(issuer_request_id, vault)
                 .await?;
         }
         drop(wallet_guard);
@@ -1058,6 +1020,46 @@ impl BurnManager {
             "Automatic burn recovery action accepted"
         );
         Ok(RecoveryOutcome::Executed)
+    }
+
+    /// Broadcasts the replacement transaction `ReplaceDeadBurn` just
+    /// persisted: re-loads the aggregate to pick up the freshly intended
+    /// replacement (its plan, signed bytes, and retry `externalTxId`) and
+    /// submits it.
+    async fn submit_replacement_after_dead_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) -> Result<(), BurnManagerError> {
+        let Some(Redemption::BurnIntended {
+            planned_burns,
+            sendable_tx,
+            external_tx_id,
+            ..
+        }) = self.store.load(issuer_request_id).await?
+        else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: "expected replacement BurnIntended".to_string(),
+            });
+        };
+
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: planned_to_burn_entries(&planned_burns),
+                        dust_shares: sendable_tx.dust_shares,
+                        owner: self.bot_wallet,
+                    },
+                    external_tx_id,
+                },
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn recover_single_burning(
@@ -1733,10 +1735,12 @@ impl BurnManager {
                 issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault: execution.vault,
-                    burns: execution.burns.clone(),
-                    dust_shares: execution.dust_shares,
-                    owner: self.bot_wallet,
+                    params: BurnParams::VaultDirect {
+                        vault: execution.vault,
+                        burns: execution.burns.clone(),
+                        dust_shares: execution.dust_shares,
+                        owner: self.bot_wallet,
+                    },
                     external_tx_id: execution.external_tx_id.clone(),
                 },
             )
@@ -1808,10 +1812,12 @@ impl BurnManager {
                 issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault: execution.vault,
-                    burns: execution.burns.clone(),
-                    dust_shares: execution.dust_shares,
-                    owner: self.bot_wallet,
+                    params: BurnParams::VaultDirect {
+                        vault: execution.vault,
+                        burns: execution.burns.clone(),
+                        dust_shares: execution.dust_shares,
+                        owner: self.bot_wallet,
+                    },
                     external_tx_id: execution.external_tx_id.clone(),
                 },
             )
@@ -1825,7 +1831,12 @@ impl BurnManager {
                 self.load_submitted_tx_id(issuer_request_id).await
             }
             Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::Vault { message, release_reservation, tx_id },
+                RedemptionError::Vault {
+                    message,
+                    release_reservation,
+                    tx_id,
+                    classification,
+                },
             ))) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %message,
@@ -1851,6 +1862,7 @@ impl BurnManager {
                             message,
                             release_reservation: false,
                             tx_id,
+                            classification,
                         },
                     ));
                 }
@@ -1859,8 +1871,7 @@ impl BurnManager {
                     .send(
                         issuer_request_id,
                         RedemptionCommand::RecordBurnFailure {
-                            classification:
-                                BurnFailureClassification::Unclassified,
+                            classification: classification.clone(),
                             issuer_request_id: issuer_request_id.clone(),
                             error: message.clone(),
                             tx_id: tx_id.clone(),
@@ -1872,6 +1883,7 @@ impl BurnManager {
                     message,
                     release_reservation,
                     tx_id,
+                    classification,
                 }))
             }
             Err(error) => Err(error.into()),
@@ -1931,7 +1943,12 @@ impl BurnManager {
                 Ok(())
             }
             Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::Vault { message, release_reservation, .. },
+                RedemptionError::Vault {
+                    message,
+                    release_reservation,
+                    classification,
+                    ..
+                },
             ))) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %message,
@@ -1951,8 +1968,7 @@ impl BurnManager {
                         .send(
                             issuer_request_id,
                             RedemptionCommand::RecordBurnFailure {
-                                classification:
-                                    BurnFailureClassification::Unclassified,
+                                classification: classification.clone(),
                                 issuer_request_id: issuer_request_id.clone(),
                                 error: message.clone(),
                                 tx_id: exact_recovery
@@ -1974,6 +1990,7 @@ impl BurnManager {
                     message,
                     release_reservation,
                     tx_id: None,
+                    classification,
                 }))
             }
             Err(error) => Err(error.into()),
@@ -2175,10 +2192,23 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 }
 
 /// Extracts the transaction hash from a `VaultError`.
+fn planned_to_burn_entries(planned: &[BurnRecord]) -> Vec<MultiBurnEntry> {
+    planned
+        .iter()
+        .map(|burn| MultiBurnEntry {
+            receipt_id: burn.receipt_id,
+            burn_shares: burn.shares_burned,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        })
+        .collect()
+}
+
 pub(crate) const fn extract_tx_hash(error: &VaultError) -> Option<B256> {
     match error {
         VaultError::Reverted { tx_hash }
-        | VaultError::EventNotFound { tx_hash } => Some(*tx_hash),
+        | VaultError::EventNotFound { tx_hash }
+        | VaultError::OrchestratorReverted { tx_hash, .. } => Some(*tx_hash),
         _ => None,
     }
 }
@@ -2268,7 +2298,7 @@ mod tests {
     use crate::redemption::RedemptionServices;
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
-        BurnFailureClassification, BurnRecord, BurnRecoveryAction,
+        BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, RedemptionError,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
@@ -2620,15 +2650,17 @@ mod tests {
                 issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(42_U256),
-                        burn_shares: uint!(17_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(42_U256),
+                            burn_shares: uint!(17_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -4904,15 +4936,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: recovery_owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: recovery_owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5084,10 +5118,12 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![],
-                    dust_shares: U256::ZERO,
-                    owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5203,15 +5239,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: recovery_owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: recovery_owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5270,10 +5308,12 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![],
-                    dust_shares: U256::ZERO,
-                    owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5484,15 +5524,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(42_U256),
-                        burn_shares: uint!(17_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(42_U256),
+                            burn_shares: uint!(17_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5563,10 +5605,12 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![],
-                    dust_shares: U256::ZERO,
-                    owner,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5646,15 +5690,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: TEST_WALLET,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5726,12 +5772,14 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![],
-                    dust_shares: U256::ZERO,
-                    owner: TEST_WALLET,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5810,15 +5858,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: TEST_WALLET,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -6194,15 +6244,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![crate::vault::MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: TEST_WALLET,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![crate::vault::MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
                     external_tx_id: None,
                 },
             )
@@ -6214,15 +6266,17 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: vec![crate::vault::MultiBurnEntry {
-                        receipt_id: uint!(99_U256),
-                        burn_shares: uint!(100_000000000000000000_U256),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: TEST_WALLET,
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![crate::vault::MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
                     external_tx_id: None,
                 },
             )
