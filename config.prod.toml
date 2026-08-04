@@ -1,0 +1,10 @@
+# Production TOML configuration, baked into the st0x-issuance systemd unit as
+# `CONFIG=<nix store path>` (see nix/upgradeable-services.nix).
+#
+# Deliberately dark: no [orchestrator] section and no [assets.<SYM>] overrides
+# means every asset runs vault-direct. See config.example.toml for the full
+# schema and the per-asset orchestrator rollout knobs.
+#
+# Parsing is strict — unknown keys and invalid vault_mode strings are startup
+# errors, and any asset resolving to orchestrator mode while
+# [orchestrator].address is missing or malformed is a startup error.
