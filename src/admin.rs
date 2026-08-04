@@ -234,6 +234,7 @@ async fn load_reprocess_context(
                 tx_hash,
                 block_number,
                 detected_at,
+                burn_mode,
             } => {
                 if metadata.is_none() {
                     metadata = Some(RedemptionMetadata {
@@ -246,6 +247,7 @@ async fn load_reprocess_context(
                         detected_tx_hash: *tx_hash,
                         block_number: *block_number,
                         detected_at: *detected_at,
+                        burn_mode: *burn_mode,
                     });
                 }
             }
@@ -2021,6 +2023,7 @@ mod tests {
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
     use crate::auth::FailedAuthRateLimiter;
+    use crate::config::VaultMode;
     use crate::mint::test_utils::{TestHarness, test_config};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::ReceiptVaultKey;
@@ -2028,11 +2031,11 @@ mod tests {
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
         Shares,
     };
-    use crate::redemption::BurnExternalTxId;
+    use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
-        BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId, Redemption,
-        RedemptionCommand, RedemptionEvent, RedemptionMetadata,
-        RedemptionServices, RedemptionView,
+        BurnFailureClassification, BurnRecord, BurnRecoveryAction,
+        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
     use crate::tokenized_asset::schedule::FreezeScheduler;
@@ -2309,6 +2312,7 @@ mod tests {
 
     fn test_metadata() -> RedemptionMetadata {
         RedemptionMetadata {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: IssuerRedemptionRequestId::random(),
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
@@ -2411,6 +2415,8 @@ mod tests {
         let tx_id = TxId::random();
         let failed_at = Utc::now();
         let view = RedemptionView::BurnFailed {
+            burn_mode: VaultMode::VaultDirect,
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: metadata.issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             underlying: metadata.underlying.clone(),
@@ -2503,6 +2509,7 @@ mod tests {
             .send(
                 &metadata.issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -2569,6 +2576,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -2655,6 +2663,7 @@ mod tests {
                     error: "burn terminally failed".to_string(),
                     tx_id: Some(tx_id.clone()),
                     planned_burns: vec![],
+                    classification: BurnFailureClassification::Unclassified,
                 },
             )
             .await
@@ -3090,6 +3099,7 @@ mod tests {
             .send(
                 &metadata.issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -3128,6 +3138,7 @@ mod tests {
             .send(
                 &metadata.issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -3225,6 +3236,7 @@ mod tests {
             .send(
                 &metadata.issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     error: "burn terminally failed".to_string(),
                     tx_id: Some(tx_id),
@@ -4081,6 +4093,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -4211,6 +4224,7 @@ mod tests {
             .send(
                 &metadata.issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -4529,6 +4543,7 @@ mod tests {
         // selects detected_entered_at — this is the post-reprocess clock.
         let detected_entered_at = detected_at + chrono::Duration::days(7);
         let detected = Detected {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
@@ -4547,6 +4562,7 @@ mod tests {
 
         // AlpacaCalled → InProgress with called_at.
         let alpaca_called = AlpacaCalled {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer.clone(),
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
@@ -4571,6 +4587,7 @@ mod tests {
         // redemptions). Use a distinct journal-completion time to make the
         // distinction observable.
         let burning = Burning {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer.clone(),
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
@@ -4607,6 +4624,8 @@ mod tests {
         // variant that motivated this PR (the original red-79631d72 /
         // red-742f9f3a incident).
         let burn_failed = BurnFailed {
+            burn_mode: VaultMode::VaultDirect,
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: issuer.clone(),
             tokenization_request_id: tok_id,
             underlying,
@@ -4661,6 +4680,7 @@ mod tests {
         // detected_entered_at (the post-reprocess clock) over detected_at.
         let detected_entered_at = detected_at + chrono::Duration::days(3);
         let detected_view = RedemptionView::Detected {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: metadata.issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
@@ -4692,6 +4712,7 @@ mod tests {
         let called_at = Utc::now();
         let tok_id = TokenizationRequestId::new("tok-progress");
         let alpaca_called_view = RedemptionView::AlpacaCalled {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: metadata.issuer_request_id.clone(),
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
@@ -4723,6 +4744,7 @@ mod tests {
         let journal_completed_at = Utc::now() - chrono::Duration::days(7);
         let burning_entered_at = Utc::now();
         let burning_view = RedemptionView::Burning {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: metadata.issuer_request_id.clone(),
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
@@ -4757,6 +4779,7 @@ mod tests {
         // text on a post-submission row. BurnTxSubmitted leaves
         // the view in Burning, so this branch is the only signal.
         let burning_view_with_history = RedemptionView::Burning {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: metadata.issuer_request_id.clone(),
             tokenization_request_id: tok_id,
             underlying: metadata.underlying.clone(),
@@ -5000,6 +5023,7 @@ mod tests {
         // back into Burning with NO new submission yet.
         let events = vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -5031,6 +5055,7 @@ mod tests {
                 submitted_at: now,
             },
             RedemptionEvent::BurningFailed {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id: issuer.clone(),
                 error: "tx failed".to_string(),
                 failed_at: now,
@@ -5045,6 +5070,7 @@ mod tests {
             // Operator resumes the burn — no new BurnTxSubmitted
             // has happened yet.
             RedemptionEvent::BurnResumed {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer,
                 underlying,
                 token,
