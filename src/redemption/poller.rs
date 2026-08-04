@@ -498,7 +498,8 @@ where
             }
             TransferOutcome::AlreadyDetected
             | TransferOutcome::SkippedMint
-            | TransferOutcome::SkippedNoAccount => {}
+            | TransferOutcome::SkippedNoAccount
+            | TransferOutcome::SkippedAdminRecovery => {}
         }
 
         Ok(ProcessedLog::Handled)

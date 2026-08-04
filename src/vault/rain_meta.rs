@@ -277,11 +277,18 @@ enum OaSchemaCacheMode {
     /// Fetches schema hashes from the Goldsky subgraph on cache miss.
     Live { client: reqwest::Client, subgraph_url: Url },
 
-    /// Returns a fixed schema hash for any vault. Used in tests to exercise
-    /// the full CBOR encoding path without requiring a live subgraph.
-    #[cfg(test)]
+    /// Returns a fixed schema hash for any vault. Used when the subgraph is
+    /// unavailable (admin burn-excess recovery) and in tests to exercise the
+    /// full CBOR encoding path without a live subgraph.
     Fixed(String),
 }
+
+/// OA schema hash the Rain vaults are deployed against.
+///
+/// Admin paths that always carry the original deposit `receipt_info_bytes` pass
+/// this to [`OaSchemaCache::fixed`] so they need no subgraph.
+pub(crate) const OA_SCHEMA_HASH: &str =
+    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
 
 /// Connect timeout for subgraph HTTP requests.
 const SUBGRAPH_CONNECT_TIMEOUT: std::time::Duration =
@@ -305,7 +312,9 @@ impl OaSchemaCache {
     }
 
     /// Creates a cache that returns a fixed schema hash for any vault address.
-    #[cfg(test)]
+    ///
+    /// Prefer this for admin paths that always pass original deposit
+    /// `receipt_info_bytes` (no re-encoding) so the subgraph is not required.
     pub(crate) fn fixed(schema_hash: &str) -> Self {
         Self {
             mode: OaSchemaCacheMode::Fixed(schema_hash.to_string()),
@@ -323,7 +332,6 @@ impl OaSchemaCache {
     /// timeouts) are NOT cached so subsequent calls will retry.
     pub(crate) async fn get(&self, vault: Address) -> Option<String> {
         match &self.mode {
-            #[cfg(test)]
             OaSchemaCacheMode::Fixed(schema) => return Some(schema.clone()),
             OaSchemaCacheMode::Live { .. } => {}
         }
@@ -399,7 +407,6 @@ impl OaSchemaCache {
                 (client, subgraph_url)
             }
 
-            #[cfg(test)]
             OaSchemaCacheMode::Fixed(_) => {
                 // Fixed mode is handled in get() before reaching here
                 return Ok(None);

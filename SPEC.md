@@ -806,6 +806,9 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 - `issuer freeze <UNDERLYING>` — dispatch the `Freeze` command.
 - `issuer unfreeze <UNDERLYING>` — dispatch the `Unfreeze` command.
 - `issuer status <UNDERLYING>` — print the underlying's current freeze status.
+- `issuer burn-excess internal|external …` — administrative supply correction
+  that burns excess shares from a proven duplicate deposit (see **Burn excess
+  shares** below). Never calls Alpaca; never opens a `Redemption` aggregate.
 - `issuer migrate-receipts <UNDERLYING>` — move a vault's ERC-1155 deposit
   receipts between the Fireblocks and Turnkey wallets. Temporary, for the
   Turnkey signing-backend cutover; removed once every vault has migrated.
@@ -825,7 +828,174 @@ The custody subcommands are listing-scoped and therefore take `--network`, plus
 against the chain that endpoint reports). `migrate-receipts` and
 `verify-custodians` require both custodians' configurations — the `TURNKEY_*`
 group and the `FIREBLOCKS_*` group the retired integration used — all from the
-service's own environment.
+service's own environment. `burn-excess` is listing/network-scoped and takes
+`--network` / `--chain-id` (cross-checked against the RPC-reported chain); its
+RPC endpoint is **not** a CLI flag — it uses the service environment for that
+network (`CHAIN_<NETWORK>_RPC_URL`, with legacy `RPC_URL` as Base fallback), the
+same secrets the long-running bot loads.
+
+### Burn excess shares
+
+There is no supported recovery path for an excess successful mint other than
+this CLI. A duplicate deposit often mints shares to a mint recipient while the
+matching receipt stays in the issuer wallet. Burning that excess via ordinary
+redemption would call Alpaca and release backing — wrong for
+undercollateralisation — and a raw Transfer of shares **into** the issuer wallet
+looks like a real redemption to the transfer poller.
+
+`issuer burn-excess` is an audited administrative supply correction:
+
+1. Prove the **duplicate deposit** (issuer request, deposit tx, receipt id,
+   exact shares, strict `receiptInformation` → issuer request, original share
+   recipient from the deposit path).
+2. Ensure the **issuer wallet** holds exactly the excess shares and enough
+   matching receipt (either already true, or after a proven funding Transfer).
+3. If (and only if) a funding Transfer into the issuer is part of recovery:
+   prove it, persist a durable exclusion so the redemption poller skips **only
+   that log**, then burn.
+4. Burn via vault `redeem` with persist-before-broadcast. **Never** Alpaca;
+   **never** a `Redemption` aggregate for this path.
+
+#### Path selection: required mode keyword
+
+The operator must pick the path with a required mode keyword immediately after
+`burn-excess`. The CLI never infers path from balances or from whether a funding
+hash happens to be present.
+
+```text
+issuer burn-excess <internal|external> [shared args…] [mode-specific…]
+```
+
+| Mode keyword | Path               | Meaning                                                                                                                        |
+| ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `internal`   | A — issuer-held    | Excess shares already sit in the issuer wallet (deposit original recipient must be the issuer); no funding Transfer to exclude |
+| `external`   | B — fund-then-burn | Shares were moved into the issuer by a Transfer that would look like a redemption; prove + exclude that log, then burn         |
+
+Shared args (both modes): `--issuer-request-id`, `--deposit-tx-hash`,
+`--receipt-id`, `--shares`, `--reason`, `--incident-id`, `--network`,
+`--chain-id`, `--execute`, `--close`, plus SignerEnv / DB. RPC comes from the
+service environment for `--network` (not passed on the command line).
+
+Mode-specific:
+
+| Mode       | Required                                   | Forbidden                                     |
+| ---------- | ------------------------------------------ | --------------------------------------------- |
+| `internal` | (none beyond shared)                       | `--funding-tx-hash` is not on this subcommand |
+| `external` | `--funding-tx-hash <0x…>` required by clap | —                                             |
+
+**Fresh run:** path is chosen **only** from the mode keyword. Issuer share
+balance, original recipient == issuer, freeze status, and funding-hash presence
+do **not** select path.
+
+**Resume:** aggregate id is the **deposit tx hash**. When a `BurnExcess` stream
+already exists, **stored path wins**. Re-invoke must use the same mode keyword;
+switching modes is `PathConflict`. External resumes also require the same
+funding tx hash as recorded.
+
+| Aggregate state                 | Locked path  | Required mode            | Funding hash                |
+| ------------------------------- | ------------ | ------------------------ | --------------------------- |
+| `NotStarted`                    | from keyword | `internal` or `external` | required only if `external` |
+| `FundingExcluded`               | External     | `external` only          | must match recorded         |
+| `Intended`/`Submitted` External | External     | `external` only          | must match recorded         |
+| `Intended`/`Submitted` Internal | Internal     | `internal` only          | N/A                         |
+| `Completed` / `Closed`          | locked       | report-only              | no re-path                  |
+
+#### Path behaviour
+
+|                                        | `internal` (Path A)               | `external` (Path B)                                   |
+| -------------------------------------- | --------------------------------- | ----------------------------------------------------- |
+| Funding                                | N/A                               | Required `--funding-tx-hash`                          |
+| Poller exclusion                       | **None**                          | **Yes** — only that verified funding log identity     |
+| First irreversible step on `--execute` | Sign + persist `IntendExcessBurn` | Persist `FundingExclusionRecorded`, then later intend |
+| Burn                                   | Same `VaultService` redeem        | Same                                                  |
+
+**Freeze is not a gate.** Freeze status may be printed as advisory; a frozen
+underlying neither blocks nor unlocks burn-excess. Ops still stop issuance /
+pause conflicting producers as needed.
+
+**Exact issuer share balance.** After path-specific funding (Path B) or
+immediately (Path A), issuer ERC-20 share balance must **exactly** equal the
+excess amount. Any extra shares at the issuer refuse
+(`IssuerShareBalanceNotExact`).
+
+**Path A recipient gate.** `internal` refuses when the deposit's original share
+recipient is not the issuer wallet (`InternalRequiresIssuerAsRecipient`); ops
+must fund shares back and use `external --funding-tx-hash …`.
+
+**Funding exclusion (Path B only).** The proof binds
+`(network, vault, tx_hash, log_index, from, to, amount)`; `from`, `to`, and
+`amount` are persisted for audit. The durable skip key is
+`(network, vault, tx_hash, log_index)`, and the poller skips only logs present
+under that key (`SkippedAdminRecovery`). Neighbours in the same tx/block remain
+eligible. No block-range skip; no checkpoint jump; no “skip all from address X”.
+Exclusion once recorded is permanent for that log (including after burn
+complete/close). Engine dual-writes the SQL index after `RecordFundingExclusion`
+and refuses prepare if the row is missing (resume re-writes the row from the
+recorded event before the presence check). Startup and CLI store open rebuild
+the index from every `FundingExclusionRecorded` event so a restored or truncated
+index table cannot leave the poller free to open a `Redemption` for an excluded
+funding Transfer. If a `Redemption` already exists for that funding tx → refuse
+(`FundingAlreadyRedeemed`), re-checked immediately before exclusion record.
+Transfer logs without `log_index` fail closed (`MissingLogIndex`) so Detect
+cannot open a redemption for an unidentifiable excluded funding log.
+
+**Dead intent / Closed.** `--close` clears the wallet nonce gate only. `Closed`
+is report-only terminal for that deposit stream (no re-intend on the same
+`deposit_tx_hash`). Reverted/ProvablyDead on resume surfaces `DeadBurnIntent`
+with that guidance.
+
+**Post-burn inventory.** After on-chain verify the stream completes, then
+inventory is reconciled. Reconcile failure fails the CLI (non-zero) even though
+the burn already landed — ops re-run report-only + manual inventory.
+
+**Dry-run (default)** proves and prints the plan (including `mode=` / `path=`
+and, for Path B, the funding log id) without events, signing, or exclusion.
+Wallet intent gates still run on dry-run (an unresolved mint/burn signer-intent
+reservation on the deposit's network, or any unresolved excess intent, refuses
+prove) so operators see the same blockers they would hit on `--execute`.
+`--execute` requires confirmation before the first irreversible step (Path A:
+intend; Path B: exclusion record) and before resume broadcast/confirm of a
+persisted `sendable_tx.hash`.
+
+**Wallet intent gates.** An unresolved excess-burn recovery refuses competing
+mint prepare and redemption burn prepare/replace paths (same family as mint/burn
+intent gates). `BurnExcess` holds no `active_signer_intents` reservation, so it
+is checked separately from the network-keyed signer-intent guard rather than
+through it. `Intended` / `Submitted` count because they hold a signed nonce.
+`FundingExcluded` counts too: it holds no signed transaction yet, but its
+exclusion write is already permanent and the stream will sign against the same
+issuer wallet, so a Path B recovery abandoned before intend must be resumed or
+`--close`d rather than raced. Gates are re-read at the irreversible sign
+boundary, together with the issuer receipt and exact share balances — the
+operator confirm prompt blocks for an unbounded time, so balances proven at plan
+time are re-read immediately before `prepare_burn_tx` signs. Deposit and funding
+proofs are mined history and are not re-read.
+
+**The issuer service must be stopped for Path B.** `FundingAlreadyRedeemed` is
+re-checked immediately before the exclusion write, but that is a check, not a
+cross-process lock: a running transfer poller can open a `Redemption` for the
+funding Transfer first and steer incident remediation onto the ordinary Alpaca
+path. Poller quiescence is therefore an operator precondition, in the same
+family as the `migrate-receipts` sequence, and the Path B plan output states it
+before the confirmation prompt.
+
+**Non-goals:** Alpaca journal / release of backing; moving the receipt to a
+liquidity wallet; block-range skip or manual checkpoint mutation; general
+redemption bypass (exclusion is one verified funding log only); auto dead-tx
+replacement; admin HTTP; multi-receipt burns; hard-coded production hashes as
+the sole path.
+
+**Production incident bind (Path B shape; values are proven inputs, never typed
+addresses as free-form operator targets):**
+
+| Input                   | Value                                                                |
+| ----------------------- | -------------------------------------------------------------------- |
+| Issuer request          | `d3042b2f-4845-4acd-9a67-92d743e4e58c`                               |
+| Duplicate deposit       | `0x1bb6afc590e58095099373a8fea2242017b31acc7940bcd0d6b68820ebeb8ebd` |
+| Issuer wallet           | `0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE`                         |
+| Original mint recipient | `0xA9C16673F65AE808688cB18952AFE3d9658C808f`                         |
+| Receipt ID              | `7`                                                                  |
+| Shares                  | `0.750` (`750000000000000000` raw)                                   |
 
 **No wallet address is ever an argument.** An ERC-1155 transfer to a wrong
 address is final — no counterparty, no recovery, and the receipts back tokens

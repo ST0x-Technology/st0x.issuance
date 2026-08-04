@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::burn_excess::BurnExcessId;
 use crate::mint::{
     IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
@@ -518,6 +519,18 @@ pub(crate) struct MultiBurnEntry {
     pub(crate) receipt_info_bytes: Option<Bytes>,
 }
 
+/// Which domain flow asked for a burn.
+///
+/// The vault burn path serves both the redemption pipeline and the operator
+/// excess-recovery CLI. Each owns its own aggregate keyspace, so the
+/// correlation id must carry that keyspace with it: an excess recovery must
+/// not be able to name a slot in the `Redemption` keyspace, even by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum BurnRequestOrigin {
+    Redemption(IssuerRedemptionRequestId),
+    ExcessRecovery(BurnExcessId),
+}
+
 /// Parameters for a multi-receipt burn operation.
 ///
 /// Atomically burns shares from multiple receipts in a single transaction.
@@ -533,8 +546,8 @@ pub(crate) struct MultiBurnParams {
     pub(crate) owner: Address,
     /// User's address that will receive the dust
     pub(crate) user: Address,
-    /// Redemption's issuer request ID
-    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    /// Domain flow this burn belongs to, and its correlation ID
+    pub(crate) origin: BurnRequestOrigin,
     /// Full transaction hash that triggered this redemption, used for
     /// constructing a collision-resistant `externalTxId`.
     pub(crate) detected_tx_hash: B256,
