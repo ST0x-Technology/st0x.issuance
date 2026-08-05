@@ -261,6 +261,7 @@ mod tests {
 
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
+    use crate::config::VaultMode;
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, network_vault_services, test_config,
     };
@@ -284,6 +285,7 @@ mod tests {
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -346,6 +348,7 @@ mod tests {
             TokenizationRequestId::new("alp-reject-ok-test");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -409,6 +412,7 @@ mod tests {
             TokenizationRequestId::new("alp-complete-123");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -501,6 +505,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 MintCommand::Initiate {
+                    mint_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     quantity: Quantity::new(Decimal::from(100)),
@@ -580,6 +585,7 @@ mod tests {
             TokenizationRequestId::new("alp-view-123");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -662,6 +668,7 @@ mod tests {
             TokenizationRequestId::new("alp-reject-123");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -742,6 +749,7 @@ mod tests {
             TokenizationRequestId::new("alp-reject-view-123");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),
@@ -828,6 +836,7 @@ mod tests {
             TokenizationRequestId::new("alp-wrong");
 
         let initiate_cmd = MintCommand::Initiate {
+            mint_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: correct_tokenization_request_id.clone(),
             quantity: Quantity::new(Decimal::from(100)),

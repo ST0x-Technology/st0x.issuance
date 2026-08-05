@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::vault::{PreparedMintTx, TxId};
+use crate::config::VaultMode;
+use crate::vault::{MintAuthorization, PreparedMintTx, TxId};
 
 use super::{
     ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
@@ -22,6 +23,15 @@ pub(crate) enum MintEvent {
         client_id: ClientId,
         wallet: Address,
         initiated_at: DateTime<Utc>,
+        /// The asset's `VaultMode` resolved from config at initiate time,
+        /// before any possible mint submission. Anchors mode-derivation for
+        /// this mint the same way `RedemptionDetected.burn_mode` anchors it
+        /// for redemptions: `SubmitMint`/`ConfirmMint`/`Recover` derive mode
+        /// from this persisted field, never from live config, and never from
+        /// the presence of `mint_authorization`. Absent on historical events,
+        /// which all predate orchestrator mode (`VaultDirect`).
+        #[serde(default)]
+        mint_mode: VaultMode,
     },
     JournalConfirmed {
         issuer_request_id: IssuerMintRequestId,
@@ -99,6 +109,17 @@ pub(crate) enum MintEvent {
         tx_hash: Option<TxHash>,
         started_at: DateTime<Utc>,
     },
+
+    /// The liquidity bot's validated `MintAuthV1` for this mint, delivered
+    /// out-of-band via the internal mint-authorization call (orchestrator
+    /// mode only). This is the persistence point for the nonce — `Initiated`
+    /// is written on the Alpaca POST, strictly before the authorization
+    /// exists, so it cannot carry one. Does not change the lifecycle state.
+    MintAuthorizationReceived {
+        issuer_request_id: IssuerMintRequestId,
+        mint_authorization: MintAuthorization,
+        received_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
@@ -133,6 +154,9 @@ impl DomainEvent for MintEvent {
             }
             Self::MintRetryStarted { .. } => {
                 "MintEvent::MintRetryStarted".to_string()
+            }
+            Self::MintAuthorizationReceived { .. } => {
+                "MintEvent::MintAuthorizationReceived".to_string()
             }
         }
     }
