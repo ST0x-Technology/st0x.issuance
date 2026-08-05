@@ -7,6 +7,44 @@ use crate::mint::IssuerMintRequestId;
 use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
 use crate::vault::ReceiptInformation;
 
+/// The ITN deposit inventory already tracks for an issuer request.
+///
+/// Inventory is 1:1 on `issuer_request_id`, held as an index into receipt
+/// metadata. Both variants are a tracked identity: an index entry whose
+/// metadata is missing still names the receipt, which is enough to refuse a
+/// second deposit. Reading that case as "nothing tracked" is the one way the
+/// duplicate-deposit gate could fail open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum TrackedItnDeposit {
+    /// The tracked receipt and the deposit transaction that created it.
+    Receipt { receipt_id: ReceiptId, tx_hash: TxHash },
+    /// The index maps the request to this receipt, but inventory holds no
+    /// metadata for it.
+    IndexOnly { receipt_id: ReceiptId },
+}
+
+impl TrackedItnDeposit {
+    pub(crate) const fn receipt_id(&self) -> ReceiptId {
+        match self {
+            Self::Receipt { receipt_id, .. }
+            | Self::IndexOnly { receipt_id } => *receipt_id,
+        }
+    }
+}
+
+impl std::fmt::Display for TrackedItnDeposit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Receipt { receipt_id, tx_hash } => {
+                write!(formatter, "receipt {receipt_id} (tx {tx_hash})")
+            }
+            Self::IndexOnly { receipt_id } => {
+                write!(formatter, "receipt {receipt_id} (metadata missing)")
+            }
+        }
+    }
+}
+
 /// Identifies how a receipt was created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum ReceiptSource {
@@ -83,6 +121,23 @@ pub(crate) enum ReceiptInventoryEvent {
         to: Address,
         tx_hash: Option<TxHash>,
     },
+    /// A second ITN `Deposit` was observed for a request inventory already
+    /// tracks — an excess mint that must be burned, never re-minted.
+    ///
+    /// Recorded rather than only logged because backfill advances its
+    /// checkpoint past the block afterwards and never re-scans it: without an
+    /// event the duplicate survives only as one log line, and remediation
+    /// (`issuer burn-excess`) needs both identities. This event records the
+    /// observation only — `Discovered` is deliberately NOT emitted for the
+    /// duplicate, so inventory stays 1:1 and the second deposit never becomes
+    /// spendable receipt balance.
+    ConflictingItnDepositObserved {
+        issuer_request_id: IssuerMintRequestId,
+        tracked: TrackedItnDeposit,
+        discovered_receipt_id: ReceiptId,
+        discovered_tx_hash: TxHash,
+        discovered_block_number: u64,
+    },
 }
 
 impl DomainEvent for ReceiptInventoryEvent {
@@ -111,6 +166,10 @@ impl DomainEvent for ReceiptInventoryEvent {
             }
             Self::CustodyMigrated { .. } => {
                 "ReceiptInventoryEvent::CustodyMigrated".to_string()
+            }
+            Self::ConflictingItnDepositObserved { .. } => {
+                "ReceiptInventoryEvent::ConflictingItnDepositObserved"
+                    .to_string()
             }
         }
     }

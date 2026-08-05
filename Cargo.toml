@@ -95,7 +95,7 @@ rsa = "0.9.10"
 rust_decimal_macros = "1.40.0"
 st0x-issuance-client = { path = "crates/client" }
 tempfile = "3.23.0"
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "test-util"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 
 [workspace]

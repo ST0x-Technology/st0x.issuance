@@ -130,9 +130,19 @@ pub(crate) enum MintCommand {
     /// Admin-closes a mint that cannot be automatically recovered.
     ///
     /// Valid from any non-terminal state. Closed mints are excluded from
-    /// recovery and stuck queries.
+    /// recovery and stuck queries. When the mint still holds a prepared
+    /// deposit identity (`MintTxIntended` / `TxSubmitted` with prepared
+    /// bytes, including via `MintingFailed`), the operator must supply
+    /// `acknowledged_unresolved_mint_tx_hash` equal to that exact hash.
+    ///
+    /// A legacy `TxSubmitted` carrying no prepared bytes falls back to its
+    /// stored `tx_id` when that id is a transaction hash, and requires the
+    /// same acknowledgement — the submission is on the wire and recovery still
+    /// confirm-polls it. Supplying an acknowledgement when no such identity
+    /// exists is rejected.
     CloseMint {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
     },
 }

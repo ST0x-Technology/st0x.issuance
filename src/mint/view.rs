@@ -159,6 +159,8 @@ pub(crate) enum MintView {
     Closed {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        #[serde(default)]
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
         closed_at: DateTime<Utc>,
     },
 }
@@ -751,6 +753,7 @@ mod tests {
             &MintView::Closed {
                 issuer_request_id: closed_fields.issuer_request_id,
                 reason: "closed by admin".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
                 closed_at: now,
             },
         )

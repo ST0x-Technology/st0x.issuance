@@ -9,12 +9,12 @@ use futures::{StreamExt, stream};
 use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{error, info, trace, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, ReceiptSource, Shares, determine_source,
-    send_receipt_inventory_command,
+    load_inventory, send_receipt_inventory_command,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::IssuerMintRequestId;
@@ -101,6 +101,18 @@ pub(crate) enum BackfillError {
     Aggregate(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Checkpoint error: {0}")]
     Checkpoint(#[from] CheckpointError),
+    /// Inventory could not be loaded while checking an ITN Deposit for
+    /// duplicate `issuer_request_id`. Fail closed before advancing the
+    /// backfill checkpoint so the same block range is retried once inventory
+    /// is readable again.
+    #[error(
+        "ITN inventory unreadable for issuer_request_id {issuer_request_id} \
+         (receipt_id {receipt_id}); refusing discovery and checkpoint advance"
+    )]
+    ItnInventoryUnreadable {
+        issuer_request_id: IssuerMintRequestId,
+        receipt_id: ReceiptId,
+    },
 }
 
 impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
@@ -483,6 +495,54 @@ where
             Some(discovery.receipt_information.clone())
         };
 
+        // Inventory is 1:1 on issuer_request_id for ITN mints. A second Deposit
+        // with a different receipt_id / tx_hash for the same request is an
+        // unrecoverable double-mint signal (operator: burn-excess / investigate).
+        // Do not apply DiscoverReceipt — that would insert the duplicate and
+        // overwrite `itn_receipts[issuer_request_id]`. Inventory load failure
+        // also fails closed (skip discovery) so we never invent a second index.
+        if let ReceiptSource::Itn { ref issuer_request_id } = source {
+            match self
+                .detect_duplicate_itn_deposit(
+                    issuer_request_id,
+                    discovery.receipt_id,
+                    discovery.tx_hash,
+                )
+                .await
+            {
+                ItnDepositCheck::Clear => {}
+                ItnDepositCheck::Conflict => {
+                    // The checkpoint advances past this block once the pass
+                    // completes and the range is never re-scanned, so the
+                    // duplicate must be recorded now or it survives only as
+                    // the log line above. `DiscoverReceipt` is still skipped:
+                    // the event records the observation, never tracked balance.
+                    send_receipt_inventory_command(
+                        &self.store,
+                        self.chain_id,
+                        &self.vault,
+                        ReceiptInventoryCommand::RecordConflictingItnDeposit {
+                            issuer_request_id: issuer_request_id.clone(),
+                            discovered_receipt_id: discovery.receipt_id,
+                            discovered_tx_hash: discovery.tx_hash,
+                            discovered_block_number: discovery.block_number,
+                        },
+                    )
+                    .await?;
+
+                    return Ok(ProcessOutcome::Processed);
+                }
+                ItnDepositCheck::Unreadable => {
+                    // Transient inventory failure: stop the pass so the
+                    // checkpoint is not advanced past this block range.
+                    return Err(BackfillError::ItnInventoryUnreadable {
+                        issuer_request_id: issuer_request_id.clone(),
+                        receipt_id: discovery.receipt_id,
+                    });
+                }
+            }
+        }
+
         send_receipt_inventory_command(
             &self.store,
             self.chain_id,
@@ -526,6 +586,63 @@ where
         Ok(ProcessOutcome::Processed)
     }
 
+    /// Check whether a second Deposit/receipt for an already-tracked ITN mint
+    /// id is being discovered. Inventory is 1:1 on `issuer_request_id`, so a
+    /// conflicting receipt id or tx hash is operator-actionable double-mint
+    /// evidence (use `issuer burn-excess` after proving the excess deposit).
+    ///
+    /// Inventory load failure is fail-closed (`Unreadable`): the caller must
+    /// not apply `DiscoverReceipt` without a successful conflict check.
+    async fn detect_duplicate_itn_deposit(
+        &self,
+        issuer_request_id: &IssuerMintRequestId,
+        discovered_receipt_id: ReceiptId,
+        discovered_tx_hash: TxHash,
+    ) -> ItnDepositCheck {
+        let inventory =
+            match load_inventory(&self.store, self.chain_id, &self.vault).await
+            {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    warn!(
+                        target: "receipt",
+                        issuer_request_id = %issuer_request_id,
+                        discovered_receipt_id = %discovered_receipt_id,
+                        discovered_tx_hash = %discovered_tx_hash,
+                        vault = %self.vault,
+                        chain_id = self.chain_id,
+                        error = %error,
+                        "Failed to load inventory for ITN duplicate-deposit \
+                         check; refusing discovery until inventory is readable"
+                    );
+                    return ItnDepositCheck::Unreadable;
+                }
+            };
+
+        let Some(tracked) = inventory.conflicting_itn_deposit(
+            issuer_request_id,
+            discovered_receipt_id,
+            discovered_tx_hash,
+        ) else {
+            return ItnDepositCheck::Clear;
+        };
+
+        error!(
+            target: "receipt",
+            issuer_request_id = %issuer_request_id,
+            tracked = %tracked,
+            existing_receipt_id = %tracked.receipt_id(),
+            discovered_receipt_id = %discovered_receipt_id,
+            discovered_tx_hash = %discovered_tx_hash,
+            vault = %self.vault,
+            chain_id = self.chain_id,
+            "Duplicate Deposit/receipt for already-tracked issuer_request_id; \
+             operator intervention required (do not mint again; consider burn-excess)"
+        );
+
+        ItnDepositCheck::Conflict
+    }
+
     /// Queries the on-chain balance of a receipt and reconciles the aggregate.
     async fn reconcile_receipt(
         &self,
@@ -558,6 +675,16 @@ where
 
         Ok(())
     }
+}
+
+/// Outcome of the ITN 1:1 deposit conflict check before applying discovery.
+enum ItnDepositCheck {
+    /// No prior ITN receipt, or same identity rediscovery.
+    Clear,
+    /// Second deposit conflicts with inventory — do not DiscoverReceipt.
+    Conflict,
+    /// Inventory could not be loaded — fail closed (do not DiscoverReceipt).
+    Unreadable,
 }
 
 struct FetchedLogs {

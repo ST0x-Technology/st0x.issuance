@@ -4,7 +4,9 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, U256, b256};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolEvent;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -13,7 +15,9 @@ use tokio::sync::{Mutex, MutexGuard};
 use uuid::{Uuid, uuid};
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
-use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
+use st0x_issuance::bindings::OffchainAssetReceiptVault::{
+    self, OffchainAssetReceiptVaultInstance,
+};
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
@@ -1367,6 +1371,475 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
         failed_count, 1,
         "Stuck BurnFailed redemption should have a RedemptionFailed event (auto-failed). \
          Found {failed_count}. Recovery is not auto-failing redemptions with insufficient balance."
+    );
+
+    Ok(())
+}
+
+/// Count vault `Deposit` logs on Anvil (all owners). Used to assert a mint
+/// recovery path never submits a second on-chain deposit.
+async fn count_vault_deposits(
+    provider: &impl Provider,
+    vault_address: Address,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let vault = OffchainAssetReceiptVaultInstance::new(vault_address, provider);
+    let deposit_logs =
+        provider.get_logs(&vault.Deposit_filter().from_block(0).filter).await?;
+    let mut count = 0usize;
+    for log in &deposit_logs {
+        OffchainAssetReceiptVault::Deposit::decode_log(&log.inner).map_err(
+            |error| format!("failed to decode vault Deposit log: {error}"),
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Poison a completed mint back to `TxSubmitted` by deleting events after the
+/// latest `MintTxSubmitted` (and clearing snapshots). Event-store-only setup
+/// for double-mint recovery e2e scenarios.
+async fn poison_mint_to_tx_submitted(
+    db_url: &str,
+    issuer_request_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+
+    let submitted_sequence: i64 = sqlx::query_scalar(
+        "
+        SELECT sequence
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND event_type = 'MintEvent::MintTxSubmitted'
+        ORDER BY sequence DESC
+        LIMIT 1
+        ",
+    )
+    .bind(issuer_request_id)
+    .fetch_one(&query_pool)
+    .await?;
+
+    sqlx::query(
+        "
+        DELETE FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND sequence > ?
+        ",
+    )
+    .bind(issuer_request_id)
+    .bind(submitted_sequence)
+    .execute(&query_pool)
+    .await?;
+
+    sqlx::query(
+        "
+        DELETE FROM snapshots
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+        ",
+    )
+    .bind(issuer_request_id)
+    .execute(&query_pool)
+    .await?;
+
+    query_pool.close().await;
+    Ok(submitted_sequence)
+}
+
+/// Poison a completed mint to `MintingFailed` after the latest
+/// `MintTxSubmitted` (null-receipt class of production failure).
+async fn poison_mint_to_minting_failed(
+    db_url: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let submitted_sequence =
+        poison_mint_to_tx_submitted(db_url, issuer_request_id).await?;
+
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+
+    let failed_sequence = submitted_sequence + 1;
+    let failed_payload = json!({
+        "MintingFailed": {
+            "issuer_request_id": issuer_request_id,
+            "error": "Simulated null receipt / uncertain confirmation after mined deposit",
+            "failed_at": (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+        }
+    });
+    insert_event(
+        &query_pool,
+        "Mint",
+        issuer_request_id,
+        i32::try_from(failed_sequence)?,
+        "MintEvent::MintingFailed",
+        &failed_payload,
+    )
+    .await?;
+
+    query_pool.close().await;
+    Ok(())
+}
+
+/// Production race: first vault deposit mined, confirmation observation was
+/// null / uncertain (RPC `NullResp` / timeout). Pre-fix the bot recorded
+/// `MintingFailed` and prepared a **second** deposit (~1 minute later),
+/// double-minting supply (incident: 0.750 wtPTY).
+///
+/// Correct behaviour:
+/// 1. Uncertain confirm leaves `TxSubmitted` (no `MintingFailed`).
+/// 2. Recovery re-observes the **same** prepared hash and completes callback.
+/// 3. Exactly one on-chain `Deposit` and one `MintTxIntended` for the mint.
+///
+/// This e2e cannot inject a live null receipt from Anvil; it reproduces the
+/// durable mid-flight state after a mined deposit whose confirm never recorded
+/// `TokensMinted` (rollback to `MintTxSubmitted`), then proves restart recovery
+/// finishes without a second deposit.
+#[tokio::test]
+async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join("test_mined_deposit_unrecorded_confirm_no_double_mint.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+
+    let (config1, _mock_subgraph1) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client1, user_wallet).await;
+    let issuer_request_id = harness::perform_mint_and_confirm(
+        &client1,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-uncertain-confirm-no-double-mint",
+        "50.0",
+    )
+    .await?;
+
+    let user_wallet_instance = EthereumWallet::from(user_signer.clone());
+    let user_provider = create_provider()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+    let shares_before = harness::wait_for_shares(&vault, user_wallet).await?;
+    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
+
+    wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintCompleted",
+        1,
+    )
+    .await?;
+
+    let deposits_before =
+        count_vault_deposits(&user_provider, evm.vault_address).await?;
+    assert_eq!(
+        deposits_before, 1,
+        "happy-path mint must create exactly one Deposit before rollback"
+    );
+
+    let intended_before = wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintTxIntended",
+        1,
+    )
+    .await?;
+    assert_eq!(intended_before, 1, "happy-path mint must prepare exactly once");
+
+    client1.terminate().await;
+
+    // Setup phase: event-store only. Drop TokensMinted/MintCompleted so the
+    // aggregate is again `TxSubmitted` with the live prepared identity while
+    // the on-chain deposit remains mined — the durable window after uncertain
+    // confirm (or a crash before TokensMinted).
+    let submitted_sequence =
+        poison_mint_to_tx_submitted(&db_url, &issuer_request_id).await?;
+
+    let remaining = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+        ",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(
+        &SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?,
+    )
+    .await?;
+    assert_eq!(
+        remaining, submitted_sequence,
+        "rollback must leave the mint at MintTxSubmitted (seq {submitted_sequence})"
+    );
+
+    // Restart: recovery re-enqueues ConfirmMint for the same hash.
+    let (config2, _mock_subgraph2) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    harness::wait_for_mock_hits(&mint_callback_mock, 2).await?;
+    // Settle briefly then re-assert exact count so late extra callbacks fail.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "recovery must deliver exactly one additional mint callback (no extras)"
+    );
+
+    let completed_count = wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintCompleted",
+        1,
+    )
+    .await?;
+    assert_eq!(
+        completed_count, 1,
+        "recovery must complete the mint exactly once"
+    );
+
+    let intended_after = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND event_type = 'MintEvent::MintTxIntended'
+        ",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(
+        &SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?,
+    )
+    .await?;
+    assert_eq!(
+        intended_after, 1,
+        "recovery must not prepare a second MintTxIntended (same hash only)"
+    );
+
+    let minting_failed_count = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND event_type = 'MintEvent::MintingFailed'
+        ",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(
+        &SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?,
+    )
+    .await?;
+    assert_eq!(
+        minting_failed_count, 0,
+        "uncertain/unrecorded confirm recovery must not record MintingFailed"
+    );
+
+    let deposits_after =
+        count_vault_deposits(&user_provider, evm.vault_address).await?;
+    assert_eq!(
+        deposits_after, 1,
+        "must keep exactly one on-chain Deposit; got {deposits_after}"
+    );
+
+    let shares_after = vault.balanceOf(user_wallet).call().await?;
+    assert_eq!(
+        shares_after, shares_before,
+        "share balance must not change (no double mint). \
+         Before: {shares_before}, After: {shares_after}"
+    );
+
+    Ok(())
+}
+
+/// Same production class of failure, but the durable poison state is
+/// `MintingFailed` after a mined deposit (what the old bot wrote when it
+/// treated null receipt as terminal). Recovery must reclassify the live
+/// prepared identity / inventory hit and complete without a second Deposit.
+#[tokio::test]
+async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join("test_minting_failed_after_mined_deposit_no_double_mint.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+
+    let (config1, _mock_subgraph1) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client1, user_wallet).await;
+    let issuer_request_id = harness::perform_mint_and_confirm(
+        &client1,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-minting-failed-after-mined-no-double",
+        "50.0",
+    )
+    .await?;
+
+    let user_wallet_instance = EthereumWallet::from(user_signer.clone());
+    let user_provider = create_provider()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+    let shares_before = harness::wait_for_shares(&vault, user_wallet).await?;
+    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
+
+    wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintCompleted",
+        1,
+    )
+    .await?;
+
+    let deposits_before =
+        count_vault_deposits(&user_provider, evm.vault_address).await?;
+    assert_eq!(deposits_before, 1);
+
+    client1.terminate().await;
+
+    poison_mint_to_minting_failed(&db_url, &issuer_request_id).await?;
+
+    let (config2, _mock_subgraph2) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    harness::wait_for_mock_hits(&mint_callback_mock, 2).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "MintingFailed recovery must deliver exactly one additional callback"
+    );
+
+    let completed_count = wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintCompleted",
+        1,
+    )
+    .await?;
+    assert_eq!(
+        completed_count, 1,
+        "MintingFailed recovery must complete the mint exactly once"
+    );
+
+    let intended_after = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND event_type = 'MintEvent::MintTxIntended'
+        ",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(
+        &SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?,
+    )
+    .await?;
+    assert_eq!(
+        intended_after, 1,
+        "MintingFailed recovery after a mined deposit must not prepare a second intent"
+    );
+
+    // Pins the other poison state: recovery that records a fresh failure and
+    // then completes through inventory would still satisfy the intent count.
+    let minting_failed_after = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)
+        FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND event_type = 'MintEvent::MintingFailed'
+        ",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(
+        &SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?,
+    )
+    .await?;
+    assert_eq!(
+        minting_failed_after, 1,
+        "recovery must not append another MintingFailed to the seeded one"
+    );
+
+    let deposits_after =
+        count_vault_deposits(&user_provider, evm.vault_address).await?;
+    assert_eq!(
+        deposits_after, 1,
+        "must keep exactly one on-chain Deposit after MintingFailed recovery"
+    );
+
+    let shares_after = vault.balanceOf(user_wallet).call().await?;
+    assert_eq!(
+        shares_after, shares_before,
+        "share balance must not change (no double mint)"
     );
 
     Ok(())

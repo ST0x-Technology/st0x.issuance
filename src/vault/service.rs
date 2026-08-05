@@ -20,7 +20,7 @@ use tracing::debug;
 
 use super::rain_meta::OaSchemaCache;
 use super::{
-    BurnTxStatus, BurnVerification, MintResult, MultiBurnResult,
+    BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnResult,
     MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
     SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
     WalletNonceGuard, classify_checked_receipt, verify_burn_in_receipt,
@@ -183,55 +183,202 @@ impl VaultService for RealBlockchainService {
         &self,
         tx_id: &TxId,
     ) -> Result<MintResult, VaultError> {
-        // Fetch receipt from chain using tx hash
+        // Bounded Option poll of eth_getTransactionReceipt — never
+        // PendingTransactionBuilder::get_receipt as the terminal classifier.
+        // Uncertain outcomes surface as ConfirmationPending so jobs fail closed
+        // instead of recording MintingFailed and authorizing a second deposit.
         debug!(target: "vault", tx_hash = %tx_id,
             "Getting mint tx from chain"
         );
 
         let tx_hash = tx_id.to_hash().ok_or(VaultError::InvalidReceipt)?;
 
-        let receipt = PendingTransactionBuilder::new(
-            self.provider.root().clone(),
-            tx_hash,
+        // Overall budget matches the historical 120s PendingTransactionBuilder
+        // timeout; cadence is a simple fixed sleep (no multi-RPC failover).
+        // Wrap the entire poll (including in-flight RPC) so a hanging provider
+        // call cannot exceed the budget and hold an apalis worker slot.
+        const CONFIRM_MINT_TIMEOUT: Duration = Duration::from_secs(120);
+        const CONFIRM_MINT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+        let poll = async {
+            loop {
+                let receipt = match self
+                    .provider
+                    .get_transaction_receipt(tx_hash)
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        // Transport / RPC blips are uncertain — never Reverted.
+                        return Err(VaultError::ConfirmationPending {
+                            tx_id: TxId::Hash(tx_hash),
+                            message: error.to_string(),
+                        });
+                    }
+                };
+
+                let Some(receipt) = receipt else {
+                    debug!(target: "vault",
+                        tx_hash = %tx_hash,
+                        "Mint receipt not yet available; polling"
+                    );
+                    tokio::time::sleep(CONFIRM_MINT_POLL_INTERVAL).await;
+                    continue;
+                };
+
+                if receipt.transaction_hash != tx_hash
+                    || receipt.block_number.is_none()
+                {
+                    return Err(VaultError::InvalidReceipt);
+                }
+
+                if !receipt.status() {
+                    debug!(target: "vault",
+                        tx_hash = %tx_hash,
+                        "Mint transaction mined with status=0"
+                    );
+                    return Err(VaultError::Reverted { tx_hash });
+                }
+
+                let (receipt_id, shares_minted, receipt_info_bytes) = receipt
+                    .inner
+                    .logs()
+                    .iter()
+                    .find_map(|log| {
+                        log.log_decode::<OffchainAssetReceiptVault::Deposit>()
+                            .ok()
+                            .map(|decoded| {
+                                let event_data = decoded.data();
+                                (
+                                    event_data.id,
+                                    event_data.shares,
+                                    event_data.receiptInformation.clone(),
+                                )
+                            })
+                    })
+                    .ok_or_else(|| VaultError::EventNotFound { tx_hash })?;
+
+                let block_number =
+                    receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+
+                debug!(target: "vault",
+                    tx_hash = %tx_hash,
+                    block_number,
+                    receipt_id = %receipt_id,
+                    "Mint transaction confirmed with Deposit"
+                );
+
+                return Ok(MintResult {
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    gas_used: receipt.gas_used,
+                    block_number,
+                    receipt_info_bytes,
+                });
+            }
+        };
+
+        tokio::time::timeout(CONFIRM_MINT_TIMEOUT, poll).await.unwrap_or_else(
+            |_| {
+                Err(VaultError::ConfirmationPending {
+                    tx_id: TxId::Hash(tx_hash),
+                    message:
+                        "receipt polling budget exhausted without a receipt"
+                            .to_string(),
+                })
+            },
         )
-        .with_timeout(Some(Duration::from_secs(120)))
-        .get_receipt()
-        .await?;
+    }
 
-        // A mined-but-reverted burn consumes no receipts, so it is a definitive
-        // failure distinct from an anomalous missing-Withdraw parse error.
-        if !receipt.status() {
-            return Err(VaultError::Reverted { tx_hash });
-        }
+    async fn classify_mint_tx(
+        &self,
+        owner: Address,
+        prepared_tx: &PreparedMintTx,
+    ) -> Result<MintTxStatus, VaultError> {
+        prepared_tx.validate_for_owner(owner)?;
+        let status = if let Some(receipt) =
+            self.provider.get_transaction_receipt(prepared_tx.hash).await?
+        {
+            if receipt.transaction_hash != prepared_tx.hash
+                || receipt.block_number.is_none()
+            {
+                return Err(VaultError::InvalidReceipt);
+            }
 
-        let (receipt_id, shares_minted, receipt_info_bytes) = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| {
-                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
-                    |decoded| {
-                        let event_data = decoded.data();
-                        (
-                            event_data.id,
-                            event_data.shares,
-                            event_data.receiptInformation.clone(),
-                        )
+            if receipt.status() {
+                MintTxStatus::MinedSuccess
+            } else {
+                MintTxStatus::MinedReverted
+            }
+        } else {
+            let latest_nonce =
+                self.provider.get_transaction_count(owner).latest().await?;
+            let finalized_nonce =
+                self.provider.get_transaction_count(owner).finalized().await?;
+            let status = if finalized_nonce > prepared_tx.nonce {
+                match self
+                    .provider
+                    .get_transaction_receipt(prepared_tx.hash)
+                    .await?
+                {
+                    Some(receipt) => {
+                        if receipt.transaction_hash != prepared_tx.hash
+                            || receipt.block_number.is_none()
+                        {
+                            return Err(VaultError::InvalidReceipt);
+                        }
+                        if receipt.status() {
+                            MintTxStatus::MinedSuccess
+                        } else {
+                            MintTxStatus::MinedReverted
+                        }
+                    }
+                    // `ProvablyDead` unlocks `RecordMintFailed` and a
+                    // replacement prepare, so it must not rest on a single
+                    // absent receipt: a lagging or load-balanced RPC node can
+                    // answer `None` for a receipt that exists. A node that has
+                    // also forgotten the transaction corroborates the death; a
+                    // node that still knows it is contradicting itself, which
+                    // is uncertainty rather than proof.
+                    None => match self
+                        .provider
+                        .get_transaction_by_hash(prepared_tx.hash)
+                        .await?
+                    {
+                        None => MintTxStatus::ProvablyDead,
+                        Some(_) => {
+                            return Err(
+                                VaultError::ContradictoryDeathSignals {
+                                    tx_hash: prepared_tx.hash,
+                                    nonce: prepared_tx.nonce,
+                                },
+                            );
+                        }
                     },
-                )
-            })
-            .ok_or_else(|| VaultError::EventNotFound { tx_hash })?;
-
-        Ok(MintResult {
-            tx_hash,
-            receipt_id,
-            shares_minted,
-            gas_used: receipt.gas_used,
-            block_number: receipt
-                .block_number
-                .ok_or(VaultError::InvalidReceipt)?,
-            receipt_info_bytes,
-        })
+                }
+            } else {
+                MintTxStatus::StillMineable
+            };
+            debug!(target: "vault",
+                owner = %owner,
+                tx_hash = %prepared_tx.hash,
+                nonce = prepared_tx.nonce,
+                latest_nonce,
+                finalized_nonce,
+                status = ?status,
+                "Classified persisted mint transaction"
+            );
+            return Ok(status);
+        };
+        debug!(target: "vault",
+            owner = %owner,
+            tx_hash = %prepared_tx.hash,
+            nonce = prepared_tx.nonce,
+            status = ?status,
+            "Classified persisted mint transaction"
+        );
+        Ok(status)
     }
 
     async fn get_share_balance(
@@ -639,8 +786,9 @@ mod tests {
     use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
-        BurnRequestOrigin, BurnTxStatus, MultiBurnEntry, MultiBurnParams,
-        ReceiptInformation, SendableTxWithHash, TxId, VaultError, VaultService,
+        BurnRequestOrigin, BurnTxStatus, MintTxStatus, MultiBurnEntry,
+        MultiBurnParams, PreparedMintTx, ReceiptInformation,
+        SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_OA_SCHEMA: &str =
@@ -1028,8 +1176,7 @@ mod tests {
 
         receipt.transaction_hash = prepared.hash;
         asserter.push_success(&prepared.hash);
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
+        asserter.push_success(&Some(receipt));
         let submitted = service.submit_mint(&prepared).await.unwrap();
         assert_eq!(submitted.tx_id, TxId::from(prepared.hash));
 
@@ -1132,8 +1279,7 @@ mod tests {
         let prepared = prepared.unwrap();
         receipt.transaction_hash = prepared.hash;
         asserter.push_success(&prepared.hash);
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
+        asserter.push_success(&Some(receipt));
         let submitted = service.submit_mint(&prepared).await.unwrap();
 
         let result = service.confirm_mint(&submitted.tx_id).await;
@@ -1143,6 +1289,250 @@ mod tests {
         assert!(
             matches!(err, VaultError::EventNotFound { .. }),
             "Expected EventNotFound but got: {err:?}"
+        );
+    }
+
+    fn persisted_mint_tx(nonce: u64) -> PreparedMintTx {
+        PreparedMintTx::valid_for_test(nonce, format!("mint-test-{nonce}"))
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_reports_mined_and_reverted_receipts() {
+        for (succeeded, expected) in [
+            (true, MintTxStatus::MinedSuccess),
+            (false, MintTxStatus::MinedReverted),
+        ] {
+            let persisted = persisted_mint_tx(7);
+            let owner = persisted.signer_for_test();
+            let mut receipt =
+                create_empty_receipt(test_vault_address(), persisted.hash);
+            receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                Receipt {
+                    status: Eip658Value::Eip658(succeeded),
+                    cumulative_gas_used: 0x6100,
+                    logs: vec![],
+                },
+                Bloom::default(),
+            ));
+            let asserter = Asserter::new();
+            asserter.push_success(&receipt);
+            let service = create_service_with_asserter(asserter);
+
+            let status = service
+                .classify_mint_tx(owner, &persisted)
+                .await
+                .expect("receipt should classify");
+
+            assert_eq!(status, expected);
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn classify_mint_tx_requires_finalized_nonce_to_prove_death() {
+        let persisted = persisted_mint_tx(7);
+        let owner = persisted.signer_for_test();
+
+        for (latest_nonce, finalized_nonce, expected) in [
+            (7, 7, MintTxStatus::StillMineable),
+            (8, 7, MintTxStatus::StillMineable),
+            (8, 8, MintTxStatus::ProvablyDead),
+        ] {
+            let asserter = Asserter::new();
+            asserter.push_success(&Option::<TransactionReceipt>::None);
+            asserter.push_success(&latest_nonce);
+            asserter.push_success(&finalized_nonce);
+            if finalized_nonce > persisted.nonce {
+                asserter.push_success(&Option::<TransactionReceipt>::None);
+                // Death needs the node to have forgotten the transaction too.
+                asserter.push_success(&Option::<RpcTransaction>::None);
+            }
+            let service = create_service_with_asserter(asserter);
+
+            let status = service
+                .classify_mint_tx(owner, &persisted)
+                .await
+                .expect("missing receipt should classify by finalized nonce");
+
+            assert_eq!(status, expected);
+        }
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "Classified persisted mint transaction",
+                "latest_nonce=8",
+                "finalized_nonce=7",
+                "StillMineable"
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_refuses_death_while_the_node_still_holds_the_tx()
+    {
+        let persisted = persisted_mint_tx(7);
+        let owner = persisted.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<TransactionReceipt>::None);
+        asserter.push_success(&8u64);
+        asserter.push_success(&8u64);
+        asserter.push_success(&Option::<TransactionReceipt>::None);
+        // A finalized nonce past ours says the nonce is spent, but the node
+        // answering with the transaction says it is not spent by another. One
+        // node cannot have it both ways, so this is not a death proof.
+        asserter.push_success(&Some(rpc_transaction(&persisted.tx, owner)));
+        let service = create_service_with_asserter(asserter);
+
+        let error = service
+            .classify_mint_tx(owner, &persisted)
+            .await
+            .expect_err("contradictory node answers must not prove death");
+
+        assert!(
+            matches!(
+                error,
+                VaultError::ContradictoryDeathSignals { tx_hash, nonce }
+                    if tx_hash == persisted.hash && nonce == persisted.nonce
+            ),
+            "expected ContradictoryDeathSignals, got {error:?}"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn classify_mint_tx_rechecks_receipt_after_nonce_advances() {
+        let persisted = persisted_mint_tx(7);
+        let owner = persisted.signer_for_test();
+        let receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<TransactionReceipt>::None);
+        asserter.push_success(&8u64);
+        asserter.push_success(&8u64);
+        asserter.push_success(&Some(receipt));
+        let service = create_service_with_asserter(asserter);
+
+        let status = service
+            .classify_mint_tx(owner, &persisted)
+            .await
+            .expect("the second receipt read should win the nonce race");
+
+        assert_eq!(status, MintTxStatus::MinedSuccess);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Classified persisted mint transaction", "MinedSuccess"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_rejects_unmined_receipt_shape() {
+        let persisted = persisted_mint_tx(7);
+        let owner = persisted.signer_for_test();
+        let mut receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        receipt.block_number = None;
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.classify_mint_tx(owner, &persisted).await;
+
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_rejects_corrupt_persisted_identity_before_rpc() {
+        let mut persisted = persisted_mint_tx(7);
+        persisted.hash = B256::ZERO;
+        let service = create_service_with_asserter(Asserter::new());
+
+        let result =
+            service.classify_mint_tx(test_receiver(), &persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedMintHashMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_rejects_a_different_signer_before_rpc() {
+        let persisted = persisted_mint_tx(7);
+        let service = create_service_with_asserter(Asserter::new());
+
+        let result = service.classify_mint_tx(Address::ZERO, &persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedMintSignerMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_mint_status_zero_is_reverted() {
+        let persisted = persisted_mint_tx(3);
+        let mut receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(false),
+                cumulative_gas_used: 0x6100,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(receipt));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.confirm_mint(&TxId::from(persisted.hash)).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::Reverted { tx_hash }) if tx_hash == persisted.hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_mint_rpc_error_reports_confirmation_pending() {
+        let persisted = persisted_mint_tx(3);
+        let asserter = Asserter::new();
+        // Transport/RPC blips must fail closed as ConfirmationPending (never
+        // Reverted). Direct RPC failure on the first receipt poll avoids the
+        // 120s empty-receipt budget in unit tests.
+        asserter.push_failure_msg("forced transport blip");
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.confirm_mint(&TxId::from(persisted.hash)).await;
+
+        assert!(
+            matches!(result, Err(VaultError::ConfirmationPending { .. })),
+            "expected ConfirmationPending, got {result:?}"
+        );
+    }
+
+    /// Empty receipts until the 120s poll budget expires must surface
+    /// `ConfirmationPending` (never Reverted / MintingFailed). Uses Tokio's
+    /// paused clock so the budget elapses without a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn confirm_mint_poll_budget_exhausted_reports_confirmation_pending() {
+        let persisted = persisted_mint_tx(3);
+        let asserter = Asserter::new();
+        // 120s budget / 2s interval ≈ 60 polls; pad past the deadline.
+        for _ in 0..80 {
+            asserter.push_success(&Option::<TransactionReceipt>::None);
+        }
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.confirm_mint(&TxId::from(persisted.hash)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::ConfirmationPending { ref message, .. })
+                    if message.contains("budget exhausted")
+            ),
+            "expected ConfirmationPending budget exhausted, got {result:?}"
         );
     }
 
@@ -1178,10 +1568,10 @@ mod tests {
     }
 
     fn rpc_transaction(
-        persisted: &SendableTxWithHash,
+        encoded_tx: &[u8],
         reported_signer: Address,
     ) -> RpcTransaction {
-        let mut encoded = persisted.tx.as_ref();
+        let mut encoded = encoded_tx;
         let envelope = TxEnvelope::decode_2718(&mut encoded)
             .expect("test transaction should decode");
 
@@ -1207,7 +1597,7 @@ mod tests {
         );
         let owner = persisted.signer_for_test();
         let receiver = test_receiver();
-        let transaction = rpc_transaction(&persisted, owner);
+        let transaction = rpc_transaction(&persisted.tx, owner);
         let receipt = create_multi_withdraw_receipt(
             vault_address,
             persisted.hash,
@@ -1235,7 +1625,7 @@ mod tests {
     async fn verify_burn_tx_rejects_rpc_transaction_for_another_hash() {
         let persisted = persisted_burn_tx(17);
         let owner = persisted.signer_for_test();
-        let transaction = rpc_transaction(&persisted, owner);
+        let transaction = rpc_transaction(&persisted.tx, owner);
         let requested_tx_hash = B256::random();
         let asserter = Asserter::new();
         asserter.push_success(&transaction);
@@ -1252,7 +1642,7 @@ mod tests {
     async fn verify_burn_tx_rejects_rpc_transaction_with_inconsistent_from() {
         let persisted = persisted_burn_tx(17);
         let owner = persisted.signer_for_test();
-        let transaction = rpc_transaction(&persisted, Address::random());
+        let transaction = rpc_transaction(&persisted.tx, Address::random());
         let asserter = Asserter::new();
         asserter.push_success(&transaction);
         let service = create_service_with_asserter(asserter);
@@ -1268,7 +1658,7 @@ mod tests {
     async fn verify_burn_tx_rejects_another_signature_when_rpc_reports_owner() {
         let persisted = persisted_burn_tx(17);
         let owner = Address::random();
-        let transaction = rpc_transaction(&persisted, owner);
+        let transaction = rpc_transaction(&persisted.tx, owner);
         let asserter = Asserter::new();
         asserter.push_success(&transaction);
         let service = create_service_with_asserter(asserter);
@@ -1287,7 +1677,7 @@ mod tests {
     async fn verify_burn_tx_rejects_rpc_receipt_for_another_hash() {
         let persisted = persisted_burn_tx(17);
         let owner = persisted.signer_for_test();
-        let transaction = rpc_transaction(&persisted, owner);
+        let transaction = rpc_transaction(&persisted.tx, owner);
         let receipt =
             create_empty_receipt(test_vault_address(), B256::random());
         let asserter = Asserter::new();

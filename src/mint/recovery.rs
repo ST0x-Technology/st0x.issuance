@@ -20,7 +20,9 @@ use super::{
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
-use crate::vault::{NetworkVaultServices, TxId, UnconfiguredNetworkError};
+use crate::vault::{
+    MintTxStatus, NetworkVaultServices, TxId, UnconfiguredNetworkError,
+};
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
 /// failed mint by enqueuing the appropriate per-state job.
@@ -41,8 +43,9 @@ pub(crate) struct MintRecoveryContext {
 /// reconciler. On-chain evidence (`tx_hash`, receipt id, shares) is already
 /// in inventory from the preceding `DiscoverReceipt`; the recovery /
 /// `SubmitMintJob` path loads that receipt and records it via
-/// `RecordExistingMint` (or re-submits only when no receipt exists — the
-/// signer does not dedup on `external_tx_id`).
+/// `RecordExistingMint` (or rebroadcasts / replaces only after burn-parity
+/// classification — never relying on `external_tx_id` for double-mint safety;
+/// the signer does not dedup on it).
 #[derive(Clone)]
 pub(crate) struct MintRecoveryHandler {
     pool: Pool<Sqlite>,
@@ -412,7 +415,12 @@ pub(crate) async fn push_mint_recovery_job(
 /// idempotency key is free to re-enqueue, leaving any active (`Pending`/
 /// `Running`) row so the re-enqueue still dedups against it. Runs on the
 /// event-store pool (same SQLite file as the apalis pool).
-async fn release_terminal_job(
+///
+/// Shared by recovery enqueue helpers and normal-flow jobs (e.g.
+/// [`super::job::SubmitMintJob::enqueue_confirm`]) so a prior `Done` confirm
+/// cannot silently drop a re-enqueue via apalis
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING`.
+pub(crate) async fn release_terminal_job(
     pool: &Pool<Sqlite>,
     job_type: &str,
     idempotency_key: &str,
@@ -937,6 +945,35 @@ async fn recover_mint_until_automatic_budget_exhausted(
             // The state is recoverable and due: enqueue the per-state job that
             // advances it, then poll for progress on the next iteration.
             AutomaticRetryDecision::Ready => {
+                // Same inventory gate as Wait/Exhausted for MintingFailed: fail
+                // closed while inventory is unreadable (may free-prepare), and
+                // surface an existing receipt so SubmitMintJob records it.
+                if matches!(&mint, Mint::MintingFailed { .. }) {
+                    match minting_failed_receipt_exists_with_backoff(
+                        ctx,
+                        &mint,
+                        issuer_request_id,
+                        backoff,
+                        &mut receipt_load_failure_backoffs,
+                    )
+                    .await
+                    {
+                        Ok(Some(true)) => {
+                            // Inside the budget loop and falling through to
+                            // another poll, so DEBUG for the same reason the
+                            // fail-closed step below is DEBUG.
+                            debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                                "MintingFailed ready for retry but on-chain receipt exists; driving recovery"
+                            );
+                        }
+                        Ok(Some(false)) => {}
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            return RecoveryConclusion::Abandoned { reason };
+                        }
+                    }
+                }
+
                 no_progress_polls += 1;
                 if no_progress_polls > max_no_progress_polls {
                     warn!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -978,6 +1015,8 @@ enum MintRecoveryStepError {
     AssetView(#[from] TokenizedAssetViewError),
     #[error(transparent)]
     UnconfiguredNetwork(#[from] UnconfiguredNetworkError),
+    #[error(transparent)]
+    ReceiptLookup(#[from] crate::receipt_inventory::ReceiptLookupError),
     #[error("no vault configured for {underlying} on {network}")]
     VaultNotFound { underlying: UnderlyingSymbol, network: Network },
 }
@@ -990,8 +1029,12 @@ struct ResolvedVault {
 
 /// Advances a recoverable mint one step by enqueuing the appropriate per-state
 /// job (or issuing the pure transition that precedes it). The durable jobs
-/// perform the actual I/O; recovery only schedules them. The deterministic
-/// `external_tx_id` keeps a re-submission double-mint-safe.
+/// perform the actual I/O; recovery only schedules them.
+///
+/// After a prepared identity exists, recovery **never** treats `external_tx_id`
+/// as double-mint protection — only exact-hash classification / rebroadcast
+/// (or inventory) is safe. Replacement requires `MinedReverted` or
+/// `ProvablyDead` under the wallet guard.
 async fn drive_one_step(
     ctx: &MintRecoveryContext,
     mint: &Mint,
@@ -1015,19 +1058,18 @@ async fn drive_one_step(
             let vault = resolve_vault(ctx, underlying, *network).await?;
             enqueue_submit(ctx, issuer_request_id, vault).await?;
         }
-        // Retry a failed mint: transition back to Minting (advancing the attempt
-        // counter), then enqueue a fresh submission.
+        // Failed mint: classify any live prepared identity under the wallet
+        // guard before RetryMint. StillMineable / Uncertain never authorize a
+        // fresh prepare; only terminal dead/revert may replace after recheck.
         Mint::MintingFailed { underlying, network, .. } => {
-            ctx.mint_store
-                .send(
-                    issuer_request_id,
-                    MintCommand::RetryMint {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                )
-                .await?;
-            let vault = resolve_vault(ctx, underlying, *network).await?;
-            enqueue_submit(ctx, issuer_request_id, vault).await?;
+            drive_minting_failed_step(
+                ctx,
+                mint,
+                issuer_request_id,
+                underlying,
+                *network,
+            )
+            .await?;
         }
         Mint::TxSubmitted { underlying, network, tx_id, .. } => {
             let vault = resolve_vault(ctx, underlying, *network).await?;
@@ -1042,6 +1084,228 @@ async fn drive_one_step(
         _ => {}
     }
 
+    Ok(())
+}
+
+/// Recovery step for `MintingFailed`. Inventory hits are handled by the
+/// budget loop / SubmitMintJob receipt check; here we gate RetryMint on
+/// observation of any predecessor prepared identity.
+async fn drive_minting_failed_step(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+    underlying: &UnderlyingSymbol,
+    network: Network,
+) -> Result<(), MintRecoveryStepError> {
+    let vault = resolve_vault(ctx, underlying, network).await?;
+
+    let Some(prepared) = mint.pending_prepared_tx() else {
+        // Post-intent without prepared bytes (legacy TxSubmitted): never
+        // free-prepare a replacement — that is the double-mint hole. Inventory
+        // may still record an existing mint via SubmitMintJob; otherwise only
+        // confirm-poll the known tx_id and leave MintingFailed for ops.
+        if mint.has_unclassifiable_post_intent_identity() {
+            let receipt_exists = match minting_failed_receipt_exists(
+                ctx,
+                mint,
+                issuer_request_id,
+            )
+            .await
+            {
+                Ok(exists) => exists,
+                Err(error) => {
+                    // Lookup failure is not "no receipt": refuse free-prepare
+                    // and fall through to confirm-poll / ops ERROR below.
+                    warn!(
+                        target: "mint",
+                        issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Inventory lookup failed for post-submit MintingFailed \
+                         without prepared_tx; fail closed"
+                    );
+                    false
+                }
+            };
+            if receipt_exists {
+                info!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    "MintingFailed post-submit without prepared_tx but inventory \
+                     has receipt; RetryMint so SubmitMintJob can record ExistingMint"
+                );
+                authorize_resubmit(ctx, issuer_request_id, vault).await?;
+                return Ok(());
+            }
+
+            // `has_unclassifiable_post_intent_identity` and
+            // `latest_known_tx_id` read the same `TxSubmitted` predecessor, so
+            // the tx_id is present here and the confirm poll below always runs.
+            // That makes this pass self-recovering, and this step repeats on
+            // every recovery poll — an ERROR per pass would alarm on a system
+            // that is still re-observing. ERROR stays for the accessors
+            // disagreeing, where nothing is left to poll and only an operator
+            // can resolve it.
+            let Some(tx_id) = mint.latest_known_tx_id() else {
+                error!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    "MintingFailed after post-submit identity without \
+                     prepared_tx or a known tx_id; fail closed with nothing \
+                     left to poll (never free-prepare)"
+                );
+                return Ok(());
+            };
+
+            debug!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_id = ?tx_id,
+                "MintingFailed after post-submit identity without prepared_tx; \
+                 fail closed (confirm poll / inventory only; never free-prepare)"
+            );
+            enqueue_confirm(ctx, issuer_request_id, vault, tx_id).await?;
+            return Ok(());
+        }
+
+        // True pre-intent failure (Minting only / never intended): no on-chain
+        // identity — existing retry schedule may prepare a first mint.
+        authorize_resubmit(ctx, issuer_request_id, vault).await?;
+        return Ok(());
+    };
+
+    let vault_service = ctx.vault_services.service(network)?;
+    let owner = match prepared.recover_signer() {
+        Ok(owner) => owner,
+        Err(error) => {
+            // Corrupt identity: fail closed — cannot prove death without a
+            // valid envelope; leave MintingFailed for operator/restart.
+            warn!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Cannot recover signer from prepared mint; fail closed"
+            );
+            return Ok(());
+        }
+    };
+
+    let wallet_guard = vault_service.lock_wallet().await;
+    let status = match vault_service.classify_mint_tx(owner, &prepared).await {
+        Ok(status) => status,
+        Err(error) => {
+            drop(wallet_guard);
+            warn!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %prepared.hash,
+                nonce = prepared.nonce,
+                error = %error,
+                "Mint recovery classification uncertain; not replacing"
+            );
+            return Ok(());
+        }
+    };
+
+    match status {
+        MintTxStatus::StillMineable => {
+            // Mempool-live / unconfirmed: rebroadcast same prepared hash.
+            // SubmitMintJob classifies again and rebroadcasts without preparing.
+            info!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %prepared.hash,
+                nonce = prepared.nonce,
+                status = ?status,
+                "Mint recovery rebroadcasting existing identity"
+            );
+            drop(wallet_guard);
+            authorize_resubmit(ctx, issuer_request_id, vault).await?;
+        }
+        MintTxStatus::MinedSuccess => {
+            // Receipt exists: observe via confirm while still MintingFailed
+            // (ConfirmMintJob::confirm_while_minting_failed → RecordExistingMint).
+            // Do not re-enter submit — a mined deposit must not rebroadcast.
+            info!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %prepared.hash,
+                nonce = prepared.nonce,
+                "Mint recovery confirming mined success for existing identity"
+            );
+            drop(wallet_guard);
+            enqueue_confirm(
+                ctx,
+                issuer_request_id,
+                vault,
+                TxId::from(prepared.hash),
+            )
+            .await?;
+        }
+        MintTxStatus::MinedReverted | MintTxStatus::ProvablyDead => {
+            // TOCTOU recheck immediately before allowing replacement prepare.
+            let recheck =
+                match vault_service.classify_mint_tx(owner, &prepared).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        drop(wallet_guard);
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %issuer_request_id,
+                            tx_hash = %prepared.hash,
+                            error = %error,
+                            "Mint recovery recheck uncertain; not replacing"
+                        );
+                        return Ok(());
+                    }
+                };
+            if !matches!(
+                recheck,
+                MintTxStatus::MinedReverted | MintTxStatus::ProvablyDead
+            ) {
+                drop(wallet_guard);
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %prepared.hash,
+                    first = ?status,
+                    recheck = ?recheck,
+                    "Mint recovery recheck no longer terminal; not replacing"
+                );
+                return Ok(());
+            }
+
+            info!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %prepared.hash,
+                nonce = prepared.nonce,
+                status = ?recheck,
+                "Mint recovery authorizing replacement after terminal dead/revert"
+            );
+            drop(wallet_guard);
+            authorize_resubmit(ctx, issuer_request_id, vault).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `RetryMint` + enqueue `SubmitMintJob` — shared by free-prepare-safe and
+/// rebroadcast / replacement-authorized recovery paths under `MintingFailed`.
+async fn authorize_resubmit(
+    ctx: &MintRecoveryContext,
+    issuer_request_id: &IssuerMintRequestId,
+    vault: ResolvedVault,
+) -> Result<(), MintRecoveryStepError> {
+    ctx.mint_store
+        .send(
+            issuer_request_id,
+            MintCommand::RetryMint {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await?;
+    enqueue_submit(ctx, issuer_request_id, vault).await?;
     Ok(())
 }
 
@@ -1064,21 +1328,21 @@ async fn resolve_vault(
 /// Whether a `MintingFailed` mint already has a discovered receipt — i.e. its
 /// on-chain transaction actually succeeded after the mint was marked failed.
 /// When true, recovery should record the existing mint now rather than wait out
-/// the re-submission backoff. A non-`MintingFailed` state, an unresolved vault,
-/// or a lookup error is treated as "no receipt" so recovery falls back to the
-/// normal retry schedule.
+/// the re-submission backoff. Only a non-`MintingFailed` state answers a
+/// definite "no receipt"; an unresolved vault or an unreadable inventory is
+/// "cannot tell" and must surface as an error. Answering `false` there would
+/// abandon a mint whose deposit already succeeded, since retry exhaustion reads
+/// `false` as proof that nothing was minted.
 async fn minting_failed_receipt_exists(
     ctx: &MintRecoveryContext,
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
-) -> Result<bool, crate::receipt_inventory::ReceiptLookupError> {
+) -> Result<bool, MintRecoveryStepError> {
     let Mint::MintingFailed { underlying, network, .. } = mint else {
         return Ok(false);
     };
 
-    let Ok(vault) = resolve_vault(ctx, underlying, *network).await else {
-        return Ok(false);
-    };
+    let vault = resolve_vault(ctx, underlying, *network).await?;
 
     ctx.receipts
         .find_by_issuer_request_id(
@@ -1088,6 +1352,7 @@ async fn minting_failed_receipt_exists(
         )
         .await
         .map(|receipt| receipt.is_some())
+        .map_err(Into::into)
 }
 
 /// Enqueues a per-state job for a recovering mint, first freeing the mint's
@@ -1177,7 +1442,8 @@ async fn enqueue_callback(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, B256, U256, address};
+    use async_trait::async_trait;
     use chrono::Utc;
     use event_sorcery::test_store;
     use rust_decimal::Decimal;
@@ -1193,9 +1459,110 @@ mod tests {
         ClientId, IssuerMintRequestId, MintEvent, MintExternalTxId, Network,
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::log_count_at;
+    use crate::receipt_inventory::{
+        BurnPlan, BurnTrackingError, CqrsReceiptService, MintedReceiptParams,
+        ReceiptInventory, ReceiptLookupError, ReceiptRegistrationError,
+        RecoveredReceipt, Shares,
+    };
+    use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
+    use crate::vault::mock::MockVaultService;
+    use crate::vault::{MintTxStatus, PreparedMintTx, VaultService};
+
+    /// Configurable `ReceiptService` stub for recovery tests. Only
+    /// `find_by_issuer_request_id` is behavior-specific; other methods are
+    /// no-ops so a future trait method needs one edit instead of three.
+    enum ReceiptLookupBehavior {
+        Present,
+        Fails,
+    }
+
+    struct ReceiptLookupStub(ReceiptLookupBehavior);
+
+    #[async_trait]
+    impl ReceiptService for ReceiptLookupStub {
+        async fn register_minted_receipt(
+            &self,
+            _params: MintedReceiptParams,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
+        }
+
+        async fn for_burn(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _redemption_issuer_request_id: &IssuerRedemptionRequestId,
+            _shares_to_burn: Shares,
+            _dust: Shares,
+        ) -> Result<BurnPlan, BurnTrackingError> {
+            Ok(BurnPlan {
+                allocations: vec![],
+                total_burn: Shares::ZERO,
+                dust: Shares::ZERO,
+            })
+        }
+
+        async fn reserve_burn(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _redemption_issuer_request_id: IssuerRedemptionRequestId,
+            _burns: Vec<BurnRecord>,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
+        }
+
+        async fn release_burn(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
+        }
+
+        async fn settle_burn(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
+        }
+
+        async fn reserved_redemptions(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+        ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
+        {
+            Ok(vec![])
+        }
+
+        async fn find_by_issuer_request_id(
+            &self,
+            _chain_id: u64,
+            _vault: &Address,
+            issuer_request_id: &IssuerMintRequestId,
+        ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
+            match self.0 {
+                ReceiptLookupBehavior::Present => Ok(Some(RecoveredReceipt {
+                    receipt_id: U256::from(1),
+                    tx_hash: B256::ZERO,
+                    shares: U256::from(100),
+                    block_number: 1,
+                })),
+                ReceiptLookupBehavior::Fails => {
+                    Err(ReceiptLookupError::Inconsistent {
+                        issuer_request_id: issuer_request_id.clone(),
+                        receipt_id: U256::from(1).into(),
+                    })
+                }
+            }
+        }
+    }
 
     /// Builds a real event-sorcery [`Store<Mint>`] over a file-backed SQLite
     /// pool shared with an apalis-sqlite pool (so the durable per-state queues
@@ -1267,6 +1634,11 @@ mod tests {
             }
         }
 
+        /// Override the vault service used by recovery (classification mocks).
+        fn with_vault(self, vault: Arc<dyn VaultService>) -> Self {
+            Self { vault_services: network_vault_services(vault), ..self }
+        }
+
         /// Seeds the event store with raw `Mint` events, putting the aggregate
         /// directly into the desired lifecycle state. Mirrors the e2e
         /// setup-phase pattern of writing rows to the `events` table; the
@@ -1322,7 +1694,26 @@ mod tests {
         }
     }
 
-    fn tx_failed_events(
+    /// True pre-intent failure (`Minting` only — never `MintTxIntended` /
+    /// `MintTxSubmitted`). Recovery may free-prepare on RetryMint.
+    fn pre_intent_failed_events(
+        issuer_request_id: &IssuerMintRequestId,
+        failed_at: chrono::DateTime<Utc>,
+    ) -> Vec<MintEvent> {
+        let mut events = minting_events(issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "prepare or pre-submit failure".to_string(),
+            failed_at,
+        });
+
+        events
+    }
+
+    /// Legacy post-submit failure: `MintTxSubmitted` without a preceding
+    /// `MintTxIntended`, so `prepared_tx` is `None` on the predecessor.
+    /// Free-prepare is forbidden; recovery must fail closed.
+    fn post_submit_without_prepared_failed_events(
         issuer_request_id: &IssuerMintRequestId,
         failed_at: chrono::DateTime<Utc>,
     ) -> Vec<MintEvent> {
@@ -1334,6 +1725,58 @@ mod tests {
         });
 
         events
+    }
+
+    /// MintingFailed after TxIntended + TxSubmitted so `prepared_tx` is retained
+    /// on the predecessor (load-bearing for rebroadcast vs fresh prepare).
+    fn tx_failed_with_prepared_events(
+        issuer_request_id: &IssuerMintRequestId,
+        failed_at: chrono::DateTime<Utc>,
+        prepared_tx: PreparedMintTx,
+    ) -> Vec<MintEvent> {
+        // failed_at must be after intent/submit so the fixture is causally
+        // ordered (callers often pass Utc::now() - N minutes for backoff).
+        let intended_at = failed_at - chrono::Duration::minutes(2);
+        let submitted_at = failed_at - chrono::Duration::minutes(1);
+        let mut events = minting_events(issuer_request_id);
+        let hash = prepared_tx.hash;
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx,
+            intended_at,
+        });
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            tx_id: TxId::from(hash),
+            submitted_at,
+        });
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "prior confirm uncertain or reverted".to_string(),
+            failed_at,
+        });
+        events
+    }
+
+    async fn count_jobs_for_mint(
+        pool: &Pool<Sqlite>,
+        job_ty: &str,
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE job_type = ?
+              AND idempotency_key = ?
+            ",
+        )
+        .bind(job_ty)
+        .bind(issuer_request_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     fn test_issuer_request_id() -> IssuerMintRequestId {
@@ -1398,7 +1841,7 @@ mod tests {
     async fn scheduled_recovery_backs_off_without_progress() {
         let issuer_request_id = test_issuer_request_id();
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
-        let events = tx_failed_events(&issuer_request_id, failed_at);
+        let events = pre_intent_failed_events(&issuer_request_id, failed_at);
         let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
@@ -1436,8 +1879,8 @@ mod tests {
             fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(
             matches!(mint, Mint::Minting { .. }),
-            "drive_one_step retries MintingFailed into Minting and re-enqueues \
-             the submission, got: {}",
+            "drive_one_step retries true pre-intent MintingFailed into Minting \
+             and re-enqueues the submission, got: {}",
             mint.state_name()
         );
 
@@ -1637,7 +2080,7 @@ mod tests {
     async fn budget_loop_reports_abandoned_when_no_progress_budget_spent() {
         let issuer_request_id = test_issuer_request_id();
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
-        let events = tx_failed_events(&issuer_request_id, failed_at);
+        let events = pre_intent_failed_events(&issuer_request_id, failed_at);
         let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
@@ -1704,109 +2147,6 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn exhausted_retries_with_existing_receipt_keep_driving() {
-        use crate::receipt_inventory::{
-            BurnPlan, BurnTrackingError, MintedReceiptParams,
-            ReceiptLookupError, ReceiptRegistrationError, ReceiptService,
-            RecoveredReceipt, Shares,
-        };
-        use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
-        use alloy::primitives::{B256, U256};
-        use async_trait::async_trait;
-
-        enum ReceiptLookupBehavior {
-            Present,
-            Fails,
-        }
-
-        struct ReceiptLookupStub(ReceiptLookupBehavior);
-
-        #[async_trait]
-        impl ReceiptService for ReceiptLookupStub {
-            async fn register_minted_receipt(
-                &self,
-                _params: MintedReceiptParams,
-            ) -> Result<(), ReceiptRegistrationError> {
-                Ok(())
-            }
-
-            async fn for_burn(
-                &self,
-                _chain_id: u64,
-                _vault: Address,
-                _redemption_issuer_request_id: &IssuerRedemptionRequestId,
-                _shares_to_burn: Shares,
-                _dust: Shares,
-            ) -> Result<BurnPlan, BurnTrackingError> {
-                Ok(BurnPlan {
-                    allocations: vec![],
-                    total_burn: Shares::ZERO,
-                    dust: Shares::ZERO,
-                })
-            }
-
-            async fn reserve_burn(
-                &self,
-                _chain_id: u64,
-                _vault: Address,
-                _redemption_issuer_request_id: IssuerRedemptionRequestId,
-                _burns: Vec<BurnRecord>,
-            ) -> Result<(), ReceiptRegistrationError> {
-                Ok(())
-            }
-
-            async fn release_burn(
-                &self,
-                _chain_id: u64,
-                _vault: Address,
-                _redemption_issuer_request_id: IssuerRedemptionRequestId,
-            ) -> Result<(), ReceiptRegistrationError> {
-                Ok(())
-            }
-
-            async fn settle_burn(
-                &self,
-                _chain_id: u64,
-                _vault: Address,
-                _redemption_issuer_request_id: IssuerRedemptionRequestId,
-            ) -> Result<(), ReceiptRegistrationError> {
-                Ok(())
-            }
-
-            async fn reserved_redemptions(
-                &self,
-                _chain_id: u64,
-                _vault: Address,
-            ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
-            {
-                Ok(vec![])
-            }
-
-            async fn find_by_issuer_request_id(
-                &self,
-                _chain_id: u64,
-                _vault: &Address,
-                _issuer_request_id: &IssuerMintRequestId,
-            ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>
-            {
-                match self.0 {
-                    ReceiptLookupBehavior::Present => {
-                        Ok(Some(RecoveredReceipt {
-                            receipt_id: U256::from(1),
-                            tx_hash: B256::ZERO,
-                            shares: U256::from(100),
-                            block_number: 1,
-                        }))
-                    }
-                    ReceiptLookupBehavior::Fails => {
-                        Err(ReceiptLookupError::Inconsistent {
-                            issuer_request_id: _issuer_request_id.clone(),
-                            receipt_id: U256::from(1).into(),
-                        })
-                    }
-                }
-            }
-        }
-
         let issuer_request_id = test_issuer_request_id();
         let failed_at = Utc::now() - chrono::Duration::hours(2);
         let mut events = tx_submitted_events(&issuer_request_id);
@@ -1881,6 +2221,76 @@ mod tests {
                 reason: AbandonReason::FailedToLoadReceipt
             }
         ));
+    }
+
+    /// A vault that cannot be resolved means "cannot tell whether a receipt
+    /// exists", not "no receipt". Reporting `AutomaticRetriesExhausted` there
+    /// would abandon a mint whose deposit may already have succeeded, and an
+    /// abandoned mint is Killed, never requeued, and unrecoverable without an
+    /// operator. The honest conclusion is the unreadable-inventory one.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_retries_with_unresolvable_vault_do_not_report_exhausted()
+    {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+        // The fixture registers a vault for AAPL/Base only, so a mint on an
+        // unregistered underlying makes `resolve_vault` fail.
+        let mut events = tx_submitted_events(&issuer_request_id);
+        if let Some(MintEvent::Initiated { underlying, token, .. }) =
+            events.first_mut()
+        {
+            *underlying = UnderlyingSymbol::new("MSFT").unwrap();
+            *token = TokenSymbol::new("tMSFT");
+        }
+        for _ in 0..5 {
+            events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(1),
+            3,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::FailedToLoadReceipt
+                }
+            ),
+            "an unresolvable vault must abandon as unreadable inventory, not \
+             as retry exhaustion"
+        );
+
+        let test =
+            "exhausted_retries_with_unresolvable_vault_do_not_report_exhausted";
+        assert!(
+            log_count_at!(
+                Level::WARN,
+                &[
+                    test,
+                    "Failed to read receipt inventory after maximum backoffs"
+                ]
+            ) >= 1,
+            "giving up on an unreadable inventory must log the WARN"
+        );
+        assert!(
+            log_count_at!(
+                Level::WARN,
+                &[test, "Automatic mint retries exhausted"]
+            ) == 0,
+            "an unreadable inventory must never be reported as retry exhaustion"
+        );
     }
 
     /// `MintRecoveryJob::perform` returns `Err(AbortError)` when recovery
@@ -2455,5 +2865,720 @@ mod tests {
             "MintingFailed",
             "a refused manual retry must not advance the mint"
         );
+    }
+    /// Uncertain classify must not RetryMint — leave MintingFailed so a second
+    /// deposit is never prepared under observation failure.
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_uncertain_classify_does_not_retry_mint() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared.hash;
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        // Replace the default success mock with one that fails classification.
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_classification_failure(),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        drive_one_step(
+            &fixture.context(),
+            &fixture
+                .mint_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            &issuer_request_id,
+        )
+        .await
+        .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "uncertain classify must not RetryMint, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.mint_classification_call_count(),
+            1,
+            "must classify under wallet guard before any retry"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "must not prepare a new mint under uncertain classification"
+        );
+
+        let test = "drive_one_step_uncertain_classify_does_not_retry_mint";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "classification uncertain", "not replacing"]
+        ));
+        // Prepared identity still recoverable for a later successful observe.
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash)
+        );
+    }
+
+    /// StillMineable rebroadcast path: RetryMint + submit reuses same hash
+    /// (pending_prepared_tx), never prepare_mint_tx a different identity.
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_still_mineable_rebroadcasts_same_hash() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared.hash;
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::StillMineable),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "StillMineable recovery RetryMints into Minting for rebroadcast, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash),
+            "rebroadcast path must keep the same prepared hash"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "drive_one_step must not prepare; SubmitMintJob rebroadcasts"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "StillMineable rebroadcast must enqueue SubmitMintJob"
+        );
+    }
+
+    /// ProvablyDead allows RetryMint; SubmitMintJob may prepare a replacement.
+    #[tokio::test]
+    async fn drive_one_step_provably_dead_allows_retry() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::ProvablyDead),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "ProvablyDead must allow RetryMint, got: {}",
+            mint.state_name()
+        );
+        // Two classify calls: initial + TOCTOU recheck.
+        assert_eq!(vault.mint_classification_call_count(), 2);
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "ProvablyDead replacement path must enqueue SubmitMintJob"
+        );
+    }
+
+    /// TOCTOU: first classify ProvablyDead, recheck StillMineable → no
+    /// RetryMint (identity may still mine; never authorize replacement).
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_toctou_provably_dead_then_still_mineable_no_retry()
+    {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared.hash;
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success().with_mint_tx_status_sequence(vec![
+                MintTxStatus::ProvablyDead,
+                MintTxStatus::StillMineable,
+            ]),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "TOCTOU recheck StillMineable must not RetryMint, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.mint_classification_call_count(),
+            2,
+            "must classify then recheck under the wallet guard"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "TOCTOU abort must not prepare a replacement"
+        );
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash)
+        );
+
+        let test =
+            "drive_one_step_toctou_provably_dead_then_still_mineable_no_retry";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "recheck no longer terminal", "not replacing"]
+        ));
+    }
+
+    /// Restart mid-`TxSubmitted`: recovery re-enqueues confirm for the same
+    /// prepared hash and never prepares a replacement.
+    #[tokio::test]
+    async fn drive_one_step_tx_submitted_restart_reuses_same_hash() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            7,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared.hash;
+        let now = Utc::now();
+        let mut events = minting_events(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: prepared,
+            intended_at: now,
+        });
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            tx_id: TxId::from(expected_hash),
+            submitted_at: now,
+        });
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint_before, Mint::TxSubmitted { .. }),
+            "fixture must start TxSubmitted, got {}",
+            mint_before.state_name()
+        );
+        assert_eq!(
+            mint_before.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash)
+        );
+
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::TxSubmitted { .. }),
+            "restart confirm enqueue must not change state, got {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash),
+            "restart recovery must keep the same prepared hash"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "drive_one_step must only enqueue ConfirmMintJob, not prepare"
+        );
+
+        let confirm_jobs: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE job_type = ?
+              AND idempotency_key = ?
+            ",
+        )
+        .bind(job_type::<ConfirmMintJob>())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            confirm_jobs, 1,
+            "restart must enqueue exactly one confirm job"
+        );
+    }
+
+    /// Post-submit identity without prepared bytes must never free-prepare:
+    /// leave MintingFailed, log ERROR for ops, and enqueue confirm poll only.
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_post_submit_without_prepared_fails_closed() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = post_submit_without_prepared_failed_events(
+            &issuer_request_id,
+            failed_at,
+        );
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            mint_before.pending_prepared_tx().is_none(),
+            "fixture is legacy TxSubmitted without prepared_tx"
+        );
+        assert!(
+            mint_before.has_unclassifiable_post_intent_identity(),
+            "fixture must be recognized as post-intent without prepared bytes"
+        );
+
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "must not RetryMint into free-prepare path, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "must never prepare_mint_tx for unclassifiable post-submit identity"
+        );
+
+        let confirm_jobs: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE job_type = ?
+              AND idempotency_key = ?
+            ",
+        )
+        .bind(job_type::<ConfirmMintJob>())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            confirm_jobs, 1,
+            "fail-closed path must still enqueue confirm poll for known tx_id"
+        );
+
+        // DEBUG, not ERROR: this step repeats on every recovery poll and the
+        // confirm poll above keeps re-observing, so the mint is not stuck
+        // awaiting an operator.
+        let test = "drive_one_step_post_submit_without_prepared_fails_closed";
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[test, "without prepared_tx", "never free-prepare"]
+        ));
+    }
+
+    /// MinedSuccess under wallet-guard recovery keeps the same prepared hash
+    /// and enqueues ConfirmMintJob (not submit) so ExistingMint can be recorded
+    /// without rebroadcasting a mined deposit.
+    #[tokio::test]
+    async fn drive_one_step_mined_success_keeps_same_prepared_hash() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared.hash;
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::MinedSuccess),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "MinedSuccess must stay MintingFailed for confirm re-observe, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash),
+            "must not prepare a different hash after MinedSuccess classify"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "drive_one_step must not call prepare_mint_tx"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<ConfirmMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "MinedSuccess must enqueue ConfirmMintJob, not SubmitMintJob"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "must not enqueue submit after MinedSuccess"
+        );
+    }
+
+    /// MinedReverted allows RetryMint + SubmitMintJob (replacement after
+    /// terminal death), mirroring ProvablyDead.
+    #[tokio::test]
+    async fn drive_one_step_mined_reverted_allows_retry() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::MinedReverted),
+        );
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "MinedReverted must allow RetryMint, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.mint_classification_call_count(),
+            2,
+            "must classify then recheck under the wallet guard"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "MinedReverted replacement path must enqueue SubmitMintJob"
+        );
+    }
+
+    /// Post-submit MintingFailed with inventory receipt: RetryMint so
+    /// SubmitMintJob can record ExistingMint (never free-prepare a new deposit).
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_post_submit_with_inventory_receipt_retries() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = post_submit_without_prepared_failed_events(
+            &issuer_request_id,
+            failed_at,
+        );
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mut ctx = fixture.context();
+        ctx.receipts =
+            Arc::new(ReceiptLookupStub(ReceiptLookupBehavior::Present));
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&ctx, &mint_before, &issuer_request_id).await.unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "inventory-present post-submit must RetryMint into Minting, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "RetryMint must not prepare_mint_tx in recovery; SubmitMintJob records ExistingMint"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "inventory-present path must enqueue SubmitMintJob"
+        );
+
+        let test = "drive_one_step_post_submit_with_inventory_receipt_retries";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[test, "has receipt", "RetryMint"]
+        ));
+    }
+
+    /// Inventory lookup Err on post-submit without prepared bytes: refuse
+    /// free-prepare, stay MintingFailed, still enqueue confirm poll.
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_post_submit_inventory_err_fails_closed() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = post_submit_without_prepared_failed_events(
+            &issuer_request_id,
+            failed_at,
+        );
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mut ctx = fixture.context();
+        ctx.receipts =
+            Arc::new(ReceiptLookupStub(ReceiptLookupBehavior::Fails));
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&ctx, &mint_before, &issuer_request_id).await.unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "inventory Err must not RetryMint free-prepare, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "must never prepare_mint_tx when inventory lookup fails"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<ConfirmMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "fail-closed path must still enqueue confirm poll for known tx_id"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "must not enqueue submit when inventory is unreadable"
+        );
+
+        let test = "drive_one_step_post_submit_inventory_err_fails_closed";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Inventory lookup failed", "fail closed"]
+        ));
+    }
+
+    /// Corrupt prepared identity: recover_signer fails closed without RetryMint
+    /// or enqueue (cannot prove death without a valid envelope).
+    #[traced_test]
+    #[tokio::test]
+    async fn drive_one_step_recover_signer_failure_fails_closed() {
+        let issuer_request_id = test_issuer_request_id();
+        let mut prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        // Invalidate hash so validate()/recover_signer fails before RPC.
+        prepared.hash = B256::ZERO;
+        let expected_hash = prepared.hash;
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture =
+            MintRecoveryFixture::new().await.with_vault(vault.clone());
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        drive_one_step(&fixture.context(), &mint_before, &issuer_request_id)
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "recover_signer failure must leave MintingFailed, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            vault.mint_classification_call_count(),
+            0,
+            "must not classify when signer recovery fails"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "must not prepare on corrupt identity"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "must not enqueue submit on corrupt prepared identity"
+        );
+        assert_eq!(
+            mint.pending_prepared_tx().map(|prepared| prepared.hash),
+            Some(expected_hash)
+        );
+
+        let test = "drive_one_step_recover_signer_failure_fails_closed";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Cannot recover signer", "fail closed"]
+        ));
     }
 }

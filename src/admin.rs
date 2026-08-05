@@ -1234,6 +1234,11 @@ pub(crate) async fn reprocess_mint(
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CloseMintRequest {
     reason: String,
+    /// Required when the mint still holds a prepared deposit identity: must
+    /// equal the exact `MintTxIntended` / prepared hash. Omit only when the
+    /// mint has no prepared identity.
+    #[schema(value_type = Option<String>)]
+    acknowledged_unresolved_mint_tx_hash: Option<B256>,
 }
 
 /// Admin endpoint to close a mint that cannot be automatically recovered.
@@ -1269,17 +1274,22 @@ pub(crate) async fn close_mint(
         .map(IssuerMintRequestId::new)
         .map_err(|_| Status::BadRequest)?;
 
+    let CloseMintRequest { reason, acknowledged_unresolved_mint_tx_hash } =
+        body.into_inner();
+
     store
         .send(
             &issuer_request_id,
             MintCommand::CloseMint {
                 issuer_request_id: issuer_request_id.clone(),
-                reason: body.into_inner().reason,
+                reason,
+                acknowledged_unresolved_mint_tx_hash,
             },
         )
         .await
         .map_err(|err| {
             error!(target: "admin", aggregate_id = %aggregate_id,
+                acknowledged_unresolved_mint_tx_hash = ?acknowledged_unresolved_mint_tx_hash,
                 error = %err,
                 "Failed to close mint"
             );
@@ -1289,13 +1299,25 @@ pub(crate) async fn close_mint(
             }
         })?;
 
-    info!(target: "admin", aggregate_id = %aggregate_id, "Mint closed");
+    info!(target: "admin", aggregate_id = %aggregate_id,
+        acknowledged_unresolved_mint_tx_hash = ?acknowledged_unresolved_mint_tx_hash,
+        "Mint closed"
+    );
+
+    let message = acknowledged_unresolved_mint_tx_hash.map_or_else(
+        || "Mint closed by admin".to_string(),
+        |acknowledged_hash| {
+            format!(
+                "Mint closed by admin after acknowledging unresolved mint {acknowledged_hash:#x}"
+            )
+        },
+    );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,
         aggregate_id: aggregate_id.to_string(),
         previous_state: "Unknown".to_string(),
-        message: "Mint closed by admin".to_string(),
+        message,
     }))
 }
 
@@ -5002,6 +5024,7 @@ mod tests {
             super::mint_view_summary(&MintView::Closed {
                 issuer_request_id,
                 reason: "closed by admin".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
                 closed_at: failed_at,
             })
             .is_none()

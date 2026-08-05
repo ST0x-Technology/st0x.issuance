@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use super::{
-    BurnTxStatus, BurnVerification, MintResult, MultiBurnParams,
+    BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnParams,
     MultiBurnResult, MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
     SubmittedTx, VaultError, VaultService, WalletNonceGuard,
 };
@@ -116,6 +116,13 @@ enum MockBurnTxClassification {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+enum MockMintTxClassification {
+    Status(MintTxStatus),
+    RpcError,
+}
+
+#[cfg(test)]
 impl Default for MockVerifyBurn {
     fn default() -> Self {
         Self::Verified {
@@ -167,13 +174,29 @@ pub(crate) struct MockVaultService {
     #[cfg(test)]
     burn_tx_status: Arc<Mutex<MockBurnTxClassification>>,
     #[cfg(test)]
+    mint_tx_status: Arc<Mutex<MockMintTxClassification>>,
+    /// Optional per-call mint classification outcomes (FIFO). When non-empty,
+    /// each `classify_mint_tx` pops the next entry; otherwise
+    /// [`Self::mint_tx_status`] is used. Enables TOCTOU recheck tests.
+    #[cfg(test)]
+    mint_tx_status_sequence: Arc<Mutex<Vec<MockMintTxClassification>>>,
+    #[cfg(test)]
     submitted_burn_txs: Arc<Mutex<Vec<SendableTxWithHash>>>,
     #[cfg(test)]
     burn_classification_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
+    mint_classification_call_count: Arc<AtomicUsize>,
+    #[cfg(test)]
     burn_preparation_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
     replacement_preparation_call_count: Arc<AtomicUsize>,
+    /// Optional sequence of confirm_mint outcomes; when non-empty, each call
+    /// pops the next entry instead of using [`MockBehavior`].
+    #[cfg(test)]
+    confirm_mint_outcomes: Arc<Mutex<Vec<Result<MintResult, VaultError>>>>,
+    /// Optional forced `submit_mint` error (e.g. uncertain broadcast).
+    #[cfg(test)]
+    submit_mint_error: Arc<Mutex<Option<VaultError>>>,
 }
 
 impl MockVaultService {
@@ -210,107 +233,47 @@ impl MockVaultService {
                 MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
             )),
             #[cfg(test)]
+            mint_tx_status: Arc::new(Mutex::new(
+                MockMintTxClassification::Status(MintTxStatus::StillMineable),
+            )),
+            #[cfg(test)]
+            mint_tx_status_sequence: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
             submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            mint_classification_call_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            confirm_mint_outcomes: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            submit_mint_error: Arc::new(Mutex::new(None)),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_failure() -> Self {
-        Self {
-            behavior: MockBehavior::Failure,
-            mint_delay_ms: 0,
-            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
-            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
-            call_count: Arc::new(AtomicUsize::new(0)),
-            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            pending_mint_result: Arc::new(Mutex::new(None)),
-            pending_burn_result: Arc::new(Mutex::new(None)),
-            last_call: Arc::new(Mutex::new(None)),
-            share_balance: Arc::new(Mutex::new(U256::MAX)),
-            last_multi_burn_params: Arc::new(Mutex::new(None)),
-            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
-            #[cfg(test)]
-            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_outcome: Arc::new(Mutex::new(
-                MockCheckTxOutcome::default(),
-            )),
-            burn_tx_status: Arc::new(Mutex::new(
-                MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
-            )),
-            submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
-            burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
-            burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-            replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-        }
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::Failure;
+        service
     }
 
     #[cfg(test)]
     pub(crate) fn new_submit_failure() -> Self {
-        Self {
-            behavior: MockBehavior::SubmitFailure,
-            mint_delay_ms: 0,
-            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
-            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
-            call_count: Arc::new(AtomicUsize::new(0)),
-            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            pending_mint_result: Arc::new(Mutex::new(None)),
-            pending_burn_result: Arc::new(Mutex::new(None)),
-            last_call: Arc::new(Mutex::new(None)),
-            share_balance: Arc::new(Mutex::new(U256::MAX)),
-            last_multi_burn_params: Arc::new(Mutex::new(None)),
-            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
-            #[cfg(test)]
-            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_outcome: Arc::new(Mutex::new(
-                MockCheckTxOutcome::default(),
-            )),
-            burn_tx_status: Arc::new(Mutex::new(
-                MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
-            )),
-            submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
-            burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
-            burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-            replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-        }
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::SubmitFailure;
+        service
     }
 
     #[cfg(test)]
     pub(crate) fn new_confirm_revert() -> Self {
-        Self {
-            behavior: MockBehavior::ConfirmRevert,
-            mint_delay_ms: 0,
-            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
-            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
-            call_count: Arc::new(AtomicUsize::new(0)),
-            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            pending_mint_result: Arc::new(Mutex::new(None)),
-            pending_burn_result: Arc::new(Mutex::new(None)),
-            last_call: Arc::new(Mutex::new(None)),
-            share_balance: Arc::new(Mutex::new(U256::MAX)),
-            last_multi_burn_params: Arc::new(Mutex::new(None)),
-            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
-            #[cfg(test)]
-            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_outcome: Arc::new(Mutex::new(
-                MockCheckTxOutcome::default(),
-            )),
-            burn_tx_status: Arc::new(Mutex::new(
-                MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
-            )),
-            submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
-            burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
-            burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-            replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-        }
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::ConfirmRevert;
+        service
     }
 
     #[cfg(test)]
@@ -380,64 +343,16 @@ impl MockVaultService {
 
     #[cfg(test)]
     pub(crate) fn new_submit_revert() -> Self {
-        Self {
-            behavior: MockBehavior::SubmitRevert,
-            mint_delay_ms: 0,
-            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
-            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
-            call_count: Arc::new(AtomicUsize::new(0)),
-            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            pending_mint_result: Arc::new(Mutex::new(None)),
-            pending_burn_result: Arc::new(Mutex::new(None)),
-            last_call: Arc::new(Mutex::new(None)),
-            share_balance: Arc::new(Mutex::new(U256::MAX)),
-            last_multi_burn_params: Arc::new(Mutex::new(None)),
-            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
-            #[cfg(test)]
-            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_outcome: Arc::new(Mutex::new(
-                MockCheckTxOutcome::default(),
-            )),
-            burn_tx_status: Arc::new(Mutex::new(
-                MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
-            )),
-            submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
-            burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
-            burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-            replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-        }
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::SubmitRevert;
+        service
     }
 
     #[cfg(test)]
     pub(crate) fn new_prepare_tx_failure() -> Self {
-        Self {
-            behavior: MockBehavior::PrepareTxFails,
-            mint_delay_ms: 0,
-            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
-            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
-            call_count: Arc::new(AtomicUsize::new(0)),
-            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            pending_mint_result: Arc::new(Mutex::new(None)),
-            pending_burn_result: Arc::new(Mutex::new(None)),
-            last_call: Arc::new(Mutex::new(None)),
-            share_balance: Arc::new(Mutex::new(U256::MAX)),
-            last_multi_burn_params: Arc::new(Mutex::new(None)),
-            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
-            #[cfg(test)]
-            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
-            prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_outcome: Arc::new(Mutex::new(
-                MockCheckTxOutcome::default(),
-            )),
-            burn_tx_status: Arc::new(Mutex::new(
-                MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
-            )),
-            submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
-            burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
-            burn_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-            replacement_preparation_call_count: Arc::new(AtomicUsize::new(0)),
-        }
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::PrepareTxFails;
+        service
     }
 
     #[cfg(test)]
@@ -510,8 +425,14 @@ impl MockVaultService {
         self.submitted_burn_txs.lock().unwrap().clear();
         self.verify_burn_call_count.store(0, Ordering::Relaxed);
         self.burn_classification_call_count.store(0, Ordering::Relaxed);
+        self.mint_classification_call_count.store(0, Ordering::Relaxed);
         self.burn_preparation_call_count.store(0, Ordering::Relaxed);
         self.replacement_preparation_call_count.store(0, Ordering::Relaxed);
+        *self.mint_tx_status.lock().unwrap() =
+            MockMintTxClassification::Status(MintTxStatus::StillMineable);
+        self.mint_tx_status_sequence.lock().unwrap().clear();
+        self.confirm_mint_outcomes.lock().unwrap().clear();
+        *self.submit_mint_error.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -663,6 +584,53 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_mint_tx_status(self, status: MintTxStatus) -> Self {
+        *self.mint_tx_status.lock().unwrap() =
+            MockMintTxClassification::Status(status);
+        self
+    }
+
+    /// FIFO classification outcomes for successive `classify_mint_tx` calls.
+    #[cfg(test)]
+    pub(crate) fn with_mint_tx_status_sequence(
+        self,
+        statuses: Vec<MintTxStatus>,
+    ) -> Self {
+        *self.mint_tx_status_sequence.lock().unwrap() = statuses
+            .into_iter()
+            .map(MockMintTxClassification::Status)
+            .collect();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_mint_tx_classification_failure(self) -> Self {
+        *self.mint_tx_status.lock().unwrap() =
+            MockMintTxClassification::RpcError;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_confirm_mint_outcomes(
+        self,
+        outcomes: Vec<Result<MintResult, VaultError>>,
+    ) -> Self {
+        *self.confirm_mint_outcomes.lock().unwrap() = outcomes;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_submit_mint_error(self, error: VaultError) -> Self {
+        *self.submit_mint_error.lock().unwrap() = Some(error);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mint_classification_call_count(&self) -> usize {
+        self.mint_classification_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_prepared_tx(&self, sendable_tx: SendableTxWithHash) {
         *self.prepared_tx.lock().unwrap() = Some(sendable_tx);
     }
@@ -784,6 +752,14 @@ impl VaultService for MockVaultService {
         prepared_tx: &PreparedMintTx,
     ) -> Result<SubmittedTx, VaultError> {
         #[cfg(test)]
+        {
+            let forced_error = self.submit_mint_error.lock().unwrap().take();
+            if let Some(error) = forced_error {
+                return Err(error);
+            }
+        }
+
+        #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitFailure) {
             return Err(VaultError::InvalidReceipt);
         }
@@ -796,10 +772,22 @@ impl VaultService for MockVaultService {
 
     async fn confirm_mint(
         &self,
-        _tx_id: &TxId,
+        tx_id: &TxId,
     ) -> Result<MintResult, VaultError> {
+        #[cfg(test)]
+        {
+            let mut outcomes = self
+                .confirm_mint_outcomes
+                .lock()
+                .expect("confirm_mint_outcomes mutex poisoned");
+            if !outcomes.is_empty() {
+                return outcomes.remove(0);
+            }
+        }
+
         match &self.behavior {
             MockBehavior::Success => {
+                let _ = tx_id;
                 let result = self
                     .pending_mint_result
                     .lock()
@@ -838,13 +826,57 @@ impl VaultService for MockVaultService {
                 Ok(result)
             }
             #[cfg(test)]
-            MockBehavior::ConfirmRevert
-            | MockBehavior::ConfirmPending
-            | MockBehavior::WalletLockBlocked { .. }
-            | MockBehavior::ConfirmPendingBlocked { .. }
+            MockBehavior::ConfirmRevert => {
+                Err(VaultError::Reverted { tx_hash: MOCK_MINT_TX_HASH })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPending => {
+                Err(VaultError::ConfirmationPending {
+                    tx_id: tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPendingBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::ConfirmationPending {
+                    tx_id: tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails => Err(VaultError::InvalidReceipt),
         }
+    }
+
+    async fn classify_mint_tx(
+        &self,
+        _owner: Address,
+        _prepared_tx: &PreparedMintTx,
+    ) -> Result<MintTxStatus, VaultError> {
+        #[cfg(test)]
+        {
+            self.mint_classification_call_count.fetch_add(1, Ordering::Relaxed);
+            // One lock at a time: holding the sequence guard while taking the
+            // fallback guard is a nesting a future helper could invert.
+            let queued = {
+                let mut sequence = self.mint_tx_status_sequence.lock().unwrap();
+                (!sequence.is_empty()).then(|| sequence.remove(0))
+            };
+            let classification =
+                queued.unwrap_or_else(|| *self.mint_tx_status.lock().unwrap());
+            return match classification {
+                MockMintTxClassification::Status(status) => Ok(status),
+                MockMintTxClassification::RpcError => {
+                    Err(VaultError::InvalidReceipt)
+                }
+            };
+        }
+        #[cfg(not(test))]
+        Ok(MintTxStatus::StillMineable)
     }
 
     async fn get_share_balance(

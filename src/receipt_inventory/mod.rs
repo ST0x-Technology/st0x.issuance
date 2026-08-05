@@ -13,7 +13,7 @@ use cqrs_es::AggregateError;
 use event_sorcery::{EventSourced, LifecycleError, Nil, SendError, Store};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
@@ -30,7 +30,9 @@ pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptWithBalance,
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
-pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
+pub(crate) use event::{
+    ReceiptInventoryEvent, ReceiptSource, TrackedItnDeposit,
+};
 use reconcile::ReconcileError;
 pub(crate) use vault_key::ReceiptVaultKey;
 
@@ -360,6 +362,9 @@ const fn receipt_inventory_operation(
         ReceiptInventoryCommand::RecordCustodyMigration { .. } => {
             "record_custody_migration"
         }
+        ReceiptInventoryCommand::RecordConflictingItnDeposit { .. } => {
+            "record_conflicting_itn_deposit"
+        }
     }
 }
 
@@ -644,6 +649,11 @@ pub(crate) struct ReceiptInventory {
     /// original one.
     #[serde(default)]
     migrations_recorded: u32,
+    /// Duplicate ITN deposits already recorded, keyed by the duplicate's own
+    /// `(receipt_id, tx_hash)`. These are observations, never tracked balance:
+    /// nothing here is spendable, reservable, or burnable by the bot.
+    #[serde(default)]
+    conflicting_itn_deposits: HashSet<(ReceiptId, TxHash)>,
 }
 
 /// Which wallet holds this vault's receipts.
@@ -756,6 +766,52 @@ impl ReceiptInventory {
         issuer_request_id: &IssuerMintRequestId,
     ) -> Option<ReceiptId> {
         self.itn_receipts.get(issuer_request_id).copied()
+    }
+
+    /// When inventory already tracks an ITN mint id, returns the tracked
+    /// deposit if the discovered deposit conflicts (different receipt or
+    /// different tx). Same-identity rediscovery returns `None`.
+    ///
+    /// An index entry whose receipt metadata is missing returns
+    /// [`TrackedItnDeposit::IndexOnly`], which carries no transaction hash: a
+    /// dangling index is a conflict, not a clear. Reading it as "nothing
+    /// tracked" is the one way this gate could fail open.
+    pub(crate) fn conflicting_itn_deposit(
+        &self,
+        issuer_request_id: &IssuerMintRequestId,
+        discovered_receipt_id: ReceiptId,
+        discovered_tx_hash: TxHash,
+    ) -> Option<TrackedItnDeposit> {
+        let existing_receipt_id =
+            self.itn_receipts.get(issuer_request_id).copied()?;
+        // Rediscovering the tracked receipt is the repair for a dangling index,
+        // not a conflict. It re-inserts the same identity, so the overwrite the
+        // gate below guards against cannot happen. Refusing it instead would
+        // strand the metadata row (nothing else re-inserts it) and record the
+        // real mint as its own excess deposit.
+        if existing_receipt_id == discovered_receipt_id
+            && self
+                .receipts
+                .get(&existing_receipt_id)
+                .is_none_or(|existing| existing.tx_hash == discovered_tx_hash)
+        {
+            return None;
+        }
+        // A dangling index entry is an inconsistency, not an absence. The
+        // tracked identity is still known, which is enough to refuse the second
+        // deposit; reading it as "nothing tracked" would let `apply_event`
+        // overwrite the index with the duplicate — the exact overwrite this
+        // gate exists to prevent.
+        let Some(existing) = self.receipts.get(&existing_receipt_id) else {
+            return Some(TrackedItnDeposit::IndexOnly {
+                receipt_id: existing_receipt_id,
+            });
+        };
+
+        Some(TrackedItnDeposit::Receipt {
+            receipt_id: existing_receipt_id,
+            tx_hash: existing.tx_hash,
+        })
     }
 
     /// Whether the given redemption holds a reservation on any receipt.
@@ -903,6 +959,23 @@ pub(crate) enum ReceiptInventoryError {
          from a wallet rotation. Run `issuer confirm-custody` first."
     )]
     CustodyUnconfirmed { receipt_id: ReceiptId, observed_wallet: Address },
+    #[error(transparent)]
+    DuplicateItnDeposit(Box<DuplicateItnDepositConflict>),
+}
+
+/// Payload for [`ReceiptInventoryError::DuplicateItnDeposit`], boxed so the
+/// error enum stays small for `Result` returns (clippy `result_large_err`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[error(
+    "Refusing DiscoverReceipt for issuer_request_id {issuer_request_id}: \
+     inventory already tracks {tracked}; discovered conflicting receipt \
+     {discovered_receipt_id} (tx {discovered_tx_hash})"
+)]
+pub(crate) struct DuplicateItnDepositConflict {
+    pub(crate) issuer_request_id: IssuerMintRequestId,
+    pub(crate) tracked: TrackedItnDeposit,
+    pub(crate) discovered_receipt_id: ReceiptId,
+    pub(crate) discovered_tx_hash: TxHash,
 }
 
 impl ReceiptInventory {
@@ -920,6 +993,26 @@ impl ReceiptInventory {
                 receipt_info,
                 receipt_info_bytes,
             } => {
+                // Inventory is 1:1 on issuer_request_id for ITN mints. A second
+                // Deposit with a different receipt_id / tx_hash for the same
+                // request must not overwrite `itn_receipts` (fail closed).
+                if let ReceiptSource::Itn { ref issuer_request_id } = source
+                    && let Some(tracked) = self.conflicting_itn_deposit(
+                        issuer_request_id,
+                        receipt_id,
+                        tx_hash,
+                    )
+                {
+                    return Err(ReceiptInventoryError::DuplicateItnDeposit(
+                        Box::new(DuplicateItnDepositConflict {
+                            issuer_request_id: issuer_request_id.clone(),
+                            tracked,
+                            discovered_receipt_id: receipt_id,
+                            discovered_tx_hash: tx_hash,
+                        }),
+                    ));
+                }
+
                 if self.receipts.contains_key(&receipt_id) {
                     return Ok(vec![]);
                 }
@@ -1122,6 +1215,42 @@ impl ReceiptInventory {
                     tx_hash,
                 }])
             }
+
+            ReceiptInventoryCommand::RecordConflictingItnDeposit {
+                issuer_request_id,
+                discovered_receipt_id,
+                discovered_tx_hash,
+                discovered_block_number,
+            } => {
+                // Only a real conflict is recordable. A caller that re-checks
+                // after the tracked receipt was reconciled away must not turn
+                // an ordinary discovery into a permanent duplicate claim.
+                let Some(tracked) = self.conflicting_itn_deposit(
+                    &issuer_request_id,
+                    discovered_receipt_id,
+                    discovered_tx_hash,
+                ) else {
+                    return Ok(vec![]);
+                };
+
+                // Backfill re-scans the same range after a restart before the
+                // checkpoint advances, so the same duplicate arrives more than
+                // once. Key on the duplicate's own identity.
+                if self
+                    .conflicting_itn_deposits
+                    .contains(&(discovered_receipt_id, discovered_tx_hash))
+                {
+                    return Ok(vec![]);
+                }
+
+                Ok(vec![ReceiptInventoryEvent::ConflictingItnDepositObserved {
+                    issuer_request_id,
+                    tracked,
+                    discovered_receipt_id,
+                    discovered_tx_hash,
+                    discovered_block_number,
+                }])
+            }
         }
     }
 
@@ -1286,6 +1415,16 @@ impl ReceiptInventory {
                     Custody::Held { holder: to, moved_from: Some(from) };
                 self.migrations_recorded =
                     self.migrations_recorded.saturating_add(1);
+            }
+            ReceiptInventoryEvent::ConflictingItnDepositObserved {
+                discovered_receipt_id,
+                discovered_tx_hash,
+                ..
+            } => {
+                // Recorded only. The duplicate never becomes tracked balance,
+                // so neither `receipts` nor `itn_receipts` may change here.
+                self.conflicting_itn_deposits
+                    .insert((discovered_receipt_id, discovered_tx_hash));
             }
         }
     }
@@ -1700,6 +1839,247 @@ mod tests {
         assert!(
             inventory.receipts_with_balance().is_empty(),
             "an empty ReserveBurn must leave the inventory empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_itn_deposit_detects_second_receipt_for_same_request() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let first_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let second_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let first_receipt = make_receipt_id(1);
+        let second_receipt = make_receipt_id(2);
+
+        let mut inventory = ReceiptInventory::default();
+        drive(
+            &mut inventory,
+            discover_itn_receipt_cmd(
+                first_receipt,
+                make_shares(100),
+                1,
+                first_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            inventory.conflicting_itn_deposit(
+                &issuer_request_id,
+                first_receipt,
+                first_hash,
+            ),
+            None,
+            "same identity rediscovery is not a conflict"
+        );
+        assert_eq!(
+            inventory.conflicting_itn_deposit(
+                &issuer_request_id,
+                second_receipt,
+                second_hash,
+            ),
+            Some(TrackedItnDeposit::Receipt {
+                receipt_id: first_receipt,
+                tx_hash: first_hash
+            }),
+            "a second receipt for the same issuer_request_id is a conflict"
+        );
+        assert_eq!(
+            inventory.conflicting_itn_deposit(
+                &issuer_request_id,
+                first_receipt,
+                second_hash,
+            ),
+            Some(TrackedItnDeposit::Receipt {
+                receipt_id: first_receipt,
+                tx_hash: first_hash
+            }),
+            "same receipt id with a different tx hash is also a conflict"
+        );
+    }
+
+    /// `DiscoverReceipt` must fail closed when a second ITN deposit conflicts
+    /// with an already-tracked issuer_request_id (different receipt id).
+    #[tokio::test]
+    async fn discover_receipt_rejects_conflicting_itn_deposit() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let first_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let second_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let first_receipt = make_receipt_id(1);
+        let second_receipt = make_receipt_id(2);
+
+        let mut inventory = ReceiptInventory::default();
+        drive(
+            &mut inventory,
+            discover_itn_receipt_cmd(
+                first_receipt,
+                make_shares(100),
+                1,
+                first_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await;
+
+        let result = inventory.handle_command(discover_itn_receipt_cmd(
+            second_receipt,
+            make_shares(100),
+            2,
+            second_hash,
+            issuer_request_id.clone(),
+        ));
+
+        match result {
+            Err(ReceiptInventoryError::DuplicateItnDeposit(conflict)) => {
+                assert_eq!(conflict.issuer_request_id, issuer_request_id);
+                assert_eq!(
+                    conflict.tracked,
+                    TrackedItnDeposit::Receipt {
+                        receipt_id: first_receipt,
+                        tx_hash: first_hash
+                    }
+                );
+                assert_eq!(conflict.discovered_receipt_id, second_receipt);
+                assert_eq!(conflict.discovered_tx_hash, second_hash);
+            }
+            other => panic!(
+                "conflicting ITN DiscoverReceipt must be rejected, got: {other:?}"
+            ),
+        }
+        assert_eq!(
+            inventory.find_by_issuer_request_id(&issuer_request_id),
+            Some(first_receipt),
+            "rejected DiscoverReceipt must not overwrite itn_receipts"
+        );
+    }
+
+    /// The 1:1 index outliving its metadata row is the one shape that could
+    /// make the duplicate gate fail open: `None` would read as "nothing
+    /// tracked" and let the second deposit overwrite the index.
+    #[tokio::test]
+    async fn conflicting_itn_deposit_refuses_on_a_dangling_index_entry() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let tracked_receipt = make_receipt_id(1);
+        let tracked_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let discovered_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+
+        let mut inventory = ReceiptInventory::default();
+        drive(
+            &mut inventory,
+            discover_itn_receipt_cmd(
+                tracked_receipt,
+                make_shares(100),
+                1,
+                tracked_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await;
+        inventory.receipts.remove(&tracked_receipt);
+
+        assert_eq!(
+            inventory.conflicting_itn_deposit(
+                &issuer_request_id,
+                make_receipt_id(2),
+                discovered_hash,
+            ),
+            Some(TrackedItnDeposit::IndexOnly { receipt_id: tracked_receipt }),
+            "a dangling index entry is a conflict, not a clear"
+        );
+
+        assert_eq!(
+            inventory.conflicting_itn_deposit(
+                &issuer_request_id,
+                tracked_receipt,
+                tracked_hash,
+            ),
+            None,
+            "rediscovering the tracked receipt repairs the dangling index; \
+             calling it a conflict would strand the metadata row and record \
+             the real mint as its own excess deposit"
+        );
+    }
+
+    /// Backfill checkpoints past the conflicting block and never re-scans it,
+    /// so the duplicate has to survive as an event rather than a log line.
+    #[tokio::test]
+    async fn recording_a_conflicting_itn_deposit_is_durable_and_idempotent() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let tracked_receipt = make_receipt_id(1);
+        let duplicate_receipt = make_receipt_id(2);
+        let tracked_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let duplicate_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+
+        let mut inventory = ReceiptInventory::default();
+        drive(
+            &mut inventory,
+            discover_itn_receipt_cmd(
+                tracked_receipt,
+                make_shares(100),
+                1,
+                tracked_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await;
+
+        let record = ReceiptInventoryCommand::RecordConflictingItnDeposit {
+            issuer_request_id: issuer_request_id.clone(),
+            discovered_receipt_id: duplicate_receipt,
+            discovered_tx_hash: duplicate_hash,
+            discovered_block_number: 4242,
+        };
+        let events = drive(&mut inventory, record.clone()).await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ReceiptInventoryEvent::ConflictingItnDepositObserved {
+                    tracked,
+                    discovered_receipt_id,
+                    discovered_tx_hash,
+                    discovered_block_number: 4242,
+                    ..
+                }] if *tracked == TrackedItnDeposit::Receipt {
+                    receipt_id: tracked_receipt,
+                    tx_hash: tracked_hash,
+                } && *discovered_receipt_id == duplicate_receipt
+                    && *discovered_tx_hash == duplicate_hash
+            ),
+            "both identities must be recorded, got: {events:?}"
+        );
+
+        // A re-scan of the same range before the checkpoint advanced must not
+        // grow the log a pass at a time.
+        assert!(
+            drive(&mut inventory, record).await.is_empty(),
+            "re-observing the same duplicate must be a no-op"
+        );
+
+        // The duplicate is evidence, never spendable balance.
+        assert_eq!(
+            inventory.find_by_issuer_request_id(&issuer_request_id),
+            Some(tracked_receipt),
+            "recording a conflict must not touch the 1:1 index"
+        );
+        assert!(
+            !inventory.receipts.contains_key(&duplicate_receipt),
+            "recording a conflict must not add tracked balance"
         );
     }
 
