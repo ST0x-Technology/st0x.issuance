@@ -7,6 +7,7 @@ use event_sorcery::{
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,13 +15,14 @@ use url::Url;
 
 use super::UnderlyingSymbol;
 use super::view::{
-    TokenizedAssetViewError, find_vault, underlying_has_listing,
+    TokenizedAssetViewError, find_vault, list_enabled_assets,
+    underlying_has_listing,
 };
 use crate::Network;
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
-    setup_tracing,
+    VaultMode, VaultModeConfig, load_vault_mode_config, setup_tracing,
 };
 use crate::fireblocks::{
     FireblocksEnv, FireblocksVaultService, fetch_vault_address,
@@ -40,6 +42,10 @@ use crate::redemption::force_complete::{
 use crate::underlying::{
     AssetStatus, Underlying, UnderlyingCommand, UnderlyingViewError,
     load_freeze_status,
+};
+use crate::vault::onboarding::{
+    ApprovalOutcome, check_orchestrator_readiness, ensure_unlimited_approval,
+    prove_signing_shapes,
 };
 use crate::wallet::turnkey::{TurnkeyConfig, resolve_turnkey_signer};
 use crate::wallet::{SignerConfig, SignerEnv};
@@ -131,6 +137,38 @@ enum IssuerCommand {
     /// other redemption may already claim it. Completes the redemption and
     /// settles its receipt reservation like a normal burn confirmation.
     ForceCompleteRedemption(Box<ForceCompleteRedemptionArgs>),
+    /// On-chain read-only pre-cutover gate for the orchestrator rollout:
+    /// verifies via on-chain reads that the Turnkey bot wallet holds
+    /// MINT_ROLE and BURN_ROLE on the orchestrator, that
+    /// vaultLogicIsExpected() reports healthy, that the orchestrator holds
+    /// DEPOSIT and WITHDRAW on each vault's authorizer, and that each
+    /// checked asset's one-time unlimited ERC-20 approval to the
+    /// orchestrator has been executed. The orchestrator address comes from
+    /// the TOML config file — never typed. Exits non-zero unless every check
+    /// passes, so runbook steps can gate on it. Submits nothing and signs
+    /// nothing on-chain; locally it does touch the operator's database —
+    /// connecting runs any pending migrations and projection catch-up before
+    /// the asset lookup.
+    OrchestratorPreflight(Box<OrchestratorPreflightArgs>),
+    /// Executes one asset's one-time unlimited ERC-20 approval (Turnkey bot
+    /// wallet -> orchestrator, on the vault share token) through the Turnkey
+    /// signer. Idempotent: an already-unlimited allowance sends nothing, so
+    /// re-runs and per-asset batches are safe. Approvals are inert until the
+    /// asset's vault_mode flips to orchestrator, and approving through
+    /// Turnkey is itself the live proof that the Turnkey signing policy
+    /// allows `approve` on this token. The orchestrator address comes from
+    /// the TOML config file — never typed.
+    ApproveOrchestrator(Box<ApproveOrchestratorArgs>),
+    /// Signs — WITHOUT broadcasting — one transaction per shape the Turnkey
+    /// signing policy must allow before an asset's cutover: mint and burn on
+    /// the orchestrator, approve on the vault share token, and ERC-1155
+    /// safeBatchTransferFrom to the orchestrator (the receipt-migration step
+    /// needs it). A policy gap surfaces here as a named signing refusal
+    /// instead of during the pilot's first live mint. On-chain read-only:
+    /// nothing is submitted and no chain state changes. Locally it does
+    /// touch the operator's database — connecting runs any pending
+    /// migrations and projection catch-up before the vault lookup.
+    VerifyOrchestratorSigning(Box<VerifyOrchestratorSigningArgs>),
 }
 
 /// Which way the operator intends custody to move. Stated explicitly and
@@ -341,6 +379,142 @@ struct ConfirmCustodyArgs {
 }
 
 #[derive(Args)]
+struct OrchestratorPreflightArgs {
+    /// TOML config file whose `[orchestrator].address` names the orchestrator
+    /// to check — the config file is the single source of truth for the
+    /// address, matching what the deployed service resolves.
+    #[arg(long, env = "CONFIG")]
+    config: PathBuf,
+
+    /// Network whose asset listings to check.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// Restrict the per-asset allowance checks to these underlyings
+    /// (repeatable). Defaults to every enabled asset on the network.
+    /// Upper-cased like [`AssetArgs`].
+    #[arg(long = "asset", value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
+    assets: Vec<UnderlyingSymbol>,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against, cross-checked against the chain the RPC
+    /// reports.
+    #[arg(long)]
+    chain_id: u64,
+
+    #[clap(flatten)]
+    signer: SignerEnv,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
+#[derive(Args)]
+struct ApproveOrchestratorArgs {
+    /// Underlying symbol, e.g. RKLB. Upper-cased like [`AssetArgs`].
+    #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
+    underlying: UnderlyingSymbol,
+
+    /// TOML config file whose `[orchestrator].address` names the approval's
+    /// spender — the config file is the single source of truth for the
+    /// address, matching what the deployed service resolves.
+    #[arg(long, env = "CONFIG")]
+    config: PathBuf,
+
+    /// Network whose vault to approve on.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against, cross-checked against the chain the RPC
+    /// reports.
+    #[arg(long)]
+    chain_id: u64,
+
+    #[clap(flatten)]
+    signer: SignerEnv,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
+#[derive(Args)]
+struct VerifyOrchestratorSigningArgs {
+    /// Underlying symbol whose vault the token-scoped shapes (approve,
+    /// receipt transfer) are built against, e.g. RKLB. Upper-cased like
+    /// [`AssetArgs`].
+    #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
+    underlying: UnderlyingSymbol,
+
+    /// TOML config file whose `[orchestrator].address` names the orchestrator
+    /// the shapes target — the config file is the single source of truth for
+    /// the address, matching what the deployed service resolves.
+    #[arg(long, env = "CONFIG")]
+    config: PathBuf,
+
+    /// Network whose vault the shapes are built against.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against, cross-checked against the chain the RPC
+    /// reports.
+    #[arg(long)]
+    chain_id: u64,
+
+    #[clap(flatten)]
+    signer: SignerEnv,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
+#[derive(Args)]
 struct AssetArgs {
     /// Underlying symbol, e.g. SGOV. Upper-cased so `"sgov"` resolves to the
     /// stored `SGOV` (assets are keyed by their upper-case symbol). Whitespace
@@ -386,6 +560,15 @@ impl IssuerCli {
             }
             IssuerCommand::ForceCompleteRedemption(args) => {
                 run_force_complete_redemption(*args, prompt_confirm).await
+            }
+            IssuerCommand::OrchestratorPreflight(args) => {
+                run_orchestrator_preflight(*args).await
+            }
+            IssuerCommand::ApproveOrchestrator(args) => {
+                run_approve_orchestrator(*args, prompt_confirm).await
+            }
+            IssuerCommand::VerifyOrchestratorSigning(args) => {
+                run_verify_orchestrator_signing(*args).await
             }
         }
     }
@@ -677,6 +860,316 @@ struct SmokeTarget {
     receipt_contract: Address,
     fireblocks_wallet: Address,
     turnkey: Address,
+}
+
+/// The read-only pre-cutover readiness gate: resolves the orchestrator from
+/// the TOML config, the bot wallet from the Turnkey configuration, and the
+/// vaults from the listing view, then reads roles, orchestrator health, and
+/// per-asset allowances on-chain. Prints the report and fails unless every
+/// check passes, so the cutover runbook can gate on the exit code. No prompt:
+/// nothing is signed or submitted.
+async fn run_orchestrator_preflight(
+    args: OrchestratorPreflightArgs,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    let vault_modes = load_vault_mode_config(&args.config)?;
+    let orchestrator = orchestrator_address_from(&vault_modes, &args.config)?;
+
+    // Only the wallet address is used — the readiness facts (roles,
+    // approvals) are keyed to the Turnkey bot wallet, and requiring the full
+    // Turnkey configuration keeps that address sourced from the service's own
+    // environment instead of an operator-typed value.
+    let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
+    else {
+        anyhow::bail!(
+            "orchestrator-preflight requires the Turnkey signer configuration"
+        );
+    };
+    let bot = turnkey_config.settings.address;
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+    let assets =
+        preflight_assets(&admin.pool, args.network, &args.assets, &vault_modes)
+            .await?;
+
+    verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let provider =
+        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+    let report =
+        check_orchestrator_readiness(&provider, orchestrator, bot, &assets)
+            .await?;
+
+    println!("{report}");
+
+    if !report.is_ready() {
+        anyhow::bail!("orchestrator preflight FAILED — see the report above");
+    }
+
+    Ok(())
+}
+
+/// Executes one asset's one-time unlimited approval through the Turnkey
+/// signer, after an explicit confirmation naming the asset, vault,
+/// orchestrator, and wallet. The mutation itself is idempotent
+/// ([`ensure_unlimited_approval`]), so a re-run after a completed approval
+/// reports "already unlimited" instead of sending again.
+async fn run_approve_orchestrator(
+    args: ApproveOrchestratorArgs,
+    confirm: impl Fn(&str) -> io::Result<bool>,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    let orchestrator = required_orchestrator_address(&args.config)?;
+
+    let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
+    else {
+        anyhow::bail!(
+            "approve-orchestrator requires the Turnkey signer configuration"
+        );
+    };
+    let bot = turnkey_config.settings.address;
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+    let vault = find_vault(&admin.pool, &args.underlying, &args.network)
+        .await?
+        .ok_or_else(|| AssetAdminError::NotFound {
+            underlying: args.underlying.clone(),
+        })?;
+
+    if !confirm(&format!(
+        "Approve UNLIMITED spending of {} vault {vault} shares by \
+         orchestrator {orchestrator}, from Turnkey wallet {bot}?",
+        args.underlying
+    ))? {
+        anyhow::bail!("aborted by operator");
+    }
+
+    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let resolved = resolve_turnkey_signer(&turnkey_config, chain_id)?;
+    let provider = ProviderBuilder::new()
+        .with_chain_id(chain_id)
+        .wallet(resolved.wallet)
+        .connect(args.rpc_url.as_str())
+        .await?;
+
+    // The spender is about to receive an UNLIMITED allowance from the
+    // production bot wallet, so prove the configured address actually IS an
+    // orchestrator before approving: these reads only answer on a contract
+    // implementing the orchestrator interface (a typo'd or stale TOML entry
+    // fails them), and a false version lock means the address is a stale
+    // deployment nothing should be approved for.
+    let readiness =
+        check_orchestrator_readiness(&provider, orchestrator, bot, &[])
+            .await
+            .map_err(|error| {
+            anyhow::anyhow!(
+                "refusing to approve: {orchestrator} cannot be verified \
+                     as an orchestrator (readiness reads failed: {error})"
+            )
+        })?;
+    if !readiness.vault_logic_expected {
+        anyhow::bail!(
+            "refusing to approve: {orchestrator} reports \
+             vaultLogicIsExpected() = false — the configured address is a \
+             stale or mismatched orchestrator deployment"
+        );
+    }
+
+    match ensure_unlimited_approval(&provider, vault, orchestrator, bot).await?
+    {
+        ApprovalOutcome::AlreadyUnlimited => println!(
+            "Already unlimited: {} vault {vault} needs no approval \
+             transaction.",
+            args.underlying
+        ),
+        ApprovalOutcome::Approved { tx_hash } => println!(
+            "Approved: unlimited allowance for orchestrator {orchestrator} \
+             on {} vault {vault} in {tx_hash}.",
+            args.underlying
+        ),
+    }
+    println!("Run orchestrator-preflight to verify overall readiness.");
+
+    Ok(())
+}
+
+/// Signs the pre-cutover policy-proof shapes with Turnkey — never
+/// broadcasting — and reports each signed shape. A Turnkey signing-policy
+/// denial fails here, naming the refused shape, which is the entire point:
+/// the alternative discovery site is the pilot's first live transaction. No
+/// prompt: nothing is submitted and no state changes.
+async fn run_verify_orchestrator_signing(
+    args: VerifyOrchestratorSigningArgs,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    let orchestrator = required_orchestrator_address(&args.config)?;
+
+    let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
+    else {
+        anyhow::bail!(
+            "verify-orchestrator-signing requires the Turnkey signer \
+             configuration — proving a local key's signing capability says \
+             nothing about the Turnkey policy"
+        );
+    };
+    let bot = turnkey_config.settings.address;
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+    let vault = find_vault(&admin.pool, &args.underlying, &args.network)
+        .await?
+        .ok_or_else(|| AssetAdminError::NotFound {
+            underlying: args.underlying.clone(),
+        })?;
+
+    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let resolved = resolve_turnkey_signer(&turnkey_config, chain_id)?;
+    let provider =
+        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+
+    let proofs = prove_signing_shapes(
+        &provider,
+        &resolved.wallet,
+        orchestrator,
+        vault,
+        bot,
+    )
+    .await?;
+
+    for proof in &proofs {
+        println!(
+            "Signed (not broadcast): {} -> {} as {}",
+            proof.label, proof.to, proof.tx_hash
+        );
+    }
+    println!(
+        "Turnkey policy allows all {} orchestrator shapes for {} from {bot}.",
+        proofs.len(),
+        args.underlying
+    );
+
+    Ok(())
+}
+
+/// Resolves the orchestrator address from the TOML config file — the single
+/// source the onboarding subcommands accept, never a typed argument. A
+/// missing section is an actionable error rather than a default, and a zero
+/// address is refused: the config may stay dark (no asset needs
+/// `vault_mode = "orchestrator"`) and still carry the address these commands
+/// work against.
+fn required_orchestrator_address(config: &Path) -> anyhow::Result<Address> {
+    let vault_modes = load_vault_mode_config(config)?;
+    orchestrator_address_from(&vault_modes, config)
+}
+
+fn orchestrator_address_from(
+    vault_modes: &VaultModeConfig,
+    config: &Path,
+) -> anyhow::Result<Address> {
+    let Some(orchestrator) = vault_modes.orchestrator_address() else {
+        anyhow::bail!(
+            "{} has no [orchestrator].address; add the section — the config \
+             may stay dark (no asset needs vault_mode = \"orchestrator\")",
+            config.display()
+        );
+    };
+
+    // No zero-address guard here: `load_vault_mode_config` already refuses a
+    // zero `[orchestrator].address` at parse time, for the service and these
+    // commands alike.
+    Ok(orchestrator)
+}
+
+/// Resolves which assets the preflight checks. `--asset` narrows to the
+/// named symbols; without it the scope defaults to the enabled listings
+/// whose configured `vault_mode` resolves to orchestrator — the assets the
+/// rollout is actually cutting over — so the incremental one-asset-at-a-time
+/// cutover never demands approvals for assets that stay vault-direct. A
+/// filter symbol with no enabled listing on the network is an error rather
+/// than silently skipped — a typo'd symbol must not produce a READY verdict
+/// that never checked the intended asset.
+async fn preflight_assets(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    filter: &[UnderlyingSymbol],
+    vault_modes: &VaultModeConfig,
+) -> anyhow::Result<Vec<(UnderlyingSymbol, Address)>> {
+    let listed: Vec<(UnderlyingSymbol, Address)> = list_enabled_assets(pool)
+        .await?
+        .into_iter()
+        .filter(|asset| asset.network == network)
+        .map(|asset| (asset.underlying, asset.vault))
+        .collect();
+
+    if filter.is_empty() {
+        if listed.is_empty() {
+            anyhow::bail!("no enabled assets listed on {network}");
+        }
+        let orchestrator_scoped: Vec<(UnderlyingSymbol, Address)> = listed
+            .into_iter()
+            .filter(|(underlying, _)| {
+                matches!(
+                    vault_modes.mode_for(underlying),
+                    VaultMode::Orchestrator { .. }
+                )
+            })
+            .collect();
+        if orchestrator_scoped.is_empty() {
+            anyhow::bail!(
+                "no enabled asset on {network} is configured for \
+                 orchestrator mode; pass --asset to check an asset ahead of \
+                 its cutover"
+            );
+        }
+        return Ok(orchestrator_scoped);
+    }
+
+    let missing = filter
+        .iter()
+        .filter(|wanted| {
+            listed.iter().all(|(underlying, _)| underlying != *wanted)
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!("not enabled on {network}: {}", missing.join(", "));
+    }
+
+    Ok(listed
+        .into_iter()
+        .filter(|(underlying, _)| filter.contains(underlying))
+        .collect())
 }
 
 /// Submits a zero-amount `safeTransferFrom` of the first tracked receipt
@@ -1449,7 +1942,9 @@ fn parse_confirmation(input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloy::network::EthereumWallet;
     use alloy::primitives::{U256, address, b256};
+    use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use cqrs_es::DomainEvent;
     use rust_decimal::Decimal;
@@ -1461,7 +1956,7 @@ mod tests {
     use crate::redemption::{
         BurnFailureClassification, BurnRecord, RedemptionEvent,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
@@ -2342,6 +2837,569 @@ mod tests {
         assert!(
             error.to_string().contains("--chain-id"),
             "the parse failure must name the missing --chain-id, got {error}"
+        );
+    }
+
+    /// Mirrors [`seed_listing_at`] but at a caller-chosen vault, so the
+    /// preflight end-to-end test can list the vault Anvil actually deployed.
+    async fn seed_listing_at_vault(
+        database_url: &str,
+        underlying: &str,
+        vault: Address,
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(database_url)
+            .await
+            .expect("Failed to open database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let (listing_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build tokenized asset store");
+
+        let underlying = UnderlyingSymbol::new(underlying).unwrap();
+        listing_store
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new(format!("t{underlying}")),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .expect("Failed to add asset");
+        pool.close().await;
+    }
+
+    #[test]
+    fn orchestrator_preflight_parses_and_uppercases_asset_filters() {
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "orchestrator-preflight",
+            "--config",
+            "issuance-config.toml",
+            "--network",
+            "base",
+            "--asset",
+            "rklb",
+            "--asset",
+            "SGOV",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--turnkey-org-id",
+            "org-id",
+            "--turnkey-api-private-key",
+            "api-key",
+            "--turnkey-address",
+            "0x00000000000000000000000000000000000000cc",
+            "--database-url",
+            "sqlite::memory:",
+        ])
+        .expect("arguments parse");
+
+        let IssuerCommand::OrchestratorPreflight(args) = cli.command else {
+            panic!("expected the orchestrator-preflight subcommand")
+        };
+
+        assert_eq!(args.config, PathBuf::from("issuance-config.toml"));
+        assert_eq!(args.network, Network::Base);
+        assert_eq!(
+            args.assets,
+            vec![
+                UnderlyingSymbol::new("RKLB").unwrap(),
+                UnderlyingSymbol::new("SGOV").unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn orchestrator_preflight_requires_a_config_file() {
+        let Err(error) = IssuerCli::try_parse_from([
+            "issuer",
+            "orchestrator-preflight",
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--turnkey-org-id",
+            "org-id",
+            "--turnkey-api-private-key",
+            "api-key",
+            "--turnkey-address",
+            "0x00000000000000000000000000000000000000cc",
+            "--database-url",
+            "sqlite::memory:",
+        ]) else {
+            panic!(
+                "omitting --config must fail at parse time — the orchestrator \
+                 address has no other source"
+            )
+        };
+
+        assert!(
+            error.to_string().contains("--config"),
+            "the parse failure must name the missing --config, got {error}"
+        );
+    }
+
+    /// A vault-modes config resolving every asset to orchestrator mode, so
+    /// the default preflight scope covers all listings.
+    fn all_orchestrator_modes() -> VaultModeConfig {
+        VaultModeConfig::new(
+            std::collections::HashMap::new(),
+            VaultMode::Orchestrator { address: Address::repeat_byte(0xdd) },
+        )
+    }
+
+    #[tokio::test]
+    async fn preflight_assets_lists_only_the_requested_network() {
+        let admin =
+            admin_with_asset("SGOV", &[Network::Base, Network::Ethereum]).await;
+
+        let assets = preflight_assets(
+            &admin.pool,
+            Network::Base,
+            &[],
+            &all_orchestrator_modes(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            assets,
+            vec![(UnderlyingSymbol::new("SGOV").unwrap(), TEST_VAULT)]
+        );
+    }
+
+    /// The default scope is the assets configured for orchestrator mode —
+    /// the incremental cutover must not demand approvals for assets staying
+    /// vault-direct, and a scope that matches nothing is an error, never a
+    /// vacuous READY.
+    #[tokio::test]
+    async fn preflight_assets_default_scope_is_orchestrator_configured() {
+        let admin =
+            admin_with_asset("SGOV", &[Network::Base, Network::Ethereum]).await;
+
+        let sgov_only = VaultModeConfig::new(
+            std::collections::HashMap::from([(
+                "SGOV".to_string(),
+                VaultMode::Orchestrator { address: Address::repeat_byte(0xdd) },
+            )]),
+            VaultMode::VaultDirect,
+        );
+        let assets =
+            preflight_assets(&admin.pool, Network::Base, &[], &sgov_only)
+                .await
+                .unwrap();
+        assert_eq!(
+            assets,
+            vec![(UnderlyingSymbol::new("SGOV").unwrap(), TEST_VAULT)]
+        );
+
+        let all_vault_direct = VaultModeConfig::new(
+            std::collections::HashMap::new(),
+            VaultMode::VaultDirect,
+        );
+        let error = preflight_assets(
+            &admin.pool,
+            Network::Base,
+            &[],
+            &all_vault_direct,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no enabled asset on base is configured"),
+            "an all-vault-direct config must refuse the default scope, got \
+             {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_assets_filter_narrows_and_rejects_unknown_symbols() {
+        let admin = admin_with_asset("SGOV", &[Network::Base]).await;
+        let rklb_vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let (listing_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(admin.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let rklb = UnderlyingSymbol::new("RKLB").unwrap();
+        listing_store
+            .send(
+                &AssetKey::new(rklb.clone(), Network::Base),
+                TokenizedAssetCommand::Add {
+                    underlying: rklb.clone(),
+                    token: TokenSymbol::new("tRKLB".to_string()),
+                    network: Network::Base,
+                    vault: rklb_vault,
+                },
+            )
+            .await
+            .unwrap();
+
+        let narrowed = preflight_assets(
+            &admin.pool,
+            Network::Base,
+            std::slice::from_ref(&rklb),
+            &all_orchestrator_modes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(narrowed, vec![(rklb, rklb_vault)]);
+
+        let error = preflight_assets(
+            &admin.pool,
+            Network::Base,
+            &[UnderlyingSymbol::new("TSLA").unwrap()],
+            &all_orchestrator_modes(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("TSLA"),
+            "the error must name the unknown symbol, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_assets_errors_when_nothing_is_listed_on_the_network() {
+        let admin = admin_with_asset("SGOV", &[Network::Ethereum]).await;
+
+        let error = preflight_assets(
+            &admin.pool,
+            Network::Base,
+            &[],
+            &all_orchestrator_modes(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("no enabled assets"),
+            "an empty listing must be an error, got {error}"
+        );
+    }
+
+    /// The full preflight glue against a real orchestrator on Anvil: NOT
+    /// READY (non-zero exit) while the approval is missing, READY after it is
+    /// executed. Turnkey credentials are parse-only stand-ins — the preflight
+    /// reads the wallet address from the configuration and never signs.
+    #[tokio::test]
+    async fn orchestrator_preflight_end_to_end_gates_on_readiness() {
+        let evm = LocalEvm::with_chain_id(8453).await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("preflight.db").display()
+        );
+        seed_listing_at_vault(&database_url, "RKLB", evm.vault_address).await;
+
+        let config_path = directory.path().join("issuance-config.toml");
+        // RKLB is configured for orchestrator mode so the default scope —
+        // the assets actually cutting over — covers it.
+        std::fs::write(
+            &config_path,
+            format!(
+                "[orchestrator]\naddress = \"{orchestrator}\"\n\n\
+                 [assets.RKLB]\nvault_mode = \"orchestrator\"\n"
+            ),
+        )
+        .unwrap();
+
+        let parse_args = |database_url: &str| {
+            let cli = IssuerCli::try_parse_from([
+                "issuer",
+                "orchestrator-preflight",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--network",
+                "base",
+                "--chain-id",
+                "8453",
+                "--rpc-url",
+                &evm.endpoint,
+                "--turnkey-org-id",
+                "org-id",
+                "--turnkey-api-private-key",
+                "api-key",
+                "--turnkey-address",
+                &evm.wallet_address.to_string(),
+                "--database-url",
+                database_url,
+            ])
+            .expect("arguments parse");
+            let IssuerCommand::OrchestratorPreflight(args) = cli.command else {
+                panic!("expected the orchestrator-preflight subcommand")
+            };
+            *args
+        };
+
+        let error = run_orchestrator_preflight(parse_args(&database_url))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("preflight FAILED"),
+            "a missing approval must fail the preflight, got {error}"
+        );
+
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+            .approve(orchestrator, U256::MAX)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        run_orchestrator_preflight(parse_args(&database_url))
+            .await
+            .expect("preflight must pass once the approval is unlimited");
+    }
+
+    fn approve_orchestrator_args(
+        config_path: &str,
+        database_url: &str,
+        signer_flags: &[&str],
+    ) -> ApproveOrchestratorArgs {
+        let mut command_line = vec![
+            "issuer",
+            "approve-orchestrator",
+            "rklb",
+            "--config",
+            config_path,
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--database-url",
+            database_url,
+        ];
+        command_line.extend_from_slice(signer_flags);
+
+        let cli =
+            IssuerCli::try_parse_from(command_line).expect("arguments parse");
+        let IssuerCommand::ApproveOrchestrator(args) = cli.command else {
+            panic!("expected the approve-orchestrator subcommand")
+        };
+        *args
+    }
+
+    const TURNKEY_FLAGS: [&str; 6] = [
+        "--turnkey-org-id",
+        "org-id",
+        "--turnkey-api-private-key",
+        "api-key",
+        "--turnkey-address",
+        "0x00000000000000000000000000000000000000cc",
+    ];
+
+    fn write_orchestrator_config(directory: &std::path::Path) -> PathBuf {
+        let config_path = directory.join("issuance-config.toml");
+        std::fs::write(
+            &config_path,
+            "[orchestrator]\n\
+             address = \"0x1234567890abcdef1234567890abcdef12345678\"\n",
+        )
+        .unwrap();
+        config_path
+    }
+
+    #[test]
+    fn approve_orchestrator_parses_and_uppercases_the_underlying() {
+        let args = approve_orchestrator_args(
+            "issuance-config.toml",
+            "sqlite::memory:",
+            &TURNKEY_FLAGS,
+        );
+
+        assert_eq!(args.underlying, UnderlyingSymbol::new("RKLB").unwrap());
+        assert_eq!(args.network, Network::Base);
+        assert_eq!(args.config, PathBuf::from("issuance-config.toml"));
+    }
+
+    /// A declined confirmation must abort before any network call. The
+    /// unreachable `--rpc-url` is the assertion: if the prompt were bypassed,
+    /// or the chain-id round-trip ran first, this would fail on the endpoint
+    /// rather than on the operator's decision.
+    #[tokio::test]
+    async fn approve_orchestrator_aborts_without_touching_the_chain_when_declined()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("approve-decline.db").display()
+        );
+        seed_listing_at(&database_url, "RKLB").await;
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = approve_orchestrator_args(
+            config_path.to_str().unwrap(),
+            &database_url,
+            &TURNKEY_FLAGS,
+        );
+
+        let error =
+            run_approve_orchestrator(args, |_| Ok(false)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("aborted by operator"),
+            "a declined confirmation must abort before any RPC, got {error}"
+        );
+    }
+
+    /// The approval must come from the Turnkey bot wallet — the wallet whose
+    /// allowance production burns will spend — so a local key is refused
+    /// outright instead of approving from an address production never uses.
+    #[tokio::test]
+    async fn approve_orchestrator_refuses_a_non_turnkey_signer() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = approve_orchestrator_args(
+            config_path.to_str().unwrap(),
+            "sqlite::memory:",
+            &["--evm-private-key", TEST_SIGNER_KEY],
+        );
+
+        let error = run_approve_orchestrator(args, |_| {
+            panic!("must refuse the signer before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Turnkey signer configuration"),
+            "the refusal must name the Turnkey requirement, got {error}"
+        );
+    }
+
+    fn verify_signing_args(
+        config_path: &str,
+        signer_flags: &[&str],
+    ) -> VerifyOrchestratorSigningArgs {
+        let mut command_line = vec![
+            "issuer",
+            "verify-orchestrator-signing",
+            "rklb",
+            "--config",
+            config_path,
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--database-url",
+            "sqlite::memory:",
+        ];
+        command_line.extend_from_slice(signer_flags);
+
+        let cli =
+            IssuerCli::try_parse_from(command_line).expect("arguments parse");
+        let IssuerCommand::VerifyOrchestratorSigning(args) = cli.command else {
+            panic!("expected the verify-orchestrator-signing subcommand")
+        };
+        *args
+    }
+
+    #[test]
+    fn verify_orchestrator_signing_parses_and_uppercases_the_underlying() {
+        let args = verify_signing_args("issuance-config.toml", &TURNKEY_FLAGS);
+
+        assert_eq!(args.underlying, UnderlyingSymbol::new("RKLB").unwrap());
+        assert_eq!(args.network, Network::Base);
+        assert_eq!(args.config, PathBuf::from("issuance-config.toml"));
+    }
+
+    /// Signing with a local key would trivially succeed and prove nothing
+    /// about the Turnkey policy — the command must refuse rather than report
+    /// a hollow pass.
+    #[tokio::test]
+    async fn verify_orchestrator_signing_refuses_a_non_turnkey_signer() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = verify_signing_args(
+            config_path.to_str().unwrap(),
+            &["--evm-private-key", TEST_SIGNER_KEY],
+        );
+
+        let error = run_verify_orchestrator_signing(args).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("Turnkey signer"),
+            "the refusal must name the Turnkey requirement, got {error}"
+        );
+    }
+
+    #[test]
+    fn required_orchestrator_address_refuses_missing_and_zero() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let dark = directory.path().join("dark.toml");
+        std::fs::write(&dark, "# dark: no [orchestrator] section\n").unwrap();
+        let error = required_orchestrator_address(&dark).unwrap_err();
+        assert!(
+            error.to_string().contains("[orchestrator].address"),
+            "the refusal must name the missing key, got {error}"
+        );
+
+        // The zero address is refused by the config loader itself (before
+        // this helper's own checks), with the same strict parse the service
+        // applies — pinned here so it can never reach these commands.
+        let zeroed = directory.path().join("zero.toml");
+        std::fs::write(
+            &zeroed,
+            format!("[orchestrator]\naddress = \"{}\"\n", Address::ZERO),
+        )
+        .unwrap();
+        let error = required_orchestrator_address(&zeroed).unwrap_err();
+        assert!(
+            error.to_string().contains("not a valid EVM address"),
+            "a zero address must be refused by the config loader, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_orchestrator_signing_requires_an_orchestrator_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("dark-config.toml");
+        std::fs::write(&config_path, "# dark: no [orchestrator] section\n")
+            .unwrap();
+
+        let args =
+            verify_signing_args(config_path.to_str().unwrap(), &TURNKEY_FLAGS);
+
+        let error = run_verify_orchestrator_signing(args).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("[orchestrator].address"),
+            "the refusal must name the missing address, got {error}"
         );
     }
 }

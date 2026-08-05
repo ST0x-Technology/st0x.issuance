@@ -28,6 +28,7 @@ use crate::vault::orchestrator::BurnProofKind;
 
 pub(crate) mod mock;
 pub(crate) mod network_services;
+pub(crate) mod onboarding;
 pub(crate) mod orchestrator;
 pub(crate) mod rain_meta;
 pub(crate) mod service;

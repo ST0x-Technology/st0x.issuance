@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{Level, warn};
 use url::Url;
@@ -84,15 +84,32 @@ pub struct VaultModeConfig {
     per_asset: HashMap<String, VaultMode>,
     /// Fallback used for any asset not listed in `per_asset`.
     default: VaultMode,
+    /// `[orchestrator].address` as parsed from the TOML file, retained even
+    /// while every asset still resolves to vault-direct: the onboarding ops
+    /// tooling (role/allowance preflight, approval execution) needs the
+    /// address before the first asset's cutover, and the config file is its
+    /// single source of truth.
+    orchestrator_address: Option<Address>,
 }
 
 impl VaultModeConfig {
+    /// Programmatic constructor for tests and harnesses. Configs built this
+    /// way carry no `[orchestrator].address` (`orchestrator_address()` is
+    /// `None`); orchestrator addresses live inside the `VaultMode` variants.
     #[must_use]
     pub const fn new(
         per_asset: HashMap<String, VaultMode>,
         default: VaultMode,
     ) -> Self {
-        Self { per_asset, default }
+        Self { per_asset, default, orchestrator_address: None }
+    }
+
+    /// The `[orchestrator].address` from the TOML file, if one was configured.
+    /// Present as soon as the section carries an address — deliberately not
+    /// gated on any asset resolving to orchestrator mode.
+    #[must_use]
+    pub const fn orchestrator_address(&self) -> Option<Address> {
+        self.orchestrator_address
     }
 
     /// Returns the `VaultMode` for the given underlying asset symbol.
@@ -382,12 +399,7 @@ impl Env {
         let signer = self.signer.into_config()?;
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
         let vault_mode_config = if let Some(config_path) = self.config {
-            let content =
-                std::fs::read_to_string(&config_path).map_err(|error| {
-                    ConfigError::ConfigFileRead { path: config_path, error }
-                })?;
-            let toml_file: TomlFile = toml::from_str(&content)?;
-            resolve_vault_modes(&toml_file)?
+            load_vault_mode_config(&config_path)?
         } else {
             VaultModeConfig::default()
         };
@@ -745,6 +757,26 @@ enum VaultModeStr {
     Orchestrator,
 }
 
+/// Reads and validates the TOML config file at `path` into a
+/// [`VaultModeConfig`]. The single loading path shared by server startup
+/// (`Env::into_config`) and the issuer CLI, so both apply identical strict
+/// parsing and validation.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, is not valid TOML for the
+/// strict schema (unknown keys are rejected), or fails the validation rules
+/// of [`resolve_vault_modes`].
+pub(crate) fn load_vault_mode_config(
+    path: &Path,
+) -> Result<VaultModeConfig, ConfigError> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        ConfigError::ConfigFileRead { path: path.to_path_buf(), error }
+    })?;
+    let toml_file: TomlFile = toml::from_str(&content)?;
+    resolve_vault_modes(&toml_file)
+}
+
 /// Converts the raw TOML file into a validated `VaultModeConfig`.
 ///
 /// Validation rules:
@@ -817,7 +849,7 @@ fn resolve_vault_modes(
         }
     }
 
-    Ok(VaultModeConfig { per_asset, default })
+    Ok(VaultModeConfig { per_asset, default, orchestrator_address })
 }
 
 /// RPC URL uses a scheme that cannot be mapped to HTTP.
@@ -886,6 +918,7 @@ pub fn setup_tracing(log_level: &LogLevel) {
 mod tests {
     use alloy::primitives::address;
     use ipnetwork::IpNetwork;
+    use tempfile::NamedTempFile;
 
     use super::*;
     use crate::auth::IpWhitelist;
@@ -1330,6 +1363,7 @@ mod tests {
         let cfg = VaultModeConfig::default();
         assert_eq!(cfg.default, VaultMode::VaultDirect);
         assert!(cfg.per_asset.is_empty());
+        assert_eq!(cfg.orchestrator_address(), None);
     }
 
     // Pins the committed per-environment deploy configs (baked into the
@@ -1367,6 +1401,7 @@ mod tests {
             Some(VaultMode::Orchestrator { address: orch_address() })
         );
         assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
     }
 
     #[test]
@@ -1442,6 +1477,7 @@ mod tests {
 
         assert_eq!(cfg.default, VaultMode::VaultDirect);
         assert!(cfg.per_asset.is_empty());
+        assert_eq!(cfg.orchestrator_address(), None);
     }
 
     #[test]
@@ -1542,6 +1578,74 @@ mod tests {
             cfg.mode_for(&UnderlyingSymbol::new("TSLA").unwrap()),
             VaultMode::VaultDirect
         );
+    }
+
+    // The address must survive resolution even while no asset resolves to
+    // orchestrator mode: the onboarding ops tooling (preflight, approvals)
+    // runs against exactly this dark configuration, before the first cutover.
+    #[test]
+    fn orchestrator_address_exposed_while_all_assets_vault_direct() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::new(),
+        };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert!(cfg.per_asset.is_empty());
+        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
+    }
+
+    #[test]
+    fn programmatic_config_carries_no_orchestrator_address() {
+        let cfg = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orch_address() },
+            )]),
+            VaultMode::VaultDirect,
+        );
+
+        assert_eq!(cfg.orchestrator_address(), None);
+    }
+
+    #[test]
+    fn load_vault_mode_config_reads_and_resolves_file() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [orchestrator]
+            address = "0x1234567890abcdef1234567890abcdef12345678"
+
+            [assets.RKLB]
+            vault_mode = "orchestrator"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = load_vault_mode_config(file.path()).unwrap();
+
+        assert_eq!(
+            cfg.per_asset.get("RKLB").copied(),
+            Some(VaultMode::Orchestrator { address: orch_address() })
+        );
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
+    }
+
+    #[test]
+    fn load_vault_mode_config_missing_file_is_read_error() {
+        let missing = PathBuf::from("/nonexistent/issuance-config.toml");
+
+        assert!(matches!(
+            load_vault_mode_config(&missing),
+            Err(ConfigError::ConfigFileRead { path, .. }) if path == missing
+        ));
     }
 
     #[test]
