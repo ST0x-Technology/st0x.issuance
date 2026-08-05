@@ -1,11 +1,13 @@
+use alloy::consensus::transaction::SignerRecoverable;
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
 use event_sorcery::{EventSourced, LifecycleError, Store};
-use rocket::http::Status;
+use rocket::http::{ContentType, Status};
+use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
@@ -21,9 +23,10 @@ use crate::auth::InternalAuth;
 use crate::config::{Config, VaultMode};
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
-    MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
-    recovery::enqueue_scheduled_mint_recovery,
+    MintFailureClassification, MintView, TokenizationRequestId,
+    find_stuck as find_stuck_mints, recovery::enqueue_manual_mint_recovery,
 };
+use crate::receipt_inventory::ReceiptService;
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
     BurnManager, BurnManagerError, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
@@ -36,10 +39,11 @@ use crate::redemption::{
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
-use crate::tokenized_asset::view::list_enabled_assets;
+use crate::tokenized_asset::view::{find_vault, list_enabled_assets};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
-    BurnVerification, NetworkVaultServices, TxId, VaultError, VaultService,
+    BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
+    NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
 };
 
 #[async_trait]
@@ -1273,11 +1277,13 @@ pub(crate) async fn reprocess_mint(
     }
     let current_state = mint.state_name().to_string();
 
-    // Manual reprocess enqueues a durable recovery job — the same path the
-    // automatic startup re-scan and the periodic reconciler use. It frees any
-    // terminal recovery job for this mint and re-drives it through the per-state
-    // jobs to completion.
-    enqueue_scheduled_mint_recovery(
+    // Manual reprocess enqueues a durable recovery job on the same worker the
+    // automatic startup re-scan and periodic reconciler use, but flagged
+    // `manual`: the recovery loop spends that flag on one re-drive of a
+    // classified failure it would otherwise skip — without it this endpoint
+    // would answer "recovery initiated" for a classified mint while nothing
+    // runs. It frees any terminal recovery job for this mint first.
+    enqueue_manual_mint_recovery(
         pool.inner(),
         apalis_pool.inner(),
         issuer_request_id,
@@ -1307,6 +1313,13 @@ pub(crate) async fn reprocess_mint(
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CloseMintRequest {
     reason: String,
+    /// Required only to close a `NonceReplayUnresolved` mint, and must
+    /// exactly echo that mint's persisted authorization nonce; rejected on
+    /// any other mint. Records that an operator verified the nonce's
+    /// absence against a chain view outside this bot.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    acknowledged_unresolved_mint_nonce: Option<B256>,
 }
 
 /// Admin endpoint to close a mint that cannot be automatically recovered.
@@ -1324,30 +1337,51 @@ pub(crate) struct CloseMintRequest {
     responses(
         (status = 200, description = "Mint closed by admin", body = ReprocessResponse),
         (status = 400, description = "Aggregate id is not a valid UUID"),
-        (status = 422, description = "Invalid state transition for close"),
+        (status = 422,
+            description = "Invalid state transition for close (including \
+                CallbackPending, whose on-chain mint is already recorded), \
+                a mint that landed on-chain (run recovery instead), a \
+                persisted transaction that could still land, or a \
+                NonceReplayUnresolved mint without a matching \
+                acknowledged_unresolved_mint_nonce"),
         (status = 500, description = "Internal failure")
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store))]
+#[tracing::instrument(skip(_auth, store, pool, vault_services, receipts))]
 #[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
 pub(crate) async fn close_mint(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<Mint>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    receipts: &rocket::State<Arc<dyn ReceiptService>>,
     aggregate_id: &str,
     body: Json<CloseMintRequest>,
-) -> Result<Json<ReprocessResponse>, Status> {
+) -> Result<Json<ReprocessResponse>, CloseMintError> {
     let issuer_request_id: IssuerMintRequestId = aggregate_id
         .parse::<uuid::Uuid>()
         .map(IssuerMintRequestId::new)
         .map_err(|_| Status::BadRequest)?;
+    let CloseMintRequest { reason, acknowledged_unresolved_mint_nonce } =
+        body.into_inner();
+
+    refuse_unsafe_close(
+        store,
+        pool,
+        vault_services,
+        receipts,
+        &issuer_request_id,
+    )
+    .await?;
 
     store
         .send(
             &issuer_request_id,
             MintCommand::CloseMint {
                 issuer_request_id: issuer_request_id.clone(),
-                reason: body.into_inner().reason,
+                reason,
+                acknowledged_unresolved_mint_nonce,
             },
         )
         .await
@@ -1362,14 +1396,428 @@ pub(crate) async fn close_mint(
             }
         })?;
 
-    info!(target: "admin", aggregate_id = %aggregate_id, "Mint closed");
+    info!(target: "admin", aggregate_id = %aggregate_id,
+        acknowledged_unresolved_mint_nonce = ?acknowledged_unresolved_mint_nonce,
+        "Mint closed"
+    );
 
+    // The acknowledged override is attributable everywhere it matters: the
+    // terminal event carries it, the structured log above records it, and
+    // the response names it too (SPEC "Close Mint").
+    let message = acknowledged_unresolved_mint_nonce.map_or_else(
+        || "Mint closed by admin".to_string(),
+        |nonce| {
+            format!(
+                "Mint closed by admin (acknowledged unresolved nonce {nonce})"
+            )
+        },
+    );
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,
         aggregate_id: aggregate_id.to_string(),
         previous_state: "Unknown".to_string(),
-        message: "Mint closed by admin".to_string(),
+        message,
     }))
+}
+
+/// Close-mint endpoint failure. Most causes respond as a bare status (their
+/// detail stays in the server logs), but the landed-refusal carries a body
+/// telling the operator what to do instead — a bare 422 would be
+/// indistinguishable from the aggregate's ordinary invalid-state rejection.
+#[derive(Debug)]
+pub(crate) enum CloseMintError {
+    Status(Status),
+    MintLanded,
+    /// The authorization nonce is consumed on-chain but no full-matching
+    /// `Minted` log was found within the bounded lookback, and the mint
+    /// carries no adjudicated `NonceConsumedByOtherMint` verdict — the
+    /// landing may be this mint's, older than the scan window. Fail closed
+    /// unless the mint is classified `NonceReplayUnresolved` and the
+    /// operator supplies the matching acknowledgement.
+    LandingUnproven,
+    /// A persisted signed transaction in the mint's history could still
+    /// land (or persisted no bytes to prove anything about): the close-time
+    /// absence read is one instant, while a pending or replaceable
+    /// transaction can land afterwards — unobserved, once `MintClosed`
+    /// removes the mint from recovery and stuck queries. Fail closed until
+    /// the transaction provably cannot land (confirmed revert, or the
+    /// wallet nonce finalized past it).
+    UnresolvedPersistedTx,
+}
+
+impl From<Status> for CloseMintError {
+    fn from(status: Status) -> Self {
+        Self::Status(status)
+    }
+}
+
+impl<'r> Responder<'r, 'static> for CloseMintError {
+    fn respond_to(
+        self,
+        request: &'r rocket::Request<'_>,
+    ) -> response::Result<'static> {
+        let body_422 = |message: &str| {
+            let body = serde_json::json!({ "error": message }).to_string();
+            rocket::Response::build()
+                .status(Status::UnprocessableEntity)
+                .header(ContentType::JSON)
+                .sized_body(body.len(), std::io::Cursor::new(body))
+                .ok()
+        };
+        match self {
+            Self::Status(status) => status.respond_to(request),
+            Self::MintLanded => body_422(
+                "Mint landed on-chain; run recovery instead of closing",
+            ),
+            Self::LandingUnproven => body_422(
+                "Authorization nonce is consumed on-chain but no landing \
+                 was found within the scan window; verify whether this \
+                 mint's tokens landed before closing (a \
+                 NonceReplayUnresolved mint closes only with a matching \
+                 acknowledged_unresolved_mint_nonce)",
+            ),
+            Self::UnresolvedPersistedTx => body_422(
+                "A persisted transaction in this mint's history could \
+                 still land (or cannot be proven dead); a close would let \
+                 it land unobserved — resolve or replace it first",
+            ),
+        }
+    }
+}
+
+/// The pre-close safety gate: closing a mint whose tokens actually minted
+/// on-chain — or whose persisted transaction could still land — would
+/// strand real backed tokens unreported to Alpaca, so the close is refused
+/// until the chain proves otherwise (SPEC "Mint Aggregate" -> `CloseMint`).
+/// The `Mint` aggregate is pure (`Services = ()`), so the on-chain checks
+/// run here, before `CloseMint` is sent. Fail closed: any failed read
+/// refuses the close rather than closing blind.
+///
+/// Three layers, all read-only:
+/// 1. Every persisted signed transaction with no recorded terminal outcome
+///    must be provably unable to land — a confirmed revert, or the signing
+///    wallet's finalized nonce past it. A still-mineable transaction (or a
+///    legacy submission that persisted no bytes to prove anything about)
+///    refuses the close: the absence read is one instant, and a later
+///    landing would go unobserved once the mint leaves recovery and stuck
+///    queries.
+/// 2. Vault-direct: a receipt recorded for this `issuer_request_id` means
+///    the mint landed — the operator runs `Recover` instead.
+/// 3. Orchestrator: `nonceUsed(to, nonce)` is the unbounded non-landing
+///    proof (unconsumed means nothing landed, however long parked), and a
+///    consumed nonce takes the three-way `Minted`-log verdict — `FullMatch`
+///    refuses (landed; run recovery), `Mismatch` proves a DIFFERENT mint
+///    consumed the pair (closable), and `NotFound` is inconclusive: it
+///    refuses unless the recorded verdict already adjudicated the pair as
+///    another mint's (`NonceConsumedByOtherMint`, proven at confirm time)
+///    or the mint is `NonceReplayUnresolved` — whose close the aggregate
+///    additionally gates on the operator's explicit
+///    `acknowledged_unresolved_mint_nonce`.
+///
+/// Inherently check-then-act: a transaction landing between this check and
+/// the `CloseMint` commit still closes the mint. The window is a single
+/// command send, and a close is an operator action on a parked mint, not an
+/// in-flight one.
+#[allow(clippy::too_many_lines)]
+async fn refuse_unsafe_close(
+    store: &Store<Mint>,
+    pool: &Pool<Sqlite>,
+    vault_services: &NetworkVaultServices,
+    receipts: &Arc<dyn ReceiptService>,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), CloseMintError> {
+    let mint = store.load(issuer_request_id).await.map_err(|err| {
+        error!(target: "admin", issuer_request_id = %issuer_request_id,
+            error = %err,
+            "Failed to load mint for the pre-close safety gate"
+        );
+        Status::InternalServerError
+    })?;
+    // An unknown mint falls through: `CloseMint` rejects it with the
+    // aggregate's own error.
+    let Some(mint) = mint else {
+        return Ok(());
+    };
+
+    // Terminal and callback-pending mints are rejected by `CloseMint`
+    // itself with their own specific errors; running the on-chain checks
+    // first would misreport them (and spend RPC lookups doing it).
+    if matches!(
+        mint,
+        Mint::Completed { .. }
+            | Mint::Closed { .. }
+            | Mint::CallbackPending { .. }
+    ) {
+        return Ok(());
+    }
+
+    let Some(network) = mint.network() else {
+        return Ok(());
+    };
+    let vault_service = vault_services.service(network).map_err(|err| {
+        error!(target: "admin", issuer_request_id = %issuer_request_id,
+            error = %err,
+            "No vault service configured for the pre-close safety gate"
+        );
+        Status::InternalServerError
+    })?;
+
+    // Layer 1: positive proof every persisted transaction can no longer
+    // land.
+    let (persisted_txs, has_unprovable) = mint.unresolved_persisted_txs();
+    if has_unprovable {
+        warn!(target: "admin", issuer_request_id = %issuer_request_id,
+            "A submission in this mint's history persisted no signed bytes; \
+             its fate cannot be proven — refusing the close (fail closed)"
+        );
+        return Err(CloseMintError::UnresolvedPersistedTx);
+    }
+    for prepared in persisted_txs {
+        let sendable = SendableTxWithHash {
+            tx: prepared.tx.clone(),
+            hash: prepared.hash,
+            nonce: prepared.nonce,
+            signed_at: prepared.signed_at,
+            dust_shares: U256::ZERO,
+        };
+        // The signer is recovered from the persisted envelope itself — the
+        // nonce comparison must run against the wallet that signed it, and
+        // the envelope is the one source that cannot disagree.
+        let signer = sendable
+            .validate()
+            .and_then(|envelope| {
+                envelope.recover_signer().map_err(VaultError::from)
+            })
+            .map_err(|err| {
+                error!(target: "admin", issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "Persisted transaction failed validation during the \
+                     pre-close safety gate"
+                );
+                Status::InternalServerError
+            })?;
+        match vault_service.classify_burn_tx(signer, &sendable).await {
+            Ok(BurnTxStatus::Reverted | BurnTxStatus::ProvablyDead) => {}
+            Ok(BurnTxStatus::Mined) => {
+                warn!(target: "admin", issuer_request_id = %issuer_request_id,
+                    tx_hash = %sendable.hash,
+                    "Refusing to close: the persisted transaction landed \
+                     on-chain; run recovery instead"
+                );
+                return Err(CloseMintError::MintLanded);
+            }
+            Ok(BurnTxStatus::StillMineable) => {
+                warn!(target: "admin", issuer_request_id = %issuer_request_id,
+                    tx_hash = %sendable.hash,
+                    "Refusing to close: the persisted transaction could \
+                     still land (fail closed)"
+                );
+                return Err(CloseMintError::UnresolvedPersistedTx);
+            }
+            Err(err) => {
+                error!(target: "admin", issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "Persisted-transaction classification failed; refusing \
+                     the close (fail closed)"
+                );
+                return Err(Status::InternalServerError.into());
+            }
+        }
+    }
+
+    let (Some(underlying), Some(wallet), Some(quantity)) =
+        (mint.underlying(), mint.wallet(), mint.quantity())
+    else {
+        return Ok(());
+    };
+
+    match mint.mint_mode() {
+        // Layer 2: a recorded receipt is a vault-direct landing.
+        Some(VaultMode::VaultDirect) => {
+            let chain_id = vault_services.chain_id(network).map_err(|err| {
+                error!(target: "admin",
+                    issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "No chain id configured for the pre-close safety gate"
+                );
+                Status::InternalServerError
+            })?;
+            let vault = find_vault(pool, underlying, &network)
+                .await
+                .map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Vault lookup failed for the pre-close safety gate"
+                    );
+                    Status::InternalServerError
+                })?
+                .ok_or_else(|| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        underlying = %underlying,
+                        network = %network,
+                        "No vault registered for the pre-close safety gate"
+                    );
+                    Status::InternalServerError
+                })?;
+            let receipt = receipts
+                .find_by_issuer_request_id(chain_id, &vault, issuer_request_id)
+                .await
+                .map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Receipt lookup failed; refusing the close (fail \
+                         closed)"
+                    );
+                    Status::InternalServerError
+                })?;
+            if let Some(receipt) = receipt {
+                warn!(target: "admin", issuer_request_id = %issuer_request_id,
+                    tx_hash = %receipt.tx_hash,
+                    receipt_id = %receipt.receipt_id,
+                    "Refusing to close vault-direct mint whose receipt is \
+                     recorded; run recovery instead"
+                );
+                return Err(CloseMintError::MintLanded);
+            }
+            Ok(())
+        }
+        // Layer 3: the orchestrator nonce gate and Minted-log verdict.
+        Some(VaultMode::Orchestrator { address: orchestrator }) => {
+            let Some(authorization) = mint.mint_authorization() else {
+                // No authorization was ever delivered: no nonce exists to
+                // have been consumed, and layer 1 already proved every
+                // persisted transaction dead.
+                return Ok(());
+            };
+
+            // `nonceUsed(to, nonce)` is the unbounded, authoritative
+            // non-landing proof: `mint()` consumes the nonce, so an
+            // unconsumed nonce means nothing can have landed no matter how
+            // long the mint has been parked. The log scan below is bounded,
+            // so on its own it would fail open for a landing older than the
+            // window — exactly the long-parked mints an admin close
+            // targets.
+            let consumed = vault_service
+                .nonce_used(orchestrator, wallet, authorization.nonce)
+                .await
+                .map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Consumed-nonce read failed; refusing the close \
+                         (fail closed)"
+                    );
+                    Status::InternalServerError
+                })?;
+            if !consumed {
+                return Ok(());
+            }
+
+            let vault = find_vault(pool, underlying, &network)
+                .await
+                .map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Vault lookup failed for the pre-close safety gate"
+                    );
+                    Status::InternalServerError
+                })?
+                .ok_or_else(|| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        underlying = %underlying,
+                        network = %network,
+                        "No vault registered for the pre-close safety gate"
+                    );
+                    Status::InternalServerError
+                })?;
+            let amount =
+                quantity.to_u256_with_18_decimals().map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Persisted mint quantity failed share conversion"
+                    );
+                    Status::InternalServerError
+                })?;
+
+            let verdict = vault_service
+                .find_orchestrator_minted_log(MintedLogQuery {
+                    orchestrator,
+                    to: wallet,
+                    nonce: authorization.nonce,
+                    token: vault,
+                    amount,
+                    lookback_blocks: None,
+                })
+                .await
+                .map_err(|err| {
+                    error!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Minted-log lookup failed; refusing the close (fail \
+                         closed)"
+                    );
+                    Status::InternalServerError
+                })?;
+
+            match verdict {
+                MintedLogScan::FullMatch(minted) => {
+                    warn!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        tx_hash = %minted.tx_hash,
+                        nonce = %minted.nonce,
+                        "Refusing to close orchestrator mint that landed \
+                         on-chain; run recovery instead"
+                    );
+                    Err(CloseMintError::MintLanded)
+                }
+                // The pair's one landing belongs to a different mint: this
+                // mint can never land, so the close is safe.
+                MintedLogScan::Mismatch => {
+                    info!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        nonce = %authorization.nonce,
+                        "Minted log at the pair disagrees on token/amount; \
+                         a different mint consumed it — close may proceed"
+                    );
+                    Ok(())
+                }
+                MintedLogScan::NotFound => {
+                    // Inconclusive — unless a prior verdict adjudicated the
+                    // pair as another mint's (proven at confirm time, when
+                    // the landing was necessarily recent enough to scan),
+                    // or the mint is the unresolved classification whose
+                    // close the aggregate gates on the operator's explicit
+                    // acknowledgement (echoing the persisted nonce).
+                    if matches!(
+                        mint,
+                        Mint::MintingFailed {
+                            classification:
+                                MintFailureClassification::NonceConsumedByOtherMint
+                                    | MintFailureClassification::NonceReplayUnresolved,
+                            ..
+                        }
+                    ) {
+                        return Ok(());
+                    }
+                    warn!(target: "admin",
+                        issuer_request_id = %issuer_request_id,
+                        nonce = %authorization.nonce,
+                        "Authorization nonce is consumed on-chain but no \
+                         landing was found within the scan window; refusing \
+                         the close (fail closed)"
+                    );
+                    Err(CloseMintError::LandingUnproven)
+                }
+            }
+        }
+        None => Ok(()),
+    }
 }
 
 /// In-progress states that haven't transitioned in this long are reported as
@@ -2311,7 +2759,7 @@ mod tests {
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use event_sorcery::{Store, test_store};
+    use event_sorcery::{Store, StoreBuilder, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -2342,13 +2790,13 @@ mod tests {
     use crate::config::{VaultMode, VaultModeConfig};
     use crate::mint::test_utils::{TestHarness, test_config};
     use crate::mint::{
-        ClientId, MintFailureClassification, MintView, Quantity,
-        TokenizationRequestId,
+        ClientId, IssuerMintRequestId, Mint, MintCommand, MintExternalTxId,
+        MintFailureClassification, MintView, Quantity, TokenizationRequestId,
     };
     use crate::receipt_inventory::ReceiptVaultKey;
     use crate::receipt_inventory::{
-        ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
-        Shares,
+        CqrsReceiptService, ReceiptId, ReceiptInventory,
+        ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
@@ -2360,13 +2808,15 @@ mod tests {
     use crate::tokenized_asset::schedule::FreezeScheduler;
     use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::tokenized_asset::{
-        AssetKey, Network, TokenSymbol, UnderlyingSymbol,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MultiBurnEntry, NetworkVaultServices, SendableTxWithHash, TxId,
-        VaultService,
+        BurnTxStatus, MultiBurnEntry, NetworkVaultServices, PreparedMintTx,
+        SendableTxWithHash, TxId, VaultService,
     };
+    use crate::vault::{MintAuthorization, OrchestratorMintedLog};
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -6278,5 +6728,885 @@ mod tests {
         let (status, _body) = dispatch_orchestrator_health(rocket, false).await;
 
         assert_eq!(status, Status::Unauthorized);
+    }
+
+    const CLOSE_ORCHESTRATOR: Address =
+        address!("0x00000000000000000000000000000000000000aa");
+    const CLOSE_VAULT: Address =
+        address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const CLOSE_RECIPIENT: Address =
+        address!("0x1234567890abcdef1234567890abcdef12345678");
+
+    fn close_test_authorization() -> MintAuthorization {
+        MintAuthorization {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from_static(&[0x42; 65]),
+        }
+    }
+
+    /// Registers AAPL -> [`CLOSE_VAULT`] through the real projection so the
+    /// pre-close landed check's `find_vault` (keyed `{underlying}:{network}`)
+    /// resolves.
+    async fn seed_close_test_asset(pool: &sqlx::Pool<sqlx::Sqlite>) {
+        let (asset_store, _asset_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("asset store must build");
+        asset_store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault: CLOSE_VAULT,
+                },
+            )
+            .await
+            .expect("asset must register");
+    }
+
+    /// Seeds a mint via commands: `Initiate` with the given mode, plus the
+    /// delivered authorization for orchestrator mints (the pre-close landed
+    /// check only runs with one on record).
+    async fn seed_close_test_mint(
+        mint_store: &Store<Mint>,
+        mint_mode: VaultMode,
+    ) -> IssuerMintRequestId {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let orchestrator_mode =
+            matches!(mint_mode, VaultMode::Orchestrator { .. });
+        mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-close-1",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    client_id: ClientId::new(),
+                    wallet: CLOSE_RECIPIENT,
+                    mint_mode,
+                },
+            )
+            .await
+            .expect("mint must initiate");
+
+        if orchestrator_mode {
+            mint_store
+                .send(
+                    &issuer_request_id,
+                    MintCommand::AuthorizeMint {
+                        issuer_request_id: issuer_request_id.clone(),
+                        mint_authorization: close_test_authorization(),
+                    },
+                )
+                .await
+                .expect("authorization must record");
+        }
+
+        issuer_request_id
+    }
+
+    fn close_mint_rocket(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        mint_store: Arc<Store<Mint>>,
+        vault_service: Arc<dyn VaultService>,
+    ) -> rocket::Rocket<rocket::Build> {
+        let vault_services = super::NetworkVaultServices::with_single_vault(
+            Network::Base,
+            ANVIL_CHAIN_ID,
+            vault_service,
+        );
+        let receipts: Arc<dyn ReceiptService> =
+            Arc::new(CqrsReceiptService::new(Arc::new(test_store::<
+                ReceiptInventory,
+            >(
+                pool.clone(), ()
+            ))));
+        rocket::build()
+            .manage(admin_test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool.clone())
+            .manage(mint_store)
+            .manage(vault_services)
+            .manage(receipts)
+            .mount("/", rocket::routes![super::close_mint])
+    }
+
+    async fn dispatch_close_mint(
+        rocket: rocket::Rocket<rocket::Build>,
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let response = client
+            .post(format!("/admin/close/mint/{issuer_request_id}"))
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(serde_json::json!({ "reason": "operator close" }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    /// Closing an orchestrator mint whose tokens actually landed on-chain
+    /// would strand real backed tokens unreported to Alpaca: the pre-close
+    /// landed check refuses the close and the mint stays open for recovery.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_landed_orchestrator_mint() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let vault_mock =
+            Arc::new(MockVaultService::new_success().with_minted_log(
+                OrchestratorMintedLog {
+                    tx_hash: B256::ZERO,
+                    nonce: close_test_authorization().nonce,
+                    shares_minted: U256::from(100u64)
+                        * U256::from(10u64).pow(U256::from(18u64)),
+                    block_number: 777,
+                },
+            ));
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a landed orchestrator mint must refuse the close"
+        );
+        assert!(
+            body.contains("run recovery instead"),
+            "the refusal body must tell the operator what to do, got: {body}"
+        );
+        assert_eq!(vault_mock.find_minted_log_call_count(), 1);
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(mint, Mint::Closed { .. }),
+            "the refused close must not record MintClosed, got: {mint:?}"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "Refusing to close orchestrator mint"
+            ]
+        ));
+    }
+
+    /// An unconsumed nonce is the unbounded non-landing proof: the close
+    /// proceeds without spending the bounded log scan at all — `mint()`
+    /// consumes the nonce, so nothing can have landed.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_closes_orchestrator_mint_with_unconsumed_nonce() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            vault_mock.find_minted_log_call_count(),
+            0,
+            "an unconsumed nonce must short-circuit the bounded log scan"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&issuer_request_id.to_string(), "Mint closed"]
+        ));
+    }
+
+    /// A consumed nonce with no full-matching landing in the bounded scan
+    /// window is inconclusive — the landing may be this mint's, older than
+    /// the window — so the close fails closed unless the mint carries the
+    /// adjudicated `NonceConsumedByOtherMint` verdict.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_consumed_nonce_without_provable_landing() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let vault_mock =
+            Arc::new(MockVaultService::new_success().with_nonce_used(true));
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a consumed nonce without a provable landing must refuse the \
+             close"
+        );
+        assert!(
+            body.contains("no landing was found within the scan window"),
+            "the refusal body must explain the inconclusive landing, got: \
+             {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(mint, Mint::Closed { .. }),
+            "the refused close must not record MintClosed, got: {mint:?}"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "no landing was found within the scan window"
+            ]
+        ));
+    }
+
+    /// A mint whose confirm-time full-match already adjudicated the consumed
+    /// nonce as another mint's (`NonceConsumedByOtherMint`) may close: its
+    /// own landing is permanently impossible.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_allows_adjudicated_nonce_consumed_mint() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let tx_id = TxId::Legacy("close-consumed-1".to_string());
+        let commands = [
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::Deposit {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::RecordTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::signed_for_test(
+                    0,
+                    "ext-close-consumed-1".to_string(),
+                ),
+            },
+            MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-close-consumed-1".to_string(),
+                ),
+                tx_id,
+            },
+            MintCommand::RecordMintFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "nonce consumed by another mint".to_string(),
+                classification:
+                    MintFailureClassification::NonceConsumedByOtherMint,
+            },
+        ];
+        for command in commands {
+            mint_store
+                .send(&issuer_request_id, command)
+                .await
+                .expect("mint must advance to the classified failure");
+        }
+
+        // The persisted transaction is the NonceReplayed revert — provably
+        // unable to land — and the consumed nonce has no full-matching log.
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_burn_tx_status(BurnTxStatus::Reverted),
+        );
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::Ok,
+            "the adjudicated NonceConsumedByOtherMint verdict must permit \
+             the close"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&issuer_request_id.to_string(), "Mint closed"]
+        ));
+    }
+
+    /// The fail-closed branches: an errored consumed-nonce read or Minted-log
+    /// lookup refuses the close with a 500 rather than closing blind.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_when_landed_check_lookup_fails() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let nonce_read_error =
+            Arc::new(MockVaultService::new_success().with_nonce_used_error());
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(
+                &pool,
+                mint_store.clone(),
+                nonce_read_error.clone(),
+            ),
+            &issuer_request_id,
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "an errored consumed-nonce read must refuse the close"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[&issuer_request_id.to_string(), "Consumed-nonce read failed"]
+        ));
+
+        let find_error = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_find_minted_log_error(),
+        );
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), find_error.clone()),
+            &issuer_request_id,
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "an errored Minted-log lookup must refuse the close"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[&issuer_request_id.to_string(), "Minted-log lookup failed"]
+        ));
+
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(mint, Mint::Closed { .. }),
+            "no refused close may record MintClosed, got: {mint:?}"
+        );
+    }
+
+    async fn dispatch_close_mint_with_body(
+        rocket: rocket::Rocket<rocket::Build>,
+        issuer_request_id: &IssuerMintRequestId,
+        body: serde_json::Value,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let response = client
+            .post(format!("/admin/close/mint/{issuer_request_id}"))
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    /// Drives an orchestrator close-test mint to `TxSubmitted` carrying a
+    /// genuinely signed persisted transaction, so the pre-close
+    /// proof-of-cannot-land layer has bytes to classify.
+    async fn advance_close_test_mint_to_submitted(
+        mint_store: &Store<Mint>,
+        issuer_request_id: &IssuerMintRequestId,
+    ) {
+        let commands = [
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::Deposit {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::RecordTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::signed_for_test(
+                    0,
+                    "ext-close-submitted".to_string(),
+                ),
+            },
+            MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-close-submitted".to_string(),
+                ),
+                tx_id: TxId::Legacy("close-submitted-1".to_string()),
+            },
+        ];
+        for command in commands {
+            mint_store
+                .send(issuer_request_id, command)
+                .await
+                .expect("mint must advance to TxSubmitted");
+        }
+    }
+
+    /// A `NonceReplayUnresolved` mint closes only with the operator's
+    /// acknowledgement echoing the persisted nonce exactly: missing and
+    /// mismatched acknowledgements are 422s, the echo closes.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_unresolved_replay_requires_matching_acknowledgement() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+        advance_close_test_mint_to_submitted(&mint_store, &issuer_request_id)
+            .await;
+        mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "nonce consumed with no log at the pair".to_string(),
+                    classification:
+                        MintFailureClassification::NonceReplayUnresolved,
+                },
+            )
+            .await
+            .expect("mint must park unresolved");
+
+        // The persisted transaction is the NonceReplayed revert (provably
+        // dead); the nonce is consumed with no full-matching log.
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_burn_tx_status(BurnTxStatus::Reverted),
+        );
+
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a missing acknowledgement must refuse the close"
+        );
+
+        let (status, _body) = dispatch_close_mint_with_body(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+            serde_json::json!({
+                "reason": "operator close",
+                "acknowledged_unresolved_mint_nonce": B256::repeat_byte(0xEE),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a non-echoing acknowledgement must refuse the close"
+        );
+
+        let (status, body) = dispatch_close_mint_with_body(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+            serde_json::json!({
+                "reason": "operator verified absence on a second provider",
+                "acknowledged_unresolved_mint_nonce":
+                    close_test_authorization().nonce,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::Ok,
+            "the echoing acknowledgement must close the unresolved mint"
+        );
+        assert!(
+            body.contains("acknowledged unresolved nonce"),
+            "the response must record the override, got: {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&issuer_request_id.to_string(), "Mint closed"]
+        ));
+    }
+
+    /// A persisted transaction that could still land blocks the close: the
+    /// one-instant absence read is not proof, and a later landing would go
+    /// unobserved once the mint leaves recovery and stuck queries.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_still_mineable_persisted_tx() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+        advance_close_test_mint_to_submitted(&mint_store, &issuer_request_id)
+            .await;
+
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a still-mineable persisted transaction must refuse the close"
+        );
+        assert!(
+            body.contains("could still land"),
+            "the refusal body must explain the pending transaction, got: \
+             {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(!matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "persisted transaction could still land"
+            ]
+        ));
+    }
+
+    /// A legacy submission that persisted no signed bytes can never be
+    /// proven dead — the close fails closed rather than letting an unknown
+    /// transaction land unobserved.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_unprovable_legacy_submission() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+        let commands = [
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::Deposit {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-close-legacy".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-close-legacy".to_string()),
+            },
+        ];
+        for command in commands {
+            mint_store
+                .send(&issuer_request_id, command)
+                .await
+                .expect("mint must reach the legacy TxSubmitted shape");
+        }
+
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a byte-less legacy submission must refuse the close"
+        );
+        assert!(
+            body.contains("could still land"),
+            "the refusal body must explain the unprovable transaction, got: \
+             {body}"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[&issuer_request_id.to_string(), "persisted no signed bytes"]
+        ));
+    }
+
+    /// A `Minted` log at the pair disagreeing on amount is affirmative proof
+    /// a DIFFERENT mint consumed it — this mint can never land, so the
+    /// close proceeds.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_allows_proven_mismatch_verdict() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: B256::ZERO,
+                    nonce: close_test_authorization().nonce,
+                    shares_minted: U256::from(1u8),
+                    block_number: 777,
+                }),
+        );
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::Ok,
+            "the proven mismatch verdict must permit the close"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&issuer_request_id.to_string(), "a different mint consumed it"]
+        ));
+    }
+
+    /// A vault-direct mint whose receipt is recorded in the inventory has
+    /// landed: the close refuses and points the operator at recovery.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_vault_direct_with_recorded_receipt() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id =
+            seed_close_test_mint(&mint_store, VaultMode::VaultDirect).await;
+
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        receipt_store
+            .send(
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, CLOSE_VAULT),
+                crate::receipt_inventory::ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(U256::from(7)),
+                    balance: Shares::from(U256::from(100)),
+                    block_number: 4_242,
+                    tx_hash: B256::repeat_byte(0xAB),
+                    source: ReceiptSource::Itn {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .expect("receipt must register");
+
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a recorded receipt must refuse the vault-direct close"
+        );
+        assert!(
+            body.contains("run recovery"),
+            "the refusal body must point at recovery, got: {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(!matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "vault-direct mint whose receipt is recorded"
+            ]
+        ));
+    }
+
+    /// A vault-direct close never touches the on-chain landed check.
+    #[tokio::test]
+    async fn close_mint_skips_landed_check_for_vault_direct() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id =
+            seed_close_test_mint(&mint_store, VaultMode::VaultDirect).await;
+
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let (status, _body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            vault_mock.find_minted_log_call_count(),
+            0,
+            "a vault-direct close must not run the landed check"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(mint, Mint::Closed { .. }));
+    }
+
+    /// A terminal orchestrator mint short-circuits before the landed check:
+    /// the aggregate's own rejection surfaces — not the "run recovery
+    /// instead" body, which would misdirect the operator on a mint that is
+    /// already completed and reported — and no RPC lookup is spent.
+    #[tokio::test]
+    async fn close_mint_rejects_completed_mint_without_landed_check() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+
+        let tx_id = TxId::Legacy("close-terminal-1".to_string());
+        let commands = [
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::Deposit {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            MintCommand::RecordTxSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-close-terminal-1".to_string(),
+                ),
+                tx_id: tx_id.clone(),
+            },
+            MintCommand::RecordOrchestratorTokensMinted {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_id,
+                tx_hash: B256::ZERO,
+                nonce: close_test_authorization().nonce,
+                // The seeded quantity at 18 decimals — the record handler
+                // cross-checks the reported shares against it.
+                shares_minted: U256::from(100_000_000_000_000_000_000u128),
+                gas_used: 21_000,
+                block_number: 1_000,
+            },
+            MintCommand::RecordCallbackSent {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        ];
+        for command in commands {
+            mint_store
+                .send(&issuer_request_id, command)
+                .await
+                .expect("mint must advance to Completed");
+        }
+
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "a completed mint must be rejected by the aggregate"
+        );
+        assert!(
+            !body.contains("run recovery instead"),
+            "the terminal rejection must not carry the landed-refusal body, \
+             got: {body}"
+        );
+        assert_eq!(
+            vault_mock.find_minted_log_call_count(),
+            0,
+            "the terminal guard must short-circuit before the landed check"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Completed { .. }),
+            "the refused close must leave the mint Completed, got: {mint:?}"
+        );
     }
 }

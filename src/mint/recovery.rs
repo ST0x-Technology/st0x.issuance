@@ -14,13 +14,18 @@ use uuid::Uuid;
 
 use super::job::{ConfirmMintJob, SendCallbackJob, SubmitMintJob};
 use super::{
-    AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, Network,
-    UnderlyingSymbol, find_all_recoverable_mints,
+    AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand,
+    MintFailureClassification, MintView, Network, UnderlyingSymbol,
+    find_all_recoverable_mints,
 };
+use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
-use crate::vault::{NetworkVaultServices, TxId, UnconfiguredNetworkError};
+use crate::vault::{
+    MintedLogQuery, MintedLogScan, NetworkVaultServices, TxId,
+    UnconfiguredNetworkError,
+};
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
 /// failed mint by enqueuing the appropriate per-state job.
@@ -113,6 +118,13 @@ const MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS: usize = 360;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MintRecoveryJob {
     issuer_request_id: IssuerMintRequestId,
+    /// Set by the admin reprocess endpoint ([`enqueue_manual_mint_recovery`]):
+    /// permits exactly one re-drive of a classified (`ManualOnly`) failure
+    /// that the automatic loop refuses to touch. Defaults to `false` for
+    /// every automatic producer (startup re-scan, reconciler, recovery
+    /// kicks), so a deserialized pre-existing job row stays automatic.
+    #[serde(default)]
+    manual: bool,
 }
 
 impl Job<MintRecoveryContext> for MintRecoveryJob {
@@ -128,6 +140,7 @@ impl Job<MintRecoveryContext> for MintRecoveryJob {
             &self.issuer_request_id,
             SCHEDULED_RECOVERY_BACKOFF,
             MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS,
+            self.manual,
         )
         .await
         {
@@ -228,6 +241,25 @@ pub(crate) async fn enqueue_scheduled_mint_recovery(
     push_mint_recovery_job(apalis_pool, issuer_request_id).await
 }
 
+/// Admin-reprocess variant of [`enqueue_scheduled_mint_recovery`]: the pushed
+/// job carries the `manual` flag, permitting exactly one re-drive of a
+/// classified failure the automatic loop refuses. A concurrent ACTIVE
+/// automatic job for the same mint dedups this push (idempotency key), but a
+/// classified mint's automatic job has already concluded and been released
+/// here, so the admin path is not raced in practice.
+pub(crate) async fn enqueue_manual_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &SqlitePool,
+    issuer_request_id: IssuerMintRequestId,
+) -> Result<(), anyhow::Error> {
+    release_terminal_recovery_job(pool, &issuer_request_id).await?;
+    push_recovery_job(
+        apalis_pool,
+        MintRecoveryJob { issuer_request_id, manual: true },
+    )
+    .await
+}
+
 /// Pushes a [`MintRecoveryJob`] for the mint, retrying transient enqueue
 /// failures with a bounded backoff. The idempotency key makes the insert a
 /// no-op when ANY job already exists for the mint — including a TERMINAL
@@ -244,20 +276,30 @@ pub(crate) async fn push_mint_recovery_job(
     apalis_pool: &SqlitePool,
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
+    push_recovery_job(
+        apalis_pool,
+        MintRecoveryJob { issuer_request_id, manual: false },
+    )
+    .await
+}
+
+async fn push_recovery_job(
+    apalis_pool: &SqlitePool,
+    job: MintRecoveryJob,
+) -> Result<(), anyhow::Error> {
     let mut attempt = 0;
     // The queue handle is reusable across attempts
     // (`push_with_idempotency_key` takes `&mut self`); build it once rather
     // than reconstructing it on every retry.
     let mut queue = JobQueue::<MintRecoveryJob>::new(apalis_pool);
+    let issuer_request_id = job.issuer_request_id.clone();
 
     loop {
         attempt += 1;
 
         match queue
             .push_with_idempotency_key(
-                MintRecoveryJob {
-                    issuer_request_id: issuer_request_id.clone(),
-                },
+                job.clone(),
                 issuer_request_id.to_string(),
             )
             .await
@@ -534,10 +576,30 @@ pub(crate) async fn reconcile_recoverable_mints(
     }
 
     let count = recoverable_mints.len();
-    for (issuer_request_id, _view) in recoverable_mints {
-        if let Err(error) =
+    for (issuer_request_id, view) in recoverable_mints {
+        // An unresolved replay is reconciled on the NORMAL SCHEDULE (SPEC
+        // "Nonce"): each pass re-runs one widened `Minted`-log query. Its
+        // previous pass's job row is terminal by design, so this push must
+        // release the terminal key first — the plain dedup push below would
+        // silently park the mint after its first pass.
+        let result = if matches!(
+            view,
+            MintView::MintingFailed {
+                classification:
+                    MintFailureClassification::NonceReplayUnresolved,
+                ..
+            }
+        ) {
+            enqueue_scheduled_mint_recovery(
+                pool,
+                apalis_pool,
+                issuer_request_id.clone(),
+            )
+            .await
+        } else {
             push_mint_recovery_job(apalis_pool, issuer_request_id.clone()).await
-        {
+        };
+        if let Err(error) = result {
             warn!(target: "mint", issuer_request_id = %issuer_request_id,
                 error = %error,
                 "Failed to re-enqueue recoverable mint during reconcile"
@@ -548,7 +610,8 @@ pub(crate) async fn reconcile_recoverable_mints(
     debug!(target: "mint", recoverable_mints = count,
         "Reconcile pass pushed an idempotent recovery job for each recoverable \
          mint; pushes for mints that already have a Pending, Running, Done, or \
-         Killed job are silent no-ops"
+         Killed job are silent no-ops (unresolved replays release their \
+         terminal row first, so their reconciliation re-runs every pass)"
     );
 }
 
@@ -584,6 +647,7 @@ impl fmt::Display for AbandonReason {
 /// Why [`recover_mint_until_automatic_budget_exhausted`] stopped, so the durable
 /// [`MintRecoveryJob`] records a clean success versus an abandoned mint that is
 /// still incomplete and needs surfacing.
+#[derive(Debug)]
 enum RecoveryConclusion {
     /// Recovery reached a definitive conclusion: the mint completed, is
     /// genuinely non-recoverable, or no longer exists. Nothing more to do.
@@ -626,16 +690,26 @@ async fn minting_failed_receipt_exists_with_backoff(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recover_mint_until_automatic_budget_exhausted(
     ctx: &MintRecoveryContext,
     issuer_request_id: &IssuerMintRequestId,
     backoff: Duration,
     max_no_progress_polls: usize,
+    manual: bool,
 ) -> RecoveryConclusion {
     let mut mint_load_failure_backoffs = 0;
     let mut receipt_load_failure_backoffs = 0;
     let mut no_progress_polls = 0;
     let mut last_state: Option<&'static str> = None;
+    // The operator's `manual` flag buys exactly one re-drive of a classified
+    // failure: after it is spent, a re-failure that classifies again stops
+    // at the `ManualOnly` arm like the automatic path does.
+    let mut manual_redrive_available = manual;
+    // An unresolved replay gets exactly one widened reconciliation query per
+    // job run; the periodic reconciler re-enqueues the job each pass, which
+    // IS the "normal schedule" its re-query runs on (SPEC "Nonce").
+    let mut reconcile_attempted = false;
 
     loop {
         let mint = match ctx.mint_store.load(issuer_request_id).await {
@@ -747,6 +821,66 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 return RecoveryConclusion::Abandoned {
                     reason: AbandonReason::AutomaticRetriesExhausted,
                 };
+            }
+            // Typed classifications are never auto-retried: the scheduled
+            // loop stops here, before any wakeup/budget bookkeeping, and the
+            // admin re-drive is the only way forward (mirrors the burn
+            // side's classified-skip). The admin path reaches this same
+            // loop, so its job carries a `manual` flag that spends exactly
+            // one re-drive here — without it the reprocess endpoint would
+            // answer "recovery initiated" while nothing runs.
+            AutomaticRetryDecision::ManualOnly(classification) => {
+                if manual_redrive_available {
+                    manual_redrive_available = false;
+                    info!(target: "mint", issuer_request_id = %issuer_request_id,
+                        classification = ?classification,
+                        "Operator-requested re-drive of a classified mint \
+                         failure"
+                    );
+                    if let Err(error) =
+                        drive_one_step(ctx, &mint, issuer_request_id).await
+                    {
+                        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                            error = %error,
+                            "Manual re-drive step failed; backing off"
+                        );
+                    }
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+
+                warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                    classification = ?classification,
+                    "Skipping non-retryable classified mint failure; manual \
+                     recovery required"
+                );
+                return RecoveryConclusion::Resolved;
+            }
+            // The inconclusive replay is reconciled, never resubmitted: one
+            // widened `Minted`-log re-query per pass. A full match advances
+            // the mint and the next iteration keeps driving it forward; a
+            // proven mismatch upgrades the classification (and the next
+            // iteration parks it via the `ManualOnly` arm); still nothing
+            // found retires this pass — the reconciler re-enqueues the next
+            // one.
+            AutomaticRetryDecision::ReconcileOnly => {
+                if reconcile_attempted {
+                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                        "Unresolved replay still has no Minted log at its pair; awaiting the next reconcile pass"
+                    );
+                    return RecoveryConclusion::Resolved;
+                }
+                reconcile_attempted = true;
+                if let Err(error) =
+                    reconcile_unresolved_replay(ctx, &mint, issuer_request_id)
+                        .await
+                {
+                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Unresolved-replay reconciliation failed; awaiting the next pass"
+                    );
+                }
+                tokio::time::sleep(backoff).await;
             }
             AutomaticRetryDecision::Wait(wait) => {
                 let receipt_exists =
@@ -882,6 +1016,16 @@ async fn drive_one_step(
             let vault = resolve_vault(ctx, underlying, *network).await?;
             enqueue_submit(ctx, issuer_request_id, vault).await?;
         }
+        // The inconclusive replay is never resubmitted — the nonce is
+        // consumed either way, so a resubmission can only revert. Its drive
+        // IS the widened reconciliation query, whichever path reaches it
+        // (the scheduled `ReconcileOnly` arm or an operator re-drive).
+        Mint::MintingFailed {
+            classification: MintFailureClassification::NonceReplayUnresolved,
+            ..
+        } => {
+            reconcile_unresolved_replay(ctx, mint, issuer_request_id).await?;
+        }
         // Retry a failed mint: transition back to Minting (advancing the attempt
         // counter), then enqueue a fresh submission.
         Mint::MintingFailed { underlying, network, .. } => {
@@ -907,6 +1051,138 @@ async fn drive_one_step(
         // Initiated / JournalRejected / Completed / Closed are not driven here
         // (NotRecoverable, or recovery doesn't start before journal confirm).
         _ => {}
+    }
+
+    Ok(())
+}
+
+/// Widened backward window for reconciling an unresolved replay: the
+/// default scan window was sized for the live recovery timeline, and its
+/// coming up empty is exactly what parked the mint — the re-query must look
+/// further back than whatever the original lookup covered (SPEC "Recipient
+/// Authorization" -> "Nonce"). ~23 days on Base's 2s blocks.
+const UNRESOLVED_REPLAY_LOOKBACK_BLOCKS: u64 = 1_000_000;
+
+/// One reconciliation attempt for a `NonceReplayUnresolved` mint: re-runs
+/// the `Minted`-log full-match over [`UNRESOLVED_REPLAY_LOOKBACK_BLOCKS`].
+/// A `FullMatch` resolves the mint forward
+/// (`RecordOrchestratorMintRecovered` — the loop's next iteration drives
+/// the callback); a `Mismatch` upgrades the classification to the proven
+/// `NonceConsumedByOtherMint`; `NotFound` (and any read failure, which
+/// proves nothing) leaves the mint parked for the next pass.
+async fn reconcile_unresolved_replay(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), MintRecoveryStepError> {
+    let Mint::MintingFailed {
+        underlying,
+        network,
+        wallet,
+        quantity,
+        mint_mode,
+        mint_authorization,
+        ..
+    } = mint
+    else {
+        return Ok(());
+    };
+    let (
+        VaultMode::Orchestrator { address: orchestrator },
+        Some(authorization),
+    ) = (mint_mode, mint_authorization)
+    else {
+        // `NonceReplayUnresolved` is only ever recorded for an
+        // orchestrator mint holding an authorization; anything else is an
+        // impossible replay and there is nothing to reconcile.
+        return Ok(());
+    };
+
+    let vault = resolve_vault(ctx, underlying, *network).await?;
+    let vault_service = ctx.vault_services.service(*network)?;
+    let amount = match quantity.to_u256_with_18_decimals() {
+        Ok(amount) => amount,
+        Err(error) => {
+            // Deterministic for the persisted quantity: reconciliation can
+            // never build the full-match query, so the mint stays parked
+            // and stuck-visible rather than looping a doomed conversion.
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Unresolved-replay quantity cannot convert to on-chain units"
+            );
+            return Ok(());
+        }
+    };
+
+    match vault_service
+        .find_orchestrator_minted_log(MintedLogQuery {
+            orchestrator: *orchestrator,
+            to: *wallet,
+            nonce: authorization.nonce,
+            token: vault.address,
+            amount,
+            lookback_blocks: Some(UNRESOLVED_REPLAY_LOOKBACK_BLOCKS),
+        })
+        .await
+    {
+        Ok(MintedLogScan::FullMatch(minted)) => {
+            info!(target: "mint", issuer_request_id = %issuer_request_id,
+                tx_hash = %minted.tx_hash,
+                nonce = %minted.nonce,
+                shares_minted = %minted.shares_minted,
+                "Widened reconciliation full-matched the unresolved replay; \
+                 recovering the landed mint"
+            );
+            ctx.mint_store
+                .send(
+                    issuer_request_id,
+                    MintCommand::RecordOrchestratorMintRecovered {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tx_hash: minted.tx_hash,
+                        nonce: minted.nonce,
+                        shares_minted: minted.shares_minted,
+                        block_number: minted.block_number,
+                    },
+                )
+                .await?;
+        }
+        Ok(MintedLogScan::Mismatch) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                to = %wallet,
+                nonce = %authorization.nonce,
+                token = %vault.address,
+                amount = %amount,
+                "Widened reconciliation proved the nonce was consumed by a \
+                 different mint; manual reconciliation required"
+            );
+            ctx.mint_store
+                .send(
+                    issuer_request_id,
+                    MintCommand::RecordMintFailed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        error: "widened Minted-log scan found the pair's \
+                                landing disagreeing on token/amount"
+                            .to_string(),
+                        classification:
+                            MintFailureClassification::NonceConsumedByOtherMint,
+                    },
+                )
+                .await?;
+        }
+        Ok(MintedLogScan::NotFound) => {
+            debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                nonce = %authorization.nonce,
+                "Widened reconciliation still found no Minted log at the \
+                 pair; the mint stays parked for the next pass"
+            );
+        }
+        Err(error) => {
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Unresolved-replay reconciliation lookup failed; the mint \
+                 stays parked for the next pass"
+            );
+        }
     }
 
     Ok(())
@@ -1051,20 +1327,27 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
+    use alloy::primitives::{B256, U256};
+
     use super::*;
     use crate::config::VaultMode;
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, network_vault_services,
     };
-    use crate::mint::tests::VAULT;
+    use crate::mint::tests::{
+        VAULT, orchestrator_events_through_tx_submitted,
+        test_mint_authorization,
+    };
     use crate::mint::{
         ClientId, IssuerMintRequestId, MintEvent, MintFailureClassification,
         Network, Quantity, TokenSymbol, TokenizationRequestId,
         UnderlyingSymbol,
     };
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::log_count_at;
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
+    use crate::vault::mock::MockVaultService;
+    use crate::vault::{OrchestratorMintedLog, VaultService};
 
     /// Builds a real event-sorcery [`Store<Mint>`] over a file-backed SQLite
     /// pool shared with an apalis-sqlite pool (so the durable per-state queues
@@ -1133,6 +1416,18 @@ mod tests {
                 submit_queue: JobQueue::new(&self.apalis_pool),
                 confirm_queue: JobQueue::new(&self.apalis_pool),
                 callback_queue: JobQueue::new(&self.apalis_pool),
+            }
+        }
+
+        /// Like [`Self::context`] but over a caller-configured vault mock —
+        /// the reconciliation tests steer the `Minted`-log verdict.
+        fn context_with_vault(
+            &self,
+            vault: Arc<dyn VaultService>,
+        ) -> MintRecoveryContext {
+            MintRecoveryContext {
+                vault_services: network_vault_services(vault),
+                ..self.context()
             }
         }
 
@@ -1281,6 +1576,7 @@ mod tests {
             &issuer_request_id,
             backoff,
             max_no_progress_polls,
+            false,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1517,6 +1813,7 @@ mod tests {
             &issuer_request_id,
             Duration::from_millis(1),
             2,
+            false,
         )
         .await;
 
@@ -1550,7 +1847,7 @@ mod tests {
         let fixture = MintRecoveryFixture::new().await;
         let issuer_request_id = test_issuer_request_id();
 
-        let result = MintRecoveryJob { issuer_request_id }
+        let result = MintRecoveryJob { issuer_request_id, manual: false }
             .perform(&fixture.context())
             .await;
 
@@ -1701,6 +1998,7 @@ mod tests {
             &issuer_request_id,
             Duration::from_millis(1),
             3,
+            false,
         )
         .await;
 
@@ -1745,6 +2043,7 @@ mod tests {
             &lookup_failure_id,
             Duration::from_millis(1),
             3,
+            false,
         )
         .await;
 
@@ -1781,7 +2080,7 @@ mod tests {
         let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
-        let error = MintRecoveryJob { issuer_request_id }
+        let error = MintRecoveryJob { issuer_request_id, manual: false }
             .perform(&fixture.context())
             .await
             .expect_err("an exhausted mint must abort, not resolve");
@@ -1983,5 +2282,356 @@ mod tests {
             "the reset must clear the lock columns, got lock_at={lock_at:?} \
              lock_by={lock_by:?}"
         );
+    }
+
+    /// Typed classifications are never auto-retried: the scheduled loop
+    /// retires as `Resolved` before any wakeup/budget bookkeeping, leaves
+    /// the classified failure untouched, and enqueues no per-state job. The
+    /// `failed_at` is far in the past, so an `Unclassified` failure would be
+    /// `Ready` — proving the skip comes from the classification, not the
+    /// retry window (the no-progress test above is that contrast: same-age
+    /// `Unclassified` failures keep driving).
+    #[traced_test]
+    #[tokio::test]
+    async fn scheduled_recovery_skips_classified_mint_failure() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::hours(24);
+        let mut events =
+            orchestrator_events_through_tx_submitted(&issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "confirmation failed".to_string(),
+            failed_at,
+            classification: MintFailureClassification::VaultLogicMismatch,
+        });
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            8,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(conclusion, RecoveryConclusion::Resolved),
+            "a classified failure must retire the job as Resolved"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                mint,
+                Mint::MintingFailed {
+                    classification:
+                        MintFailureClassification::VaultLogicMismatch,
+                    ..
+                }
+            ),
+            "the classified failure must be left untouched, got: {}",
+            mint.state_name()
+        );
+
+        let queued_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued_jobs, 0,
+            "the classified skip must not enqueue any per-state job"
+        );
+
+        let test = "scheduled_recovery_skips_classified_mint_failure";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Skipping non-retryable classified mint failure"]
+        ));
+    }
+
+    /// The admin reprocess path reaches the same recovery loop that skips
+    /// classified failures, so its job carries the `manual` flag: one
+    /// re-drive is spent on the classified mint (`RetryMint` fires, a
+    /// submission job is enqueued) instead of retiring as a silent no-op —
+    /// the endpoint's "recovery initiated" answer must mean something ran.
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_recovery_redrives_classified_mint_failure_once() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::hours(24);
+        let mut events =
+            orchestrator_events_through_tx_submitted(&issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "nonce consumed by another mint".to_string(),
+            failed_at,
+            classification: MintFailureClassification::NonceConsumedByOtherMint,
+        });
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            8,
+            true,
+        )
+        .await;
+
+        // No worker drains the enqueued submission in this fixture, so the
+        // loop exhausts its no-progress budget — the point is that the
+        // re-drive actually ran, unlike the automatic path's silent skip.
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::NoProgressBudgetExhausted
+                }
+            ),
+            "expected the fixture loop to stop on its no-progress budget, \
+             got {conclusion:?}"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "the operator re-drive must retry the classified failure back \
+             into Minting, got: {}",
+            mint.state_name()
+        );
+
+        let submit_jobs: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE job_type = ?
+            ",
+        )
+        .bind(job_type::<SubmitMintJob>())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            submit_jobs, 1,
+            "the manual re-drive must enqueue exactly one submission job"
+        );
+
+        let test = "manual_recovery_redrives_classified_mint_failure_once";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[test, "Operator-requested re-drive"]
+        ));
+    }
+
+    fn unresolved_replay_events(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events =
+            orchestrator_events_through_tx_submitted(issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "nonce consumed with no log at the pair".to_string(),
+            failed_at: Utc::now() - chrono::Duration::hours(24),
+            classification: MintFailureClassification::NonceReplayUnresolved,
+        });
+        events
+    }
+
+    /// A widened reconciliation that full-matches resolves the unresolved
+    /// replay forward: the landed mint is recorded and the loop keeps
+    /// driving it (the callback job is enqueued) — no resubmission ever
+    /// happens.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciliation_resolves_unresolved_replay_forward() {
+        let issuer_request_id = test_issuer_request_id();
+        let fixture = MintRecoveryFixture::new().await;
+        fixture
+            .seed_mint_events(
+                &issuer_request_id,
+                unresolved_replay_events(&issuer_request_id),
+            )
+            .await;
+
+        let vault = Arc::new(MockVaultService::new_success().with_minted_log(
+            OrchestratorMintedLog {
+                tx_hash: B256::repeat_byte(0xcc),
+                nonce: test_mint_authorization().nonce,
+                shares_minted: U256::from(100u64)
+                    * U256::from(10u64).pow(U256::from(18u64)),
+                block_number: 777,
+            },
+        ));
+
+        recover_mint_until_automatic_budget_exhausted(
+            &fixture.context_with_vault(vault.clone()),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            2,
+            false,
+        )
+        .await;
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::CallbackPending { .. }),
+            "a full-matched reconciliation must resolve the mint forward, \
+             got: {}",
+            mint.state_name()
+        );
+        let callback_jobs: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE job_type = ?
+            ",
+        )
+        .bind(job_type::<SendCallbackJob>())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            callback_jobs, 1,
+            "the resolved mint must be driven on to its callback"
+        );
+
+        let test = "reconciliation_resolves_unresolved_replay_forward";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[test, "Widened reconciliation full-matched"]
+        ));
+    }
+
+    /// A widened reconciliation that finds the pair's landing disagreeing on
+    /// amount upgrades the verdict to the PROVEN `NonceConsumedByOtherMint`
+    /// — which then parks manual-only; nothing is ever resubmitted.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciliation_upgrades_unresolved_replay_to_proven_mismatch() {
+        let issuer_request_id = test_issuer_request_id();
+        let fixture = MintRecoveryFixture::new().await;
+        fixture
+            .seed_mint_events(
+                &issuer_request_id,
+                unresolved_replay_events(&issuer_request_id),
+            )
+            .await;
+
+        let vault = Arc::new(MockVaultService::new_success().with_minted_log(
+            OrchestratorMintedLog {
+                tx_hash: B256::repeat_byte(0xcc),
+                nonce: test_mint_authorization().nonce,
+                shares_minted: U256::from(1u8),
+                block_number: 777,
+            },
+        ));
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context_with_vault(vault.clone()),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            4,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(conclusion, RecoveryConclusion::Resolved),
+            "the upgraded verdict must retire via the manual-only skip, got \
+             {conclusion:?}"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                mint,
+                Mint::MintingFailed {
+                    classification:
+                        MintFailureClassification::NonceConsumedByOtherMint,
+                    ..
+                }
+            ),
+            "the mismatching landing must upgrade the classification, got: \
+             {mint:?}"
+        );
+        let queued_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued_jobs, 0,
+            "an upgraded verdict must never enqueue a submission"
+        );
+
+        let test =
+            "reconciliation_upgrades_unresolved_replay_to_proven_mismatch";
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[test, "proved the nonce was consumed by a different mint"]
+        ));
+    }
+
+    /// A widened reconciliation that still finds nothing leaves the mint
+    /// parked — one query per pass, no state change, no submission — for
+    /// the reconciler's next pass.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciliation_leaves_still_unresolved_replay_parked() {
+        let issuer_request_id = test_issuer_request_id();
+        let fixture = MintRecoveryFixture::new().await;
+        fixture
+            .seed_mint_events(
+                &issuer_request_id,
+                unresolved_replay_events(&issuer_request_id),
+            )
+            .await;
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context_with_vault(vault.clone()),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            4,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(conclusion, RecoveryConclusion::Resolved),
+            "a still-unresolved replay must retire the pass cleanly, got \
+             {conclusion:?}"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                mint,
+                Mint::MintingFailed {
+                    classification:
+                        MintFailureClassification::NonceReplayUnresolved,
+                    ..
+                }
+            ),
+            "a still-empty scan must leave the mint parked unchanged, got: \
+             {mint:?}"
+        );
+        let queued_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued_jobs, 0,
+            "an unresolved replay must never enqueue a submission"
+        );
+
+        let test = "reconciliation_leaves_still_unresolved_replay_parked";
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[test, "still found no Minted log"]
+        ));
     }
 }

@@ -306,6 +306,20 @@ pub(crate) trait VaultService: Send + Sync {
         Err(VaultError::InvalidReceipt)
     }
 
+    /// Reads the orchestrator's `nonceUsed(to, nonce)` consumed flag — the
+    /// single cheap read gating [`Self::find_orchestrator_minted_log`]'s
+    /// full lookback scan: `false` proves nothing can have landed under this
+    /// mint's nonce (the on-chain uniqueness key), so the scan is skipped on
+    /// every ordinary first submission.
+    async fn nonce_used(
+        &self,
+        _orchestrator: Address,
+        _to: Address,
+        _nonce: B256,
+    ) -> Result<bool, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
     /// Validates a delivered recipient authorization before it is stored:
     /// the signature must recover to `query.to` over the orchestrator's own
     /// `mintAuthDigest(token, to, amount, nonce)` (ECDSA, or ERC-1271 when
@@ -484,6 +498,39 @@ impl PreparedMintTx {
             input: Bytes::new(),
         };
         let signature = Signature::new(U256::from(1), U256::from(1), false);
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+
+        Self {
+            tx: envelope.encoded_2718(),
+            hash: *envelope.tx_hash(),
+            nonce: envelope.nonce(),
+            signed_at: Utc::now(),
+            external_tx_id,
+        }
+    }
+
+    /// Like [`Self::valid_for_test`] but GENUINELY signed (fixed test key),
+    /// so tests exercising signer recovery — the admin close gate's
+    /// proof-of-cannot-land classification — get a recoverable signature.
+    #[cfg(test)]
+    pub(crate) fn signed_for_test(nonce: u64, external_tx_id: String) -> Self {
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))
+            .expect("fixed test key is valid");
+        let signature = signer
+            .sign_hash_sync(&transaction.signature_hash())
+            .expect("fixed test key signs");
         let envelope = TxEnvelope::from(transaction.into_signed(signature));
 
         Self {
