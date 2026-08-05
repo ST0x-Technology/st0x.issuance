@@ -236,6 +236,13 @@ burns that failed with a deterministic classification (`InsufficientReceipts`,
 underlying cause and re-drives them via the admin recovery endpoint
 (`ResumeBurn`).
 
+Recovery, on-chain burn verification, and the admin surface are all mode-aware:
+each redemption's recovery and force-completion derive from its own persisted
+burn mode (never live config), so vault-direct and orchestrator redemptions
+recover side by side during the incremental per-asset cutover. Operators can see
+which path each asset is on, and whether each orchestrator is healthy, via
+`GET /admin/orchestrator-health`.
+
 Receipt and redemption transfer backfills use durable per-vault checkpoints.
 Periodic receipt backfill keeps receipt checkpoints current during long uptime,
 and live receipt monitoring processes new events without advancing the durable
