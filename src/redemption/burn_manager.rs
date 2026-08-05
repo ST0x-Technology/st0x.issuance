@@ -11,7 +11,7 @@ use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
 use super::{
-    BurnExternalTxId, BurnParams, BurnRecoveryAction,
+    BurnExternalTxId, BurnParams, BurnRecoveryAction, ExistingBurnProof,
     IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionEvent, next_burn_retry_external_tx_id_from_history,
 };
@@ -630,21 +630,6 @@ impl BurnManager {
             return Ok(());
         }
 
-        // Orchestrator-mode failures with a submitted transaction need the
-        // orchestrator-shaped recovery (`OrchestratorBurnRecovered`), which
-        // lands with the recovery/admin work — defer rather than run the
-        // vault-direct confirm path against an orchestrator transaction.
-        if matches!(burn_mode, VaultMode::Orchestrator { .. })
-            && tx_id.is_some()
-        {
-            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                tx_id = ?tx_id,
-                "Skipping orchestrator burn failure with a submitted \
-                 transaction; orchestrator recovery is not yet automated"
-            );
-            return Ok(());
-        }
-
         let vault = find_vault(&self.view_pool, underlying, network)
             .await?
             .ok_or_else(|| BurnManagerError::AssetNotFound {
@@ -654,18 +639,32 @@ impl BurnManager {
 
         let vault_service = self.vault_for(*network)?;
 
-        // If a tx was already submitted before failure, inspect it
-        // before deciding whether to confirm, wait, or submit a replacement.
-        let retry_external_tx_id = if let Some(fb_tx_id) = tx_id {
-            return self
-                .recover_burn_failed_with_existing_tx(
-                    issuer_request_id,
-                    network,
-                    vault,
-                    fb_tx_id,
-                    dust_quantity,
-                )
-                .await;
+        // If a tx was already submitted before failure, inspect it before
+        // deciding whether to confirm, wait, or submit a replacement. The
+        // confirm path is mode-scoped: each mode confirms via its own
+        // on-chain shape and records its own success event.
+        let retry_external_tx_id = if let Some(existing_tx_id) = tx_id {
+            return match burn_mode {
+                VaultMode::VaultDirect => {
+                    self.recover_burn_failed_with_existing_tx(
+                        issuer_request_id,
+                        network,
+                        vault,
+                        existing_tx_id,
+                        dust_quantity,
+                    )
+                    .await
+                }
+                VaultMode::Orchestrator { .. } => {
+                    self.recover_orchestrator_burn_failed_with_existing_tx(
+                        *network,
+                        issuer_request_id,
+                        existing_tx_id,
+                        dust_quantity,
+                    )
+                    .await
+                }
+            };
         } else {
             self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
                 .await?
@@ -845,7 +844,9 @@ impl BurnManager {
                             issuer_request_id: issuer_request_id.clone(),
                             tx_id: tx_id.clone(),
                             tx_hash: result.tx_hash,
-                            planned_burns: actual_burns,
+                            proof: ExistingBurnProof::VaultDirect {
+                                burns: actual_burns,
+                            },
                             block_number: result.block_number,
                         },
                     )
@@ -896,6 +897,98 @@ impl BurnManager {
                     %tx_id,
                     error = %err,
                     "Failed to confirm previously submitted burn"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Orchestrator-mode counterpart of `recover_burn_failed_with_existing_tx`.
+    /// Confirms a previously submitted `orchestrator.burn()` and records the
+    /// outcome as an `OrchestratorBurnRecovered` (via the `RecordExistingBurn`
+    /// orchestrator proof). No reservation exists in orchestrator mode, so
+    /// none is settled or released.
+    async fn recover_orchestrator_burn_failed_with_existing_tx(
+        &self,
+        network: Network,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_id: &TxId,
+        dust_quantity: &Quantity,
+    ) -> Result<(), BurnManagerError> {
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            %tx_id,
+            "BurnFailed recovery — confirming previously submitted orchestrator burn"
+        );
+
+        match self
+            .vaults
+            .service(network)?
+            .confirm_orchestrator_burn(tx_id)
+            .await
+        {
+            Ok(result) => {
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    tx_hash = %result.tx_hash,
+                    "Previously submitted orchestrator burn confirmed on-chain"
+                );
+
+                // dust_retained is derived from the redemption's own persisted
+                // dust_quantity — the orchestrator has no multicall to return
+                // it on-chain — matching OrchestratorTokensBurned.
+                let dust_retained = dust_quantity.to_u256_with_18_decimals()?;
+
+                // Safe: BurningFailed always transitions the aggregate to
+                // Failed, so RecordExistingBurn (which requires Failed) is valid.
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::RecordExistingBurn {
+                            issuer_request_id: issuer_request_id.clone(),
+                            tx_id: tx_id.clone(),
+                            tx_hash: result.tx_hash,
+                            proof: ExistingBurnProof::Orchestrator {
+                                shares_burned: result.shares_burned,
+                                burn_range: result.burn_range,
+                                dust_retained,
+                            },
+                            block_number: result.block_number,
+                        },
+                    )
+                    .await?;
+
+                Ok(())
+            }
+            Err(err) => {
+                if should_release_reserved_burn(&err) {
+                    // Definitive on-chain revert. No reservation exists in
+                    // orchestrator mode, so there is nothing to release — just
+                    // terminalize with the decoded reason.
+                    let reason = format!(
+                        "Orchestrator burn confirmation failed for tx {tx_id}: {err}"
+                    );
+
+                    self.store
+                        .send(
+                            issuer_request_id,
+                            RedemptionCommand::MarkFailed {
+                                issuer_request_id: issuer_request_id.clone(),
+                                reason,
+                            },
+                        )
+                        .await?;
+
+                    return Err(BurnManagerError::Vault(err));
+                }
+
+                // Non-terminal error (RPC blip, pending-receipt timeout): the
+                // tx may still be in-flight. Keep the redemption in BurnFailed
+                // with tx_id intact so the next recovery pass retries
+                // confirmation rather than submitting a replacement while the
+                // original is still pending, which would risk double-burning.
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    %tx_id,
+                    error = %err,
+                    "Failed to confirm previously submitted orchestrator burn"
                 );
                 Ok(())
             }
@@ -2477,9 +2570,11 @@ impl BurnManager {
     /// mined revert, so the transaction can never land, and a tx-id-less
     /// `BurnFailed` routes the next recovery pass into the mode-aware
     /// preparation retry (`ResumeBurn` -> `handle_burning_started`). The
-    /// orchestrator deferral gate in `recover_single_burn_failed` guards the
-    /// complementary kept-tx-id case, where the transaction's outcome is
-    /// still ambiguous and the vault-direct confirm path must not run.
+    /// complementary kept-tx-id case is handled in `recover_single_burn_failed`,
+    /// which confirms the still-submitted transaction through the matching
+    /// mode's confirm path (`recover_burn_failed_with_existing_tx` for
+    /// vault-direct, `recover_orchestrator_burn_failed_with_existing_tx` for
+    /// orchestrator).
     async fn record_definitive_confirm_failure(
         &self,
         network: Network,
@@ -3753,20 +3848,12 @@ mod tests {
         ));
     }
 
-    /// An orchestrator burn failure with a submitted transaction — even an
-    /// `Unclassified` one that would normally retry — must be deferred, not
-    /// routed into `recover_burn_failed_with_existing_tx`, whose confirm and
-    /// settle logic assumes vault-direct receipt semantics.
-    #[traced_test]
-    #[tokio::test]
-    async fn reconciler_defers_orchestrator_burn_failure_with_submitted_tx() {
-        let setup = setup_orchestrator_burning(Arc::new(
-            MockVaultService::new_success(),
-        ))
-        .await;
-
-        // Reach BurnSubmitted through the aggregate commands, then record an
-        // Unclassified failure carrying the submitted transaction id.
+    /// Drives an orchestrator redemption to `BurnFailed` with the submitted
+    /// transaction id retained on the `BurningFailed` event, so the reconciler
+    /// takes the kept-tx-id confirm path.
+    async fn drive_orchestrator_to_burn_failed_with_tx(
+        setup: &OrchestratorTestSetup,
+    ) {
         setup
             .harness
             .store
@@ -3801,7 +3888,6 @@ mod tests {
             )
             .await
             .expect("orchestrator submission should persist");
-        assert_eq!(setup.vault_mock.orchestrator_submit_call_count(), 1);
 
         let Redemption::BurnSubmitted { tx_id, .. } =
             load_aggregate(&setup.harness.store, &setup.issuer_request_id)
@@ -3824,35 +3910,125 @@ mod tests {
             )
             .await
             .expect("burn failure should persist");
+    }
+
+    /// A landed orchestrator burn failure with a submitted transaction is now
+    /// confirmed on-chain (no longer deferred): the reconciler records the
+    /// existing burn and completes the redemption, without resubmitting or
+    /// touching the receipt lifecycle.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciler_confirms_orchestrator_burn_failed_with_submitted_tx() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success(),
+        ))
+        .await;
+        drive_orchestrator_to_burn_failed_with_tx(&setup).await;
 
         setup.manager.recover_unresolved_burns().await;
 
-        // The success-behavior mock's vault-direct confirm_burn would have
-        // recorded an existing burn and completed the redemption, so staying
-        // Failed proves the vault-direct recovery path never ran.
+        let aggregate =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await;
+        assert!(
+            matches!(aggregate, Redemption::Completed { .. }),
+            "a mined orchestrator burn must be confirmed and completed, \
+             got {aggregate:?}"
+        );
+        assert_eq!(
+            setup.vault_mock.orchestrator_submit_call_count(),
+            1,
+            "recovery must confirm the existing burn, not resubmit"
+        );
+        assert_eq!(
+            setup.recording.call_count(),
+            0,
+            "orchestrator recovery must not touch the receipt lifecycle"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Previously submitted orchestrator burn confirmed on-chain"]
+        ));
+    }
+
+    /// A pending (non-terminal) orchestrator confirmation keeps the redemption
+    /// in `BurnFailed` with its tx id intact so the next reconciler pass
+    /// retries confirmation rather than submitting a replacement.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciler_defers_pending_orchestrator_burn_failed() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_confirm_pending(),
+        ))
+        .await;
+        drive_orchestrator_to_burn_failed_with_tx(&setup).await;
+
+        setup.manager.recover_unresolved_burns().await;
+
         let aggregate =
             load_aggregate(&setup.harness.store, &setup.issuer_request_id)
                 .await;
         assert!(
             matches!(aggregate, Redemption::Failed { .. }),
-            "orchestrator failure with a submitted tx must stay Failed for \
-             manual recovery, got {aggregate:?}"
+            "a pending orchestrator confirmation must stay Failed, \
+             got {aggregate:?}"
         );
         assert_eq!(
             setup.vault_mock.orchestrator_submit_call_count(),
             1,
-            "the deferral must not resubmit the orchestrator burn"
+            "a pending confirmation must not resubmit the burn"
+        );
+        assert_eq!(setup.recording.call_count(), 0);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Failed to confirm previously submitted orchestrator burn"]
+        ));
+    }
+
+    /// A definitively reverted orchestrator confirmation terminalizes the
+    /// redemption via `MarkFailed` (no reservation to release in orchestrator
+    /// mode) and never resubmits or touches the receipt lifecycle.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciler_marks_reverted_orchestrator_burn_failed() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_confirm_revert(
+                OrchestratorRevertReason::Unknown,
+            ),
+        ))
+        .await;
+        drive_orchestrator_to_burn_failed_with_tx(&setup).await;
+
+        setup.manager.recover_unresolved_burns().await;
+
+        let aggregate =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await;
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "a reverted orchestrator burn stays Failed, got {aggregate:?}"
         );
         assert_eq!(
             setup.recording.call_count(),
             0,
-            "the deferral must not touch the receipt lifecycle"
+            "orchestrator mode has no reservation to release"
         );
         assert!(logs_contain_at!(
             tracing::Level::WARN,
-            &["Skipping orchestrator burn failure with a submitted \
-                 transaction",]
+            &["Failed to recover BurnFailed redemption"]
         ));
+
+        // MarkFailed moved the view out of BurnFailed, so a second reconciler
+        // pass must not re-confirm the reverted transaction — the parked
+        // redemption would otherwise loop confirm/MarkFailed on every pass.
+        let confirms_after_first_pass =
+            setup.vault_mock.orchestrator_confirm_call_count();
+        setup.manager.recover_unresolved_burns().await;
+        assert_eq!(
+            setup.vault_mock.orchestrator_confirm_call_count(),
+            confirms_after_first_pass,
+            "a MarkFailed-parked redemption must leave the reconciler's scan"
+        );
     }
 
     /// A definitively reverted orchestrator burn with an `Unclassified`

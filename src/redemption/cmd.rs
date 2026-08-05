@@ -34,6 +34,24 @@ pub(crate) enum BurnParams {
     },
 }
 
+/// Mode-specific proof of an existing on-chain burn carried by
+/// `RecordExistingBurn`. Cross-checked against the redemption's persisted
+/// `burn_mode` anchor by the command handler. `dust_retained` is supplied by
+/// the caller (derived from the redemption's persisted `dust_quantity`)
+/// because the `Failed` state does not retain it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum ExistingBurnProof {
+    VaultDirect {
+        burns: Vec<super::BurnRecord>,
+    },
+    Orchestrator {
+        shares_burned: U256,
+        /// `(firstReceiptId, nextBurnReceiptIdAfter)` from the `Burned` event.
+        burn_range: (U256, U256),
+        dust_retained: U256,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum RedemptionCommand {
     Detect {
@@ -113,12 +131,15 @@ pub(crate) enum RedemptionCommand {
     },
     /// Records an existing on-chain burn discovered via tx lookup.
     /// Only valid from `Failed` state. Used when the transaction
-    /// succeeded on-chain but the bot timed out before recording it.
+    /// succeeded on-chain but the bot timed out before recording it. The
+    /// `proof` variant is cross-checked against the redemption's persisted
+    /// `burn_mode` anchor, so a vault-direct redemption can never be recorded
+    /// with an orchestrator proof or vice versa.
     RecordExistingBurn {
         issuer_request_id: IssuerRedemptionRequestId,
         tx_id: TxId,
         tx_hash: B256,
-        planned_burns: Vec<super::BurnRecord>,
+        proof: ExistingBurnProof,
         block_number: u64,
     },
     /// Admin-closes a redemption that cannot be automatically recovered.
