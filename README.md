@@ -209,8 +209,38 @@ endpoints.
 2. We validate and respond with `issuer_request_id`
 3. Alpaca journals shares from AP to our custodian account
 4. Alpaca confirms journal → we receive `/inkind/issuance/confirm`
-5. We mint tokens on-chain via `vault.deposit()`
+5. We mint tokens on-chain (vault-direct: `vault.deposit()`; orchestrator:
+   `ST0xOrchestrator.mint()` — see below)
 6. We call Alpaca's callback endpoint
+
+Each mint anchors its mode at initiation from the per-asset `vault_mode` config
+(see SPEC.md "Orchestrator Migration"): vault-direct assets mint via the
+`vault.deposit()` multicall with the receipt held by the bot; orchestrator
+assets mint via a single `ST0xOrchestrator.mint()` — the orchestrator custodies
+the receipt and forwards the shares to the recipient wallet.
+
+An orchestrator-mode mint additionally requires a **recipient authorization**:
+the liquidity bot signs the orchestrator's EIP-712 `MintAuthV1` digest over
+`(token, to, amount, nonce)` with the recipient wallet's key and delivers
+`{nonce, signature}` via the internal
+`POST /internal/mints/<tokenization_request_id>/authorization` endpoint, which
+validates the signer and nonce on-chain before recording it. Until the
+authorization arrives the mint waits — it never falls back to vault-direct. The
+consumed nonce is single-use on-chain, making it the mint's idempotency key:
+recovery of a landed mint full-matches the orchestrator's `Minted` log against
+`(to, nonce, token, amount)` and completes without resubmitting. A consumed
+nonce that does not full-match takes one of two verdicts, never conflated: a log
+at the pair disagreeing on token/amount is proof a different mint consumed it
+(parked as `NonceConsumedByOtherMint` for manual reconciliation), while an empty
+scan is an inconclusive chain view (parked as `NonceReplayUnresolved`,
+re-queried by recovery over a widened window and resolved forward once the
+landing becomes visible — closable only with an explicit operator
+acknowledgement). The `vault_mode` field on
+`GET /tokenized-assets/<underlying>/status` tells the liquidity bot which assets
+will need authorizations for _new_ mints, but the authoritative requirement for
+any given mint is its own persisted `mint_mode` anchor: a mint initiated before
+a config flip keeps the mode it was initiated with, so the bot must answer the
+mint it was asked about, not the asset's current config.
 
 ## Redemption Flow
 

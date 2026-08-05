@@ -17,7 +17,7 @@
 //! submission resolves, while every outcome command is a no-op once its event
 //! is recorded.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use apalis_sqlite::SqlitePool;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, SendError, Store};
@@ -106,7 +106,6 @@ impl Job<SubmitMintContext> for SubmitMintJob {
     type Output = ();
     type Error = MintJobError;
 
-    #[allow(clippy::too_many_lines)]
     async fn perform(
         &self,
         ctx: &SubmitMintContext,
@@ -117,186 +116,8 @@ impl Job<SubmitMintContext> for SubmitMintJob {
         };
 
         match &mint {
-            Mint::Minting {
-                tokenization_request_id,
-                quantity,
-                underlying,
-                network,
-                wallet,
-                journal_confirmed_at,
-                mint_mode,
-                mint_authorization,
-                ..
-            } => {
-                if self.record_existing_receipt(ctx).await? {
-                    return Ok(());
-                }
-
-                let Some(vault) =
-                    self.resolve_vault_service(ctx, *network).await?
-                else {
-                    return Ok(());
-                };
-
-                // A quantity that cannot be converted is deterministic for
-                // the persisted mint: record a domain failure instead of
-                // returning a job error apalis would re-drive forever.
-                let assets = match quantity.to_u256_with_18_decimals() {
-                    Ok(assets) => assets,
-                    Err(error) => {
-                        warn!(
-                            target: "mint",
-                            issuer_request_id = %self.issuer_request_id,
-                            error = %error,
-                            "Mint quantity cannot be converted to on-chain \
-                             units"
-                        );
-
-                        ctx.mint_store
-                            .send(
-                                &self.issuer_request_id,
-                                MintCommand::RecordMintFailed {
-                                    issuer_request_id: self
-                                        .issuer_request_id
-                                        .clone(),
-                                    error: error.to_string(),
-                                    classification:
-                                        MintFailureClassification::Unclassified,
-                                },
-                            )
-                            .await?;
-
-                        return Ok(());
-                    }
-                };
-                let receipt_info = ReceiptInformation::new(
-                    tokenization_request_id.clone(),
-                    self.issuer_request_id.clone(),
-                    underlying.clone(),
-                    quantity.clone(),
-                    *journal_confirmed_at,
-                    None,
-                );
-
-                let external_tx_id = mint
-                    .retry_submission_external_tx_id()
-                    .map(super::MintExternalTxId::into_string);
-
-                let wallet_guard = vault.lock_wallet().await;
-                if has_unresolved_mint_intent(
-                    &ctx.pool,
-                    Some(&self.issuer_request_id),
-                )
-                .await?
-                {
-                    return Err(MintJobError::UnresolvedWalletIntent {
-                        issuer_request_id: self.issuer_request_id.clone(),
-                    });
-                }
-                let prepared = if let Some(prepared) =
-                    mint.pending_prepared_tx()
-                {
-                    prepared
-                } else {
-                    let prepared = match mint_mode {
-                        VaultMode::VaultDirect => {
-                            vault
-                                .prepare_mint_tx(
-                                    self.vault,
-                                    assets,
-                                    ctx.bot,
-                                    *wallet,
-                                    receipt_info,
-                                    external_tx_id,
-                                )
-                                .await
-                        }
-                        VaultMode::Orchestrator { address: orchestrator } => {
-                            // An orchestrator mint without its recipient
-                            // authorization cannot submit yet — and never
-                            // falls back to vault-direct. No event is
-                            // recorded: the mint stays in `Minting`, visible
-                            // in `/admin/stuck` past the threshold, and the
-                            // next drive retries once the liquidity bot
-                            // delivers.
-                            let Some(authorization) = mint_authorization else {
-                                drop(wallet_guard);
-                                warn!(
-                                    target: "mint",
-                                    issuer_request_id = %self.issuer_request_id,
-                                    "Orchestrator mint is awaiting its \
-                                     recipient authorization; deferring \
-                                     submission"
-                                );
-                                return Ok(());
-                            };
-
-                            vault
-                                .prepare_orchestrator_mint_tx(
-                                    &OrchestratorMintParams {
-                                        orchestrator: *orchestrator,
-                                        token: self.vault,
-                                        to: *wallet,
-                                        amount: assets,
-                                        authorization: authorization.clone(),
-                                        receipt_info,
-                                        external_tx_id,
-                                    },
-                                )
-                                .await
-                        }
-                    };
-                    let prepared = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            drop(wallet_guard);
-                            self.record_submission_failure(ctx, error).await?;
-                            return Ok(());
-                        }
-                    };
-
-                    ctx.mint_store
-                        .send(
-                            &self.issuer_request_id,
-                            MintCommand::RecordTxIntended {
-                                issuer_request_id: self
-                                    .issuer_request_id
-                                    .clone(),
-                                prepared_tx: prepared.clone(),
-                            },
-                        )
-                        .await?;
-                    prepared
-                };
-
-                let submitted = vault.submit_mint(&prepared).await;
-
-                match submitted {
-                    Ok(submitted) => {
-                        let tx_id = submitted.tx_id;
-                        ctx.mint_store
-                            .send(
-                                &self.issuer_request_id,
-                                MintCommand::RecordTxSubmitted {
-                                    issuer_request_id: self
-                                        .issuer_request_id
-                                        .clone(),
-                                    external_tx_id:
-                                        super::MintExternalTxId::from_string(
-                                            submitted.external_tx_id,
-                                        ),
-                                    tx_id: tx_id.clone(),
-                                },
-                            )
-                            .await?;
-
-                        self.enqueue_confirm(ctx, tx_id).await?;
-                    }
-                    Err(error) => {
-                        self.record_submission_failure(ctx, error).await?;
-                    }
-                }
-                drop(wallet_guard);
+            Mint::Minting { .. } => {
+                self.submit_from_minting(ctx, &mint).await?;
             }
             // Crash recovery for a prepare-then-submit job that persisted
             // intent via the inline PrepareMint path before the job rewrite.
@@ -369,7 +190,401 @@ impl Job<SubmitMintContext> for SubmitMintJob {
     }
 }
 
+/// Outcome of the orchestrator pre-submit double-mint guard
+/// ([`SubmitMintJob::recover_landed_orchestrator_mint`]).
+enum OrchestratorPreSubmitOutcome {
+    /// A landed mint full-matched and was recorded; the confirm job owns the
+    /// rest of the chain.
+    Recovered,
+    /// An on-chain read failed — nothing is provable, so submission defers
+    /// to the next recovery pass rather than proceeding blind.
+    Defer,
+    /// The nonce is consumed and a classified `MintingFailed` was recorded
+    /// (`NonceConsumedByOtherMint` on the proven mismatch,
+    /// `NonceReplayUnresolved` on an empty scan). Submission must not run;
+    /// recovery's reconciliation or the operator owns the mint now.
+    Parked,
+    /// Nothing landed under this mint's nonce; submission proceeds.
+    Proceed,
+}
+
 impl SubmitMintJob {
+    /// Drives a `Minting`-state submission: existing-receipt short-circuit,
+    /// the orchestrator pre-submit double-mint guard, mode-branched
+    /// preparation (vault-direct deposit multicall vs `orchestrator.mint()`),
+    /// intent persistence, broadcast, and confirm-job handoff. An
+    /// orchestrator mint whose recipient authorization has not arrived
+    /// defers silently — no event, no vault call — leaving the mint in
+    /// `Minting` for the next recovery drive. Any other state is a no-op.
+    async fn submit_from_minting(
+        &self,
+        ctx: &SubmitMintContext,
+        mint: &Mint,
+    ) -> Result<(), MintJobError> {
+        let Mint::Minting {
+            tokenization_request_id,
+            quantity,
+            underlying,
+            network,
+            wallet,
+            journal_confirmed_at,
+            mint_mode,
+            mint_authorization,
+            ..
+        } = mint
+        else {
+            return Ok(());
+        };
+
+        if self.record_existing_receipt(ctx).await? {
+            return Ok(());
+        }
+
+        let Some(vault) = self.resolve_vault_service(ctx, *network).await?
+        else {
+            return Ok(());
+        };
+
+        // A quantity that cannot be converted is deterministic for the
+        // persisted mint: record a domain failure instead of returning a job
+        // error apalis would re-drive forever.
+        let assets = match quantity.to_u256_with_18_decimals() {
+            Ok(assets) => assets,
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    error = %error,
+                    "Mint quantity cannot be converted to on-chain units"
+                );
+
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordMintFailed {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            error: error.to_string(),
+                            classification:
+                                MintFailureClassification::Unclassified,
+                        },
+                    )
+                    .await?;
+
+                return Ok(());
+            }
+        };
+        // Runs before the wallet lock, so the answer can age between the
+        // read and the send — benign, because the on-chain nonce is the
+        // real double-mint guard: a submission racing a landing reverts
+        // `NonceReplayed` and reconciles through this same full-match on
+        // the next drive. This check exists to discover recoveries and
+        // spare doomed submissions, not to be the safety boundary.
+        if let (
+            VaultMode::Orchestrator { address: orchestrator },
+            Some(authorization),
+        ) = (mint_mode, mint_authorization)
+        {
+            match self
+                .recover_landed_orchestrator_mint(
+                    ctx,
+                    &vault,
+                    *orchestrator,
+                    *wallet,
+                    authorization,
+                    assets,
+                )
+                .await?
+            {
+                OrchestratorPreSubmitOutcome::Recovered
+                | OrchestratorPreSubmitOutcome::Defer
+                | OrchestratorPreSubmitOutcome::Parked => {
+                    return Ok(());
+                }
+                OrchestratorPreSubmitOutcome::Proceed => {}
+            }
+        }
+
+        let receipt_info = ReceiptInformation::new(
+            tokenization_request_id.clone(),
+            self.issuer_request_id.clone(),
+            underlying.clone(),
+            quantity.clone(),
+            *journal_confirmed_at,
+            None,
+        );
+
+        let external_tx_id = mint
+            .retry_submission_external_tx_id()
+            .map(super::MintExternalTxId::into_string);
+
+        let wallet_guard = vault.lock_wallet().await;
+        if has_unresolved_mint_intent(&ctx.pool, Some(&self.issuer_request_id))
+            .await?
+        {
+            return Err(MintJobError::UnresolvedWalletIntent {
+                issuer_request_id: self.issuer_request_id.clone(),
+            });
+        }
+        let prepared = if let Some(prepared) = mint.pending_prepared_tx() {
+            prepared
+        } else {
+            let prepared = match mint_mode {
+                VaultMode::VaultDirect => {
+                    vault
+                        .prepare_mint_tx(
+                            self.vault,
+                            assets,
+                            ctx.bot,
+                            *wallet,
+                            receipt_info,
+                            external_tx_id,
+                        )
+                        .await
+                }
+                VaultMode::Orchestrator { address: orchestrator } => {
+                    // An orchestrator mint without its recipient
+                    // authorization cannot submit yet — and never falls back
+                    // to vault-direct. No event is recorded: the mint stays
+                    // in `Minting`, visible in `/admin/stuck` past the
+                    // threshold, and the next drive retries once the
+                    // liquidity bot delivers.
+                    let Some(authorization) = mint_authorization else {
+                        drop(wallet_guard);
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %self.issuer_request_id,
+                            "Orchestrator mint is awaiting its recipient \
+                             authorization; deferring submission"
+                        );
+                        return Ok(());
+                    };
+
+                    vault
+                        .prepare_orchestrator_mint_tx(&OrchestratorMintParams {
+                            orchestrator: *orchestrator,
+                            token: self.vault,
+                            to: *wallet,
+                            amount: assets,
+                            authorization: authorization.clone(),
+                            receipt_info,
+                            external_tx_id,
+                        })
+                        .await
+                }
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(wallet_guard);
+                    self.record_submission_failure(ctx, error).await?;
+                    return Ok(());
+                }
+            };
+
+            ctx.mint_store
+                .send(
+                    &self.issuer_request_id,
+                    MintCommand::RecordTxIntended {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                        prepared_tx: prepared.clone(),
+                    },
+                )
+                .await?;
+            prepared
+        };
+
+        let submitted = vault.submit_mint(&prepared).await;
+
+        match submitted {
+            Ok(submitted) => {
+                let tx_id = submitted.tx_id;
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordTxSubmitted {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            external_tx_id:
+                                super::MintExternalTxId::from_string(
+                                    submitted.external_tx_id,
+                                ),
+                            tx_id: tx_id.clone(),
+                        },
+                    )
+                    .await?;
+
+                self.enqueue_confirm(ctx, tx_id).await?;
+            }
+            Err(error) => {
+                self.record_submission_failure(ctx, error).await?;
+            }
+        }
+        drop(wallet_guard);
+
+        Ok(())
+    }
+
+    /// Orchestrator counterpart of [`Self::record_existing_receipt`]: the
+    /// bot never custodies a receipt for an orchestrator mint, so the
+    /// double-mint guard is the landed `Minted` log full-matching
+    /// `(to, nonce, token, amount)`. A full match records the landing
+    /// instead of re-submitting (whose consumed nonce would only revert); a
+    /// consumed nonce that does NOT full-match applies the same two-outcome
+    /// split as the confirm-side recheck (SPEC "Nonce"): a log at the pair
+    /// disagreeing on token/amount is the proven `NonceConsumedByOtherMint`,
+    /// while an empty scan is the inconclusive `NonceReplayUnresolved` —
+    /// stuck-visible and re-queried by recovery's widened reconciliation,
+    /// which resolves the fresh-landing case forward once the
+    /// reorg-confirmation buffer moves past it. A failed read defers to the
+    /// next recovery pass rather than deciding blind.
+    ///
+    /// A single `nonceUsed` read gates the log scan: `false` proves nothing
+    /// can have landed under this mint's nonce (the on-chain uniqueness
+    /// key), sparing the full lookback scan on every ordinary first
+    /// submission.
+    async fn recover_landed_orchestrator_mint(
+        &self,
+        ctx: &SubmitMintContext,
+        vault: &Arc<dyn VaultService>,
+        orchestrator: Address,
+        wallet: Address,
+        authorization: &MintAuthorization,
+        assets: U256,
+    ) -> Result<OrchestratorPreSubmitOutcome, MintJobError> {
+        let consumed = match vault
+            .nonce_used(orchestrator, wallet, authorization.nonce)
+            .await
+        {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    error = %error,
+                    "Consumed-nonce read failed; deferring submission to \
+                     the next recovery pass"
+                );
+                return Ok(OrchestratorPreSubmitOutcome::Defer);
+            }
+        };
+        if !consumed {
+            return Ok(OrchestratorPreSubmitOutcome::Proceed);
+        }
+
+        match vault
+            .find_orchestrator_minted_log(MintedLogQuery {
+                orchestrator,
+                to: wallet,
+                nonce: authorization.nonce,
+                token: self.vault,
+                amount: assets,
+                lookback_blocks: None,
+            })
+            .await
+        {
+            Ok(MintedLogScan::FullMatch(minted)) => {
+                info!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    tx_hash = %minted.tx_hash,
+                    nonce = %minted.nonce,
+                    "Found landed orchestrator mint, recording recovery \
+                     instead of re-submitting"
+                );
+
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordOrchestratorMintRecovered {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            tx_hash: minted.tx_hash,
+                            nonce: minted.nonce,
+                            shares_minted: minted.shares_minted,
+                            block_number: minted.block_number,
+                        },
+                    )
+                    .await?;
+
+                // The confirm job's CallbackPending re-run arm pushes the
+                // callback job, completing the chain.
+                self.enqueue_confirm(ctx, TxId::Hash(minted.tx_hash)).await?;
+                Ok(OrchestratorPreSubmitOutcome::Recovered)
+            }
+            // The pair's one landing disagrees on token/amount: affirmative
+            // proof a DIFFERENT mint consumed it — this mint can never
+            // land. Park it under the proven verdict; only `CloseMint` plus
+            // a fresh `Initiate` resolves it.
+            Ok(MintedLogScan::Mismatch) => {
+                error!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    to = %wallet,
+                    nonce = %authorization.nonce,
+                    token = %self.vault,
+                    amount = %assets,
+                    "Authorization nonce was consumed by a different mint; \
+                     manual reconciliation required"
+                );
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordMintFailed {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            error: "Minted log at (to, nonce) disagrees on \
+                                    token/amount; a different mint consumed \
+                                    the pair"
+                                .to_string(),
+                            classification:
+                                MintFailureClassification::NonceConsumedByOtherMint,
+                        },
+                    )
+                    .await?;
+                Ok(OrchestratorPreSubmitOutcome::Parked)
+            }
+            // Consumed nonce with NO log at the pair at all: the two facts
+            // cannot both be true of a healthy chain view (our own landing
+            // may still sit inside the reorg-confirmation buffer the scan
+            // excludes), so this is the inconclusive
+            // `NonceReplayUnresolved` — never a submission (the consumed
+            // nonce can only revert) and never the proven mismatch.
+            // Recovery's widened reconciliation re-queries it each pass and
+            // resolves the fresh-landing case forward once the buffer moves
+            // past it.
+            Ok(MintedLogScan::NotFound) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    nonce = %authorization.nonce,
+                    "Nonce is consumed but no Minted log was found at the \
+                     pair; parking for reconciliation"
+                );
+                ctx.mint_store
+                    .send(
+                        &self.issuer_request_id,
+                        MintCommand::RecordMintFailed {
+                            issuer_request_id: self.issuer_request_id.clone(),
+                            error: "authorization nonce consumed on-chain \
+                                    with no Minted log at the pair"
+                                .to_string(),
+                            classification:
+                                MintFailureClassification::NonceReplayUnresolved,
+                        },
+                    )
+                    .await?;
+                Ok(OrchestratorPreSubmitOutcome::Parked)
+            }
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %self.issuer_request_id,
+                    error = %error,
+                    "Landed-mint lookup failed; deferring submission to the \
+                     next recovery pass"
+                );
+                Ok(OrchestratorPreSubmitOutcome::Defer)
+            }
+        }
+    }
+
     async fn record_existing_receipt(
         &self,
         ctx: &SubmitMintContext,
@@ -1084,7 +1299,7 @@ async fn kick_mint_recovery(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, U256};
+    use alloy::primitives::{B256, U256, address};
     use async_trait::async_trait;
     use cqrs_es::{AggregateError, DomainEvent};
     use event_sorcery::test_store;
@@ -1937,6 +2152,358 @@ mod tests {
         );
     }
 
+    /// The pre-submit double-mint guard: a landed `Minted` log full-matching
+    /// the mint's `(to, nonce, token, amount)` proves it already minted —
+    /// the submit job records `OrchestratorMintRecovered` and hands off to
+    /// the confirm job, never preparing a re-submission whose consumed nonce
+    /// could only revert.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_orchestrator_records_landed_mint_without_submitting()
+     {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let landed_tx_hash = B256::repeat_byte(0xcc);
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: U256::from(100u64)
+                        * U256::from(10u64).pow(U256::from(18u64)),
+                    block_number: 777,
+                })
+                // Bound to the fixture's exact orchestrator, recipient, and
+                // token: a lookup passing any wrong address must miss.
+                .with_minted_log_binding(
+                    ORCHESTRATOR,
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                    VAULT,
+                ),
+        );
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                &mint,
+                Mint::CallbackPending {
+                    receipt_id: None,
+                    mint_nonce: Some(_),
+                    ..
+                }
+            ),
+            "the landed mint must be recorded as recovered, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.orchestrator_mint_preparation_call_count(),
+            0,
+            "a landed mint must never be re-submitted"
+        );
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "the vault-direct preparation must not be invoked either"
+        );
+        assert_eq!(
+            count_jobs(
+                &harness.pool,
+                type_name::<ConfirmMintJob>(),
+                &issuer_request_id.to_string(),
+            )
+            .await,
+            1,
+            "the recovered mint must hand off to the confirm job for the \
+             callback"
+        );
+
+        let test = "submit_mint_job_orchestrator_records_landed_mint_without_submitting";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[test, "Found landed orchestrator mint"]
+        ));
+    }
+
+    /// The `nonceUsed` gate spares the full lookback scan on the ordinary
+    /// first submission: an unconsumed nonce proves nothing landed, so the
+    /// `Minted`-log lookup never runs and the mint submits normally.
+    #[tokio::test]
+    async fn submit_mint_job_orchestrator_skips_landed_scan_for_unused_nonce() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let vault =
+            Arc::new(MockVaultService::new_success().with_nonce_used(false));
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::TxSubmitted { .. }),
+            "an unconsumed nonce must submit normally, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.find_minted_log_call_count(),
+            0,
+            "an unconsumed nonce must never trigger the lookback scan"
+        );
+        assert_eq!(vault.orchestrator_mint_preparation_call_count(), 1);
+    }
+
+    /// A consumed nonce with NO log at the pair parks the mint as the
+    /// inconclusive `NonceReplayUnresolved` — never submitted (the nonce
+    /// can only revert), never mislabeled as the proven mismatch. The mint
+    /// becomes stuck-visible, and recovery's widened reconciliation owns
+    /// the re-query (which resolves the fresh-landing case forward once the
+    /// reorg buffer moves past it).
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_consumed_nonce_without_log_parks_unresolved() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let vault =
+            Arc::new(MockVaultService::new_success().with_nonce_used(true));
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                &mint,
+                Mint::MintingFailed {
+                    classification:
+                        MintFailureClassification::NonceReplayUnresolved,
+                    ..
+                }
+            ),
+            "a consumed nonce with an empty scan must park unresolved, got: \
+             {mint:?}"
+        );
+        assert_eq!(
+            vault.find_minted_log_call_count(),
+            1,
+            "the consumed nonce must trigger the landed-mint scan first"
+        );
+        assert_eq!(
+            vault.orchestrator_mint_preparation_call_count(),
+            0,
+            "nothing may be prepared or submitted for the parked mint"
+        );
+
+        let test =
+            "submit_mint_job_consumed_nonce_without_log_parks_unresolved";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "no Minted log was found at the pair", "parking"]
+        ));
+    }
+
+    /// A consumed nonce whose landing disagrees on amount parks the mint as
+    /// the PROVEN `NonceConsumedByOtherMint` — the pre-submit guard applies
+    /// the same two-outcome split as the confirm-side recheck.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_consumed_nonce_with_mismatch_parks_proven() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: B256::repeat_byte(0xcc),
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: U256::from(1u8),
+                    block_number: 777,
+                }),
+        );
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                &mint,
+                Mint::MintingFailed {
+                    classification:
+                        MintFailureClassification::NonceConsumedByOtherMint,
+                    ..
+                }
+            ),
+            "a mismatching landing must park as the proven verdict, got: \
+             {mint:?}"
+        );
+        assert_eq!(
+            vault.orchestrator_mint_preparation_call_count(),
+            0,
+            "nothing may be prepared or submitted for the parked mint"
+        );
+
+        let test = "submit_mint_job_consumed_nonce_with_mismatch_parks_proven";
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[test, "consumed by a different mint"]
+        ));
+    }
+
+    /// A failed `nonceUsed` read proves nothing about the nonce, so the gate
+    /// defers: no state change, nothing signed, nothing submitted.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_defers_when_nonce_read_fails() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let vault =
+            Arc::new(MockVaultService::new_success().with_nonce_used_error());
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "a failed consumed-nonce read must defer in Minting, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.orchestrator_mint_preparation_call_count(),
+            0,
+            "nothing may be signed on a failed consumed-nonce read"
+        );
+
+        let test = "submit_mint_job_defers_when_nonce_read_fails";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Consumed-nonce read failed"]
+        ));
+    }
+
+    /// A failed `Minted`-log lookup after a consumed nonce also defers — the
+    /// lookup proves nothing, so submitting blind is never an option.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_mint_job_defers_when_landed_lookup_fails() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_minting_authorized(&issuer_request_id),
+        )
+        .await;
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_find_minted_log_error(),
+        );
+        let ctx = submit_ctx(&harness, vault.clone());
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: 1,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::Minting { .. }),
+            "a failed landed-mint lookup must defer in Minting, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.orchestrator_mint_preparation_call_count(),
+            0,
+            "nothing may be signed on a failed landed-mint lookup"
+        );
+
+        let test = "submit_mint_job_defers_when_landed_lookup_fails";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Landed-mint lookup failed"]
+        ));
+    }
+
     /// Orchestrator confirmation records `OrchestratorTokensMinted` and never
     /// touches the receipt service — the orchestrator custodies the receipt.
     /// The failing receipt stub would log a warning if it were reached.
@@ -2047,7 +2614,14 @@ mod tests {
                     shares_minted: U256::from(100u64)
                         * U256::from(10u64).pow(U256::from(18u64)),
                     block_number: 777,
-                }),
+                })
+                // Bound to the fixture's exact orchestrator, recipient, and
+                // token: a lookup passing any wrong address must miss.
+                .with_minted_log_binding(
+                    ORCHESTRATOR,
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                    VAULT,
+                ),
         );
         let ctx = confirm_ctx(&harness, vault, cqrs_receipts(&harness.pool));
 

@@ -17,84 +17,19 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
-use std::collections::HashMap;
 
 use st0x_issuance::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Instance;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{Network, initialize_rocket};
-use st0x_issuance::{VaultMode, VaultModeConfig};
 
-use crate::harness::{MintFlowRequest, create_provider};
+use crate::harness::{
+    MintFlowRequest, authenticated_get_json, bot_provider, create_provider,
+    fetch_stuck_entries, orchestrator_vault_modes, tokens,
+};
 
 const USER_PRIVATE_KEY: B256 =
     b256!("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
-
-fn tokens(amount: u64) -> U256 {
-    U256::from(amount) * U256::from(10u64).pow(U256::from(18u64))
-}
-
-fn orchestrator_vault_modes(
-    underlying: &str,
-    orchestrator_address: Address,
-) -> VaultModeConfig {
-    VaultModeConfig::new(
-        HashMap::from([(
-            underlying.to_string(),
-            VaultMode::Orchestrator { address: orchestrator_address },
-        )]),
-        VaultMode::VaultDirect,
-    )
-}
-
-async fn bot_provider(
-    evm: &LocalEvm,
-) -> Result<impl alloy::providers::Provider + Clone, Box<dyn std::error::Error>>
-{
-    let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
-    Ok(create_provider()
-        .wallet(EthereumWallet::from(bot_signer))
-        .connect(&evm.endpoint)
-        .await?)
-}
-
-/// Dispatches an authenticated admin `GET`, failing loudly on a non-OK
-/// status or a non-JSON body so a broken endpoint can never read as a
-/// healthy/empty response.
-async fn authenticated_get_json(
-    client: &Client,
-    path: &str,
-) -> serde_json::Value {
-    let response = client
-        .get(path)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .dispatch()
-        .await;
-    assert_eq!(
-        response.status(),
-        rocket::http::Status::Ok,
-        "{path} must respond OK"
-    );
-    response
-        .into_json()
-        .await
-        .unwrap_or_else(|| panic!("{path} must return a JSON body"))
-}
-
-/// Fetches the current `GET /admin/stuck` entries, failing loudly on an
-/// endpoint error so a broken endpoint can never read as "nothing stuck".
-async fn fetch_stuck_entries(client: &Client) -> Vec<serde_json::Value> {
-    let body = authenticated_get_json(client, "/admin/stuck").await;
-
-    body["stuck"]
-        .as_array()
-        .expect("/admin/stuck must contain a stuck array")
-        .clone()
-}
 
 /// Polls `GET /admin/stuck` until a `BurnFailed` entry appears, returning it.
 async fn wait_for_burn_failed_entry(
@@ -261,7 +196,7 @@ async fn orchestrator_burn_walks_multiple_receipts()
             orchestrator_address,
             &user_signer,
             tokens(10),
-            nonce_seed,
+            B256::with_last_byte(nonce_seed),
         )
         .await?;
     }
@@ -359,7 +294,7 @@ async fn orchestrator_shortfall_is_classified_without_submission()
         orchestrator_address,
         &user_signer,
         tokens(10),
-        1,
+        B256::with_last_byte(1),
     )
     .await?;
     // ...but the user holds 30: 20 more minted with a receipt the user
@@ -463,7 +398,7 @@ async fn orchestrator_recovery_confirms_landed_burn_without_resubmitting()
         orchestrator_address,
         &bot_signer,
         tokens(10),
-        1,
+        B256::with_last_byte(1),
     )
     .await?;
     let provider = bot_provider(&evm).await?;
@@ -658,7 +593,7 @@ async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
         orchestrator_address,
         &bot_signer,
         tokens(10),
-        1,
+        B256::with_last_byte(1),
     )
     .await?;
     let provider = bot_provider(&evm).await?;
@@ -880,7 +815,7 @@ async fn mixed_mode_assets_each_take_their_own_burn_path()
         orchestrator_address,
         &user_signer,
         tokens(10),
-        1,
+        B256::with_last_byte(1),
     )
     .await?;
 
