@@ -710,39 +710,46 @@ token symbol) stays on `TokenizedAsset`.
 
 **Aggregate State:**
 
-- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
-  rejected across all networks, but listings stay supported and in-flight
-  redemptions still complete)
+- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty set
+  of typed, independently owned `FreezeHoldId`s. Mints are rejected across all
+  networks while any hold remains, but listings stay supported and in-flight
+  redemptions still complete.
 
-A stream originates on the first `Frozen` event; an underlying with no stream is
-`Enabled` by definition.
+A stream originates on the first legacy `Frozen` or new `FreezeHoldAcquired`
+event; an underlying with no stream is `Enabled` by definition.
 
 **Commands:**
 
-- `Freeze` - Stop accepting new mints for every listing of this underlying
-  (idempotent — freezing a frozen underlying is a no-op).
-- `Unfreeze` - Resume accepting mints (idempotent; a no-op when no stream
-  exists).
+- `Freeze` - Acquire the operator hold for every listing of this underlying
+  (idempotent when that hold is already active).
+- `Unfreeze` - Release only the operator hold. Mints resume only when no other
+  hold remains (idempotent when the operator hold is absent).
+- `AcquireFreezeHold { hold_id }` - Acquire an independently owned freeze hold.
+- `ReleaseFreezeHold { hold_id }` - Release only the named freeze hold.
 
 **Events:**
 
-- `Frozen { frozen_at }` - Underlying frozen (new mints rejected on all
-  networks)
-- `Unfrozen { unfrozen_at }` - Underlying unfrozen (mints resume)
+- `Frozen { frozen_at }` - Legacy operator-freeze event retained for replay.
+- `Unfrozen { unfrozen_at }` - Legacy operator-unfreeze event retained for
+  replay.
+- `FreezeHoldAcquired { hold_id, acquired_at }` - Named freeze hold acquired.
+- `FreezeHoldReleased { hold_id, released_at }` - Named freeze hold released.
 
 **Command -> Event Mappings:**
 
-| Command    | Events Produced | Notes                                    |
-| ---------- | --------------- | ---------------------------------------- |
-| `Freeze`   | `Frozen`        | No event if already frozen (idempotent)  |
-| `Unfreeze` | `Unfrozen`      | No event if already enabled (idempotent) |
+| Command             | Events Produced      | Notes                                   |
+| ------------------- | -------------------- | --------------------------------------- |
+| `Freeze`            | `FreezeHoldAcquired` | Acquires the operator hold              |
+| `Unfreeze`          | `FreezeHoldReleased` | Releases only the operator hold         |
+| `AcquireFreezeHold` | `FreezeHoldAcquired` | No event if that hold is already active |
+| `ReleaseFreezeHold` | `FreezeHoldReleased` | No event if that hold is absent         |
 
 **Freeze State Machine:**
 
 ```
-Enabled ⇄ Frozen
-   Freeze:   Enabled -> Frozen
-   Unfreeze: Frozen  -> Enabled
+Enabled -> Frozen: first hold acquired
+Frozen  -> Frozen: additional hold acquired or one of several holds released
+Frozen  -> Enabled: final hold released
 ```
 
 **Freeze invariant — frozen is not de-listed.** Freezing only gates _new_ mints:
@@ -757,9 +764,10 @@ Endpoint"). This issuance-side freeze plus the liquidity guard form the single
 dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze is
 involved here (that is separate, heavier supply-control work and out of scope).
 
-The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
-in M1 and automatically by the dividend scheduler in M3 — the same command path
-either way.
+The issuer-host CLI acquires and releases the operator hold. The dividend
+scheduler independently acquires and releases a hold identified by the complete
+corporate-action window, preventing either trigger from releasing another
+owner's freeze.
 
 **Issuer CLI.** A dedicated `issuer` binary (separate from the HTTP server
 binary) is the M1 manual freeze trigger. It runs on the issuer host (over SSH)
@@ -894,6 +902,32 @@ CLI. Listing-scoped subcommands (asset addition and any future per-listing
 action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
+
+**Scheduled freeze windows.** For a corporate action known in advance (an
+ex-date), the freeze/unfreeze pair can be armed ahead of time instead of fired
+by hand at the exact instants. `POST /admin/freeze-schedules` (internal
+API-key + IP-allowlist auth, like all admin endpoints) takes an underlying and a
+`freeze_at`/`unfreeze_at` window and enqueues two durable apalis jobs — acquire
+that window's underlying-scoped hold at `freeze_at` and release it at
+`unfreeze_at`. Scheduled transitions survive restarts (apalis persists the due
+time), re-posting an identical window is an idempotent no-op while its jobs are
+pending or running (jobs are keyed by underlying + both window boundaries), and
+overlapping windows remain frozen until the final active hold is released. A
+window whose job reached a terminal state (done, killed, or out of retries)
+releases its key on re-arm, so an infrastructure failure never permanently
+blocks a window. At startup, orphaned `Running` rows reset to `Pending` and
+terminal rows are vacuumed, mirroring the mint jobs; transitions that died
+without applying (killed or out of retries) are surfaced at ERROR before their
+rows are removed. An underlying with no listing is rejected with 404 (the
+`Underlying` commands would succeed for any symbol, so an unchecked typo would
+arm a freeze that gates nothing while reporting success; the check lives in the
+scheduler itself so every schedule source inherits it); an inverted or
+sub-second window is rejected with 422 (apalis schedules at second granularity,
+so a sub-second window has no defined execution order); a fully elapsed window
+is rejected rather than flapping the asset; a `freeze_at` already in the past
+with `unfreeze_at` still ahead (window in progress) freezes immediately. This
+is the schedule mechanism the automated corporate-actions sourcing feeds; until
+then an operator arms windows manually.
 
 ## Services
 
