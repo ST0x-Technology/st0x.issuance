@@ -23,5 +23,6 @@ in
     ST0X_STOX_RECEIPT_ABI = "${abi}/out/StoxReceipt.sol/StoxReceipt.json";
     ST0X_STOX_RECEIPT_VAULT_ABI = "${abi}/out/StoxReceiptVault.sol/StoxReceiptVault.json";
     ST0X_STOX_OARV_BEACON_SET_DEPLOYER_ABI = "${abi}/out/StoxOffchainAssetReceiptVaultBeaconSetDeployer.sol/StoxOffchainAssetReceiptVaultBeaconSetDeployer.json";
+    IERC1271_ABI = "${abi}/out/IERC1271.sol/IERC1271.json";
   };
 }
