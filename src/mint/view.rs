@@ -6,8 +6,8 @@ use sqlx::{Pool, Sqlite};
 use uuid::Uuid;
 
 use super::{
-    ClientId, IssuerMintRequestId, Mint, Network, Quantity, TokenSymbol,
-    TokenizationRequestId, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Mint, MintFailureClassification, Network,
+    Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
 use crate::vault::{PreparedMintTx, TxId};
 
@@ -129,7 +129,12 @@ pub(crate) enum MintView {
         initiated_at: DateTime<Utc>,
         journal_confirmed_at: DateTime<Utc>,
         tx_hash: B256,
-        receipt_id: U256,
+        /// Vault-direct audit data; `None` for orchestrator mints, whose
+        /// receipts are custodied by the orchestrator.
+        receipt_id: Option<U256>,
+        /// The consumed authorization nonce; `None` for vault-direct mints.
+        #[serde(default)]
+        mint_nonce: Option<B256>,
         shares_minted: U256,
         gas_used: Option<u64>,
         block_number: u64,
@@ -148,6 +153,10 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
+        /// Typed failure classification mirrored from the aggregate state;
+        /// defaults to `Unclassified` on rows written before it existed.
+        #[serde(default)]
+        classification: MintFailureClassification,
     },
     Completed {
         issuer_request_id: IssuerMintRequestId,
@@ -161,7 +170,12 @@ pub(crate) enum MintView {
         initiated_at: DateTime<Utc>,
         journal_confirmed_at: DateTime<Utc>,
         tx_hash: B256,
-        receipt_id: U256,
+        /// Vault-direct audit data; `None` for orchestrator mints, whose
+        /// receipts are custodied by the orchestrator.
+        receipt_id: Option<U256>,
+        /// The consumed authorization nonce; `None` for vault-direct mints.
+        #[serde(default)]
+        mint_nonce: Option<B256>,
         shares_minted: U256,
         gas_used: Option<u64>,
         block_number: u64,
@@ -868,6 +882,7 @@ mod tests {
                 journal_confirmed_at: now,
                 error: "Transaction reverted".to_string(),
                 failed_at: now,
+                classification: MintFailureClassification::Unclassified,
             },
             MintView::CallbackPending {
                 issuer_request_id: fields[5].issuer_request_id.clone(),
@@ -885,7 +900,8 @@ mod tests {
                 tx_hash: b256!(
                     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
                 ),
-                receipt_id: uint!(1_U256),
+                receipt_id: Some(uint!(1_U256)),
+                mint_nonce: None,
                 shares_minted: uint!(100_000000000000000000_U256),
                 gas_used: Some(50000),
                 block_number: 1000,
@@ -934,7 +950,8 @@ mod tests {
             initiated_at: fields.initiated_at,
             journal_confirmed_at: now,
             tx_hash: b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
-            receipt_id: uint!(2_U256),
+            receipt_id: Some(uint!(2_U256)),
+            mint_nonce: None,
             shares_minted: uint!(100_000000000000000000_U256),
             gas_used: Some(50000),
             block_number: 1001,
@@ -1046,7 +1063,8 @@ mod tests {
             initiated_at: completed_fields.initiated_at,
             journal_confirmed_at: now,
             tx_hash: b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
-            receipt_id: uint!(2_U256),
+            receipt_id: Some(uint!(2_U256)),
+            mint_nonce: None,
             shares_minted: uint!(100_000000000000000000_U256),
             gas_used: Some(50000),
             block_number: 1001,

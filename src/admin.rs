@@ -2341,7 +2341,10 @@ mod tests {
     };
     use crate::config::{VaultMode, VaultModeConfig};
     use crate::mint::test_utils::{TestHarness, test_config};
-    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::mint::{
+        ClientId, MintFailureClassification, MintView, Quantity,
+        TokenizationRequestId,
+    };
     use crate::receipt_inventory::ReceiptVaultKey;
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
@@ -5368,7 +5371,6 @@ mod tests {
     #[test]
     fn mint_view_summary_classifies_and_timestamps_each_variant() {
         use super::StuckClass::{InProgress, TerminalFail};
-        use crate::mint::{ClientId, MintView, Network};
 
         let issuer_request_id = crate::mint::IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-stuck-1");
@@ -5479,7 +5481,8 @@ mod tests {
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            receipt_id: U256::from(1u64),
+            receipt_id: Some(U256::from(1u64)),
+            mint_nonce: None,
             shares_minted: U256::from(100u64),
             gas_used: None,
             block_number: 1,
@@ -5504,6 +5507,7 @@ mod tests {
             journal_confirmed_at,
             error: "deposit failed".to_string(),
             failed_at,
+            classification: MintFailureClassification::Unclassified,
         };
         let s = super::mint_view_summary(&minting_failed).unwrap();
         assert_eq!(s.class, TerminalFail);
@@ -5528,7 +5532,8 @@ mod tests {
                 tx_hash: b256!(
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 ),
-                receipt_id: U256::from(2u64),
+                receipt_id: Some(U256::from(2u64)),
+                mint_nonce: None,
                 shares_minted: U256::from(100u64),
                 gas_used: None,
                 block_number: 1,
