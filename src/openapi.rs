@@ -50,8 +50,8 @@ expressed as an OpenAPI scheme."
         crate::account::api::RegisterAccountResponse,
         crate::account::api::WhitelistWalletRequest,
         crate::account::api::WhitelistWalletResponse,
-        crate::mint::api::MintAuthorizationRequest,
-        crate::mint::api::MintAuthorizationResponse,
+        st0x_issuance_dto::MintAuthorizationRequest,
+        st0x_issuance_dto::MintAuthorizationResponse,
         crate::admin::AggregateKind,
         crate::admin::ReprocessResponse,
         crate::admin::StuckAggregate,
@@ -208,10 +208,10 @@ mod tests {
             serde_json::json!(["enabled", "frozen"])
         );
 
-        // The authorization DTOs carry `schema(value_type = String)` over
-        // `B256`/`Bytes`/`IssuerMintRequestId`; the overrides must hold so
-        // the schema advertises the 0x-hex strings the liquidity bot sends
-        // rather than alloy's internal representations.
+        // The authorization request DTO carries `schema(value_type = String)`
+        // over `B256`/`Bytes`; the overrides must hold so the schema
+        // advertises the 0x-hex strings the liquidity bot sends rather than
+        // alloy's internal representations.
         assert_eq!(
             schemas["MintAuthorizationRequest"]["properties"]["nonce"]["type"],
             "string"
