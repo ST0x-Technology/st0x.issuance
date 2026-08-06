@@ -19,7 +19,10 @@
 
 use reqwest::StatusCode;
 use reqwest::redirect::Policy;
-use st0x_issuance_dto::{TokenizedAssetStatusResponse, UnderlyingSymbol};
+use st0x_issuance_dto::{
+    MintAuthorizationRequest, MintAuthorizationResponse,
+    TokenizedAssetStatusResponse, UnderlyingSymbol,
+};
 use std::time::Duration;
 use url::Url;
 
@@ -130,10 +133,73 @@ impl IssuanceClient {
             status => Err(ClientError::Status { status, url }),
         }
     }
+
+    /// Delivers a signed `MintAuthV1` recipient authorization for the mint
+    /// correlated by `tokenization_request_id`, via
+    /// `POST /internal/mints/<tokenization_request_id>/authorization`
+    /// (RAI-1243). A retried delivery MUST reuse the same
+    /// `MintAuthorizationRequest` byte-identically — the nonce is fixed per
+    /// mint, and the server treats an identical redelivery as an idempotent
+    /// `200`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on URL/transport failures, and every non-`200`
+    /// status as [`ClientError::Status`] for the caller to map. The server's
+    /// contract: `404` — no mint exists yet for the tokenization request
+    /// (retryable: the mint's Alpaca-side initiation may not have reached
+    /// the issuance bot yet); `409` — a conflicting authorization is already
+    /// recorded, or the mint has advanced past intent; `422` — the mint is
+    /// vault-direct, the signer does not recover to the recipient, or the
+    /// nonce is already consumed on-chain; `502` — the server's on-chain
+    /// validation read failed (retryable).
+    pub async fn deliver_mint_authorization(
+        &self,
+        tokenization_request_id: &str,
+        authorization: &MintAuthorizationRequest,
+    ) -> Result<MintAuthorizationResponse, ClientError> {
+        // Segment-appended (never `Url::join`ed) for the same reasons as
+        // `tokenized_asset_status`: preserve a base path prefix and
+        // percent-encode a path-significant character in the id into one
+        // segment instead of corrupting the route.
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| ClientError::NotABase {
+                base: self.base_url.clone(),
+            })?
+            .pop_if_empty()
+            .extend([
+                "internal",
+                "mints",
+                tokenization_request_id,
+                "authorization",
+            ]);
+
+        let response = self
+            .http
+            .post(url.clone())
+            .header(API_KEY_HEADER, &self.api_key)
+            .json(authorization)
+            .send()
+            .await?;
+
+        match response.status() {
+            StatusCode::OK => {
+                response.json().await.map_err(ClientError::ParseResponse)
+            }
+            // No `Ok(None)` mapping here, unlike `tokenized_asset_status`:
+            // for a delivery, a 404 is a retryable race (the mint is not
+            // initiated yet), not a benign "asset unknown" — collapsing it
+            // into a non-error would hide the state the caller must retry
+            // on. The URL never carries the API key (it is a header).
+            status => Err(ClientError::Status { status, url }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::{B256, Bytes};
     use httpmock::prelude::*;
     use serde_json::json;
     use st0x_issuance_dto::{TokenizedAssetStatus, VaultModeTag};
@@ -310,6 +376,153 @@ mod tests {
 
         mock.assert();
         assert_eq!(status.status, TokenizedAssetStatus::Enabled);
+    }
+
+    fn test_authorization() -> MintAuthorizationRequest {
+        MintAuthorizationRequest {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from(vec![0xab, 0xcd]),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_mint_authorization_posts_hex_body_and_parses_response() {
+        let server = MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/internal/mints/tok-123/authorization")
+                .header(API_KEY_HEADER, "test-key")
+                .json_body(json!({
+                    "nonce": "0x0707070707070707070707070707070707070707070707070707070707070707",
+                    "signature": "0xabcd"
+                }));
+            then.status(200).json_body(json!({
+                "issuer_request_id": "550e8400-e29b-41d4-a716-446655440000",
+                "status": "authorized"
+            }));
+        });
+
+        let response = client_for(&server)
+            .deliver_mint_authorization("tok-123", &test_authorization())
+            .await
+            .expect("delivery succeeds");
+
+        mock.assert();
+        assert_eq!(
+            response.issuer_request_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(response.status, "authorized");
+    }
+
+    /// An empty signature (`"0x"`) is a valid delivery for contract
+    /// recipients — the client must send it as `"0x"`, not omit or reshape
+    /// the field.
+    #[tokio::test]
+    async fn deliver_mint_authorization_sends_empty_signature_as_0x() {
+        let server = MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/internal/mints/tok-123/authorization")
+                .json_body_includes(r#"{"signature":"0x"}"#);
+            then.status(200).json_body(json!({
+                "issuer_request_id": "550e8400-e29b-41d4-a716-446655440000",
+                "status": "authorized"
+            }));
+        });
+
+        client_for(&server)
+            .deliver_mint_authorization(
+                "tok-123",
+                &MintAuthorizationRequest {
+                    nonce: B256::repeat_byte(0x07),
+                    signature: Bytes::new(),
+                },
+            )
+            .await
+            .expect("delivery succeeds");
+
+        mock.assert();
+    }
+
+    // The server's delivery contract distinguishes retryable races (404: the
+    // mint is not initiated yet; 502: on-chain validation read failed) from
+    // terminal rejections (409 conflict, 422 invalid) purely by status. The
+    // client must surface EVERY non-200 as `Status` with the exact code —
+    // in particular 404 must NOT collapse into a benign `None` the way the
+    // status endpoint's does, or the caller would lose the retry signal.
+    #[tokio::test]
+    async fn deliver_mint_authorization_surfaces_each_contract_status() {
+        for code in [404u16, 409, 422, 502] {
+            let server = MockServer::start_async().await;
+            let mock = server.mock(|when, then| {
+                when.method(POST).path("/internal/mints/tok-123/authorization");
+                then.status(code);
+            });
+
+            let err = client_for(&server)
+                .deliver_mint_authorization("tok-123", &test_authorization())
+                .await
+                .expect_err("a non-200 must surface as an error");
+
+            mock.assert();
+            assert!(
+                matches!(
+                    err,
+                    ClientError::Status { status, .. } if status.as_u16() == code
+                ),
+                "expected Status({code}), got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_mint_authorization_errors_on_malformed_body() {
+        let server = MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/internal/mints/tok-123/authorization");
+            then.status(200).body("not json");
+        });
+
+        let err = client_for(&server)
+            .deliver_mint_authorization("tok-123", &test_authorization())
+            .await
+            .expect_err("a malformed 200 body must surface as a parse error");
+
+        mock.assert();
+        assert!(
+            matches!(err, ClientError::ParseResponse(_)),
+            "expected ParseResponse, got {err:?}"
+        );
+    }
+
+    /// Same URL-building contract as the status endpoint: a base path prefix
+    /// survives, and a path-significant character in the tokenization id is
+    /// percent-encoded into a single segment instead of corrupting the
+    /// route (which would 404 and masquerade as the initiation race).
+    #[tokio::test]
+    async fn deliver_mint_authorization_builds_prefixed_encoded_paths() {
+        let server = MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/internal/mints/tok%2F123/authorization");
+            then.status(200).json_body(json!({
+                "issuer_request_id": "550e8400-e29b-41d4-a716-446655440000",
+                "status": "authorized"
+            }));
+        });
+
+        let base = Url::parse(&format!("{}/api/", server.base_url()))
+            .expect("valid prefixed base URL");
+        let client =
+            IssuanceClient::new(base, "test-key").expect("client builds");
+
+        client
+            .deliver_mint_authorization("tok/123", &test_authorization())
+            .await
+            .expect("delivery succeeds");
+
+        mock.assert();
     }
 
     // The freeze-gating contract is "only 404 -> None; every other status ->

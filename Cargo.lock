@@ -5801,6 +5801,7 @@ dependencies = [
 name = "st0x-issuance-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "httpmock",
  "reqwest",
  "serde_json",
