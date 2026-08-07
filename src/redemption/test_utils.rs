@@ -93,6 +93,26 @@ pub(crate) fn create_transfer_log(
     tx_hash: B256,
     block_number: u64,
 ) -> Log {
+    create_transfer_log_with_index(
+        vault_address,
+        from,
+        to,
+        value,
+        tx_hash,
+        block_number,
+        0,
+    )
+}
+
+pub(crate) fn create_transfer_log_with_index(
+    vault_address: Address,
+    from: Address,
+    to: Address,
+    value: U256,
+    tx_hash: B256,
+    block_number: u64,
+    log_index: u64,
+) -> Log {
     let topics = vec![
         OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
         B256::left_padding_from(&from[..]),
@@ -113,7 +133,7 @@ pub(crate) fn create_transfer_log(
         block_timestamp: None,
         transaction_hash: Some(tx_hash),
         transaction_index: Some(0),
-        log_index: Some(0),
+        log_index: Some(log_index),
         removed: false,
     }
 }

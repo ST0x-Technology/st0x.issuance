@@ -14,6 +14,7 @@ use super::{
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
+use crate::burn_excess::exclusion::is_excluded_funding_log;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
 };
@@ -29,6 +30,8 @@ pub(crate) enum TransferOutcome {
     AlreadyDetected,
     SkippedMint,
     SkippedNoAccount,
+    /// Path B burn-excess funding Transfer — not a real AP redemption.
+    SkippedAdminRecovery,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +42,10 @@ pub(crate) enum TransferProcessingError {
     MissingTxHash,
     #[error("Missing block number in log")]
     MissingBlockNumber,
+    #[error(
+        "Missing log index in log (required for funding-exclusion identity)"
+    )]
+    MissingLogIndex,
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
     #[error("CQRS error: {0}")]
@@ -52,6 +59,8 @@ pub(crate) enum TransferProcessingError {
          attribute its redemptions to an arbitrary underlying"
     )]
     AmbiguousVault { vault: Address },
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
 }
 
 // `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
@@ -74,6 +83,7 @@ impl TransferProcessingError {
             Self::SolTypes(_)
                 | Self::MissingTxHash
                 | Self::MissingBlockNumber
+                | Self::MissingLogIndex
                 | Self::QuantityConversion(_)
                 | Self::NoMatchingAsset { .. }
         )
@@ -108,6 +118,24 @@ pub(crate) async fn detect_transfer(
 
     let block_number =
         log.block_number.ok_or(TransferProcessingError::MissingBlockNumber)?;
+
+    // Fail closed: exclusion identity is (network, vault, tx_hash, log_index).
+    // Without log_index we cannot prove the transfer is not an excluded Path B
+    // funding log, so refuse Detect rather than open a Redemption by accident.
+    let log_index =
+        log.log_index.ok_or(TransferProcessingError::MissingLogIndex)?;
+
+    if is_excluded_funding_log(pool, network, vault, tx_hash, log_index).await?
+    {
+        debug!(
+            target: "redemption",
+            %tx_hash,
+            log_index,
+            %vault,
+            "Skipping admin recovery funding transfer"
+        );
+        return Ok(TransferOutcome::SkippedAdminRecovery);
+    }
 
     let account_view = find_by_wallet(pool, &transfer_event.from).await?;
 
@@ -342,10 +370,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::Redemption;
     use crate::redemption::RedemptionServices;
     use crate::redemption::test_utils::{
-        create_transfer_log, setup_test_db_with_asset,
+        create_transfer_log, create_transfer_log_with_index,
+        setup_test_db_with_asset,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::list_enabled_assets;
@@ -475,6 +505,197 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn detect_transfer_skips_excluded_funding_log_only() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let other_wallet =
+            address!("0x8888888888888888888888888888888888888888");
+
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        // Adjacent same-wallet transfer still redeems: also whitelist other.
+        {
+            use crate::account::{
+                Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
+            };
+            use event_sorcery::StoreBuilder;
+
+            let (account_store, _) = StoreBuilder::<Account>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let client_id = ClientId::new();
+            account_store
+                .send(
+                    &client_id,
+                    AccountCommand::Register {
+                        client_id,
+                        email: Email::new("other@example.com").unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            account_store
+                .send(
+                    &client_id,
+                    AccountCommand::LinkToAlpaca {
+                        alpaca_account: AlpacaAccountNumber(
+                            "ALPACA999".to_string(),
+                        ),
+                    },
+                )
+                .await
+                .unwrap();
+            account_store
+                .send(
+                    &client_id,
+                    AccountCommand::WhitelistWallet { wallet: other_wallet },
+                )
+                .await
+                .unwrap();
+        }
+
+        let store = setup_test_store(&pool);
+        let value = U256::from_str_radix("750000000000000000", 10).unwrap();
+        let funding_tx = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let neighbor_tx = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let unrecorded_tx = b256!(
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+
+        let funding = crate::burn_excess::FundingTransferId {
+            network: Network::Base,
+            vault,
+            tx_hash: funding_tx,
+            log_index: 2,
+            from: ap_wallet,
+            to: bot_wallet,
+            amount: value,
+        };
+        crate::burn_excess::exclusion::record_funding_exclusion(
+            &pool,
+            &funding,
+            b256!(
+                "0x1bb6afc590e58095099373a8fea2242017b31acc7940bcd0d6b68820ebeb8ebd"
+            ),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let assets = list_enabled_assets(&pool).await.unwrap();
+
+        let excluded = create_transfer_log_with_index(
+            vault, ap_wallet, bot_wallet, value, funding_tx, 100, 2,
+        );
+        let excluded_outcome = detect_transfer(
+            &excluded,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(excluded_outcome, TransferOutcome::SkippedAdminRecovery),
+            "excluded funding log must not open a redemption: {excluded_outcome:?}"
+        );
+        assert!(
+            store
+                .load(&IssuerRedemptionRequestId::new(funding_tx))
+                .await
+                .unwrap()
+                .is_none(),
+            "no Redemption aggregate for excluded funding log"
+        );
+
+        // Sibling log in the *same* transaction as the excluded one. The skip
+        // key is (network, vault, tx_hash, log_index), so only log_index 2 is
+        // excluded; log 3 must still redeem. This is what pins the exclusion to
+        // one log rather than to the whole transaction.
+        let sibling = create_transfer_log_with_index(
+            vault, ap_wallet, bot_wallet, value, funding_tx, 100, 3,
+        );
+        let sibling_outcome = detect_transfer(
+            &sibling,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(sibling_outcome, TransferOutcome::Detected { .. }),
+            "a sibling log in the excluded transaction must still redeem: \
+             {sibling_outcome:?}"
+        );
+
+        // Neighbor transfer (different tx / log) still redeems; exclusion is
+        // exact-identity only, not "skip all from this wallet".
+        let neighbor = create_transfer_log_with_index(
+            vault,
+            other_wallet,
+            bot_wallet,
+            value,
+            neighbor_tx,
+            100,
+            0,
+        );
+        let neighbor_outcome = detect_transfer(
+            &neighbor,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(neighbor_outcome, TransferOutcome::Detected { .. }),
+            "neighbor transfer must still redeem: {neighbor_outcome:?}"
+        );
+
+        let unrecorded = create_transfer_log_with_index(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            value,
+            unrecorded_tx,
+            101,
+            0,
+        );
+        let unrecorded_outcome = detect_transfer(
+            &unrecorded,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(unrecorded_outcome, TransferOutcome::Detected { .. }),
+            "unrecorded same-wallet transfer must still redeem: {unrecorded_outcome:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Skipping admin recovery funding transfer"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn detect_transfer_skips_mint_events() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -573,6 +794,42 @@ mod tests {
         assert!(
             matches!(result, Err(TransferProcessingError::MissingBlockNumber)),
             "Expected MissingBlockNumber, got {result:?}"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn detect_transfer_missing_log_index_fails_closed() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
+
+        let mut log = create_transfer_log(
+            vault,
+            address!("0x9999999999999999999999999999999999999999"),
+            bot_wallet,
+            U256::from(100),
+            b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            12345,
+        );
+        log.log_index = None;
+
+        let assets = list_enabled_assets(&pool).await.unwrap();
+        let result =
+            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
+                .await;
+
+        assert!(
+            matches!(result, Err(TransferProcessingError::MissingLogIndex)),
+            "Expected MissingLogIndex, got {result:?}"
+        );
+        assert!(
+            result.as_ref().unwrap_err().is_non_transient(),
+            "missing log_index must not retry/freeze checkpoint indefinitely"
         );
     }
 

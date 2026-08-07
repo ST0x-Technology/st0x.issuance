@@ -15,6 +15,7 @@ use super::{
     Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
     next_burn_retry_external_tx_id_from_history,
 };
+use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
@@ -954,18 +955,24 @@ impl BurnManager {
         if status == BurnTxStatus::ProvablyDead {
             // Network-keyed reservation: one check covers competing burn AND
             // mint intents on this signer's nonce domain, excluding only this
-            // redemption's own reservation.
+            // redemption's own reservation. BurnExcess is not tracked in
+            // `active_signer_intents`, so its intents need their own check.
             let unresolved_intent = has_unresolved_signer_intent(
                 &self.view_pool,
                 metadata.network,
                 Some(issuer_request_id),
             )
             .await?;
-            if unresolved_intent {
+            let unresolved_excess =
+                has_unresolved_excess_burn_intent(&self.view_pool, None)
+                    .await?;
+            if unresolved_intent || unresolved_excess {
                 drop(wallet_guard);
                 debug!(target: "redemption",
                     issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable_tx.hash,
+                    unresolved_intent,
+                    unresolved_excess,
                     "Deferring dead burn replacement behind another persisted wallet intent"
                 );
                 return Ok(RecoveryOutcome::SkippedManualIntervention);
@@ -1637,7 +1644,10 @@ impl BurnManager {
                 Some(issuer_request_id),
             )
             .await?;
-            if !unresolved_intent {
+            let unresolved_excess =
+                has_unresolved_excess_burn_intent(&self.view_pool, None)
+                    .await?;
+            if !unresolved_intent && !unresolved_excess {
                 break wallet_guard;
             }
 
@@ -1656,6 +1666,8 @@ impl BurnManager {
             }
             debug!(target: "redemption",
                 issuer_request_id = %issuer_request_id,
+                unresolved_intent,
+                unresolved_excess,
                 "Waiting for an earlier wallet intent before preparing burn"
             );
             tokio::time::sleep(Duration::from_secs(1)).await;

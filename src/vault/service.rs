@@ -639,8 +639,8 @@ mod tests {
     use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
-        SendableTxWithHash, TxId, VaultError, VaultService,
+        BurnRequestOrigin, BurnTxStatus, MultiBurnEntry, MultiBurnParams,
+        ReceiptInformation, SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_OA_SCHEMA: &str =
@@ -683,7 +683,7 @@ mod tests {
             dust_shares: U256::ZERO,
             owner,
             user: address!("0x3333333333333333333333333333333333333333"),
-            issuer_request_id: test_issuer_redemption_id(),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
             detected_tx_hash: b256!(
                 "0xabababababababababababababababababababababababababababababababab"
             ),
@@ -1741,7 +1741,9 @@ mod tests {
                     dust_shares: U256::ZERO,
                     owner,
                     user,
-                    issuer_request_id: test_issuer_redemption_id(),
+                    origin: BurnRequestOrigin::Redemption(
+                        test_issuer_redemption_id(),
+                    ),
                     detected_tx_hash,
                     external_tx_id: None,
                 },
@@ -1814,7 +1816,9 @@ mod tests {
                     dust_shares: U256::ZERO,
                     owner,
                     user,
-                    issuer_request_id: test_issuer_redemption_id(),
+                    origin: BurnRequestOrigin::Redemption(
+                        test_issuer_redemption_id(),
+                    ),
                     detected_tx_hash,
                     external_tx_id: Some(BurnExternalTxId::from_string(
                         override_id.clone(),
@@ -1888,7 +1892,7 @@ mod tests {
                 dust_shares: U256::ZERO,
                 owner,
                 user,
-                issuer_request_id: test_issuer_redemption_id(),
+                origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
                 detected_tx_hash: b256!(
                     "0xabababababababababababababababababababababababababababababababab"
                 ),
@@ -1933,7 +1937,7 @@ mod tests {
             dust_shares,
             owner,
             user,
-            issuer_request_id: test_issuer_redemption_id(),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
             detected_tx_hash,
             external_tx_id: None,
         };
@@ -1978,7 +1982,7 @@ mod tests {
             dust_shares: U256::ZERO,
             owner,
             user,
-            issuer_request_id: test_issuer_redemption_id(),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
             detected_tx_hash,
             external_tx_id: None,
         };

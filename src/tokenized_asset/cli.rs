@@ -18,6 +18,9 @@ use super::view::{
 use super::{TokenizedAsset, UnderlyingSymbol};
 use crate::Network;
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::burn_excess::cli::{
+    BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
+};
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
     setup_tracing,
@@ -154,6 +157,12 @@ enum IssuerCommand {
     /// documented bound; identical rejections carry the server's own error
     /// code for diagnosis. Submits nothing and reads only the vault address.
     FireblocksAuthProbe(Box<FireblocksAuthProbeArgs>),
+    /// Administrative supply correction: burn excess shares from a proven
+    /// duplicate deposit. Path is a required mode keyword
+    /// (`internal` | `external`); never Alpaca, never a Redemption aggregate.
+    /// Default is dry-run inspection; pass `--execute` to mutate.
+    #[command(subcommand)]
+    BurnExcess(Box<BurnExcessCliCommand>),
 }
 
 #[derive(Args)]
@@ -862,6 +871,9 @@ impl IssuerCli {
             }
             IssuerCommand::SweepLegacyReceipts(args) => {
                 run_sweep_legacy_receipts(*args, prompt_confirm).await
+            }
+            IssuerCommand::BurnExcess(command) => {
+                run_burn_excess_cli(*command, prompt_confirm).await
             }
         }
     }

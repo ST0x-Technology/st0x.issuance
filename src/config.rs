@@ -563,6 +563,17 @@ pub enum ConfigError {
         network.as_str().to_uppercase()
     )]
     ChainIdNotForNetwork { network: Network, configured: u64, expected: u64 },
+    #[error(
+        "no RPC URL configured for {network}; set {hint} in the service \
+         environment (deployment secrets / .env)"
+    )]
+    NetworkRpcNotConfigured { network: Network, hint: &'static str },
+    #[error("configured RPC URL for {network} is not a valid URL: {source}")]
+    InvalidConfiguredRpcUrl {
+        network: Network,
+        #[source]
+        source: url::ParseError,
+    },
     #[error("chain registry initialization failed: {0}")]
     ChainRegistry(#[source] Box<ChainRegistryError>),
 }
@@ -587,6 +598,46 @@ pub(crate) fn wss_to_http(url: &Url) -> Result<Url, InvalidRpcScheme> {
         .map_err(|()| InvalidRpcScheme(url.scheme().to_string()))?;
 
     Ok(http_url)
+}
+
+/// Resolves the service RPC URL for `network` from process environment
+/// (deployment secrets / `.env` — the same variables the long-running bot
+/// loads). Operator CLIs call this instead of taking `--rpc-url`.
+///
+/// Precedence matches service config: for Base, `CHAIN_BASE_RPC_URL` wins over
+/// legacy `RPC_URL`; other networks use only their `CHAIN_<NETWORK>_RPC_URL`.
+pub(crate) fn configured_rpc_url(network: Network) -> Result<Url, ConfigError> {
+    resolve_configured_rpc_url(network, |name| {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    })
+}
+
+fn resolve_configured_rpc_url(
+    network: Network,
+    env_get: impl Fn(&str) -> Option<String>,
+) -> Result<Url, ConfigError> {
+    let (primary, fallback, hint) = match network {
+        Network::Base => (
+            "CHAIN_BASE_RPC_URL",
+            Some("RPC_URL"),
+            "CHAIN_BASE_RPC_URL or RPC_URL",
+        ),
+        Network::Ethereum => {
+            ("CHAIN_ETHEREUM_RPC_URL", None, "CHAIN_ETHEREUM_RPC_URL")
+        }
+        Network::HyperEvm => {
+            ("CHAIN_HYPEREVM_RPC_URL", None, "CHAIN_HYPEREVM_RPC_URL")
+        }
+    };
+
+    let raw = env_get(primary)
+        .or_else(|| fallback.and_then(&env_get))
+        .ok_or(ConfigError::NetworkRpcNotConfigured { network, hint })?;
+
+    Url::parse(&raw).map_err(|source| ConfigError::InvalidConfiguredRpcUrl {
+        network,
+        source,
+    })
 }
 
 /// Domain target categories used in `target:` on all tracing macros.
@@ -1051,6 +1102,62 @@ mod tests {
             result,
             Err(ConfigError::InvalidSubgraphScheme { variable, .. })
                 if variable == "SUBGRAPH_URL"
+        ));
+    }
+
+    #[test]
+    fn configured_rpc_url_base_prefers_grouped_over_legacy() {
+        let lookup = |name: &str| match name {
+            "CHAIN_BASE_RPC_URL" => Some("wss://base-grouped.example".into()),
+            "RPC_URL" => Some("wss://legacy.example".into()),
+            _ => None,
+        };
+
+        let url = resolve_configured_rpc_url(Network::Base, lookup).unwrap();
+        assert_eq!(url, Url::parse("wss://base-grouped.example").unwrap());
+    }
+
+    #[test]
+    fn configured_rpc_url_base_falls_back_to_legacy() {
+        let lookup = |name: &str| match name {
+            "RPC_URL" => Some("wss://legacy.example".into()),
+            _ => None,
+        };
+
+        let url = resolve_configured_rpc_url(Network::Base, lookup).unwrap();
+        assert_eq!(url, Url::parse("wss://legacy.example").unwrap());
+    }
+
+    #[test]
+    fn configured_rpc_url_ethereum_requires_grouped_var() {
+        let lookup = |name: &str| match name {
+            "RPC_URL" => Some("wss://legacy.example".into()),
+            _ => None,
+        };
+
+        let err =
+            resolve_configured_rpc_url(Network::Ethereum, lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NetworkRpcNotConfigured {
+                network: Network::Ethereum,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn configured_rpc_url_rejects_invalid_url() {
+        let lookup = |name: &str| match name {
+            "RPC_URL" => Some("not a url".into()),
+            _ => None,
+        };
+
+        let err =
+            resolve_configured_rpc_url(Network::Base, lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidConfiguredRpcUrl { network: Network::Base, .. }
         ));
     }
 

@@ -23,6 +23,9 @@ use uuid::Uuid;
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
+use crate::burn_excess::{
+    BurnExcess, exclusion::rebuild_funding_exclusion_index,
+};
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
 };
@@ -76,6 +79,7 @@ pub mod underlying;
 pub(crate) mod admin;
 pub(crate) mod alpaca;
 pub(crate) mod auth;
+pub(crate) mod burn_excess;
 pub(crate) mod catchers;
 pub(crate) mod chain;
 pub(crate) mod config;
@@ -645,6 +649,17 @@ async fn setup_aggregate_cqrs(
         .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
         .build(redemption_services)
         .await?;
+
+    // BurnExcess has no Table projection; the funding-exclusion SQL index is a
+    // derived read model, and this rebuild is what the server needs: it
+    // repopulates the index before the transfer pollers spawn, so a restored
+    // DB cannot leave the poller free to open a Redemption for an excluded
+    // funding Transfer. No reactor is wired here — the server dispatches no
+    // `BurnExcess` command, and the CLI builds its own store in
+    // `burn_excess_store`, so a reactor on a server-side store would never
+    // fire.
+    prepare_event_sourced_startup::<BurnExcess>(pool).await?;
+    rebuild_funding_exclusion_index(pool).await?;
 
     Ok(AggregateCqrsSetup { mint_store, redemption_store })
 }

@@ -30,6 +30,7 @@ use super::{
     IssuerMintRequestId, Mint, MintCommand, has_unresolved_signer_intent,
 };
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
+use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
@@ -185,6 +186,8 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     Some(&self.issuer_request_id),
                 )
                 .await?
+                    || has_unresolved_excess_burn_intent(&ctx.pool, None)
+                        .await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),
@@ -277,6 +280,8 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     Some(&self.issuer_request_id),
                 )
                 .await?
+                    || has_unresolved_excess_burn_intent(&ctx.pool, None)
+                        .await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),

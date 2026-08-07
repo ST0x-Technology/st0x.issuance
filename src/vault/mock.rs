@@ -516,8 +516,15 @@ impl MockVaultService {
 
     #[cfg(test)]
     pub(crate) fn with_share_balance(self, balance: U256) -> Self {
-        *self.share_balance.lock().unwrap() = balance;
+        self.set_share_balance(balance);
         self
+    }
+
+    /// Moves the balance on an already-shared mock, so a test can model the
+    /// issuer's balance changing part-way through a run.
+    #[cfg(test)]
+    pub(crate) fn set_share_balance(&self, balance: U256) {
+        *self.share_balance.lock().unwrap() = balance;
     }
 
     /// Configures `verify_burn_tx` to report the operator-supplied tx as a
@@ -658,6 +665,17 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn set_prepared_tx(&self, sendable_tx: SendableTxWithHash) {
         *self.prepared_tx.lock().unwrap() = Some(sendable_tx);
+    }
+
+    /// Seeds the result returned by the next `confirm_burn` (resume paths that
+    /// skip `submit_burn` otherwise fall back to default mock burn deltas).
+    #[cfg(test)]
+    pub(crate) fn with_pending_burn_result(
+        self,
+        result: MultiBurnResult,
+    ) -> Self {
+        *self.pending_burn_result.lock().unwrap() = Some(result);
+        self
     }
 }
 
@@ -1132,7 +1150,7 @@ mod tests {
     };
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, ReceiptInformation,
+        BurnRequestOrigin, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
         SendableTxWithHash, VaultError, VaultService,
     };
 
@@ -1353,7 +1371,9 @@ mod tests {
             dust_shares: U256::from(10),
             owner: test_receiver(),
             user: address!("0x2222222222222222222222222222222222222222"),
-            issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
+            origin: BurnRequestOrigin::Redemption(
+                IssuerRedemptionRequestId::new(detected_tx_hash),
+            ),
             detected_tx_hash,
             external_tx_id: None,
         }

@@ -191,9 +191,9 @@ impl std::fmt::Display for BurnExternalTxId {
 }
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{
-    BurnTxStatus, MultiBurnEntry, MultiBurnParams, NetworkVaultServices,
-    SendableTxWithHash, TxId, UnconfiguredNetworkError, VaultError,
-    VaultService,
+    BurnRequestOrigin, BurnTxStatus, MultiBurnEntry, MultiBurnParams,
+    NetworkVaultServices, SendableTxWithHash, TxId, UnconfiguredNetworkError,
+    VaultError, VaultService,
 };
 
 pub(super) const fn default_redemption_network() -> Network {
@@ -541,7 +541,7 @@ impl Redemption {
             dust_shares: input.dust_shares,
             owner: input.owner,
             user: user_wallet,
-            issuer_request_id: issuer_request_id.clone(),
+            origin: BurnRequestOrigin::Redemption(issuer_request_id.clone()),
             detected_tx_hash: metadata.detected_tx_hash,
             external_tx_id: input.external_tx_id,
         };
@@ -1046,7 +1046,7 @@ impl Redemption {
             dust_shares: input.dust_shares,
             owner: input.owner,
             user: user_wallet,
-            issuer_request_id: issuer_request_id.clone(),
+            origin: BurnRequestOrigin::Redemption(issuer_request_id.clone()),
             detected_tx_hash: metadata.detected_tx_hash,
             external_tx_id: input.external_tx_id,
         };
