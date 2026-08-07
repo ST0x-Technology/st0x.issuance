@@ -95,6 +95,20 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
     },
 
+    /// Operator-authorized retry of a `MintingFailed` mint past the exhausted
+    /// automatic budget, refused unless the failure chain PROVES the fresh
+    /// submission is unambiguous: the handler requires a `Minting`
+    /// predecessor (the mint failed at prepare/signing, before any
+    /// transaction was persisted or broadcast). A `TxIntended`/`TxSubmitted`
+    /// predecessor holds a transaction that may still mine, so a fresh
+    /// submission could double-mint — those chains are rejected atomically
+    /// here, not in the racy endpoint. Pure: produces the same
+    /// `MintRetryStarted` as `RetryMint`. Idempotent — a no-op if the mint
+    /// already left `MintingFailed`.
+    ManualRetryMint {
+        issuer_request_id: IssuerMintRequestId,
+    },
+
     /// Records a mint whose on-chain transaction already succeeded, as evidenced
     /// by a receipt the `SubmitMintJob` found before submitting. Pure: produces
     /// `ExistingMintRecovered` (no I/O) and advances to `CallbackPending`,
