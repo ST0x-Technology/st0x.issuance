@@ -305,6 +305,8 @@ pub(crate) enum Mint {
     Closed {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        /// Exact prepared deposit hash acknowledged at close, when any.
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
         closed_at: DateTime<Utc>,
     },
 }
@@ -397,9 +399,42 @@ impl Mint {
         }
     }
 
+    /// Live prepared mint identity for rebroadcast / classification.
+    ///
+    /// Resolves through `MintingFailed` / `Minting { retry }` via
+    /// [`Self::non_failed_predecessor`], and returns prepared bytes from
+    /// `TxIntended` **or** `TxSubmitted` (when present). Without the
+    /// `TxSubmitted` arm, a post-submit failure always looked like "no
+    /// intent" and `SubmitMintJob` prepared a **new** hash — the double-mint
+    /// amplifier for uncertain confirmation recovery.
     pub(super) fn pending_prepared_tx(&self) -> Option<PreparedMintTx> {
         match self.non_failed_predecessor() {
             Self::TxIntended { prepared_tx, .. } => Some(prepared_tx.clone()),
+            Self::TxSubmitted { prepared_tx: Some(prepared_tx), .. } => {
+                Some(prepared_tx.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Post-intent predecessor that cannot supply prepared bytes for
+    /// classification (legacy `TxSubmitted { prepared_tx: None }`).
+    ///
+    /// Free-preparing a replacement in this state risks double-minting: a
+    /// submission or intent already existed on-chain, but we cannot rebroadcast
+    /// or prove death without the signed envelope. Recovery must inventory /
+    /// confirm-poll only.
+    pub(super) fn has_unclassifiable_post_intent_identity(&self) -> bool {
+        matches!(
+            self.non_failed_predecessor(),
+            Self::TxSubmitted { prepared_tx: None, .. }
+        )
+    }
+
+    /// Backend `tx_id` of the latest `TxSubmitted` predecessor, if any.
+    pub(super) fn latest_known_tx_id(&self) -> Option<TxId> {
+        match self.non_failed_predecessor() {
+            Self::TxSubmitted { tx_id, .. } => Some(tx_id.clone()),
             _ => None,
         }
     }
@@ -1048,9 +1083,13 @@ impl Mint {
         tx_id: TxId,
         _submitted_at: DateTime<Utc>,
     ) {
+        // Rebroadcast after RetryMint submits from `Minting { retry }` without a
+        // new `MintTxIntended`. Preserve the live prepared identity from the
+        // predecessor chain so recovery can keep classifying/rebroadcasting the
+        // same hash (dropping it here re-opened the double-mint hole).
         let prepared_tx = match self {
             Self::TxIntended { prepared_tx, .. } => Some(prepared_tx.clone()),
-            Self::Minting { .. } => None,
+            Self::Minting { .. } => self.pending_prepared_tx(),
             _ => return,
         };
 
@@ -1517,19 +1556,70 @@ impl Mint {
         &self,
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
     ) -> Result<Vec<MintEvent>, MintError> {
-        match self {
-            Self::Completed { .. } | Self::Closed { .. } => {
-                Err(MintError::NotRecoverable {
-                    current_state: self.state_name().to_string(),
-                })
-            }
-            _ => Ok(vec![MintEvent::MintClosed {
-                issuer_request_id,
-                reason,
-                closed_at: Utc::now(),
-            }]),
+        if matches!(self, Self::Completed { .. } | Self::Closed { .. }) {
+            return Err(MintError::NotRecoverable {
+                current_state: self.state_name().to_string(),
+            });
         }
+
+        // A legacy `TxSubmitted { prepared_tx: None }` carries no prepared
+        // bytes, but its submission is already on the wire and recovery still
+        // enqueues confirm for the stored `tx_id`. Closing it terminal without
+        // an acknowledgement would mark a live deposit resolved, so fall back
+        // to the stored submission identity when there are no prepared bytes.
+        let unresolved_mint_tx_hash = self
+            .pending_prepared_tx()
+            .map(|prepared_tx| prepared_tx.hash)
+            .or_else(|| {
+                self.latest_known_tx_id().and_then(|tx_id| tx_id.to_hash())
+            });
+        let acknowledged_unresolved_mint_tx_hash = match (
+            unresolved_mint_tx_hash,
+            acknowledged_unresolved_mint_tx_hash,
+        ) {
+            (Some(mint_tx_hash), acknowledgement) => {
+                Some(Self::require_unresolved_mint_acknowledgement(
+                    mint_tx_hash,
+                    acknowledgement,
+                )?)
+            }
+            (None, Some(provided)) => {
+                return Err(
+                    MintError::UnexpectedUnresolvedMintAcknowledgement {
+                        provided,
+                    },
+                );
+            }
+            (None, None) => None,
+        };
+
+        Ok(vec![MintEvent::MintClosed {
+            issuer_request_id,
+            reason,
+            acknowledged_unresolved_mint_tx_hash,
+            closed_at: Utc::now(),
+        }])
+    }
+
+    fn require_unresolved_mint_acknowledgement(
+        persisted_mint_hash: B256,
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
+    ) -> Result<B256, MintError> {
+        let acknowledged_hash = acknowledged_unresolved_mint_tx_hash.ok_or(
+            MintError::UnresolvedMintRequiresAcknowledgement {
+                mint_tx_hash: persisted_mint_hash,
+            },
+        )?;
+        if acknowledged_hash != persisted_mint_hash {
+            return Err(MintError::UnresolvedMintAcknowledgementMismatch {
+                expected: persisted_mint_hash,
+                provided: acknowledged_hash,
+            });
+        }
+
+        Ok(acknowledged_hash)
     }
 }
 
@@ -1753,9 +1843,15 @@ impl EventSourced for Mint {
                 shares_minted,
                 block_number,
             ),
-            MintCommand::CloseMint { issuer_request_id, reason } => {
-                self.handle_close_mint(issuer_request_id, reason)
-            }
+            MintCommand::CloseMint {
+                issuer_request_id,
+                reason,
+                acknowledged_unresolved_mint_tx_hash,
+            } => self.handle_close_mint(
+                issuer_request_id,
+                reason,
+                acknowledged_unresolved_mint_tx_hash,
+            ),
         }
     }
 }
@@ -1857,8 +1953,18 @@ impl Mint {
             } => {
                 self.apply_mint_retry_started(tx_hash, started_at);
             }
-            MintEvent::MintClosed { issuer_request_id, reason, closed_at } => {
-                *self = Self::Closed { issuer_request_id, reason, closed_at };
+            MintEvent::MintClosed {
+                issuer_request_id,
+                reason,
+                acknowledged_unresolved_mint_tx_hash,
+                closed_at,
+            } => {
+                *self = Self::Closed {
+                    issuer_request_id,
+                    reason,
+                    acknowledged_unresolved_mint_tx_hash,
+                    closed_at,
+                };
             }
         }
     }
@@ -1950,6 +2056,18 @@ pub(crate) enum MintError {
     PendingWalletIntent,
     #[error("Vault: {message}")]
     Vault { message: String },
+    #[error(
+        "Unresolved prepared mint {mint_tx_hash:?} requires explicit operator acknowledgement"
+    )]
+    UnresolvedMintRequiresAcknowledgement { mint_tx_hash: B256 },
+    #[error(
+        "Unresolved mint acknowledgement mismatch: expected {expected:?}, provided {provided:?}"
+    )]
+    UnresolvedMintAcknowledgementMismatch { expected: B256, provided: B256 },
+    #[error(
+        "Unresolved mint acknowledgement {provided:?} was provided, but this mint has no persisted prepared deposit"
+    )]
+    UnexpectedUnresolvedMintAcknowledgement { provided: B256 },
 }
 
 impl From<TokenizedAssetViewError> for MintError {
@@ -2867,6 +2985,108 @@ pub(crate) mod tests {
                 )
             ),
             "a pre-cutover mint must be refused, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn pending_prepared_tx_resolves_from_tx_intended() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mint =
+            replay::<Mint>(events_through_tx_intended(&issuer_request_id))
+                .unwrap()
+                .unwrap();
+        let prepared =
+            mint.pending_prepared_tx().expect("TxIntended holds prepared");
+        assert_eq!(prepared.nonce, 1);
+        assert_eq!(
+            prepared.external_tx_id,
+            format!("mint-{issuer_request_id}")
+        );
+    }
+
+    #[test]
+    fn pending_prepared_tx_resolves_from_tx_submitted_after_intended() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            7,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared_tx.hash;
+        let mut events = events_through_tx_intended(&issuer_request_id);
+        // Rewrite intended with known prepared, then submit so apply copies it.
+        if let MintEvent::MintTxIntended { prepared_tx: stored, .. } =
+            &mut events[3]
+        {
+            *stored = prepared_tx;
+        }
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            tx_id: TxId::from(expected_hash),
+            submitted_at: Utc::now(),
+        });
+        let mint = replay::<Mint>(events).unwrap().unwrap();
+        let prepared = mint
+            .pending_prepared_tx()
+            .expect("TxSubmitted must retain prepared_tx from intended");
+        assert_eq!(prepared.hash, expected_hash);
+        assert_eq!(prepared.nonce, 7);
+    }
+
+    #[test]
+    fn pending_prepared_tx_resolves_failed_from_tx_submitted_chain() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            9,
+            format!("mint-{issuer_request_id}"),
+        );
+        let expected_hash = prepared_tx.hash;
+        let mut events = events_through_tx_intended(&issuer_request_id);
+        if let MintEvent::MintTxIntended { prepared_tx: stored, .. } =
+            &mut events[3]
+        {
+            *stored = prepared_tx;
+        }
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            tx_id: TxId::from(expected_hash),
+            submitted_at: Utc::now(),
+        });
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "reverted".to_string(),
+            failed_at: Utc::now(),
+        });
+        let failed = replay::<Mint>(events).unwrap().unwrap();
+        let prepared = failed
+            .pending_prepared_tx()
+            .expect("MintingFailed must resolve prepared via failed_from");
+        assert_eq!(prepared.hash, expected_hash);
+
+        // After RetryMint the Minting{retry} chain must still see the same hash.
+        let mut after_retry = failed;
+        after_retry.apply_event(MintEvent::MintRetryStarted {
+            issuer_request_id,
+            tx_hash: None,
+            manual_retry_id: None,
+            started_at: Utc::now(),
+        });
+        let prepared_after_retry = after_retry
+            .pending_prepared_tx()
+            .expect("retry Minting must resolve prepared via failed_from");
+        assert_eq!(prepared_after_retry.hash, expected_hash);
+    }
+
+    #[test]
+    fn pending_prepared_tx_none_for_first_minting_attempt() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mint = replay::<Mint>(events_through_minting(&issuer_request_id))
+            .unwrap()
+            .unwrap();
+        assert!(
+            mint.pending_prepared_tx().is_none(),
+            "first Minting attempt has no prepared identity; prepare is allowed"
         );
     }
 
@@ -4596,5 +4816,206 @@ pub(crate) mod tests {
     fn test_tokenization_request_id_display() {
         let id = TokenizationRequestId::new("alp-456");
         assert_eq!(format!("{id}"), "alp-456");
+    }
+
+    #[tokio::test]
+    async fn close_mint_without_prepared_identity_needs_no_acknowledgement() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let events = TestHarness::<Mint>::with(())
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed pre-prepare".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [MintEvent::MintClosed {
+                issuer_request_id: closed_id,
+                acknowledged_unresolved_mint_tx_hash: None,
+                ..
+            }] if closed_id == &issuer_request_id
+        ));
+    }
+
+    /// A legacy `TxSubmitted { prepared_tx: None }` has no prepared bytes, but
+    /// a hash `tx_id` is still a broadcast identity recovery keeps polling.
+    /// Closing it must not be cheaper than closing an intended mint.
+    #[tokio::test]
+    async fn close_mint_with_legacy_submitted_hash_requires_acknowledgement() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let submitted_hash = B256::random();
+        let mut seed = events_through_minting(&issuer_request_id);
+        seed.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: "ext-legacy".to_string(),
+            tx_id: TxId::Hash(submitted_hash),
+            submitted_at: Utc::now(),
+        });
+
+        let missing = TestHarness::<Mint>::with(())
+            .given(seed.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed legacy submitted".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                missing,
+                LifecycleError::Apply(
+                    MintError::UnresolvedMintRequiresAcknowledgement {
+                        mint_tx_hash
+                    }
+                ) if mint_tx_hash == submitted_hash
+            ),
+            "legacy submitted close without ack must fail, got {missing:?}"
+        );
+
+        let wrong_hash = B256::random();
+        let wrong = TestHarness::<Mint>::with(())
+            .given(seed.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed legacy submitted".to_string(),
+                acknowledged_unresolved_mint_tx_hash: Some(wrong_hash),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                wrong,
+                LifecycleError::Apply(
+                    MintError::UnresolvedMintAcknowledgementMismatch {
+                        expected,
+                        provided,
+                    }
+                ) if expected == submitted_hash && provided == wrong_hash
+            ),
+            "mismatched ack must fail, got {wrong:?}"
+        );
+
+        let events = TestHarness::<Mint>::with(())
+            .given(seed)
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed legacy submitted".to_string(),
+                acknowledged_unresolved_mint_tx_hash: Some(submitted_hash),
+            })
+            .await
+            .events();
+        assert!(matches!(
+            events.as_slice(),
+            [MintEvent::MintClosed {
+                acknowledged_unresolved_mint_tx_hash: Some(acknowledged),
+                ..
+            }] if acknowledged == &submitted_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_mint_with_prepared_identity_requires_matching_hash() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let seed = events_through_tx_intended(&issuer_request_id);
+        let prepared_hash = match &seed[3] {
+            MintEvent::MintTxIntended { prepared_tx, .. } => prepared_tx.hash,
+            other => panic!("expected MintTxIntended, got {other:?}"),
+        };
+
+        let missing = TestHarness::<Mint>::with(())
+            .given(seed.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed intended".to_string(),
+                acknowledged_unresolved_mint_tx_hash: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                missing,
+                LifecycleError::Apply(
+                    MintError::UnresolvedMintRequiresAcknowledgement {
+                        mint_tx_hash
+                    }
+                ) if mint_tx_hash == prepared_hash
+            ),
+            "missing ack must fail, got {missing:?}"
+        );
+
+        let wrong = TestHarness::<Mint>::with(())
+            .given(seed.clone())
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "wrong hash".to_string(),
+                acknowledged_unresolved_mint_tx_hash: Some(b256!(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                )),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                wrong,
+                LifecycleError::Apply(
+                    MintError::UnresolvedMintAcknowledgementMismatch {
+                        expected,
+                        ..
+                    }
+                ) if expected == prepared_hash
+            ),
+            "mismatched ack must fail, got {wrong:?}"
+        );
+
+        let events = TestHarness::<Mint>::with(())
+            .given(seed)
+            .when(MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "operator closed intended".to_string(),
+                acknowledged_unresolved_mint_tx_hash: Some(prepared_hash),
+            })
+            .await
+            .events();
+        assert!(matches!(
+            events.as_slice(),
+            [MintEvent::MintClosed {
+                issuer_request_id: closed_id,
+                acknowledged_unresolved_mint_tx_hash: Some(ack),
+                ..
+            }] if closed_id == &issuer_request_id && *ack == prepared_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_mint_rejects_unexpected_acknowledgement() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let unexpected = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let error = TestHarness::<Mint>::with(())
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::CloseMint {
+                issuer_request_id,
+                reason: "ack without intent".to_string(),
+                acknowledged_unresolved_mint_tx_hash: Some(unexpected),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::UnexpectedUnresolvedMintAcknowledgement {
+                        provided
+                    }
+                ) if provided == unexpected
+            ),
+            "unexpected ack must fail, got {error:?}"
+        );
     }
 }

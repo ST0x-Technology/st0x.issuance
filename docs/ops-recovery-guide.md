@@ -72,6 +72,62 @@ request ID, transaction hash, nonce, and required operator action.
   persisted signed transaction. Reconcile legacy or unverifiable burns off-chain
   before closing.
 
+### Uncertain mint confirmation (do not force a second deposit)
+
+Vault-direct mint confirm polls `eth_getTransactionReceipt` as `Option`. A null
+receipt, timeout, transport error, or other uncertain observation **does not**
+record `MintingFailed` and **must not** be "fixed" by submitting another
+deposit. The aggregate stays in `TxSubmitted`; scheduled recovery re-polls
+(~60s). After ~6h with no progress, automatic recovery abandons until process
+restart or admin reprocess — restart is safe because the prepared hash is
+rebroadcast / re-confirmed, not replaced.
+
+**Reprocess / recover only rebroadcasts or reconfirms the exact signed hash**
+already on the aggregate. A new deposit (replacement prepare) is authorized only
+after the prior identity is terminal (`MinedReverted` or `ProvablyDead`), with a
+wallet-guard TOCTOU recheck immediately before signing, and only when inventory
+has **no** receipt for that `issuer_request_id`. Do not hand-craft a second
+deposit while identity is still mineable, uncertain, or inventory already shows
+a mint receipt.
+
+If logs show `Duplicate Deposit/receipt for already-tracked issuer_request_id`,
+a second on-chain deposit already landed for that mint. Do **not** mint again —
+the excess shares must be burned, and `issuer burn-excess` is the only supported
+way to do it.
+
+The observation is also recorded durably as a
+`ReceiptInventoryEvent::ConflictingItnDepositObserved` event on the vault's
+receipt-inventory stream, so the evidence survives the backfill checkpoint
+advancing past that block. There is no admin health list of duplicates yet; read
+the event (or the ERROR log fields) for both identities.
+
+Collect these before running anything:
+
+| Input              | Where it comes from                                                 |
+| ------------------ | ------------------------------------------------------------------- |
+| Issuer request id  | `issuer_request_id` on the event / log line                         |
+| Tracked deposit    | `tracked` — the receipt and tx the mint is already accounted for    |
+| Duplicate deposit  | `discovered_receipt_id` + `discovered_tx_hash` — the excess to burn |
+| Excess shares      | The duplicate `Deposit` log's share amount, read from the explorer  |
+| Network / chain id | The vault's listing (`--network`, cross-checked `--chain-id`)       |
+| Vault              | The vault the duplicate deposit hit                                 |
+
+Then pick the mode by where the excess shares sit **now** — the CLI never infers
+it:
+
+- Shares still in the issuer wallet (the deposit's original recipient is the
+  issuer):
+  `issuer burn-excess internal --issuer-request-id <id> --deposit-tx-hash
+  <discovered_tx_hash> --receipt-id <discovered_receipt_id> --shares <raw>
+  --network <net> --chain-id <id> --reason "<why>" --incident-id <id> --execute`
+- Shares were minted to someone else and must be moved back first: transfer them
+  to the issuer wallet, then run the same command as `external` with
+  `--funding-tx-hash <that transfer's tx>` added. Stop the issuer service first
+  — a running transfer poller can open a `Redemption` for that funding transfer.
+
+Run it without `--execute` first: the dry run proves the deposit and prints the
+plan without signing or writing an exclusion.
+
 ## Step 2: Diagnose the failure
 
 ### Common failure patterns
@@ -111,14 +167,17 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
   http://localhost:8000/admin/reprocess/mint/<aggregate_id> | python3 -m json.tool
 ```
 
-This retries recovery inline (no restart needed). If the previous on-chain mint
-transaction failed, manual reprocess submits the next deterministic retry
-transaction even after automatic retries are exhausted, and hands the mint to a
-background task that drives that submitted transaction through confirmation. A
-single reprocess is usually enough. The exception is a retry submitted past the
-automatic cap (e.g. `retry-5`): if that transaction also fails, the background
-task is exhausted and gives up, so you must reprocess again. A 409 Conflict
-response means it already completed — no action needed.
+This retries recovery inline (no restart needed). Reprocess re-drives the
+**persisted** mint identity only: it rebroadcasts or reconfirms the exact signed
+hash already on the aggregate. It does **not** create a second deposit for an
+unresolved intent. A replacement prepare is signed only after classification
+proves the prior hash is terminal (`MinedReverted` or `ProvablyDead`), with a
+wallet-guard recheck and only when inventory has no receipt for that
+`issuer_request_id` (same rules as Step 1 above). After a successful rebroadcast
+or reconfirm path, a background task drives confirmation. A single reprocess is
+usually enough; if recovery abandons again (e.g. still pending after the
+budget), reprocess once more. A 409 Conflict response means it already completed
+— no action needed.
 
 ### Recovering redemptions
 
@@ -171,11 +230,15 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/js
 ```
 
 Closing just marks the transaction as done in our system. **It does not perform
-or prove any on-chain action.** If the redemption has a persisted signed burn,
-the JSON body must also include
-`"acknowledged_unresolved_burn_tx_hash": "0x..."` with that exact hash. The
-reservation remains held because the acknowledged transaction may still land.
-The reason and acknowledgement are recorded in the event store for audit.
+or prove any on-chain action.** If the mint still holds a prepared deposit
+identity (`MintTxIntended` / prepared bytes on `TxSubmitted`, including via
+`MintingFailed`), the JSON body must also include
+`"acknowledged_unresolved_mint_tx_hash": "0x..."` with that exact hash (422 on
+miss/mismatch). If the redemption has a persisted signed burn, the JSON body
+must also include `"acknowledged_unresolved_burn_tx_hash": "0x..."` with that
+exact hash. The reservation remains held because the acknowledged transaction
+may still land. The reason and acknowledgement are recorded in the event store
+for audit.
 
 ### Force-completing a verified burn
 

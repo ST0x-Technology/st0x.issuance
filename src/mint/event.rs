@@ -75,6 +75,11 @@ pub(crate) enum MintEvent {
     MintClosed {
         issuer_request_id: IssuerMintRequestId,
         reason: String,
+        /// Exact prepared deposit hash the operator acknowledged when closing
+        /// over an unresolved intent. `None` when the mint had no prepared
+        /// identity. Older events omit this field.
+        #[serde(default)]
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
         closed_at: DateTime<Utc>,
     },
 

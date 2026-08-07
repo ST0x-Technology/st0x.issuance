@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::event::ReceiptSource;
 use super::{ReceiptId, Shares};
+use crate::mint::IssuerMintRequestId;
 use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
 use crate::vault::ReceiptInformation;
 
@@ -57,5 +58,16 @@ pub(crate) enum ReceiptInventoryCommand {
         from: Address,
         to: Address,
         tx_hash: Option<TxHash>,
+    },
+    /// Record a second ITN `Deposit` observed for an already-tracked request.
+    ///
+    /// Records the observation only; it never applies the discovery, so the
+    /// 1:1 index is untouched. Idempotent on the duplicate's own identity so a
+    /// re-scanned block range records it once.
+    RecordConflictingItnDeposit {
+        issuer_request_id: IssuerMintRequestId,
+        discovered_receipt_id: ReceiptId,
+        discovered_tx_hash: TxHash,
+        discovered_block_number: u64,
     },
 }

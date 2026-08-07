@@ -6,9 +6,9 @@ use alloy::eips::Decodable2718;
 #[cfg(test)]
 use alloy::eips::Encodable2718;
 use alloy::hex::decode;
-use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
 #[cfg(test)]
-use alloy::primitives::{Signature, TxKind};
+use alloy::primitives::TxKind;
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
 use alloy::providers::SendableTxErr;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 #[cfg(test)]
@@ -47,8 +47,11 @@ pub(crate) trait VaultService: Send + Sync {
     /// The returned bytes and hash must be persisted before calling
     /// [`VaultService::submit_mint`].
     ///
-    /// Uses a deterministic `external_tx_id` so that resubmitting the same mint
-    /// after a crash triggers transaction duplicate rejection instead of a double-mint.
+    /// `external_tx_id` is a signing-backend correlation id (Fireblocks
+    /// idempotency / Turnkey labeling). It is **not** vault-direct double-mint
+    /// protection — after the first `MintTxIntended`, only exact-hash
+    /// classification / rebroadcast of the persisted prepared bytes (or
+    /// inventory) is safe.
     async fn prepare_mint_tx(
         &self,
         vault: Address,
@@ -69,8 +72,11 @@ pub(crate) trait VaultService: Send + Sync {
 
     /// Confirms a previously submitted mint transaction.
     ///
-    /// Polls the signing backend until the transaction reaches a terminal state,
-    /// then fetches the on-chain receipt and parses the Deposit event.
+    /// Bounded-polls `eth_getTransactionReceipt` as `Option` (never uses
+    /// `PendingTransactionBuilder::get_receipt` as the terminal classifier).
+    /// Terminal outcomes: mined success with a `Deposit` log, mined revert
+    /// (`status=0`), or [`VaultError::ConfirmationPending`] when the poll
+    /// budget is exhausted with no receipt. Provider uncertainty fails closed.
     ///
     /// # Arguments
     ///
@@ -79,6 +85,20 @@ pub(crate) trait VaultService: Send + Sync {
         &self,
         tx_id: &TxId,
     ) -> Result<MintResult, VaultError>;
+
+    /// Classifies whether a persisted signed mint transaction can still land.
+    ///
+    /// Implementations must check the exact hash receipt before comparing the
+    /// owner's finalized nonce. Any provider uncertainty returns an error so
+    /// callers fail closed and keep the persisted transaction live. `Uncertain`
+    /// is expressed as `Err`, never as a success variant.
+    async fn classify_mint_tx(
+        &self,
+        _owner: Address,
+        _prepared_tx: &PreparedMintTx,
+    ) -> Result<MintTxStatus, VaultError> {
+        Ok(MintTxStatus::StillMineable)
+    }
 
     /// Gets the ERC-20 share balance for an address.
     ///
@@ -193,6 +213,19 @@ pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
 pub(crate) enum BurnTxStatus {
     Mined,
     Reverted,
+    StillMineable,
+    ProvablyDead,
+}
+
+/// Observation of a persisted signed vault-direct mint transaction.
+///
+/// Parallel to [`BurnTxStatus`]. Provider/identity uncertainty is **not** a
+/// variant — callers receive `Err` and must fail closed (no `MintingFailed`, no
+/// replacement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintTxStatus {
+    MinedSuccess,
+    MinedReverted,
     StillMineable,
     ProvablyDead,
 }
@@ -312,7 +345,7 @@ pub(crate) struct PreparedMintTx {
 impl PreparedMintTx {
     /// Verifies that the redundant persisted identity fields describe the
     /// exact signed envelope bytes.
-    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+    pub(crate) fn validate(&self) -> Result<TxEnvelope, VaultError> {
         let envelope = TxEnvelope::decode_2718_exact(&self.tx)?;
         let decoded_hash = *envelope.tx_hash();
         if decoded_hash != self.hash {
@@ -330,7 +363,31 @@ impl PreparedMintTx {
             });
         }
 
-        Ok(())
+        Ok(envelope)
+    }
+
+    /// Like [`Self::validate`], and requires the recovered signer to match
+    /// `owner` (the bot wallet whose nonce is authoritative for death proof).
+    pub(crate) fn validate_for_owner(
+        &self,
+        owner: Address,
+    ) -> Result<TxEnvelope, VaultError> {
+        let envelope = self.validate()?;
+        let signer = envelope.recover_signer()?;
+        if signer != owner {
+            return Err(VaultError::PreparedMintSignerMismatch {
+                expected: owner,
+                decoded: signer,
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// Recovers the signing address from the persisted envelope after
+    /// identity validation. Used when classify needs an owner and the job
+    /// context does not carry the bot address.
+    pub(crate) fn recover_signer(&self) -> Result<Address, VaultError> {
+        Ok(self.validate()?.recover_signer()?)
     }
 
     #[cfg(test)]
@@ -344,7 +401,11 @@ impl PreparedMintTx {
             value: U256::ZERO,
             input: Bytes::new(),
         };
-        let signature = Signature::new(U256::from(1), U256::from(1), false);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let signature = signer
+            .sign_hash_sync(&transaction.signature_hash())
+            .expect("test mint transaction should sign");
         let envelope = TxEnvelope::from(transaction.into_signed(signature));
 
         Self {
@@ -354,6 +415,12 @@ impl PreparedMintTx {
             signed_at: Utc::now(),
             external_tx_id,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signer_for_test(&self) -> Address {
+        self.recover_signer()
+            .expect("test mint transaction signature should recover")
     }
 }
 
@@ -679,6 +746,16 @@ pub(crate) enum VaultError {
     /// held for it must be released.
     #[error("Transaction reverted on-chain: {tx_hash:?}")]
     Reverted { tx_hash: B256 },
+    /// The node's own answers contradict each other: the sender's finalized
+    /// nonce is past this transaction's, so the nonce is permanently spent,
+    /// yet the node still knows the transaction and reports no receipt for
+    /// it. A death proof cannot be read out of an inconsistent node, so this
+    /// is uncertainty, not a terminal identity.
+    #[error(
+        "node reports nonce {nonce} finalized but still knows unmined \
+         transaction {tx_hash:?}"
+    )]
+    ContradictoryDeathSignals { tx_hash: B256, nonce: u64 },
     /// Transaction was mined and succeeded but does not prove the expected
     /// burn — it contains no `Transfer(owner -> 0x0)` of the vault's shares.
     /// The operator-supplied hash cannot terminalize the redemption.
@@ -696,6 +773,10 @@ pub(crate) enum VaultError {
         "Persisted mint transaction nonce {expected} does not match decoded nonce {decoded}"
     )]
     PreparedMintNonceMismatch { expected: u64, decoded: u64 },
+    #[error(
+        "Persisted mint transaction signer {decoded:?} does not match wallet {expected:?}"
+    )]
+    PreparedMintSignerMismatch { expected: Address, decoded: Address },
     #[error(
         "Persisted burn transaction hash {expected:?} does not match decoded hash {decoded:?}"
     )]
