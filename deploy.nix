@@ -241,19 +241,25 @@ in
           envInfraPkgs = infraPkgs.perEnv.${env};
 
           deployPreamble = ''
-            # parseIdentity (inside resolveHost) redefines this. The no-op keeps
-            # the EXIT trap from failing with exit 127 -- masking the real exit
-            # code -- when DEPLOY_HOST is pre-set and resolveHost never runs.
-            _cleanup_identity() { :; }
+            # Ahead of the DEPLOY_HOST branch, so the identity flags are
+            # consumed off "$@" whichever way the host is resolved -- otherwise
+            # they reach `deploy` (or bind $profile in the prelude below).
+            ${infraPkgs.parseIdentity}
 
             if [ -n "''${DEPLOY_HOST:-}" ]; then
               host_ip="$DEPLOY_HOST"
               echo "Using pre-set DEPLOY_HOST=$host_ip"
+              # An op:// identity is materialized for decryption alone, which
+              # this branch skips -- so no key file exists and the agent really
+              # is the credential.
+              if [ -n "''${SSH_IDENTITY_OP:-}" ] && [ -z "$ssh_identity" ]; then
+                echo "WARNING: SSH_IDENTITY_OP is set but DEPLOY_HOST skips decryption; relying on the 1Password SSH agent for authentication" >&2
+              fi
             else
               # Resolves the droplet IP from the encrypted per-env cache
               # (infra/.remote-${env}.age), decryptable by every key in
               # roles.${env}.ssh -- including the CI deploy key.
-              ${envInfraPkgs.resolveHost}
+              ${envInfraPkgs.resolveHostBody}
             fi
 
             # Pin the host key from keys.nix so SSH verifies it during
@@ -263,13 +269,15 @@ in
             ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
             echo "$host_ip ${hostKey}" >> "$HOME/.ssh/known_hosts"
 
-            identity="''${SSH_IDENTITY:-$HOME/.ssh/id_ed25519}"
             ssh_flag=""
-            if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
-              export NIX_SSHOPTS="-i $identity"
-              ssh_flag="--ssh-opts=-i $identity"
+            # The bare default key is left unpinned: -i replaces ssh's default
+            # IdentityFile list, so pinning it would lock out an operator whose
+            # login key is another default. Agent keys are unaffected -- ssh
+            # still offers them unless IdentitiesOnly=yes.
+            if [ -n "$ssh_identity" ] && [ "$ssh_identity" != "$HOME/.ssh/id_ed25519" ]; then
+              export NIX_SSHOPTS="-i $ssh_identity"
+              ssh_flag="--ssh-opts=-i $ssh_identity"
             fi
-            trap _cleanup_identity EXIT
           '';
 
           mkDeployScript =

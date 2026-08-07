@@ -1,6 +1,9 @@
 *.tfstate
 *.tfstate.backup
+# `??????` matches mktemp residue only, so terraform.tfvars.example stays tracked
+terraform.tfstate.??????
 terraform.tfvars
+terraform.tfvars.??????
 tfplan
 .terraform/
 .remote-*
