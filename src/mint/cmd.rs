@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     ClientId, IssuerMintRequestId, MintExternalTxId, Network, Quantity,
@@ -107,6 +108,10 @@ pub(crate) enum MintCommand {
     /// already left `MintingFailed`.
     ManualRetryMint {
         issuer_request_id: IssuerMintRequestId,
+        /// Correlates this operator command with the event it commits so queue
+        /// dispatch can distinguish a successful transition from an idempotent
+        /// no-op against already-advanced state.
+        manual_retry_id: Uuid,
     },
 
     /// Records a mint whose on-chain transaction already succeeded, as evidenced

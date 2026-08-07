@@ -220,6 +220,16 @@ initial request through journal confirmation to on-chain minting and callback.
   automatic retry cap so an operator can retry after fixing the underlying
   cause. This prevents double-minting after crashes while ensuring terminal
   failures can be retried with new `externalTxId`s
+- `ManualRetryMint { issuer_request_id, manual_retry_id }` - Operator-authorized
+  retry of a `MintingFailed` mint past the exhausted automatic budget, gated on
+  the aggregate's own failure provenance (not a snapshot that may be stale by
+  execution time). Refused unless the failure chain proves a fresh submission is
+  unambiguous: only a `Minting` predecessor with no transaction provenance
+  qualifies, since a `MintIntended`/`TxSubmitted` predecessor's transaction may
+  still land, and a fresh submission over it could double-mint. Mints initiated
+  before the job-based submit flow are refused outright — their provenance
+  cannot be proven from event history. Produces the same `MintRetryStarted`
+  event as automatic retry
 - `RecoverWalletStep { issuer_request_id, mode }` - Internal recovery variant
   used only while the wallet lock is held. It performs the same recoverable
   on-chain steps as `Recover`, but becomes a no-op if a concurrent transition
@@ -250,7 +260,11 @@ initial request through journal confirmation to on-chain minting and callback.
 - `MintCompleted` - Alpaca callback sent, mint fully completed (terminal)
 - `ExistingMintRecovered` - Existing on-chain mint discovered during recovery
   (carries tx details)
-- `MintRetryStarted` - Mint retry started during recovery
+- `MintRetryStarted` - Mint retry started during recovery, either automatic or
+  operator-authorized. An operator-authorized retry carries a `manual_retry_id`
+  correlating the command with the event it commits, so queue dispatch can
+  distinguish a successful transition from an idempotent no-op against
+  already-advanced state
 
 Newly persisted transaction IDs use an explicitly tagged `hash` or `legacy`
 representation so replay preserves the original `TxId` variant, including a
@@ -295,14 +309,37 @@ critical section. Startup mint recovery processes its persisted intents in nonce
 order before mint states that may prepare a new transaction. Mint and redemption
 recovery run concurrently so persisted transactions from either domain can fill
 lower nonce gaps while higher transactions await confirmation. Live mint and
-burn preparation query the authoritative event log and are blocked while any
-other wallet intent remains unresolved; this safety check does not depend on a
-fallible read-model projection. Together these rules prevent two aggregate
-commands from signing the same wallet nonce without relying on in-memory nonce
-state that would be lost on restart. Each live burn attempt waits at most 30
-seconds behind an earlier unresolved wallet intent. On timeout it prepares and
-broadcasts nothing, leaves the redemption recoverable, and defers the burn to
-recovery rather than occupying the live flow indefinitely.
+burn preparation consult the trigger-maintained signer-intent reservation and
+are blocked while any other wallet intent remains unresolved; this safety check
+does not depend on a fallible read-model projection. Together these rules
+prevent two aggregate commands from signing the same wallet nonce without
+relying on in-memory nonce state that would be lost on restart. Each live burn
+attempt waits at most 30 seconds behind an earlier unresolved wallet intent. On
+timeout it prepares and broadcasts nothing, leaves the redemption recoverable,
+and defers the burn to recovery rather than occupying the live flow
+indefinitely.
+
+**Cross-instance signer-intent guard.** The pre-check above is an
+application-level read; it cannot by itself stop two separate processes from
+independently signing the same nonce during the brief overlap between the old
+process terminating and its replacement starting. `active_signer_intents` is the
+durable, cross-process backstop for that window: one row per network (a signer's
+nonce domain), reserved by a trigger in the same transaction that appends
+`MintTxIntended` or `BurnIntended`, and released by a trigger on that
+aggregate's own definitively-resolved terminal event. The reservation key is
+`network` alone, so it is shared between `Mint` and `Redemption` — only one
+signer intent per nonce domain can be outstanding at a time, regardless of which
+aggregate holds it. This makes the event append itself the durable arbitration
+point: a second instance's competing intent is rejected by SQLite before it can
+commit, rather than relying on an in-memory lock or a fallible read-model
+projection. When the pre-append check finds the network occupied, a mint job
+returns `MintJobError::UnresolvedWalletIntent` and refuses to submit rather than
+risk a nonce collision, leaving the job to retry once the guard clears. When the
+race is lost between that check and the append, the trigger aborts the append
+with an explicit signer-reservation error — worded distinctly from a
+same-aggregate concurrency conflict so an operator reading the failure is
+pointed at the nonce-domain guard, not at a phantom concurrent modification of
+the aggregate.
 
 The issuer is a single-writer service: exactly one process may own a given
 SQLite event store and signing wallet at a time. Horizontal replicas sharing a

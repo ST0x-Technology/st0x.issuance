@@ -27,14 +27,13 @@ use tracing::{info, warn};
 
 use super::recovery::enqueue_scheduled_mint_recovery;
 use super::{
-    IssuerMintRequestId, Mint, MintCommand, has_unresolved_mint_intent,
+    IssuerMintRequestId, Mint, MintCommand, has_unresolved_signer_intent,
 };
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
 };
-use crate::redemption::has_unresolved_burn_intent;
 use crate::tokenized_asset::Network;
 use crate::vault::{
     NetworkVaultServices, ReceiptInformation, TxId, UnconfiguredNetworkError,
@@ -174,16 +173,18 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     .map(super::MintExternalTxId::into_string);
 
                 let wallet_guard = vault.lock_wallet().await;
-                if has_unresolved_mint_intent(
+                // The reservation is keyed by network alone, so this single
+                // check also blocks behind an unresolved burn on the same
+                // signer: a persisted-but-unbroadcast burn transaction may
+                // still land, and signing a mint over it risks a nonce
+                // conflict. Intents on other networks use independent nonce
+                // domains and must not block this one.
+                if has_unresolved_signer_intent(
                     &ctx.pool,
+                    *network,
                     Some(&self.issuer_request_id),
                 )
                 .await?
-                    // A persisted-but-unresolved burn transaction from the
-                    // same wallet may still land; signing a mint over it
-                    // risks a nonce conflict, so wait like the burn path
-                    // waits for unresolved mint intents.
-                    || has_unresolved_burn_intent(&ctx.pool, None).await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),
@@ -268,12 +269,14 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     return Ok(());
                 };
                 let wallet_guard = vault.lock_wallet().await;
-                if has_unresolved_mint_intent(
+                // Network-keyed reservation: one check covers competing mint
+                // AND burn intents on this signer's nonce domain.
+                if has_unresolved_signer_intent(
                     &ctx.pool,
+                    *network,
                     Some(&self.issuer_request_id),
                 )
                 .await?
-                    || has_unresolved_burn_intent(&ctx.pool, None).await?
                 {
                     return Err(MintJobError::UnresolvedWalletIntent {
                         issuer_request_id: self.issuer_request_id.clone(),
@@ -1207,6 +1210,7 @@ mod tests {
         events.push(MintEvent::MintRetryStarted {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: None,
+            manual_retry_id: None,
             started_at: chrono::Utc::now(),
         });
         seed_mint_events(&harness.pool, &issuer_request_id, events).await;

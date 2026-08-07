@@ -15,13 +15,13 @@ use super::{
     Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
     next_burn_retry_external_tx_id_from_history,
 };
-use crate::mint::{QuantityConversionError, has_unresolved_mint_intent};
+use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
     Shares,
 };
 use crate::redemption::{
-    BurnRecord, RedemptionMetadata, has_unresolved_burn_intent,
+    BurnRecord, RedemptionMetadata, has_unresolved_signer_intent,
 };
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
@@ -952,14 +952,16 @@ impl BurnManager {
             network: metadata.network,
         })?;
         if status == BurnTxStatus::ProvablyDead {
-            let unresolved_mint =
-                has_unresolved_mint_intent(&self.view_pool, None).await?;
-            let unresolved_burn = has_unresolved_burn_intent(
+            // Network-keyed reservation: one check covers competing burn AND
+            // mint intents on this signer's nonce domain, excluding only this
+            // redemption's own reservation.
+            let unresolved_intent = has_unresolved_signer_intent(
                 &self.view_pool,
+                metadata.network,
                 Some(issuer_request_id),
             )
             .await?;
-            if unresolved_mint || unresolved_burn {
+            if unresolved_intent {
                 drop(wallet_guard);
                 debug!(target: "redemption",
                     issuer_request_id = %issuer_request_id,
@@ -1622,20 +1624,36 @@ impl BurnManager {
     ) -> Result<(), BurnManagerError> {
         let execution =
             BurnExecutionPlan::new(network, vault, &plan, external_tx_id);
+        // Bounded to the 30 seconds SPEC promises: a live burn defers to
+        // recovery rather than occupying the flow indefinitely behind an
+        // intent that is not resolving.
+        const MAX_WALLET_INTENT_WAIT_ATTEMPTS: u32 = 30;
+        let mut wait_attempts = 0;
         let wallet_guard = loop {
             let wallet_guard = self.vault_for(network)?.lock_wallet().await;
-            let unresolved_mint =
-                has_unresolved_mint_intent(&self.view_pool, None).await?;
-            let unresolved_burn = has_unresolved_burn_intent(
+            let unresolved_intent = has_unresolved_signer_intent(
                 &self.view_pool,
+                network,
                 Some(issuer_request_id),
             )
             .await?;
-            if !unresolved_mint && !unresolved_burn {
+            if !unresolved_intent {
                 break wallet_guard;
             }
 
             drop(wallet_guard);
+            wait_attempts += 1;
+            if wait_attempts >= MAX_WALLET_INTENT_WAIT_ATTEMPTS {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    attempts = wait_attempts,
+                    "Earlier wallet intent did not resolve within the wait \
+                     budget; deferring this burn to recovery"
+                );
+                return Err(BurnManagerError::WalletIntentWaitExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                });
+            }
             debug!(target: "redemption",
                 issuer_request_id = %issuer_request_id,
                 "Waiting for an earlier wallet intent before preparing burn"
@@ -1771,7 +1789,41 @@ impl BurnManager {
                     RedemptionError::PreparingBurnTxFailed { message },
                 ))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                // The append failed before anything reached the chain (the
+                // event store rolls the write back atomically, including a
+                // signer-intent trigger rejection), so the receipt
+                // reservation must not outlive the attempt — a stranded
+                // reservation blocks every later burn on the vault.
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    network = %execution.network,
+                    error = %error,
+                    "Burn intent append failed; releasing the receipt \
+                     reservation before propagating"
+                );
+                match self.chain_id_for(execution.network) {
+                    Ok(chain_id) => {
+                        self.release_reserved_burn(
+                            chain_id,
+                            execution.vault,
+                            issuer_request_id,
+                        )
+                        .await;
+                    }
+                    Err(chain_id_error) => {
+                        warn!(target: "redemption",
+                            issuer_request_id = %issuer_request_id,
+                            network = %execution.network,
+                            append_error = %error,
+                            chain_id_error = %chain_id_error,
+                            "Burn intent append failed and the receipt \
+                             reservation could not be released"
+                        );
+                    }
+                }
+                Err(error.into())
+            }
         }
     }
 
@@ -2220,6 +2272,11 @@ pub(crate) enum BurnManagerError {
     ReceiptRegistration(#[from] ReceiptRegistrationError),
     #[error("Burn recovery attempt counter overflowed for {issuer_request_id}")]
     RecoveryAttemptOverflow { issuer_request_id: IssuerRedemptionRequestId },
+    #[error(
+        "earlier wallet intent did not resolve within the wait budget for \
+         {issuer_request_id}; deferred to recovery"
+    )]
+    WalletIntentWaitExhausted { issuer_request_id: IssuerRedemptionRequestId },
 }
 
 #[cfg(test)]
@@ -2270,6 +2327,39 @@ mod tests {
 
     fn transaction_failed() -> VaultError {
         VaultError::Reverted { tx_hash: B256::random() }
+    }
+
+    async fn insert_raw_event(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 
     #[test]
@@ -5251,31 +5341,41 @@ mod tests {
             .await
             .expect("burn intent should persist");
 
-        sqlx::query(
+        // The durable uniqueness guard prevents this overlap now. Remove the
+        // derived row for the current burn to model a historical pre-guard
+        // database and retain coverage for the query-level defence in depth.
+        let removed = sqlx::query(
             "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
-            )
-            VALUES (
-                'Mint',
-                'blocking-mint',
-                1,
-                'MintEvent::MintTxIntended',
-                '1.0',
-                '{}',
-                '{}'
-            )
+            DELETE FROM active_signer_intents
+            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
             ",
         )
+        .bind(issuer_request_id.to_string())
         .execute(pool)
         .await
-        .expect("blocking mint intent should seed");
+        .expect("test should remove the derived guard row");
+        assert_eq!(
+            removed.rows_affected(),
+            1,
+            "the reserve trigger must have created exactly the guard row this \
+             test removes; a zero-row delete would silently stop modeling the \
+             pre-guard database"
+        );
+        for (sequence, event_type, payload) in [
+            (1, "MintEvent::Initiated", r#"{"Initiated":{"network":"base"}}"#),
+            (2, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            insert_raw_event(
+                pool,
+                "Mint",
+                "blocking-mint",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("blocking mint intent should seed");
+        }
 
         let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
@@ -5316,57 +5416,36 @@ mod tests {
             ]
         ));
 
-        sqlx::query(
-            "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
-            )
-            VALUES (
-                'Mint',
-                'blocking-mint',
-                2,
-                'MintEvent::MintTxSubmitted',
-                '1.0',
-                '{}',
-                '{}'
-            )
-            ",
+        insert_raw_event(
+            pool,
+            "Mint",
+            "blocking-mint",
+            3,
+            "MintEvent::MintTxSubmitted",
+            "{}",
         )
-        .execute(pool)
         .await
         .expect("blocking mint intent should resolve");
 
-        sqlx::query(
-            "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+        ] {
+            insert_raw_event(
+                pool,
+                "Redemption",
+                "blocking-redemption",
                 sequence,
                 event_type,
-                event_version,
                 payload,
-                metadata
             )
-            VALUES (
-                'Redemption',
-                'blocking-redemption',
-                1,
-                'RedemptionEvent::BurnIntended',
-                '1.0',
-                '{}',
-                '{}'
-            )
-            ",
-        )
-        .execute(pool)
-        .await
-        .expect("blocking burn intent should seed");
+            .await
+            .expect("blocking burn intent should seed");
+        }
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
             Ok(RecoveryOutcome::SkippedManualIntervention)
@@ -5374,29 +5453,14 @@ mod tests {
         assert_eq!(vault_mock.replacement_preparation_call_count(), 0);
         assert!(vault_mock.submitted_burn_txs().is_empty());
 
-        sqlx::query(
-            "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
-            )
-            VALUES (
-                'Redemption',
-                'blocking-redemption',
-                2,
-                'RedemptionEvent::BurnTxSubmitted',
-                '1.0',
-                '{}',
-                '{}'
-            )
-            ",
+        insert_raw_event(
+            pool,
+            "Redemption",
+            "blocking-redemption",
+            3,
+            "RedemptionEvent::BurnTxSubmitted",
+            "{}",
         )
-        .execute(pool)
         .await
         .expect("blocking burn intent should resolve");
         vault_mock.set_prepared_tx(replacement_tx.clone());

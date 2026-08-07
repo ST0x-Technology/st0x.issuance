@@ -27,36 +27,38 @@ pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
 pub(crate) use view::{MintView, find_all_recoverable_mints, find_stuck};
 
-/// Returns whether another mint has a prepared transaction whose terminal
-/// submission outcome has not yet been persisted.
-pub(crate) async fn has_unresolved_mint_intent(
+/// Returns whether any signed transaction on the same signer network — a
+/// mint or a burn — is still awaiting its terminal outcome, excluding at
+/// most this mint's own reservation.
+///
+/// Reads the trigger-maintained `active_signer_intents` table rather than
+/// re-deriving the answer from event streams: the triggers update the table
+/// in the same transaction that appends the intent event, so the table is
+/// the single source of truth and cannot drift from the reserve/release
+/// rules the migration encodes. Because the table is keyed by network, an
+/// outstanding Redemption burn intent blocks a mint on the same nonce
+/// domain too — which is exactly right, both flows sign with the same key.
+pub(crate) async fn has_unresolved_signer_intent(
     pool: &Pool<Sqlite>,
+    network: Network,
     excluding: Option<&IssuerMintRequestId>,
 ) -> Result<bool, sqlx::Error> {
+    // `None` collapses to "" rather than a NULL bind: `aggregate_id = NULL`
+    // is NULL in SQL, `NOT NULL` is NULL, and a NULL predicate silently
+    // excludes EVERY row — the empty string matches no aggregate_id, which
+    // is the intended "exclude nothing".
     let excluding = excluding.map(ToString::to_string).unwrap_or_default();
     let exists = sqlx::query_scalar::<_, bool>(
         "
         SELECT EXISTS (
             SELECT 1
-            FROM events AS intent
-            WHERE intent.aggregate_type = 'Mint'
-              AND intent.event_type = 'MintEvent::MintTxIntended'
-              AND intent.aggregate_id != ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM events AS later
-                  WHERE later.aggregate_type = intent.aggregate_type
-                    AND later.aggregate_id = intent.aggregate_id
-                    AND later.sequence > intent.sequence
-                    AND later.event_type IN (
-                        'MintEvent::MintTxSubmitted',
-                        'MintEvent::TokensMinted',
-                        'MintEvent::ExistingMintRecovered'
-                    )
-              )
+            FROM active_signer_intents
+            WHERE network = ?
+              AND NOT (aggregate_type = 'Mint' AND aggregate_id = ?)
         )
         ",
     )
+    .bind(network.as_str())
     .bind(excluding)
     .fetch_one(pool)
     .await?;
@@ -324,6 +326,12 @@ struct ConfirmedMint {
 pub(crate) struct MintRetryContext {
     attempts: u32,
     failed_from: Box<Mint>,
+    /// Legacy receipt-triggered retries could carry an on-chain transaction
+    /// hash even though replay moved the aggregate back to `Minting`. Preserve
+    /// it so a later manual retry cannot mistake that state for a transaction-
+    /// free prepare failure.
+    #[serde(default)]
+    tx_hash: Option<B256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -824,6 +832,7 @@ impl Mint {
                 Ok(vec![MintEvent::MintRetryStarted {
                     issuer_request_id,
                     tx_hash: None,
+                    manual_retry_id: None,
                     started_at: Utc::now(),
                 }])
             }
@@ -856,6 +865,7 @@ impl Mint {
     fn handle_manual_retry_mint(
         &self,
         issuer_request_id: IssuerMintRequestId,
+        manual_retry_id: Uuid,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::MintingFailed {
@@ -877,7 +887,9 @@ impl Mint {
                     });
                 }
 
-                if !matches!(failed_from.as_ref(), Self::Minting { .. }) {
+                if !matches!(failed_from.as_ref(), Self::Minting { .. })
+                    || failed_from.has_transaction_provenance()
+                {
                     return Err(MintError::AmbiguousRetryPredecessor {
                         predecessor: failed_from.state_name().to_string(),
                     });
@@ -886,6 +898,7 @@ impl Mint {
                 Ok(vec![MintEvent::MintRetryStarted {
                     issuer_request_id,
                     tx_hash: None,
+                    manual_retry_id: Some(manual_retry_id),
                     started_at: Utc::now(),
                 }])
             }
@@ -1242,7 +1255,11 @@ impl Mint {
                 Box::new(self.clone()),
             ),
             Self::Minting { retry: Some(context), .. } => {
-                (context.attempts + 1, context.failed_from.clone())
+                // Keep the retry wrapper, not only its older predecessor: the
+                // wrapper may carry transaction-hash provenance that a manual
+                // retry must never flatten away. `non_failed_predecessor`
+                // already traverses this chain for automatic retry identity.
+                (context.attempts + 1, Box::new(self.clone()))
             }
             _ => (1, Box::new(self.clone())),
         };
@@ -1436,7 +1453,32 @@ impl Mint {
         };
     }
 
-    fn apply_mint_retry_started(&mut self, started_at: DateTime<Utc>) {
+    fn has_transaction_provenance(&self) -> bool {
+        match self {
+            Self::TxIntended { .. }
+            | Self::TxSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::Completed { .. } => true,
+            Self::Minting { retry: Some(retry), .. } => {
+                retry.tx_hash.is_some()
+                    || retry.failed_from.has_transaction_provenance()
+            }
+            Self::MintingFailed { failed_from, .. } => {
+                failed_from.has_transaction_provenance()
+            }
+            Self::Initiated { .. }
+            | Self::JournalConfirmed { .. }
+            | Self::JournalRejected { .. }
+            | Self::Minting { retry: None, .. }
+            | Self::Closed { .. } => false,
+        }
+    }
+
+    fn apply_mint_retry_started(
+        &mut self,
+        tx_hash: Option<B256>,
+        started_at: DateTime<Utc>,
+    ) {
         let Self::MintingFailed {
             issuer_request_id,
             tokenization_request_id,
@@ -1468,7 +1510,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at: started_at,
-            retry: Some(MintRetryContext { attempts, failed_from }),
+            retry: Some(MintRetryContext { attempts, failed_from, tx_hash }),
         };
     }
     fn handle_close_mint(
@@ -1693,9 +1735,11 @@ impl EventSourced for Mint {
             MintCommand::RetryMint { issuer_request_id } => {
                 self.handle_retry_mint(issuer_request_id)
             }
-            MintCommand::ManualRetryMint { issuer_request_id } => {
-                self.handle_manual_retry_mint(issuer_request_id)
-            }
+            MintCommand::ManualRetryMint {
+                issuer_request_id,
+                manual_retry_id,
+            } => self
+                .handle_manual_retry_mint(issuer_request_id, manual_retry_id),
             MintCommand::RecordExistingMint {
                 issuer_request_id,
                 tx_hash,
@@ -1807,10 +1851,11 @@ impl Mint {
             }
             MintEvent::MintRetryStarted {
                 issuer_request_id: _,
+                tx_hash,
                 started_at,
                 ..
             } => {
-                self.apply_mint_retry_started(started_at);
+                self.apply_mint_retry_started(tx_hash, started_at);
             }
             MintEvent::MintClosed { issuer_request_id, reason, closed_at } => {
                 *self = Self::Closed { issuer_request_id, reason, closed_at };
@@ -1921,7 +1966,7 @@ impl From<UnconfiguredNetworkError> for MintError {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::primitives::{Address, address, b256, uint};
+    use alloy::primitives::{Address, B256, address, b256, uint};
     use chrono::{DateTime, Utc};
     use event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
     use proptest::prelude::*;
@@ -1936,6 +1981,7 @@ pub(crate) mod tests {
         ClientId, IssuerMintRequestId, ManualRecoveryDecision, Mint,
         MintCommand, MintError, MintEvent, MintExternalTxId, Network, Quantity,
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        has_unresolved_signer_intent,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -1949,6 +1995,602 @@ pub(crate) mod tests {
 
     pub(super) const BOT: Address =
         address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    async fn insert_raw_event(
+        pool: &Pool<Sqlite>,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unresolved_mint_intents_only_block_the_same_signer_network() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+        let aggregate_id = IssuerMintRequestId::random().to_string();
+
+        for (sequence, event_type, payload) in [
+            (1, "MintEvent::Initiated", r#"{"Initiated":{"network":"base"}}"#),
+            (2, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('Mint', ?, ?, ?, '1.0', ?, '{}')
+                ",
+            )
+            .bind(&aggregate_id)
+            .bind(sequence)
+            .bind(event_type)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .expect("test event should insert");
+        }
+
+        assert!(
+            has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "an unresolved intent must keep the same network's gate closed"
+        );
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Ethereum, None)
+                .await
+                .expect("intent query should succeed"),
+            "a Base intent must not block an independent Ethereum signer"
+        );
+
+        let orphaned = sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Mint',
+                'orphaned-intent',
+                1,
+                'MintEvent::MintTxIntended',
+                '1.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await;
+
+        let orphaned_error = orphaned
+            .expect_err(
+                "an intent with no origin metadata must be rejected atomically",
+            )
+            .to_string();
+        assert!(
+            orphaned_error.contains("requires one Initiated event"),
+            "the validation trigger must name the missing origin, got: \
+             {orphaned_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_intent_migration_backfills_and_rejects_ambiguous_history() {
+        const INIT: &str =
+            include_str!("../../migrations/20251016210348_init.sql");
+        const GUARD: &str = include_str!(
+            "../../migrations/20260801095000_enforce_active_signer_intents.sql"
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(INIT).execute(&pool).await.unwrap();
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "existing-mint",
+            1,
+            "MintEvent::Initiated",
+            r#"{"Initiated":{"network":"base"}}"#,
+        )
+        .await
+        .unwrap();
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "existing-mint",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(GUARD).execute(&pool).await.unwrap();
+        let active: (String, String, String) = sqlx::query_as(
+            "SELECT network, aggregate_type, aggregate_id \
+             FROM active_signer_intents",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active,
+            (
+                "base".to_string(),
+                "Mint".to_string(),
+                "existing-mint".to_string(),
+            )
+        );
+
+        let malformed = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(INIT).execute(&malformed).await.unwrap();
+        insert_raw_event(
+            &malformed,
+            "Mint",
+            "missing-network",
+            1,
+            "MintEvent::Initiated",
+            r#"{"Initiated":{}}"#,
+        )
+        .await
+        .unwrap();
+        insert_raw_event(
+            &malformed,
+            "Mint",
+            "missing-network",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let malformed_error = sqlx::raw_sql(GUARD)
+            .execute(&malformed)
+            .await
+            .expect_err(
+                "migration must fail closed when an active intent has no \
+                 signer domain",
+            )
+            .to_string();
+        assert!(
+            malformed_error.contains("NOT NULL constraint failed"),
+            "the malformed origin must abort on the NOT NULL network \
+             constraint specifically, got: {malformed_error}"
+        );
+
+        // The core double-signing hazard the table exists to prevent: TWO
+        // historical aggregates left unresolved intents on the same network.
+        // The backfill must abort on the PRIMARY KEY rather than pick a
+        // winner — remediation is resolving one aggregate, never guessing.
+        let conflicted = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(INIT).execute(&conflicted).await.unwrap();
+        for aggregate_id in ["first-unresolved", "second-unresolved"] {
+            insert_raw_event(
+                &conflicted,
+                "Mint",
+                aggregate_id,
+                1,
+                "MintEvent::Initiated",
+                r#"{"Initiated":{"network":"base"}}"#,
+            )
+            .await
+            .unwrap();
+            insert_raw_event(
+                &conflicted,
+                "Mint",
+                aggregate_id,
+                2,
+                "MintEvent::MintTxIntended",
+                "{}",
+            )
+            .await
+            .unwrap();
+        }
+        let conflicted_error = sqlx::raw_sql(GUARD)
+            .execute(&conflicted)
+            .await
+            .expect_err(
+                "migration must abort on two unresolved intents sharing a \
+                 network instead of silently choosing one",
+            )
+            .to_string();
+        assert!(
+            conflicted_error.contains("UNIQUE constraint failed"),
+            "the historical conflict must abort on the network PRIMARY KEY \
+             specifically, got: {conflicted_error}"
+        );
+
+        // Duplicate origin events make the signer domain ambiguous; the
+        // backfill must fail closed exactly like the live validation trigger
+        // instead of trusting whichever duplicate a LIMIT picks.
+        let duplicated = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(INIT).execute(&duplicated).await.unwrap();
+        for (sequence, event_type, payload) in [
+            (1, "MintEvent::Initiated", r#"{"Initiated":{"network":"base"}}"#),
+            (
+                2,
+                "MintEvent::Initiated",
+                r#"{"Initiated":{"network":"ethereum"}}"#,
+            ),
+            (3, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            insert_raw_event(
+                &duplicated,
+                "Mint",
+                "duplicated-origin",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .unwrap();
+        }
+        let duplicated_error = sqlx::raw_sql(GUARD)
+            .execute(&duplicated)
+            .await
+            .expect_err(
+                "migration must fail closed on duplicate origin events \
+                 instead of guessing which network is authoritative",
+            )
+            .to_string();
+        assert!(
+            duplicated_error.contains("NOT NULL constraint failed"),
+            "duplicate origins must abort on the NOT NULL network constraint \
+             specifically, got: {duplicated_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_store_atomically_rejects_a_second_same_network_intent() {
+        // A single connection: each pooled connection to ":memory:" opens
+        // its OWN empty database, so a second connection would see neither
+        // the schema nor the seeded events.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+
+        for (aggregate_id, sequence, event_type, payload) in [
+            (
+                "mint-a",
+                1,
+                "MintEvent::Initiated",
+                r#"{"Initiated":{"network":"base"}}"#,
+            ),
+            ("mint-a", 2, "MintEvent::MintTxIntended", "{}"),
+            (
+                "mint-b",
+                1,
+                "MintEvent::Initiated",
+                r#"{"Initiated":{"network":"base"}}"#,
+            ),
+        ] {
+            insert_raw_event(
+                &pool,
+                "Mint",
+                aggregate_id,
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test history should insert");
+        }
+
+        let competing = insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-b",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await;
+        let competing_error = competing
+            .expect_err(
+                "the intent append must atomically reject a competing signer \
+                 nonce",
+            )
+            .to_string();
+        assert!(
+            competing_error.contains("signer network already reserved"),
+            "the cross-instance rejection must carry the explicit \
+             reservation message, not an implicit unique violation that \
+             upstream layers misreport as a same-aggregate conflict; got: \
+             {competing_error}"
+        );
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-missing-network",
+            1,
+            "MintEvent::Initiated",
+            r#"{"Initiated":{}}"#,
+        )
+        .await
+        .expect("malformed origin should seed for boundary testing");
+        let missing_error = insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-missing-network",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .expect_err(
+            "missing mint network metadata must fail closed before intent \
+             commit",
+        )
+        .to_string();
+        assert!(
+            missing_error.contains("requires network metadata"),
+            "the validation trigger must name the missing metadata, got: \
+             {missing_error}"
+        );
+
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "MintEvent::Initiated",
+                r#"{"Initiated":{"network":"ethereum"}}"#,
+            ),
+            (2, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            insert_raw_event(
+                &pool,
+                "Mint",
+                "mint-ethereum",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("an independent signer network must remain available");
+        }
+
+        insert_raw_event(
+            &pool,
+            "Redemption",
+            "redemption-base",
+            1,
+            "RedemptionEvent::Detected",
+            r#"{"Detected":{"network":"base"}}"#,
+        )
+        .await
+        .expect("redemption origin should insert");
+        let competing_burn = insert_raw_event(
+            &pool,
+            "Redemption",
+            "redemption-base",
+            2,
+            "RedemptionEvent::BurnIntended",
+            "{}",
+        )
+        .await;
+        let competing_burn_error = competing_burn
+            .expect_err(
+                "mint and burn intents must share one per-network nonce domain",
+            )
+            .to_string();
+        assert!(
+            competing_burn_error.contains("signer network already reserved"),
+            "a burn competing with an unresolved mint must carry the explicit \
+             reservation message, got: {competing_burn_error}"
+        );
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-a",
+            3,
+            "MintEvent::MintTxSubmitted",
+            "{}",
+        )
+        .await
+        .expect("terminal submission should release the signer domain");
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-b",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .expect("a resolved intent must release the next same-network append");
+    }
+
+    /// An operator close is valid from any non-terminal state, including
+    /// TxIntended. It must release the network's signer reservation — a
+    /// close that left the row behind would permanently reject every later
+    /// mint and burn on that network with no self-healing path.
+    #[tokio::test]
+    async fn admin_close_releases_the_signer_reservation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+
+        for (sequence, event_type, payload) in [
+            (1, "MintEvent::Initiated", r#"{"Initiated":{"network":"base"}}"#),
+            (2, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            insert_raw_event(
+                &pool,
+                "Mint",
+                "mint-closed",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test history should insert");
+        }
+        assert!(
+            has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "the intent must reserve the network before the close"
+        );
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-closed",
+            3,
+            "MintEvent::MintClosed",
+            "{}",
+        )
+        .await
+        .expect("the admin close event should insert");
+
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "an admin close must release the network's signer reservation"
+        );
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-after-close",
+            1,
+            "MintEvent::Initiated",
+            r#"{"Initiated":{"network":"base"}}"#,
+        )
+        .await
+        .expect("successor origin should insert");
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-after-close",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .expect("a closed mint must not block the next same-network intent");
+    }
+
+    /// The validation trigger's third branch: a network value outside the
+    /// known set must abort the intent append, not reserve an ambiguous
+    /// signer domain.
+    #[tokio::test]
+    async fn unknown_network_metadata_rejects_the_intent_append() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-unknown-network",
+            1,
+            "MintEvent::Initiated",
+            r#"{"Initiated":{"network":"solana"}}"#,
+        )
+        .await
+        .expect("unknown-network origin should seed for boundary testing");
+
+        let unknown_error = insert_raw_event(
+            &pool,
+            "Mint",
+            "mint-unknown-network",
+            2,
+            "MintEvent::MintTxIntended",
+            "{}",
+        )
+        .await
+        .expect_err(
+            "an unknown mint network must fail closed before intent commit",
+        )
+        .to_string();
+        assert!(
+            unknown_error.contains("has an unknown network"),
+            "the validation trigger must name the unknown-network branch, \
+             got: {unknown_error}"
+        );
+    }
 
     fn minting_events_for_retry(
         issuer_request_id: &IssuerMintRequestId,
@@ -2135,6 +2777,7 @@ pub(crate) mod tests {
             .given(events)
             .when(MintCommand::ManualRetryMint {
                 issuer_request_id: issuer_request_id.clone(),
+                manual_retry_id: Uuid::new_v4(),
             })
             .await
             .events();
@@ -2143,6 +2786,51 @@ pub(crate) mod tests {
             emitted.as_slice(),
             [MintEvent::MintRetryStarted { .. }]
         ));
+    }
+
+    /// A replayed legacy retry can carry a transaction hash while its enum
+    /// state is `Minting`; a later prepare-looking failure must retain and
+    /// reject that provenance instead of authorizing another mint transaction.
+    #[tokio::test]
+    async fn manual_retry_refuses_transaction_provenance_hidden_by_retry_state()
+    {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "first attempt failed".to_string(),
+            failed_at: Utc::now(),
+        });
+        events.push(MintEvent::MintRetryStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: Some(B256::random()),
+            manual_retry_id: None,
+            started_at: Utc::now(),
+        });
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "retry failed".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::ManualRetryMint {
+                issuer_request_id: issuer_request_id.clone(),
+                manual_retry_id: Uuid::new_v4(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(
+                    MintError::AmbiguousRetryPredecessor { .. }
+                )
+            ),
+            "transaction-bearing retry provenance must block a fresh mint, got {error:?}"
+        );
     }
 
     /// A mint initiated before the job-based submit flow cannot prove its
@@ -2166,6 +2854,7 @@ pub(crate) mod tests {
             .given(events)
             .when(MintCommand::ManualRetryMint {
                 issuer_request_id: issuer_request_id.clone(),
+                manual_retry_id: Uuid::new_v4(),
             })
             .await
             .then_expect_error();
@@ -2443,6 +3132,7 @@ pub(crate) mod tests {
         mint.apply_event(MintEvent::MintRetryStarted {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: None,
+            manual_retry_id: None,
             started_at: now,
         });
 
@@ -2475,8 +3165,13 @@ pub(crate) mod tests {
             "the attempt counter must survive the retry transition"
         );
         assert!(
-            matches!(failed_from.as_ref(), Mint::TxSubmitted { .. }),
-            "the predecessor chain must survive a failed retry"
+            matches!(failed_from.as_ref(), Mint::Minting { .. })
+                && matches!(
+                    failed_from.non_failed_predecessor(),
+                    Mint::TxSubmitted { .. }
+                ),
+            "the retry wrapper and its predecessor chain must both survive a \
+             failed retry"
         );
     }
 
@@ -2494,6 +3189,7 @@ pub(crate) mod tests {
         mint.apply_event(MintEvent::MintRetryStarted {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: None,
+            manual_retry_id: None,
             started_at: now,
         });
         mint.apply_event(MintEvent::MintTxIntended {
@@ -3511,7 +4207,7 @@ pub(crate) mod tests {
     /// calls `load_with_context`, which deserializes into `Lifecycle<Mint>`.
     #[traced_test]
     #[tokio::test]
-    async fn pre_lifecycle_snapshot_cleared_before_projection_catch_up() {
+    async fn mint_pre_lifecycle_snapshot_cleared_before_projection_catch_up() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")

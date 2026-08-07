@@ -21,7 +21,10 @@ use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
     MintView, TokenizationRequestId, find_stuck as find_stuck_mints,
-    recovery::{enqueue_scheduled_mint_recovery, manually_retry_failed_mint},
+    recovery::{
+        ManualRetryOutcome, enqueue_scheduled_mint_recovery,
+        manually_retry_failed_mint,
+    },
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1167,8 +1170,8 @@ pub(crate) async fn reprocess_mint(
     // and would abandon an exhausted mint instead of retrying it. Every other
     // eligible state enqueues the durable recovery job, the same path the
     // automatic startup re-scan and the periodic reconciler use.
-    if matches!(&mint, Mint::MintingFailed { .. }) {
-        manually_retry_failed_mint(
+    let message = if matches!(&mint, Mint::MintingFailed { .. }) {
+        match manually_retry_failed_mint(
             store.inner(),
             pool.inner(),
             vault_services.inner(),
@@ -1183,7 +1186,17 @@ pub(crate) async fn reprocess_mint(
                 "Failed to drive manual mint retry"
             );
             Status::InternalServerError
-        })?;
+        })? {
+            ManualRetryOutcome::Enqueued => "Recovery initiated",
+            ManualRetryOutcome::AlreadyHandled => "Recovery already initiated",
+            ManualRetryOutcome::DeferredToRecovery { error } => {
+                warn!(target: "admin", aggregate_id = aggregate_id,
+                    error,
+                    "Manual mint retry committed; queue dispatch deferred"
+                );
+                "Recovery authorized; queue dispatch deferred to reconciler"
+            }
+        }
     } else {
         enqueue_scheduled_mint_recovery(
             pool.inner(),
@@ -1198,18 +1211,23 @@ pub(crate) async fn reprocess_mint(
             );
             Status::InternalServerError
         })?;
-    }
+        "Recovery initiated"
+    };
 
+    // `message` already distinguishes enqueued / already-handled / deferred;
+    // logging it keeps this line truthful for the outcomes where nothing was
+    // enqueued.
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
-        "Mint reprocess enqueued successfully"
+        outcome = message,
+        "Mint reprocess request completed"
     );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,
         aggregate_id: aggregate_id.to_string(),
         previous_state: current_state,
-        message: "Recovery initiated".to_string(),
+        message: message.to_string(),
     }))
 }
 

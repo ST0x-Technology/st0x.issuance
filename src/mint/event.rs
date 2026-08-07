@@ -2,6 +2,7 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::vault::{PreparedMintTx, TxId};
 
@@ -97,6 +98,10 @@ pub(crate) enum MintEvent {
         /// when triggered by startup auto-recovery (which may retry the mint).
         #[serde(default)]
         tx_hash: Option<TxHash>,
+        /// Present only for operator-authorized retries. Older and automatic
+        /// retry events default to `None` during replay.
+        #[serde(default)]
+        manual_retry_id: Option<Uuid>,
         started_at: DateTime<Utc>,
     },
 }
