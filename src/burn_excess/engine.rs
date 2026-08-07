@@ -2829,4 +2829,287 @@ mod tests {
             store.load(&BurnExcessId::new(deposit_tx)).await.unwrap().unwrap();
         assert!(matches!(state, BurnExcess::Completed { .. }));
     }
+
+    /// `--close` never proves a plan, so it reaches no chain and no signer.
+    /// Constructing the provider without a live node keeps these tests off
+    /// Anvil and makes the "no I/O on the close path" property structural.
+    fn offline_provider() -> impl Provider {
+        ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1".parse().unwrap())
+    }
+
+    fn close_request(
+        mode: BurnExcessMode,
+        issuer_request_id: IssuerMintRequestId,
+        deposit_tx_hash: B256,
+        receipt_id: U256,
+        funding_tx_hash: Option<B256>,
+        execute: bool,
+    ) -> BurnExcessRequest {
+        BurnExcessRequest {
+            close: true,
+            ..request(
+                mode,
+                issuer_request_id,
+                deposit_tx_hash,
+                receipt_id,
+                funding_tx_hash,
+                execute,
+            )
+        }
+    }
+
+    fn test_bind(
+        issuer_request_id: &IssuerMintRequestId,
+        deposit_tx_hash: B256,
+    ) -> ExcessBurnBind {
+        ExcessBurnBind {
+            issuer_request_id: issuer_request_id.clone(),
+            deposit_tx_hash,
+            receipt_id: U256::from(7u64),
+            shares: excess_shares(),
+            original_recipient: address!(
+                "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+            ),
+            vault: address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            network: Network::Base,
+            issuer_wallet: address!(
+                "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
+            ),
+        }
+    }
+
+    fn test_funding_log(bind: &ExcessBurnBind) -> FundingTransferId {
+        FundingTransferId {
+            network: bind.network,
+            vault: bind.vault,
+            tx_hash: b256!(
+                "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1"
+            ),
+            log_index: 2,
+            from: bind.original_recipient,
+            to: bind.issuer_wallet,
+            amount: bind.shares,
+        }
+    }
+
+    /// Seeds an abandoned Path B recovery: the exclusion is permanent, but no
+    /// transaction is signed. This is the state `--close` exists to release.
+    async fn seed_funding_excluded(
+        pool: &Pool<Sqlite>,
+        issuer_request_id: &IssuerMintRequestId,
+        deposit_tx: B256,
+    ) -> Arc<Store<BurnExcess>> {
+        let bind = test_bind(issuer_request_id, deposit_tx);
+        let store = burn_excess_store(pool.clone()).await.unwrap();
+        store
+            .send(
+                &BurnExcessId::new(deposit_tx),
+                BurnExcessCommand::RecordFundingExclusion {
+                    funding_log_id: test_funding_log(&bind),
+                    bind,
+                    reason: "abandoned path b".into(),
+                    incident_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn close_dry_run_records_no_event_and_keeps_the_gate_closed() {
+        let pool = pool().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let deposit_tx = B256::random();
+        let store =
+            seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
+
+        run_burn_excess(
+            &pool,
+            &MockVaultService::new_success(),
+            &offline_provider(),
+            test_bind(&issuer_request_id, deposit_tx).issuer_wallet,
+            close_request(
+                BurnExcessMode::External,
+                issuer_request_id,
+                deposit_tx,
+                U256::from(7u64),
+                Some(B256::random()),
+                false,
+            ),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
+                Some(BurnExcess::FundingExcluded { .. })
+            ),
+            "a dry-run close must not advance the stream"
+        );
+        assert!(
+            has_unresolved_excess_burn_intent(&pool, None).await.unwrap(),
+            "a dry-run close must leave the wallet gate held"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_execute_releases_the_wallet_gate() {
+        let pool = pool().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let deposit_tx = B256::random();
+        let store =
+            seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
+        assert!(
+            has_unresolved_excess_burn_intent(&pool, None).await.unwrap(),
+            "an abandoned Path B recovery must hold the gate before close"
+        );
+
+        run_burn_excess(
+            &pool,
+            &MockVaultService::new_success(),
+            &offline_provider(),
+            test_bind(&issuer_request_id, deposit_tx).issuer_wallet,
+            close_request(
+                BurnExcessMode::External,
+                issuer_request_id,
+                deposit_tx,
+                U256::from(7u64),
+                Some(B256::random()),
+                true,
+            ),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
+            Some(BurnExcess::Closed { .. })
+        ));
+        assert!(
+            !has_unresolved_excess_burn_intent(&pool, None).await.unwrap(),
+            "close is the only escape from a stuck stream: it must release \
+             the gate that blocks every mint and redemption burn"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_aborts_when_the_operator_declines() {
+        let pool = pool().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let deposit_tx = B256::random();
+        let store =
+            seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
+
+        let error = run_burn_excess(
+            &pool,
+            &MockVaultService::new_success(),
+            &offline_provider(),
+            test_bind(&issuer_request_id, deposit_tx).issuer_wallet,
+            close_request(
+                BurnExcessMode::External,
+                issuer_request_id,
+                deposit_tx,
+                U256::from(7u64),
+                Some(B256::random()),
+                true,
+            ),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, BurnExcessEngineError::Aborted),
+            "a declined confirmation must abort, got: {error:?}"
+        );
+        assert!(matches!(
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
+            Some(BurnExcess::FundingExcluded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_stream_that_was_never_started() {
+        let pool = pool().await;
+        let deposit_tx = B256::random();
+
+        let error = run_burn_excess(
+            &pool,
+            &MockVaultService::new_success(),
+            &offline_provider(),
+            address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"),
+            close_request(
+                BurnExcessMode::Internal,
+                IssuerMintRequestId::random(),
+                deposit_tx,
+                U256::from(7u64),
+                None,
+                true,
+            ),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                BurnExcessEngineError::Aggregate(inner)
+                    if matches!(
+                        **inner,
+                        super::super::BurnExcessError::InvalidState { .. }
+                    )
+            ),
+            "closing an uninitialized stream must refuse, got: {error:?}"
+        );
+    }
+
+    /// `ReportOnly` is matched before `close`, so `--close` on a terminal
+    /// stream reports instead of erroring — re-running an ops command must be
+    /// safe.
+    #[tokio::test]
+    async fn close_on_a_closed_stream_is_report_only() {
+        let pool = pool().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let deposit_tx = B256::random();
+        let store =
+            seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
+        store
+            .send(
+                &BurnExcessId::new(deposit_tx),
+                BurnExcessCommand::CloseExcessBurn {
+                    reason: "already closed".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        run_burn_excess(
+            &pool,
+            &MockVaultService::new_success(),
+            &offline_provider(),
+            test_bind(&issuer_request_id, deposit_tx).issuer_wallet,
+            close_request(
+                BurnExcessMode::External,
+                issuer_request_id,
+                deposit_tx,
+                U256::from(7u64),
+                Some(B256::random()),
+                true,
+            ),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
+            Some(BurnExcess::Closed { .. })
+        ));
+    }
 }

@@ -2300,6 +2300,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
     use std::sync::Arc;
+    use std::time::Duration;
     use tracing_test::traced_test;
 
     use super::{
@@ -2307,6 +2308,7 @@ mod tests {
         RecoveryOutcome, Redemption, RedemptionCommand,
         should_release_reserved_burn,
     };
+    use crate::burn_excess::BurnExcessEvent;
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
@@ -5483,6 +5485,215 @@ mod tests {
         ));
         assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
         assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
+    }
+
+    /// Seeds an unresolved `BurnExcess` stream. The gate reads the event stream
+    /// rather than `active_signer_intents` (`BurnExcess` reserves no row there),
+    /// so only `event_type` matters and an empty payload is enough.
+    async fn seed_unresolved_excess_burn(
+        pool: &SqlitePool,
+        event_type: &str,
+    ) -> Result<(), sqlx::Error> {
+        insert_raw_event(
+            pool,
+            "BurnExcess",
+            "0x00000000000000000000000000000000000000000000000000000000000000e1",
+            1,
+            event_type,
+            "{}",
+        )
+        .await
+    }
+
+    /// A dead burn may only be replaced when nothing else holds this wallet.
+    /// `has_unresolved_signer_intent` cannot see an excess-burn recovery, so
+    /// without the separate gate the replacement would sign over its nonce.
+    #[traced_test]
+    #[tokio::test]
+    async fn provably_dead_replacement_waits_for_an_unresolved_excess_burn() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            4,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let owner = old_tx.signer_for_test();
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            5,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_prepared_tx(old_tx),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault,
+                    burns: vec![],
+                    dust_shares: U256::ZERO,
+                    owner,
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("burn intent should persist");
+
+        // `FundingExcluded` holds no signed transaction yet, and must still
+        // block: the exclusion write is already permanent and the stream will
+        // sign against the same issuer wallet.
+        seed_unresolved_excess_burn(
+            pool,
+            BurnExcessEvent::FUNDING_EXCLUSION_RECORDED,
+        )
+        .await
+        .expect("excess burn intent should seed");
+
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+        );
+        assert!(matches!(
+            manager.recover_single_burning(&issuer_request_id).await,
+            Ok(RecoveryOutcome::SkippedManualIntervention)
+        ));
+        assert_eq!(vault_mock.replacement_preparation_call_count(), 0);
+        assert!(vault_mock.submitted_burn_txs().is_empty());
+        assert!(matches!(
+            load_aggregate(store, &issuer_request_id).await,
+            Redemption::BurnIntended { .. }
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Deferring dead burn replacement",
+                "unresolved_intent=false",
+                "unresolved_excess=true",
+            ]
+        ));
+
+        // Closing the excess stream must free the gate, or an abandoned
+        // recovery would block burns forever.
+        insert_raw_event(
+            pool,
+            "BurnExcess",
+            "0x00000000000000000000000000000000000000000000000000000000000000e1",
+            2,
+            BurnExcessEvent::EXCESS_BURN_CLOSED,
+            "{}",
+        )
+        .await
+        .expect("excess burn intent should resolve");
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+
+        assert!(matches!(
+            manager.recover_single_burning(&issuer_request_id).await,
+            Ok(RecoveryOutcome::Executed)
+        ));
+        assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
+        assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
+    }
+
+    /// The live burn path waits behind an excess recovery rather than racing
+    /// it for the nonce, and resumes once that stream resolves.
+    ///
+    /// Exhausting the full 30-attempt budget is deliberately not asserted here:
+    /// the waits are real one-second sleeps, and paused time cannot stand in
+    /// for them because advancing the clock 30 seconds also trips sqlx's
+    /// 30-second pool acquire timeout.
+    #[traced_test]
+    #[tokio::test]
+    async fn live_burn_waits_for_an_unresolved_excess_burn_then_proceeds() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, vault).await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(42_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        seed_unresolved_excess_burn(
+            pool,
+            BurnExcessEvent::EXCESS_BURN_INTENDED,
+        )
+        .await
+        .expect("excess burn intent should seed");
+
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
+
+        // Resolve the excess stream while the burn is parked in the wait loop,
+        // so the test also proves the gate releases instead of only blocking.
+        let releasing_pool = pool.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            insert_raw_event(
+                &releasing_pool,
+                "BurnExcess",
+                "0x00000000000000000000000000000000000000000000000000000000000000e1",
+                2,
+                BurnExcessEvent::EXCESS_BURN_CLOSED,
+                "{}",
+            )
+            .await
+            .expect("excess burn intent should resolve");
+        });
+
+        manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("the burn must proceed once the excess stream resolves");
+        release.await.unwrap();
+
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            1,
+            "the burn must reach the chain exactly once, after the wait"
+        );
+        assert!(matches!(
+            load_aggregate(store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Waiting for an earlier wallet intent",
+                "unresolved_intent=false",
+                "unresolved_excess=true",
+            ]
+        ));
     }
 
     #[tokio::test]
