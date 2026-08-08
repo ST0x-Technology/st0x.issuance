@@ -308,7 +308,6 @@
                 ];
               text = ''
                 ${infraPkgs.parseIdentity}
-                trap _cleanup_identity EXIT
 
                 env="''${1:?usage: bootstrap [-i identity] <prod|staging>}"
                 shift
@@ -325,6 +324,10 @@
                     exit 1 ;;
                 esac
 
+                # bootstrap.nu needs a concrete key path, so resolve one here
+                # -- after argv validation, so a usage error never prompts.
+                _require_identity
+
                 # No exec: replacing the shell would skip the EXIT trap and
                 # leak the 1Password temp identity file.
                 export env flake_config host_key_field identity
@@ -338,18 +341,33 @@
                 ragenixPkg
                 pkgs.nushell
                 pkgs.coreutils
+                infraPkgs.opIdentity
               ];
               text = ''
-                exec nu ${./scripts/secret.nu} "$@"
+                ${infraPkgs.parseIdentity}
+                # Resolved here rather than in nushell, which cannot trap
+                # SIGINT: Ctrl-C while $EDITOR is open would otherwise leave the
+                # 1Password temp key on disk. No exec, for the same reason:
+                # replacing the shell would skip the EXIT trap that removes it.
+                #
+                # Handed over as --identity, not $SSH_IDENTITY: nushell's $env
+                # lookup is case-insensitive, so the ssh_identity parseIdentity
+                # exports would shadow it. An --identity/-i the operator passes
+                # after the file still wins -- nushell takes the last flag.
+                _require_identity
+                nu ${./scripts/secret.nu} --identity "$identity" "$@"
               '';
             };
 
             rekey = pkgs.writeShellApplication {
               name = "rekey";
-              runtimeInputs = [ ragenixPkg ];
+              runtimeInputs = [
+                ragenixPkg
+                pkgs.coreutils
+              ];
               text = ''
                 ${infraPkgs.parseIdentity}
-                trap _cleanup_identity EXIT
+                _require_identity
                 ${rekeySecrets}
               '';
             };

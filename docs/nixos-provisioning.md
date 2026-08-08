@@ -20,14 +20,87 @@ are **kebab-case**.
 
 ```bash
 # from repo root — either:
-nix run .#tfEditVars -- -i "$SSH_IDENTITY"
+nix run .#tfEditVars
 # or:
 nix develop
-tf-edit-vars -i "$SSH_IDENTITY"
+tf-edit-vars
 ```
 
-Identity: `export SSH_IDENTITY=~/.ssh/id_ed25519`, or pass `-i`, or
-`--op 'op://vault/item'`.
+### Identity resolution
+
+`tf*`, `{env}Remote`, `{env}Service*`, `bootstrap`, `rekey`, `secret`, and the
+deploy scripts all resolve one decryption identity through the same precedence:
+`--op <uri>` (+ `--op-account <acct>`, accepted only alongside `--op`) >
+`-i <key>` > `$SSH_IDENTITY` > `$SSH_IDENTITY_OP` (+ optional
+`$SSH_IDENTITY_OP_ACCOUNT`) > `~/.ssh/id_ed25519`. Every command in this doc is
+shown bare — pass one of the flags, as the first argument, only to override the
+default. With an `op://` source the key file is materialized for decryption only
+and is never passed to `ssh -i`, so SSH itself authenticates through the
+1Password SSH agent. `bootstrap` is the exception: it provisions a fresh
+droplet, and both `nixos-anywhere` and its pre/post-install SSH probes need a
+concrete key path, so bootstrap does pass the materialized key as `ssh -i` /
+`IdentityFile=` for the lifetime of that command.
+
+For every command but `bootstrap`, SSH access therefore requires the 1Password
+SSH agent to be serving a key that is present in the server's `authorized_keys`
+— the `op://` item used for decryption does not have to be that SSH key, and
+cannot be when it holds an age identity.
+
+An SSH agent cannot substitute for any of this: age decryption needs the raw
+private key for key agreement with the recipient, and the SSH agent protocol
+exposes only a sign operation, no way to derive a shared secret from the key it
+holds. `DEPLOY_HOST=<ip>` deploys are the one exception (see "Deploy" below) —
+they skip decryption entirely, so `SSH_IDENTITY_OP` has no effect there and an
+`op://` source leaves the 1Password SSH agent as the only credential. A file
+identity (`-i <key>` or `$SSH_IDENTITY`) is still passed to ssh as `-i`.
+
+**Recommended setup:** put your 1Password identity in the gitignored
+`.envrc.local` (sourced by `.envrc`; run `direnv allow` once after creating or
+editing it):
+
+```bash
+echo "export SSH_IDENTITY_OP='op://<vault>/<item>/private key'" >> .envrc.local
+# optional, only if the item is not in your default 1Password account:
+echo "export SSH_IDENTITY_OP_ACCOUNT=<account>" >> .envrc.local
+direnv allow
+```
+
+The bare field URI above is right for an item that stores the key in a **text
+field**. For a 1Password **SSH key** item, append `?ssh-format=openssh` —
+without it `op read` serves the key as PKCS#8, which `rage` cannot parse (see
+the
+[`op read` reference](https://developer.1password.com/docs/cli/reference/commands/read)).
+The tooling checks the fetched key's format and says so if it is wrong.
+
+**Caching:** no key material is ever cached. Every `--op`/`SSH_IDENTITY_OP`
+resolution is a fresh `op read` into a `0600` temp file that is deleted when the
+command exits, Ctrl-C included: every command resolves the key in its shell
+wrapper, where an EXIT trap owns the removal. That resolution is also lazy — it
+only happens the moment a command actually needs to decrypt something, so a
+command that never decrypts never calls `op` and is never prompted. What IS
+cached is the **decrypted droplet IP** (`{env}Remote`, `{env}Service*`,
+`{env}DbReset` and the deploy scripts): `0600` inside a `0700` per-user runtime
+directory (`$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `~/.cache`), keyed by the
+sha256 of `infra/.remote-{env}.age` itself. `tf-apply` and `tf-destroy` rewrite
+that file on exit, so every one of them changes the hash and is an automatic,
+exact cache miss — there is nothing to clear by hand. (`rekey` does not: it
+re-encrypts the secrets in `secret/secrets.nix`, which never include the
+remote-IP caches.)
+
+**Prompt model:** `{env}Remote`-style commands prompt `op` at most once per IP
+rotation (cache hits skip identity resolution entirely); `tf*`, `rekey`,
+`tf-edit-vars`, `secret` and `bootstrap` prompt once per invocation, since they
+always decrypt. SSH authentication for the remote/service/deploy scripts goes
+through the 1Password SSH agent whenever the identity came from an `op://`
+source (`-i` is then never passed to ssh) — the agent's own approval/biometric
+settings are the knob for how often you are prompted for a fresh SSH connection.
+`bootstrap` is the exception noted above: it passes the materialized key as `-i`
+/ `IdentityFile=`, so it prompts `op` up front and that key is the one offered
+first. The agent is not locked out — `-i` only replaces ssh's default identity
+files, and agent keys are still offered unless `IdentitiesOnly=yes`. One caveat:
+the ambient `op` signed-in account is not part of the IP cache key when
+`--account`/`SSH_IDENTITY_OP_ACCOUNT` is omitted, so switching accounts reuses a
+cached IP the same as before.
 
 Service secrets encrypt to `roles.{env}.service` (`st0x-op` + `host-{env}`). Use
 the **st0x-op private key** as `-i` when creating service secrets unless you
@@ -57,9 +130,9 @@ Bootstrap overwrites each `host-{env}` with the real key and runs `ragenix -r`.
 
 Per environment (`staging`, then `prod`):
 
-| File                                              | Contents                                  |
-| ------------------------------------------------- | ----------------------------------------- |
-| `secret/st0x-issuance-{env}.env.age`              | Service env (from `.env.secrets.example`) |
+| File                                 | Contents                                  |
+| ------------------------------------ | ----------------------------------------- |
+| `secret/st0x-issuance-{env}.env.age` | Service env (from `.env.secrets.example`) |
 
 Shared:
 
@@ -70,9 +143,9 @@ Shared:
 ```bash
 cp infra/terraform.tfvars.example infra/terraform.tfvars
 $EDITOR infra/terraform.tfvars
-nix run .#tfEditVars -- -i "$SSH_IDENTITY"
+nix run .#tfEditVars
 
-nix run .#rekey -- -i "$SSH_IDENTITY"
+nix run .#rekey
 git add secret/*.age infra/terraform.tfvars.age keys.nix
 git commit -m "ops: encrypted secrets for provisioning"
 ```
@@ -84,9 +157,9 @@ git commit -m "ops: encrypted secrets for provisioning"
 Creates **both** prod and staging modules by default.
 
 ```bash
-nix run .#tfInit -- -i "$SSH_IDENTITY"
-nix run .#tfPlan -- -i "$SSH_IDENTITY" -target=module.staging   # staging only
-nix run .#tfApply -- -i "$SSH_IDENTITY"
+nix run .#tfInit
+nix run .#tfPlan -- -target=module.staging   # staging only
+nix run .#tfApply
 git add infra/terraform.tfstate.age && git commit -m "ops: terraform state"
 ```
 
@@ -103,8 +176,8 @@ Requires TCP 22 on the DigitalOcean cloud firewall (for the Ubuntu image and
 NixOS accepts operator/CI SSH on the public IP with key-only auth.
 
 ```bash
-nix run .#bootstrap -- -i "$SSH_IDENTITY" staging
-nix run .#bootstrap -- -i "$SSH_IDENTITY" prod
+nix run .#bootstrap -- staging
+nix run .#bootstrap -- prod
 ```
 
 **Trust-on-first-use caveat:** the first SSH connection to the fresh droplet is
@@ -133,11 +206,14 @@ git commit -m "ops: bootstrap host keys + rekey"
 ## Deploy
 
 The deploy scripts resolve the droplet IP from `infra/.remote-{env}.age` and pin
-the host key from `keys.nix`; `DEPLOY_HOST=<ip>` overrides resolution.
+the host key from `keys.nix`; `DEPLOY_HOST=<ip>` overrides resolution. With
+`DEPLOY_HOST` set, no `.remote-{env}.age` decryption happens, so
+`SSH_IDENTITY_OP` is ignored — the 1Password SSH agent alone must cover the
+connection.
 
 ```bash
-nix run .#stagingDeployAll -- -i "$SSH_IDENTITY"
-nix run .#prodDeployAll -- -i "$SSH_IDENTITY"
+nix run .#stagingDeployAll
+nix run .#prodDeployAll
 ```
 
 ---
