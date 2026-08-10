@@ -113,9 +113,8 @@ pub(crate) enum ReceiptInventoryEvent {
     ///
     /// `from` is retained because it is where a rollback returns custody to, so
     /// reversing a migration needs no address from an operator. `tx_hash` is
-    /// absent when the transfer was signed outside this binary (the production
-    /// forward leg is signed by the retiring custodian) and the move was
-    /// verified against on-chain balances after the fact.
+    /// absent when a completed move is re-observed without a transaction from
+    /// this execution, including historical externally signed moves.
     CustodyMigrated {
         from: Address,
         to: Address,

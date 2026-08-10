@@ -56,9 +56,10 @@ pub(crate) trait VaultService: Send + Sync {
     /// The returned bytes and hash must be persisted before calling
     /// [`VaultService::submit_mint`].
     ///
-    /// `external_tx_id` is a signing-backend correlation id (Fireblocks
-    /// idempotency / Turnkey labeling). It is **not** vault-direct double-mint
-    /// protection — after the first `MintTxIntended`, only exact-hash
+    /// `external_tx_id` correlates deterministic retry attempts across the
+    /// mint aggregate and durable submit job. Legacy event streams also carry
+    /// it as a signing-backend correlation id. It is **not** vault-direct
+    /// double-mint protection — after the first `MintTxIntended`, only exact-hash
     /// classification / rebroadcast of the persisted prepared bytes (or
     /// inventory) is safe.
     async fn prepare_mint_tx(
