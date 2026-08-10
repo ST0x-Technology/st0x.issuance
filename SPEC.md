@@ -1178,19 +1178,6 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 - `issuer burn-excess internal|external …` — administrative supply correction
   that burns excess shares from a proven duplicate deposit (see **Burn excess
   shares** below). Never calls Alpaca; never opens a `Redemption` aggregate.
-- `issuer migrate-receipts <UNDERLYING>` — move a vault's ERC-1155 deposit
-  receipts between the Fireblocks and Turnkey wallets. Temporary, for the
-  Turnkey signing-backend cutover; removed once every vault has migrated.
-- `issuer confirm-custody <UNDERLYING>` — record which wallet holds a vault's
-  receipts, after verifying on-chain that it holds exactly every tracked
-  balance. The bootstrap that arms the reconciliation displacement guard for
-  history predating custody tracking. Temporary, like `migrate-receipts`.
-- `issuer verify-custodians <UNDERLYING>` — prove both custodian connections
-  before anything moves: authenticate against Fireblocks and resolve the
-  whitelisted Receipt contract, and sign the exact rollback-shaped transaction
-  with Turnkey without broadcasting it. `--smoke` additionally submits a
-  zero-amount transfer through the full Fireblocks path. Temporary, like
-  `migrate-receipts`.
 - `issuer orchestrator-preflight` — the on-chain read-only pre-cutover gate for
   the orchestrator rollout: verifies the Turnkey bot wallet holds `MINT_ROLE`
   and `BURN_ROLE` on the orchestrator, `vaultLogicIsExpected()` is healthy, the
@@ -1211,12 +1198,7 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   `receipt.safeBatchTransferFrom`), so a policy gap surfaces as a named signing
   refusal instead of during the pilot's first live mint.
 
-The custody subcommands are listing-scoped and therefore take `--network`, plus
-`--rpc-url` (the service's own `RPC_URL`) and `--chain-id` (cross-checked
-against the chain that endpoint reports). `migrate-receipts` and
-`verify-custodians` require both custodians' configurations — the `TURNKEY_*`
-group and the `FIREBLOCKS_*` group the retired integration used — all from the
-service's own environment. `burn-excess` is listing/network-scoped and takes
+`burn-excess` is listing/network-scoped and takes
 `--network` / `--chain-id` (cross-checked against the RPC-reported chain); its
 RPC endpoint is **not** a CLI flag — it uses the service environment for that
 network (`CHAIN_<NETWORK>_RPC_URL`, with legacy `RPC_URL` as Base fallback), the
@@ -1393,27 +1375,36 @@ is the only source of the orchestrator address — never typed) and require the
 Turnkey bot wallet, so a local-key signer is refused. See
 `docs/runbooks/orchestrator-onboarding.md` for the ordered procedure.
 
-**No wallet address is ever an argument.** An ERC-1155 transfer to a wrong
-address is final — no counterparty, no recovery, and the receipts back tokens
-that are still outstanding — so every address is derived, never typed: the
-Fireblocks wallet from the Fireblocks API (`fetch_vault_address`), the Turnkey
-wallet from `TURNKEY_ADDRESS` (the exact value the service runs with after the
-cutover), and the direction from the inventory's recorded custody. Custody at
-the Fireblocks wallet → forward transfer, submitted through the Fireblocks API
-as a `CONTRACT_CALL` via the whitelisted Receipt contract with a deterministic
-`externalTxId` (a retried run resumes the original transaction instead of
-double-submitting), polled to a terminal status. Custody at the Turnkey wallet →
-rollback, signed by Turnkey back to the API-derived Fireblocks wallet.
-Unobserved custody → refuse and demand `confirm-custody`.
+### Receipt custody
 
-**Ownership verification is the check, not address comparison.** The engine
-requires the holder to hold exactly every tracked balance on-chain before
-submitting (a wrong Fireblocks workspace holds nothing tracked and is refused),
-and verifies the recipient's per-identifier gain afterwards. The derived
-destination is additionally refused if it is the zero address or the sender
-itself, and must be corroborated by the chain (an address with no transaction
-history and no native balance is what a corrupted config value looks like) via a
-witness type the transfer cannot be reached without.
+The receipt-moving engine is vendor-neutral and deliberately has no operator
+entry point. It remains reusable library code until
+[RAI-1681](https://linear.app/makeitrain/issue/RAI-1681) supplies a dedicated
+driver with a signing provider and stated destination. The engine and custody
+state are exercised by end-to-end tests in `tests/receipt_custody.rs`.
+
+An ERC-1155 transfer to a wrong address is final — no counterparty, no recovery,
+and the receipts back tokens that are still outstanding. The engine therefore
+requires a `CorroboratedRecipient` witness before a transfer can be reached. The
+witness refuses the zero address, the current holder itself, and a destination
+with neither transaction history nor native balance on the target chain.
+
+`VaultIdentity` is also a corroborated witness rather than a caller-assembled
+tuple. Its network must name the requested chain, the provider must report that
+chain, and the tokenized-asset listing must bind the underlying to the vault.
+The engine rebuilds the listing and in-flight-work projections from events, and
+the listing is re-read from the execution store immediately before confirmation
+or migration, so an identity cannot be verified against one database and used
+against another. Migration requires aggregate custody to be recorded at the
+outgoing holder; unobserved or unrelated custody is refused. If custody is
+already recorded at the destination, its recorded migration origin must be the
+requested source and only an on-chain `AlreadyMigrated` observation is accepted
+— no second transfer can be submitted.
+
+**Ownership verification is the check.** Before submitting, the engine requires
+the recorded holder to own exactly every tracked balance on-chain. Afterwards,
+it verifies the recipient's per-identifier gain rather than relying on address
+comparison alone.
 
 ERC-1155 lets a balance be moved only by its holder or by an operator the holder
 has approved via `setApprovalForAll`, and the migration relies on the holder
@@ -1423,7 +1414,7 @@ transfer would be a far wider authorization than the operation needs.
 
 Quiescence is deliberately **not** a freeze check: the `Underlying` freeze means
 "corporate action in progress", and a custody migration must neither require
-declaring one nor end one that is real. The migration refuses when any of the
+declaring one nor end one that is real. The engine refuses when any of the
 following holds, read from the same store the recovery paths read:
 
 - a burn is reserved against the vault's receipts;
@@ -1436,19 +1427,17 @@ following holds, read from the same store the recovery paths read:
 
 The in-flight gates are scoped to the asset because stuck work only ever resumes
 against its own vault; work that cannot be attributed to an asset counts against
-every vault instead of none. Beyond quiescence: the tracked inventory is
+every vault instead of none. Beyond quiescence, the tracked inventory is
 cross-checked against on-chain balances, the vault's certification and
 owner-freeze gates are re-read immediately before submission, and a completed
-move observed again is recorded (idempotently) instead of re-transferred,
-reported as `AlreadyMigrated`.
-
-The operator sequence is **pause liquidity rebalancing → stop the issuer service
-→ `migrate-receipts` → start the replacement service**. Stopping first keeps the
-window clean: startup reads `balanceOf(bot_wallet)` for every tracked receipt
-(the backfiller first, then startup reconciliation), and a service still
-configured with the outgoing signer reads zero for every one of them after
-custody moves. Applying that as depletion is what the custody guard exists to
-refuse — the readings are refused at the aggregate, per vault, at ERROR.
+move observed again is recorded idempotently instead of being re-transferred
+(`AlreadyMigrated`). A single transfer is limited to the 14-receipt batch size
+proven in production; larger inventories refuse until a future driver supplies
+resumable chunking. That driver must verify the deployment hold, bind the
+signing provider to the recorded holder, and add destination-type-specific proof
+of control and gas readiness before the generic engine is invoked. Use
+`docs/runbooks/deploy-hold.md` when the service must remain stopped across a
+deploy.
 
 Custody is therefore part of the `ReceiptInventory` aggregate's own state,
 maintained by two events. `CustodyConfirmed { holder }` records the wallet the
@@ -1467,17 +1456,18 @@ backfiller has already checkpointed past the deposits that created them.
 The guard is enforced in the aggregate's `ReconcileBalance` handler itself:
 every balance reading carries the wallet it was taken against, and the handler
 refuses readings from any wallet other than the recorded holder — and refuses a
-destructive zero reading outright while no holder has ever been confirmed
-(`issuer confirm-custody` is the bootstrap). Every reader — the startup
-backfiller, startup and periodic reconciliation, and any future caller — goes
-through this one handler, so no code path can apply a wrong-wallet reading. The
-refusal is per vault and writes nothing: the service keeps serving vaults whose
-custody matches while a displaced vault fails loudly at ERROR. This is what
-makes a single-asset cutover safe — vaults that have not migrated yet are
-refused rather than wiped — and it is also what lets the service operate
-normally after a bulk cutover while a straggler vault awaits its own migration.
-A pass that cannot read every balance confirms nothing, so one flaky call cannot
-disarm the guard.
+destructive zero reading outright while no holder has ever been confirmed.
+Custody is confirmed automatically when startup reconciliation reads every
+tracked balance without error; `confirm_custody_holder` remains available to a
+future custody driver for holders that are not the signing wallet. Confirmation
+is not retried periodically: after a startup read failure, correct the cause and
+restart the service. Every balance reader goes through this handler, so no code
+path can apply a wrong-wallet reading. The refusal is per vault and writes
+nothing: the service keeps serving vaults whose custody matches while a
+displaced vault fails loudly at ERROR. A pass that cannot read every balance
+confirms nothing, so one flaky call cannot disarm the guard. An empty inventory
+also confirms no custody and leaves the vault `Unobserved`; confirmation
+requires at least one tracked receipt to be read successfully.
 
 Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
 network argument: one freeze covers every listing of the underlying. The CLI
@@ -2567,7 +2557,7 @@ Commands:
   receipts. No-op when the holder is unchanged, so the periodic reconciler
   cannot grow the log a pass at a time
 - `RecordCustodyMigration { from, to, tx_hash }` - Record a verified custody
-  move (issued by `migrate-receipts` only after post-conditions hold)
+  move only after post-conditions hold
 
 Release and settle are keyed only by redemption; `apply` uses the stored
 `reserved` amounts, so neither carries a `burns` payload.
@@ -2593,8 +2583,8 @@ Events:
   when custody goes from unobserved to known or the holder changes — never per
   reconciliation pass
 - `CustodyMigrated { from, to, tx_hash }` - Custody of every tracked receipt
-  moved to a replacement wallet; `from` is where a rollback returns it to, read
-  off the aggregate instead of asked for
+  moved to a replacement wallet; `from` is where a reverse migration returns it,
+  read off the aggregate instead of asked for
 
 **Startup reservation recovery** (`recover_stuck_reservations`) runs after
 redemption recovery. For each vault it enumerates the redemptions holding a
