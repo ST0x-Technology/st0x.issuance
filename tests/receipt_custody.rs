@@ -533,7 +533,7 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
         &user_signer,
         user_wallet,
         &mint_callback_mock,
-        &databases.fireblocks_url,
+        &databases.outgoing_url,
     )
     .await?;
 
@@ -627,7 +627,7 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
         mint_callback_mock: &mint_callback_mock,
         redeem_mock: &redeem_mock,
         poll_mock: &poll_mock,
-        db_url: &databases.turnkey_url,
+        db_url: &databases.incoming_url,
     }
     .run()
     .await?;
@@ -912,7 +912,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
         &user_signer,
         user_wallet,
         &mint_callback_mock,
-        &databases.fireblocks_url,
+        &databases.outgoing_url,
     )
     .await?;
     wait_for_completed_mint(
@@ -961,7 +961,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
         mint_callback_mock: &mint_callback_mock,
         redeem_mock: &redeem_mock,
         poll_mock: &poll_mock,
-        db_url: &databases.turnkey_url,
+        db_url: &databases.incoming_url,
     }
     .run()
     .await?;
@@ -1135,7 +1135,7 @@ async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_sh
         &user_signer,
         user_wallet,
         &mint_callback_mock,
-        &databases.fireblocks_url,
+        &databases.outgoing_url,
     )
     .await?;
     let (receipt_id, receipt_shares, _receipt_information) =
