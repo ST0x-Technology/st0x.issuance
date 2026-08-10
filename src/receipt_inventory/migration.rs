@@ -1045,21 +1045,6 @@ const ROLLBACK_PROOF_GAS_LIMIT: u64 = 1_000_000;
 const ROLLBACK_PROOF_MAX_FEE_PER_GAS: u128 = 100_000_000_000;
 const ROLLBACK_PROOF_MAX_PRIORITY_FEE: u128 = 1_000_000_000;
 
-/// The minimum native balance the Turnkey wallet must hold before a forward
-/// move becomes acceptable.
-///
-/// A bare non-zero check lets one wei pass while leaving a real rollback
-/// unbroadcastable — a one-way door discovered only when the way back is
-/// needed. Sized as the proof's gas limit at its priority fee (0.001 ether):
-/// enough to broadcast a worst-case rollback batch under congested Base fees
-/// with a wide margin, without demanding the proof's deliberately absurd
-/// `max_fee` ceiling, which is two orders of magnitude above any real
-/// broadcast cost.
-pub(crate) fn rollback_gas_reserve() -> U256 {
-    U256::from(ROLLBACK_PROOF_GAS_LIMIT)
-        * U256::from(ROLLBACK_PROOF_MAX_PRIORITY_FEE)
-}
-
 /// The wallet a rollback returns custody to, read from the recorded migration.
 ///
 /// # Errors
