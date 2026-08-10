@@ -18,7 +18,6 @@ let
     runtimeInputs = [ ];
     text = ''
       export DATABASE_URL="''${DATABASE_URL:-sqlite:///mnt/data/issuance.db}"
-      export FIREBLOCKS_SECRET_PATH="''${FIREBLOCKS_SECRET_PATH:-/run/agenix/fireblocks-secret-issuance.key}"
       if [ -f /run/agenix/st0x-issuance.env ]; then
         set -a
         # shellcheck source=/dev/null

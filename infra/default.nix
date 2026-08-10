@@ -221,7 +221,7 @@ let
           ${requireDecryptedSecrets}
           echo "Starting st0x-issuance on ${env}..."
           ssh ''${identity:+-i "$identity"} "root@$host_ip" \
-            "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
+            "test ! -e /run/st0x/st0x-issuance.hold || { echo 'ERROR: deployment hold is armed; refusing to start st0x-issuance' >&2; exit 1; }; mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
           ssh ''${identity:+-i "$identity"} "root@$host_ip" systemctl is-active st0x-issuance
         '';
       };
@@ -248,7 +248,7 @@ let
           ${requireDecryptedSecrets}
           echo "Restarting st0x-issuance on ${env}..."
           ssh ''${identity:+-i "$identity"} "root@$host_ip" \
-            "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl restart st0x-issuance"
+            "test ! -e /run/st0x/st0x-issuance.hold || { echo 'ERROR: deployment hold is armed; refusing to restart st0x-issuance' >&2; exit 1; }; mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl restart st0x-issuance"
           ssh ''${identity:+-i "$identity"} "root@$host_ip" systemctl is-active st0x-issuance
         '';
       };
@@ -284,10 +284,15 @@ let
             ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
           }
 
+          if ! ssh_remote "test ! -e /run/st0x/st0x-issuance.hold"; then
+            echo "ERROR: deployment hold is armed; refusing to reset the database" >&2
+            exit 1
+          fi
+
           _restart_service() {
             if [ "$stay_stopped" = false ]; then
               echo "Ensuring st0x-issuance is restarted on ${env}..." >&2
-              ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance" || true
+              ssh_remote "if test -e /run/st0x/st0x-issuance.hold; then echo 'WARNING: deployment hold is armed; leaving st0x-issuance stopped' >&2; else mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance; fi" || true
             fi
             _cleanup_identity
           }
@@ -310,7 +315,7 @@ let
 
           if [ "$stay_stopped" = false ]; then
             echo "Starting st0x-issuance on ${env}..."
-            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
+            ssh_remote "test ! -e /run/st0x/st0x-issuance.hold || { echo 'ERROR: deployment hold is armed; refusing to start st0x-issuance' >&2; exit 1; }; mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
             ssh_remote systemctl is-active st0x-issuance
             trap - EXIT
             _cleanup_identity
