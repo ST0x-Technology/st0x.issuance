@@ -643,12 +643,6 @@ pub(crate) struct ReceiptInventory {
     /// from. Absent on inventories that predate custody being recorded.
     #[serde(default)]
     custody: Custody,
-    /// How many custody migrations this vault has recorded. Gives each
-    /// deliberate re-migration (forward after a rollback, or vice versa) a
-    /// distinct transfer identity while retries of the same attempt keep the
-    /// original one.
-    #[serde(default)]
-    migrations_recorded: u32,
     /// Duplicate ITN deposits already recorded, keyed by the duplicate's own
     /// `(receipt_id, tx_hash)`. These are observations, never tracked balance:
     /// nothing here is spendable, reservable, or burnable by the bot.
@@ -669,8 +663,8 @@ pub(crate) enum Custody {
     #[default]
     Unobserved,
     /// `holder` is confirmed to hold the tracked receipts. `moved_from` is the
-    /// wallet custody was migrated away from, which is where a rollback returns
-    /// it to.
+    /// wallet custody was migrated away from, which is where a reverse
+    /// migration returns it.
     Held { holder: Address, moved_from: Option<Address> },
 }
 
@@ -682,8 +676,8 @@ impl Custody {
         }
     }
 
-    /// The wallet custody was last migrated away from — a rollback's
-    /// destination, known without anyone having to name an address.
+    /// The wallet custody was last migrated away from — the destination for a
+    /// reverse migration, known without anyone having to name an address.
     pub(crate) const fn moved_from(&self) -> Option<Address> {
         match self {
             Self::Unobserved => None,
@@ -695,12 +689,6 @@ impl Custody {
 impl ReceiptInventory {
     pub(crate) const fn custody(&self) -> &Custody {
         &self.custody
-    }
-
-    /// How many custody migrations this vault has recorded — the ordinal that
-    /// gives each deliberate re-migration a fresh transfer identity.
-    pub(crate) const fn migrations_recorded(&self) -> u32 {
-        self.migrations_recorded
     }
 
     /// Receipts with shares reserved against an in-flight redemption burn.
@@ -944,8 +932,8 @@ pub(crate) enum ReceiptInventoryError {
     #[error(
         "Refusing balance reading for receipt {receipt_id} taken against \
          wallet {observed_wallet}: recorded custody holder is {holder}. \
-         Point the service at the holder or migrate custody with \
-         `issuer migrate-receipts`."
+         Keep the service stopped and escalate: the neutral custody engine has \
+         no operator driver until RAI-1681."
     )]
     CustodyDisplaced {
         receipt_id: ReceiptId,
@@ -956,7 +944,8 @@ pub(crate) enum ReceiptInventoryError {
         "Refusing to deplete receipt {receipt_id} from a zero reading at \
          wallet {observed_wallet}: no custody holder has ever been \
          confirmed for this vault, so the reading cannot be distinguished \
-         from a wallet rotation. Run `issuer confirm-custody` first."
+         from a wallet rotation. Keep the service stopped and escalate: no \
+         custody-confirmation CLI exists until RAI-1681."
     )]
     CustodyUnconfirmed { receipt_id: ReceiptId, observed_wallet: Address },
     #[error(transparent)]
@@ -1195,9 +1184,9 @@ impl ReceiptInventory {
             }
 
             // Idempotent for the verify-and-record flow: the same completed
-            // move observed again (a re-run after a lost terminal, or a
-            // rollback preflight) must not append a second event. Keyed on the
-            // destination alone — once custody is recorded at `to`, a repeat
+            // move observed again after a lost terminal must not append a
+            // second event. Keyed on the destination alone — once custody is
+            // recorded at `to`, a repeat
             // observation must not rewrite `moved_from` history, whatever
             // wallet the repeat claims it came from.
             ReceiptInventoryCommand::RecordCustodyMigration {
@@ -1409,12 +1398,10 @@ impl ReceiptInventory {
             }
 
             // A migration both moves the holder and records where it came from,
-            // which is where a rollback returns it to.
+            // which is where a reverse migration returns it.
             ReceiptInventoryEvent::CustodyMigrated { from, to, .. } => {
                 self.custody =
                     Custody::Held { holder: to, moved_from: Some(from) };
-                self.migrations_recorded =
-                    self.migrations_recorded.saturating_add(1);
             }
             ReceiptInventoryEvent::ConflictingItnDepositObserved {
                 discovered_receipt_id,
@@ -4429,7 +4416,8 @@ mod tests {
         /// A destructive zero reading while custody has never been confirmed
         /// is refused: a rotated wallet reading zero is indistinguishable
         /// from a spent receipt, so the operator must bootstrap custody with
-        /// `issuer confirm-custody` before any depletion can apply.
+        /// the approved custody-confirmation procedure before depletion can
+        /// apply.
         #[tokio::test]
         async fn a_zero_reading_without_confirmed_custody_is_refused() {
             let mut aggregate = ReceiptInventory::default();
@@ -4538,8 +4526,8 @@ mod tests {
             );
         }
 
-        /// A migration is where a rollback's destination comes from: the event
-        /// keeps the outgoing wallet, so reversing the move needs no address
+        /// A migration records the destination for a reverse move: the event
+        /// keeps the outgoing wallet, so reversing custody needs no address
         /// from anyone.
         #[tokio::test]
         async fn a_migration_records_where_custody_came_from() {
@@ -4567,12 +4555,12 @@ mod tests {
             assert_eq!(
                 aggregate.custody().moved_from(),
                 Some(HOLDER),
-                "the rollback destination must be readable off the aggregate"
+                "the reverse destination must be readable off the aggregate"
             );
         }
 
-        /// The same completed move observed again — a re-run after a lost
-        /// terminal, or a rollback preflight — must not append a second event.
+        /// The same completed move observed again after a lost terminal must
+        /// not append a second event.
         #[tokio::test]
         async fn recording_the_same_migration_twice_emits_one_event() {
             let mut aggregate = ReceiptInventory::default();
@@ -4613,9 +4601,9 @@ mod tests {
 
         /// The repeat is keyed on the destination alone: a re-observation
         /// claiming a different origin must also be a no-op, and must not
-        /// rewrite where a rollback returns custody to.
+        /// rewrite where a reverse migration returns custody.
         #[tokio::test]
-        async fn a_repeat_claiming_another_origin_cannot_rewrite_the_rollback_target()
+        async fn a_repeat_claiming_another_origin_cannot_rewrite_the_reverse_target()
          {
             let mut aggregate = ReceiptInventory::default();
             let stranger =
@@ -4656,81 +4644,13 @@ mod tests {
             assert_eq!(
                 aggregate.custody().moved_from(),
                 Some(HOLDER),
-                "the recorded rollback target must survive the repeat"
-            );
-        }
-
-        /// The migration ordinal salts the forward transfer's `externalTxId`:
-        /// it must advance on every real move (a re-migration after rollback
-        /// gets a fresh id) and must not advance on the deduplicated repeat
-        /// (an in-flight retry resumes the same Fireblocks transaction).
-        #[tokio::test]
-        async fn the_migration_ordinal_advances_on_moves_and_not_on_repeats() {
-            let mut aggregate = ReceiptInventory::default();
-            assert_eq!(aggregate.migrations_recorded(), 0);
-
-            let forward = aggregate
-                .transition(
-                    ReceiptInventoryCommand::RecordCustodyMigration {
-                        from: HOLDER,
-                        to: REPLACEMENT,
-                        tx_hash: None,
-                    },
-                    &(),
-                )
-                .await
-                .unwrap();
-            for event in forward {
-                aggregate.apply_event(event);
-            }
-            assert_eq!(
-                aggregate.migrations_recorded(),
-                1,
-                "a real move must advance the ordinal"
-            );
-
-            let repeat = aggregate
-                .transition(
-                    ReceiptInventoryCommand::RecordCustodyMigration {
-                        from: HOLDER,
-                        to: REPLACEMENT,
-                        tx_hash: None,
-                    },
-                    &(),
-                )
-                .await
-                .unwrap();
-            assert!(repeat.is_empty());
-            assert_eq!(
-                aggregate.migrations_recorded(),
-                1,
-                "the deduplicated repeat must not advance the ordinal"
-            );
-
-            let rollback = aggregate
-                .transition(
-                    ReceiptInventoryCommand::RecordCustodyMigration {
-                        from: REPLACEMENT,
-                        to: HOLDER,
-                        tx_hash: None,
-                    },
-                    &(),
-                )
-                .await
-                .unwrap();
-            for event in rollback {
-                aggregate.apply_event(event);
-            }
-            assert_eq!(
-                aggregate.migrations_recorded(),
-                2,
-                "the rollback is a real move and must advance the ordinal"
+                "the recorded reverse target must survive the repeat"
             );
         }
 
         /// Reconciliation passes after a migration keep confirming the new
-        /// holder; that must not erase where custody came from, or a rollback
-        /// after the first post-cutover pass would have nowhere to go.
+        /// holder; that must not erase where custody came from, or a reverse
+        /// migration after the first pass would have nowhere to go.
         #[tokio::test]
         async fn confirming_after_a_migration_keeps_the_origin() {
             let mut aggregate = ReceiptInventory::default();

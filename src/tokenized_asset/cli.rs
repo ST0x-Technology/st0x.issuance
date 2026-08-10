@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, Bytes, U256, address};
+use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Parser, Subcommand};
 use event_sorcery::{
@@ -19,7 +19,6 @@ use super::view::{
 };
 use super::{TokenizedAsset, UnderlyingSymbol};
 use crate::Network;
-use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
@@ -27,12 +26,7 @@ use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
     VaultMode, VaultModeConfig, load_vault_mode_config, setup_tracing,
 };
-use crate::fireblocks::auth_probe::probe_auth_pair;
-use crate::fireblocks::{
-    Environment, FireblocksEnv, FireblocksVaultService, fetch_vault_address,
-};
 use crate::prepare_event_sourced_startup;
-use crate::receipt_inventory::migration::ensure_holder_quiescent;
 use crate::redemption::IssuerRedemptionRequestId;
 use crate::redemption::force_complete::{
     VerifiedCompletion, ensure_burn_unclaimed, landed_burn_evidence,
@@ -94,27 +88,6 @@ enum IssuerCommand {
     /// other redemption may already claim it. Completes the redemption and
     /// settles its receipt reservation like a normal burn confirmation.
     ForceCompleteRedemption(Box<ForceCompleteRedemptionArgs>),
-    /// Sweep the legacy holdings the receipt-custody migration could not see
-    /// out of the Fireblocks wallet: five ERC-1155 receipts inherited from the
-    /// pre-Fireblocks issuer wallet in March 2026 (they predate the service's
-    /// inventory tracking, so `migrate-receipts` never listed them), plus the
-    /// stranded 0.2 tCOIN ERC-20 redemption, forwarded to the liquidity bot
-    /// wallet for re-sending. Every value is pinned in a hardcoded table and
-    /// cross-checked against live on-chain balances before anything is
-    /// submitted; entries already swept are skipped, so re-running is safe.
-    ///
-    /// Temporary, Base-only, thrown away with the Fireblocks integration.
-    SweepLegacyReceipts(Box<SweepLegacyReceiptsArgs>),
-    /// A/B-probe Fireblocks API authentication and print the raw responses.
-    ///
-    /// Sends the same authenticated vault-address GET twice, varying only the
-    /// JWT expiry window: once compliant with Fireblocks' documented
-    /// `exp < iat + 30s` bound, once with the SDK's out-of-spec `iat + 55`.
-    /// Prints each response's status and verbatim body — the diagnostic the
-    /// SDK swallows on 401. A split verdict proves the platform enforces the
-    /// documented bound; identical rejections carry the server's own error
-    /// code for diagnosis. Submits nothing and reads only the vault address.
-    FireblocksAuthProbe(Box<FireblocksAuthProbeArgs>),
     /// Administrative supply correction: burn excess shares from a proven
     /// duplicate deposit. Path is a required mode keyword
     /// (`internal` | `external`); never Alpaca, never a Redemption aggregate.
@@ -153,453 +126,6 @@ enum IssuerCommand {
     /// touch the operator's database — connecting runs any pending
     /// migrations and projection catch-up before the vault lookup.
     VerifyOrchestratorSigning(Box<VerifyOrchestratorSigningArgs>),
-}
-
-#[derive(Args)]
-struct FireblocksAuthProbeArgs {
-    #[clap(flatten)]
-    fireblocks: FireblocksEnv,
-}
-
-#[derive(Args)]
-struct SweepLegacyReceiptsArgs {
-    /// RPC endpoint for Base — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
-
-    /// Chain the sweep must run against, cross-checked against the chain the
-    /// RPC reports. The sweep table is Base-only, so anything but 8453 is
-    /// refused.
-    #[arg(long)]
-    chain_id: u64,
-
-    /// Attempt counter salted into every Fireblocks externalTxId. Fireblocks
-    /// treats an externalTxId as spent once a transaction under it completes
-    /// — including a transaction that completed on the platform but REVERTED
-    /// on-chain, which a plain rerun would recover forever instead of
-    /// resubmitting. After the sweep reports a reverted transaction, rerun
-    /// with the next attempt number to submit fresh.
-    #[arg(long, default_value_t = 1)]
-    attempt: u32,
-
-    #[clap(flatten)]
-    fireblocks: FireblocksEnv,
-}
-
-/// The retired Fireblocks issuer wallet every sweep entry moves out of.
-const LEGACY_HOLDER: Address =
-    address!("0x1c66D6708914C40239D54919320b4C48cAE3D1A9");
-
-/// The Turnkey issuer wallet that now custodies every receipt. The running
-/// service discovers inbound receipt transfers to this wallet on its next
-/// backfill pass, so swept receipts enter tracked inventory with no restart.
-const TURNKEY_RECIPIENT: Address =
-    address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE");
-
-/// The liquidity bot wallet. The stranded redemption goes back here rather
-/// than straight to the redemption wallet because redemption detection skips
-/// transfers from senders it cannot attribute; the bot re-sends it as a
-/// normal redemption.
-const LIQUIDITY_BOT: Address =
-    address!("0xa9c16673F65AE808688cB18952AFE3d9658C808f");
-
-/// The tCOIN vault, whose ERC-20 shares include the stranded redemption.
-const TCOIN_VAULT: Address =
-    address!("0x626757e6F50675D17fcAd312E82f989aE7A23d38");
-
-/// The 0.2 tCOIN redemption that landed at the retired wallet on 2026-07-29.
-const STRANDED_TCOIN: u128 = 200_000_000_000_000_000;
-
-/// A Base block mined before this tool existed (2026-07-31, early UTC). The
-/// stranded-tCOIN forward can only have been submitted by this tool, so any
-/// proof of it lives at or after this block; scanning starts here.
-const SWEEP_ERA_START_BLOCK: u64 = 49_330_000;
-
-/// Proves the stranded tCOIN actually reached the liquidity bot wallet by
-/// finding the exact legacy-to-bot `Transfer` on the tCOIN contract. A
-/// drained source with no such event means the tokens went somewhere else,
-/// which is an error, not a skip.
-async fn find_stranded_forward_event<P: Provider + Clone>(
-    provider: &P,
-) -> anyhow::Result<B256> {
-    let vault = OffchainAssetReceiptVault::new(TCOIN_VAULT, provider);
-    let expected = U256::from(STRANDED_TCOIN);
-    let latest = provider.get_block_number().await?;
-
-    // Public Base RPC caps eth_getLogs at 10k blocks per query.
-    let mut from_block = SWEEP_ERA_START_BLOCK;
-    while from_block <= latest {
-        let to_block = from_block.saturating_add(9_999).min(latest);
-        let events = vault
-            .Transfer_filter()
-            .from_block(from_block)
-            .to_block(to_block)
-            .query()
-            .await?;
-
-        for (event, log) in events {
-            if event.from == LEGACY_HOLDER
-                && event.to == LIQUIDITY_BOT
-                && event.value == expected
-            {
-                return log.transaction_hash.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "the stranded-tCOIN forward Transfer event carries \
-                         no transaction hash"
-                    )
-                });
-            }
-        }
-        from_block = to_block.saturating_add(1);
-    }
-
-    anyhow::bail!(
-        "stranded tCOIN: the legacy wallet is drained but no Transfer of \
-         {expected} from {LEGACY_HOLDER} to {LIQUIDITY_BOT} exists on \
-         {TCOIN_VAULT} since block {SWEEP_ERA_START_BLOCK} — the tokens \
-         went somewhere else; investigate before rerunning"
-    )
-}
-
-/// One receipt contract's worth of legacy holdings to sweep.
-struct LegacyReceiptSweep {
-    label: &'static str,
-    external_tx_id: &'static str,
-    receipt_contract: Address,
-    /// `(receipt id, expected balance)` — the sweep refuses to move a balance
-    /// that no longer matches, so a stale table cannot move the wrong amount.
-    holdings: &'static [(u64, u128)],
-}
-
-/// The five receipts the March 2026 issuer-wallet handover left at the
-/// Fireblocks wallet. They were inherited from the previous issuer wallet
-/// (0xe70d821f3462a074e63b42d0aac6523faae1d611) before this service's
-/// inventory tracking began, so `migrate-receipts` — which enumerates tracked
-/// holdings — never saw them. Balances verified on-chain 2026-07-31.
-const LEGACY_RECEIPT_SWEEPS: [LegacyReceiptSweep; 4] = [
-    LegacyReceiptSweep {
-        label: "tCOIN receipts",
-        external_tx_id: "legacy-receipt-sweep-tcoin",
-        receipt_contract: address!(
-            "0xBA1B8836A5510815e96103F067715b7CCC7c2E0E"
-        ),
-        holdings: &[(19, 1_000_000_000_000_000_000)],
-    },
-    LegacyReceiptSweep {
-        label: "tCRCL receipts",
-        external_tx_id: "legacy-receipt-sweep-tcrcl",
-        receipt_contract: address!(
-            "0xd508B97975fBE04E62bFf18959549b046bD8FA78"
-        ),
-        holdings: &[(4, 11_048_599_999_999_999_980)],
-    },
-    LegacyReceiptSweep {
-        label: "tMSTR receipts",
-        external_tx_id: "legacy-receipt-sweep-tmstr",
-        receipt_contract: address!(
-            "0x1c1fEF6f7b8e576219554b1d11c8aF29D00C0cEC"
-        ),
-        holdings: &[(5, 8_000_000_000_000_000_000)],
-    },
-    LegacyReceiptSweep {
-        label: "tSPYM receipts",
-        external_tx_id: "legacy-receipt-sweep-tspym",
-        receipt_contract: address!(
-            "0x957056dD6e2E594742E36675e8AA5A567163E5bd"
-        ),
-        holdings: &[
-            (10, 28_401_765_980_495_899_205),
-            (12, 90_000_000_000_000_000_000),
-        ],
-    },
-];
-
-async fn run_sweep_legacy_receipts(
-    args: SweepLegacyReceiptsArgs,
-    confirm: fn(&str) -> io::Result<bool>,
-) -> anyhow::Result<()> {
-    let fireblocks_config = args.fireblocks.into_config()?;
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
-    anyhow::ensure!(
-        chain_id == 8453,
-        "the legacy sweep table is Base-only (chain 8453); the RPC reports \
-         chain {chain_id}"
-    );
-
-    let provider =
-        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
-    let fireblocks_wallet = fetch_vault_address(&fireblocks_config).await?;
-    anyhow::ensure!(
-        fireblocks_wallet == LEGACY_HOLDER,
-        "Fireblocks credentials resolve to {fireblocks_wallet}, not the \
-         legacy holder {LEGACY_HOLDER} the sweep table was written for"
-    );
-
-    println!("Sweeping legacy holdings out of {LEGACY_HOLDER}:");
-    for sweep in &LEGACY_RECEIPT_SWEEPS {
-        for (receipt_id, amount) in sweep.holdings {
-            println!(
-                "  {} id {receipt_id}: {amount} -> {TURNKEY_RECIPIENT}",
-                sweep.label
-            );
-        }
-    }
-    println!(
-        "  stranded tCOIN redemption: {STRANDED_TCOIN} -> {LIQUIDITY_BOT}"
-    );
-
-    if !confirm(
-        "Submit these transfers through Fireblocks (console approval may be \
-         required)?",
-    )? {
-        anyhow::bail!("aborted by operator");
-    }
-
-    let service = FireblocksVaultService::new(
-        &fireblocks_config,
-        provider.clone(),
-        chain_id,
-    )?;
-
-    for sweep in &LEGACY_RECEIPT_SWEEPS {
-        sweep_legacy_receipt_contract(&service, &provider, sweep, args.attempt)
-            .await?;
-    }
-    sweep_stranded_tcoin(&service, &provider, args.attempt).await?;
-
-    println!("Legacy sweep complete.");
-    Ok(())
-}
-
-/// Requires the Fireblocks-completed transaction to have SUCCEEDED on-chain.
-///
-/// Fireblocks reports "Completed" for a transaction that was mined but
-/// REVERTED, and a completed transaction's externalTxId is spent forever — a
-/// rerun under the same id recovers the reverted transaction instead of
-/// submitting fresh. Refusing here keeps a revert from being reported as
-/// success, and the error names the `--attempt` bump that mints fresh ids.
-async fn require_onchain_success<P: Provider>(
-    provider: &P,
-    tx_hash: B256,
-    attempt: u32,
-) -> anyhow::Result<()> {
-    let onchain =
-        provider.get_transaction_receipt(tx_hash).await?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no on-chain receipt found for {tx_hash} although Fireblocks \
-                 reported it completed"
-            )
-        })?;
-
-    anyhow::ensure!(
-        onchain.status(),
-        "{tx_hash} REVERTED on-chain although Fireblocks reported it \
-         completed; nothing moved, and its externalTxId is spent — rerun \
-         with --attempt {}",
-        attempt.saturating_add(1)
-    );
-    Ok(())
-}
-
-/// Sweeps the still-held subset of one contract's legacy receipts, refusing
-/// on any balance that matches neither the table nor zero. Success requires
-/// the transaction to have succeeded on-chain, the legacy wallet drained, and
-/// the Turnkey wallet to have gained exactly the swept amounts.
-async fn sweep_legacy_receipt_contract<P: Provider + Clone>(
-    service: &FireblocksVaultService<P>,
-    provider: &P,
-    sweep: &LegacyReceiptSweep,
-    attempt: u32,
-) -> anyhow::Result<()> {
-    let receipt = Receipt::new(sweep.receipt_contract, provider);
-
-    let mut ids = Vec::new();
-    let mut amounts = Vec::new();
-    let mut recipient_before = Vec::new();
-    for (receipt_id, amount) in sweep.holdings {
-        let receipt_id = U256::from(*receipt_id);
-        let expected = U256::from(*amount);
-        let held = receipt.balanceOf(LEGACY_HOLDER, receipt_id).call().await?;
-
-        if held.is_zero() {
-            // A drained source only proves a sweep if the receipt actually
-            // sits at the Turnkey wallet; anything else means it went
-            // somewhere it should not have.
-            let at_recipient =
-                receipt.balanceOf(TURNKEY_RECIPIENT, receipt_id).call().await?;
-            // The destination may have held this receipt before the sweep.
-            // Drained source custody is corroborated when it holds at least the
-            // swept amount, matching the migration path's rerun semantics.
-            anyhow::ensure!(
-                at_recipient >= expected,
-                "{}: id {receipt_id} is gone from the legacy wallet but \
-                 {TURNKEY_RECIPIENT} holds {at_recipient}, less than the \
-                 expected swept amount {expected} — it was NOT fully swept \
-                 here; investigate before rerunning",
-                sweep.label
-            );
-            continue;
-        }
-        anyhow::ensure!(
-            held == expected,
-            "{}: id {receipt_id} holds {held} at the legacy wallet, but the \
-             sweep table expects {expected}; refusing to move an unexpected \
-             balance",
-            sweep.label
-        );
-        let before =
-            receipt.balanceOf(TURNKEY_RECIPIENT, receipt_id).call().await?;
-        ids.push(receipt_id);
-        amounts.push(expected);
-        recipient_before.push(before);
-    }
-
-    if ids.is_empty() {
-        println!(
-            "{}: already swept and verified at {TURNKEY_RECIPIENT}, skipping",
-            sweep.label
-        );
-        return Ok(());
-    }
-
-    let calldata = receipt
-        .safeBatchTransferFrom(
-            LEGACY_HOLDER,
-            TURNKEY_RECIPIENT,
-            ids.clone(),
-            amounts.clone(),
-            Bytes::new(),
-        )
-        .calldata()
-        .clone();
-
-    // The retiring wallet may have a broadcast-but-unmined transaction from
-    // an earlier attempt or another process; submitting over it would create
-    // a second in-flight transfer without knowing the first one's outcome.
-    // Same guard as every custody-transfer submission path.
-    ensure_holder_quiescent(provider, LEGACY_HOLDER).await?;
-
-    let external_tx_id = format!("{}-a{attempt}", sweep.external_tx_id);
-    let tx_hash = service
-        .submit_contract_call_to_completion(
-            sweep.receipt_contract,
-            &calldata,
-            sweep.label,
-            &external_tx_id,
-        )
-        .await?;
-
-    require_onchain_success(provider, tx_hash, attempt).await?;
-
-    for ((receipt_id, amount), before) in
-        ids.iter().zip(&amounts).zip(&recipient_before)
-    {
-        let remaining =
-            receipt.balanceOf(LEGACY_HOLDER, *receipt_id).call().await?;
-        anyhow::ensure!(
-            remaining.is_zero(),
-            "{}: id {receipt_id} still holds {remaining} at the legacy \
-             wallet after {tx_hash}",
-            sweep.label
-        );
-
-        let gained = receipt
-            .balanceOf(TURNKEY_RECIPIENT, *receipt_id)
-            .call()
-            .await?
-            .checked_sub(*before)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{}: id {receipt_id} balance at {TURNKEY_RECIPIENT} \
-                     DECREASED across {tx_hash}",
-                    sweep.label
-                )
-            })?;
-        anyhow::ensure!(
-            gained == *amount,
-            "{}: id {receipt_id} gained {gained} at {TURNKEY_RECIPIENT} \
-             across {tx_hash}, expected {amount}",
-            sweep.label
-        );
-    }
-
-    println!("{}: swept in {tx_hash}", sweep.label);
-    Ok(())
-}
-
-/// Forwards the stranded 0.2 tCOIN redemption to the liquidity bot wallet,
-/// with the same on-chain success and recipient-gain verification as the
-/// receipt sweeps.
-async fn sweep_stranded_tcoin<P: Provider + Clone>(
-    service: &FireblocksVaultService<P>,
-    provider: &P,
-    attempt: u32,
-) -> anyhow::Result<()> {
-    let vault = OffchainAssetReceiptVault::new(TCOIN_VAULT, provider);
-    let expected = U256::from(STRANDED_TCOIN);
-    let held = vault.balanceOf(LEGACY_HOLDER).call().await?;
-
-    if held.is_zero() {
-        // The bot wallet holds tCOIN transiently during its own operations,
-        // so its balance proves nothing about where the stranded tokens
-        // went. Only the exact legacy-to-bot Transfer event does.
-        let forwarded_in = find_stranded_forward_event(provider).await?;
-        println!(
-            "stranded tCOIN: already forwarded in {forwarded_in}, skipping"
-        );
-        return Ok(());
-    }
-    anyhow::ensure!(
-        held == expected,
-        "stranded tCOIN: the legacy wallet holds {held}, but the sweep \
-         expects {expected}; refusing to move an unexpected balance"
-    );
-    let recipient_before = vault.balanceOf(LIQUIDITY_BOT).call().await?;
-
-    let calldata = vault.transfer(LIQUIDITY_BOT, expected).calldata().clone();
-
-    // Same guard as the receipt sweeps: never submit over an in-flight
-    // transaction from the retiring wallet.
-    ensure_holder_quiescent(provider, LEGACY_HOLDER).await?;
-
-    let external_tx_id = format!("legacy-sweep-stranded-tcoin-a{attempt}");
-    let tx_hash = service
-        .submit_contract_call_to_completion(
-            TCOIN_VAULT,
-            &calldata,
-            "stranded tCOIN redemption forward",
-            &external_tx_id,
-        )
-        .await?;
-
-    require_onchain_success(provider, tx_hash, attempt).await?;
-
-    let remaining = vault.balanceOf(LEGACY_HOLDER).call().await?;
-    anyhow::ensure!(
-        remaining.is_zero(),
-        "stranded tCOIN: the legacy wallet still holds {remaining} after \
-         {tx_hash}"
-    );
-
-    let gained = vault
-        .balanceOf(LIQUIDITY_BOT)
-        .call()
-        .await?
-        .checked_sub(recipient_before)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "stranded tCOIN: balance at {LIQUIDITY_BOT} DECREASED across \
-                 {tx_hash}"
-            )
-        })?;
-    anyhow::ensure!(
-        gained == expected,
-        "stranded tCOIN: {LIQUIDITY_BOT} gained {gained} across {tx_hash}, \
-         expected {expected}"
-    );
-
-    println!("stranded tCOIN: forwarded in {tx_hash}");
-    Ok(())
 }
 
 #[derive(Args)]
@@ -831,12 +357,6 @@ impl IssuerCli {
             }
             IssuerCommand::ForceCompleteRedemption(args) => {
                 run_force_complete_redemption(*args, prompt_confirm).await
-            }
-            IssuerCommand::FireblocksAuthProbe(args) => {
-                run_fireblocks_auth_probe(*args).await
-            }
-            IssuerCommand::SweepLegacyReceipts(args) => {
-                run_sweep_legacy_receipts(*args, prompt_confirm).await
             }
             IssuerCommand::BurnExcess(command) => {
                 run_burn_excess_cli(*command, prompt_confirm).await
@@ -1272,29 +792,6 @@ async fn preflight_assets(
         .collect())
 }
 
-/// Runs the authentication A/B probe against the environment's API host and
-/// prints each attempt's status and verbatim body.
-async fn run_fireblocks_auth_probe(
-    args: FireblocksAuthProbeArgs,
-) -> anyhow::Result<()> {
-    let config = args.fireblocks.into_config()?;
-    let base_url = match config.environment {
-        Environment::Production => "https://api.fireblocks.io",
-        Environment::Sandbox => "https://sandbox-api.fireblocks.io",
-    };
-
-    println!("Probing {base_url} with the service's credential pair");
-    for report in probe_auth_pair(base_url, &config).await? {
-        println!(
-            "exp = iat + {}s -> HTTP {}",
-            report.expiry_seconds, report.status
-        );
-        println!("{}", report.body);
-    }
-
-    Ok(())
-}
-
 /// Connects to the RPC and cross-checks the chain it reports against
 /// `--chain-id`.
 ///
@@ -1637,6 +1134,7 @@ mod tests {
 
     use super::*;
     use crate::Quantity;
+    use crate::bindings::OffchainAssetReceiptVault;
     use crate::redemption::{
         BurnFailureClassification, BurnRecord, RedemptionEvent,
     };
@@ -1649,10 +1147,7 @@ mod tests {
     const TEST_SIGNER_KEY: &str =
         "0x0000000000000000000000000000000000000000000000000000000000000001";
 
-    /// The one vault every CLI test seeds. `seed_custody_at` keys the
-    /// aggregate with this same vault (and Base's chain id), so the seeded
-    /// custody can never silently desynchronise from the listing the CLI
-    /// resolves.
+    /// The one vault every CLI test seeds.
     const TEST_VAULT: Address =
         address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
@@ -1961,9 +1456,8 @@ mod tests {
         );
     }
 
-    /// Seeds a listing into a file-backed store, since the commands under
-    /// test open their own pool from the URL and so cannot share an
-    /// in-memory one.
+    /// Seeds a listing into a file-backed store for commands that open their
+    /// own pool from the URL and therefore cannot share an in-memory one.
     async fn seed_listing_at(database_url: &str, underlying: &str) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

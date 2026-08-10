@@ -22,7 +22,7 @@ use st0x_issuance::receipt_inventory::migration::{
 };
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::tokenized_asset::UnderlyingSymbol;
-use st0x_issuance::{Config, SignerConfig, initialize_rocket};
+use st0x_issuance::{Config, Network, SignerConfig, initialize_rocket};
 use std::path::{Path, PathBuf};
 
 use crate::harness::create_provider;
@@ -345,11 +345,10 @@ impl PostMigrationCanaries<'_, '_> {
     }
 }
 
-/// Migrates custody against the given database — the same engine `issuer
-/// migrate-receipts` runs, exercised in the same order an operator would. The
-/// migration deliberately touches no freeze state: freezing means "corporate
-/// action in progress", and the window is controlled operationally (liquidity
-/// rebalancing paused, service stopped) instead.
+/// Migrates custody against the given database through the vendor-neutral
+/// engine. The migration deliberately touches no freeze state: freezing means
+/// "corporate action in progress", and the window is controlled operationally
+/// (liquidity rebalancing paused, service stopped) instead.
 ///
 /// The migration is run twice: the second run stands in for the operator losing
 /// the terminal between the transaction confirming and success being recorded,
@@ -368,20 +367,29 @@ async fn run_custody_migration(
         .await?;
 
     let underlying: UnderlyingSymbol = CUSTODY_UNDERLYING.parse()?;
-    let incoming = CorroboratedRecipient::verify(provider, incoming).await?;
+    let incoming =
+        CorroboratedRecipient::verify(provider, outgoing, incoming).await?;
 
-    let identity = VaultIdentity { chain_id, vault, underlying: &underlying };
+    let identity = VaultIdentity::verify(
+        &pool,
+        provider,
+        Network::Base,
+        chain_id,
+        vault,
+        &underlying,
+    )
+    .await?;
+    // No bootstrap call is allowed here: success proves production startup
+    // reconciliation already recorded the outgoing holder.
     let outcome =
-        migrate_vault_receipts(&pool, provider, identity, outgoing, incoming)
-            .await?;
+        migrate_vault_receipts(&pool, provider, identity, incoming).await?;
     assert!(
         matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
         "the migration must report moving receipts, got {outcome:?}"
     );
 
     let rerun =
-        migrate_vault_receipts(&pool, provider, identity, outgoing, incoming)
-            .await?;
+        migrate_vault_receipts(&pool, provider, identity, incoming).await?;
     assert!(
         matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
         "re-running a completed migration must be a no-op, got {rerun:?}"
@@ -476,7 +484,7 @@ async fn single_deposit_for_owner(
 #[tokio::test]
 async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart()
 -> Result<(), Box<dyn std::error::Error>> {
-    let evm = LocalEvm::new().await?;
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
     let mock_alpaca = MockServer::start();
 
     let outgoing_wallet = evm.wallet_address;
@@ -581,7 +589,7 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
         .await?;
 
     run_custody_migration(
-        &databases.outgoing_url,
+        &databases.incoming_url,
         &outgoing_provider,
         evm.chain_id,
         evm.vault_address,
@@ -692,7 +700,7 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
 #[tokio::test]
 async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
 -> Result<(), Box<dyn std::error::Error>> {
-    let evm = LocalEvm::new().await?;
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
     let mock_alpaca = MockServer::start();
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
@@ -768,18 +776,27 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         .await?;
 
     let underlying: UnderlyingSymbol = CUSTODY_UNDERLYING.parse()?;
-    let identity = VaultIdentity {
-        chain_id: evm.chain_id,
-        vault: evm.vault_address,
-        underlying: &underlying,
-    };
+    let identity = VaultIdentity::verify(
+        &pool,
+        &outgoing_provider,
+        Network::Base,
+        evm.chain_id,
+        evm.vault_address,
+        &underlying,
+    )
+    .await?;
+    // No bootstrap call is allowed here: the forward move must depend on the
+    // custody event written by production startup reconciliation above.
     let forward = migrate_vault_receipts(
         &pool,
         &outgoing_provider,
         identity,
-        outgoing_wallet,
-        CorroboratedRecipient::verify(&outgoing_provider, incoming_wallet)
-            .await?,
+        CorroboratedRecipient::verify(
+            &outgoing_provider,
+            outgoing_wallet,
+            incoming_wallet,
+        )
+        .await?,
     )
     .await?;
     assert!(
@@ -792,9 +809,8 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         "the incoming wallet must hold the receipt after the forward move"
     );
 
-    // The rollback: same command with the wallets swapped, and its destination
-    // derived from the recorded forward migration rather than named — exactly
-    // what the CLI reads in production.
+    // The rollback: same engine with the wallets swapped, and its destination
+    // derived from the recorded forward migration rather than named.
     let derived_destination =
         recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
             .await?;
@@ -811,9 +827,12 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
         &pool,
         &incoming_provider,
         identity,
-        incoming_wallet,
-        CorroboratedRecipient::verify(&incoming_provider, derived_destination)
-            .await?,
+        CorroboratedRecipient::verify(
+            &incoming_provider,
+            incoming_wallet,
+            derived_destination,
+        )
+        .await?,
     )
     .await?;
 
@@ -859,7 +878,7 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
 #[tokio::test]
 async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let evm = LocalEvm::new().await?;
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
     let mock_alpaca = MockServer::start();
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
@@ -1087,7 +1106,7 @@ async fn resume_on_outgoing_wallet_and_redeem_canary(
 #[tokio::test]
 async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_shares()
 -> Result<(), Box<dyn std::error::Error>> {
-    let evm = LocalEvm::new().await?;
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
     let mock_alpaca = MockServer::start();
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
