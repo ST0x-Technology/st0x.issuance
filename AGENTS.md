@@ -332,16 +332,14 @@ wraps into a signing `Provider` for `RealBlockchainService`:
 Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 `wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
 
-**Receipt custody migration (`receipt_inventory/migration.rs` +
-`src/fireblocks/`, temporary):** rotating the signer strands the vault's
-receipts at the old address. **Stop the service before `migrate-receipts`.** No
-wallet address is an argument: Fireblocks wallet from its API, Turnkey wallet
-from `TURNKEY_ADDRESS`, direction from recorded custody; forward submits via the
-restored narrow Fireblocks client, rollback signs with Turnkey. Ownership
-verification (exact balances before, per-identifier gain after) is the check.
+**Receipt custody (`receipt_inventory/migration.rs`):** rotating a holder can
+strand the vault's receipts at the old address. The vendor-neutral migration
+engine verifies exact source balances and per-identifier recipient gains.
 Custody is aggregate state: a rotated wallet reading zero is refused, not
 depleted. Quiescence gates on in-flight mints/redemptions, never on freeze
-(freeze = corporate action). See `docs/turnkey-receipt-migration-plan.md`.
+(freeze = corporate action). The engine deliberately has no CLI driver. See
+`docs/runbooks/deploy-hold.md` when maintenance must keep issuance stopped
+across a deploy.
 
 ### Core Flows
 
