@@ -6,8 +6,10 @@
 //! at the old address: the new wallet holds shares it cannot redeem because the
 //! matching receipt sits elsewhere. Custody has to follow the rotation.
 //!
-//! The vendor-neutral engine deliberately has no operator entry point. A new
-//! operational driver will be introduced with the next signer migration.
+//! The vendor-neutral engine's operator driver is `issuer move-receipts`
+//! (`src/tokenized_asset/cli.rs`), which supplies the Turnkey signing
+//! provider and the kind-corroborated destination, and performs the
+//! outside-the-engine checks (deploy hold, gas readiness, confirmation).
 //!
 //! **The issuer service must be stopped before this runs.** Startup
 //! reconciliation reads `balanceOf(bot_wallet)` for every tracked receipt
@@ -23,6 +25,7 @@
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{PendingTransactionError, Provider};
+use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use event_sorcery::StoreBuilder;
 use itertools::izip;
@@ -35,7 +38,9 @@ use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
     SharesOverflow, load_inventory, send_receipt_inventory_command,
 };
-use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::bindings::{
+    IERC165, IERC1155Receiver, OffchainAssetReceiptVault, Receipt,
+};
 use crate::mint::{Mint, find_stuck as find_stuck_mints};
 use crate::prepare_event_sourced_startup;
 use crate::redemption::view::{
@@ -53,6 +58,33 @@ use crate::tokenized_asset::{Network, TokenizedAsset, UnderlyingSymbol};
 /// bound is safer than submitting an irreversible transaction with unverified
 /// gas behaviour.
 const MAX_RECEIPTS_PER_TRANSFER: usize = 14;
+
+/// EIP-165 defines an interface's id as the XOR of all its function
+/// selectors. Deriving it from the bound receiver-hook signatures (the very
+/// functions an ERC-1155 transfer calls) means it can never drift from what
+/// is actually probed — `0x4e2312e0` for `IERC1155Receiver`.
+const ERC1155_RECEIVER_INTERFACE_ID: [u8; 4] = xor_selectors(
+    IERC1155Receiver::onERC1155ReceivedCall::SELECTOR,
+    IERC1155Receiver::onERC1155BatchReceivedCall::SELECTOR,
+);
+
+/// ERC-165's own interface id. `supportsInterface(bytes4)` is the
+/// interface's only function, so the id IS its selector (`0x01ffc9a7`).
+const ERC165_INTERFACE_ID: [u8; 4] = IERC165::supportsInterfaceCall::SELECTOR;
+
+/// EIP-165 requires a compliant contract to answer `false` for
+/// `0xffffffff`; answering `true` unmasks a fallback that affirms
+/// everything, whose answers prove nothing.
+const ERC165_INVALID_INTERFACE_ID: [u8; 4] = [0xff; 4];
+
+const fn xor_selectors(first: [u8; 4], second: [u8; 4]) -> [u8; 4] {
+    [
+        first[0] ^ second[0],
+        first[1] ^ second[1],
+        first[2] ^ second[2],
+        first[3] ^ second[3],
+    ]
+}
 
 /// Refuses unless the deployment is quiescent: no burn reserved against this
 /// vault's receipts, and no mint or redemption anywhere between initiation and
@@ -458,6 +490,32 @@ enum MigrationRefusal {
     )]
     RecipientUnknownToChain { recipient: Address, chain_id: u64 },
 
+    #[error(
+        "recipient {recipient} is a contract that answers \
+         supportsInterface(IERC1155Receiver) = false: it states it cannot \
+         receive ERC-1155 transfers, so the receipt transfer would revert"
+    )]
+    RecipientContractRefusesReceipts { recipient: Address },
+
+    #[error(
+        "recipient {recipient} is a contract whose ERC-165 answers are \
+         inconsistent (a compliant responder answers true for ERC-165 itself \
+         and false for 0xffffffff), so its receiver-support claim proves \
+         nothing; receipts only move to a contract whose support is proven"
+    )]
+    RecipientErc165Inconsistent { recipient: Address },
+
+    #[error(
+        "recipient {recipient} is a contract that does not answer ERC-165 \
+         supportsInterface, so ERC-1155 receiver support cannot be proven \
+         before an irreversible transfer"
+    )]
+    RecipientReceiverSupportUnproven {
+        recipient: Address,
+        #[source]
+        source: Box<alloy::contract::Error>,
+    },
+
     #[error(transparent)]
     SharesOverflow(#[from] SharesOverflow),
 
@@ -675,39 +733,78 @@ pub enum MigrationOutcome {
     },
 }
 
-/// A destination the chain itself has seen, paired with the caller's stated
-/// current holder.
+/// Which kind of address a destination was proven to be.
+///
+/// Deciding which corroboration it had to clear. Recorded on the witness so
+/// the driver's confirmation prompt and the audit trail state what was proven
+/// rather than assuming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientKind {
+    /// No deployed code; corroborated by on-chain history (transaction
+    /// count or native balance).
+    ExternallyOwned,
+    /// Deployed code that proves ERC-1155 receiver support through a
+    /// consistent ERC-165 responder.
+    Erc1155Receiver,
+}
+
+impl fmt::Display for RecipientKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExternallyOwned => {
+                write!(formatter, "externally owned account")
+            }
+            Self::Erc1155Receiver => {
+                write!(formatter, "ERC-1155-receiving contract")
+            }
+        }
+    }
+}
+
+/// A destination the chain itself has corroborated, paired with the caller's
+/// stated current holder.
 ///
 /// Existence proves only the destination and chain were corroborated by
-/// [`CorroboratedRecipient::verify`]. The stated holder is checked against the
-/// inventory's recorded custody before any transfer. An ERC-1155 transfer is
-/// final and has no counterparty to ask for it back, so a mistyped destination
-/// is not a recoverable mistake.
+/// [`CorroboratedRecipient::verify`] — with a corroboration as strong as the
+/// kind of address the destination is (see [`RecipientKind`]). The stated
+/// holder is checked against the inventory's recorded custody before any
+/// transfer. An ERC-1155 transfer is final and has no counterparty to ask
+/// for it back, so a mistyped destination is not a recoverable mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorroboratedRecipient {
     chain_id: u64,
     holder: Address,
     recipient: Address,
+    kind: RecipientKind,
 }
 
 impl CorroboratedRecipient {
-    /// Confirms `recipient` differs from `holder` and that the chain has
-    /// independent evidence the destination exists.
+    /// Confirms `recipient` differs from `holder` and corroborates it by
+    /// what the chain says it is.
     ///
-    /// An address that has never sent a transaction and holds no native balance
-    /// has no on-chain existence at all — which is precisely what a
-    /// fat-fingered address looks like, since the odds of a typo landing on a
-    /// used address are negligible. Both legitimate destinations clear it: the
-    /// incoming signing wallet has to be funded for gas before it can run the
-    /// service, while a prior signing wallet has already been active on-chain.
+    /// An address with no deployed code is an externally owned account and
+    /// must have on-chain history: an address that has never sent a
+    /// transaction and holds no native balance has no on-chain existence at
+    /// all — precisely what a fat-fingered address looks like, since the
+    /// odds of a typo landing on a used address are negligible. Both
+    /// legitimate EOA destinations clear it: an incoming signing wallet has
+    /// to be funded for gas before it can run the service, while a prior
+    /// signing wallet has already been active on-chain.
+    ///
+    /// An address with deployed code clears the EOA evidence for the wrong
+    /// reason — deployment proves nothing about receiving ERC-1155 — so a
+    /// contract must instead prove receiver support up front, through a
+    /// consistent ERC-165 responder affirming `IERC1155Receiver`. Receiver
+    /// support is proven before submitting, never discovered by a revert.
     ///
     /// The error type is erased to `anyhow` for the same reason as
     /// [`migrate_vault_receipts`]: [`MigrationRefusal`] stays crate-internal.
     ///
     /// # Errors
     ///
-    /// Returns an error for the zero address, the current holder, and when the
-    /// chain has no record of the address at all.
+    /// Returns an error for the zero address, the current holder, an EOA the
+    /// chain has no record of, and a contract that does not prove ERC-1155
+    /// receiver support.
     pub async fn verify<P: Provider>(
         provider: &P,
         holder: Address,
@@ -728,25 +825,18 @@ impl CorroboratedRecipient {
         let chain_id =
             provider.get_chain_id().await.map_err(ReceiptCustodyError::from)?;
 
-        let nonce = provider
-            .get_transaction_count(recipient)
+        let code = provider
+            .get_code_at(recipient)
             .await
             .map_err(ReceiptCustodyError::from)?;
 
-        let balance = provider
-            .get_balance(recipient)
-            .await
-            .map_err(ReceiptCustodyError::from)?;
+        let kind = if code.is_empty() {
+            corroborate_externally_owned(provider, recipient, chain_id).await?
+        } else {
+            corroborate_erc1155_receiver(provider, recipient).await?
+        };
 
-        if nonce == 0 && balance.is_zero() {
-            return Err(MigrationRefusal::RecipientUnknownToChain {
-                recipient,
-                chain_id,
-            }
-            .into());
-        }
-
-        Ok(Self { chain_id, holder, recipient })
+        Ok(Self { chain_id, holder, recipient, kind })
     }
 
     const fn address(self) -> Address {
@@ -760,6 +850,103 @@ impl CorroboratedRecipient {
     const fn chain_id(self) -> u64 {
         self.chain_id
     }
+
+    /// The kind of address the destination was proven to be.
+    #[must_use]
+    pub const fn kind(self) -> RecipientKind {
+        self.kind
+    }
+}
+
+/// The EOA corroboration: refused unless the chain has independent evidence
+/// the address exists — transaction history or native balance.
+async fn corroborate_externally_owned<P: Provider>(
+    provider: &P,
+    recipient: Address,
+    chain_id: u64,
+) -> anyhow::Result<RecipientKind> {
+    let nonce = provider
+        .get_transaction_count(recipient)
+        .await
+        .map_err(ReceiptCustodyError::from)?;
+
+    let balance = provider
+        .get_balance(recipient)
+        .await
+        .map_err(ReceiptCustodyError::from)?;
+
+    if nonce == 0 && balance.is_zero() {
+        return Err(MigrationRefusal::RecipientUnknownToChain {
+            recipient,
+            chain_id,
+        }
+        .into());
+    }
+
+    Ok(RecipientKind::ExternallyOwned)
+}
+
+/// The contract corroboration: a consistent ERC-165 responder affirming
+/// `IERC1155Receiver`.
+///
+/// Consistency first (EIP-165's own detection procedure): the responder must
+/// affirm ERC-165 itself and deny `0xffffffff` — a fallback that affirms
+/// everything proves nothing — and only then is its answer for the receiver
+/// interface trusted.
+async fn corroborate_erc1155_receiver<P: Provider>(
+    provider: &P,
+    recipient: Address,
+) -> anyhow::Result<RecipientKind> {
+    let responder = IERC165::new(recipient, provider);
+
+    let affirms_erc165 = responder
+        .supportsInterface(ERC165_INTERFACE_ID.into())
+        .call()
+        .await
+        .map_err(|source| {
+            MigrationRefusal::RecipientReceiverSupportUnproven {
+                recipient,
+                source: Box::new(source),
+            }
+        })?;
+
+    let affirms_invalid = responder
+        .supportsInterface(ERC165_INVALID_INTERFACE_ID.into())
+        .call()
+        .await
+        .map_err(|source| {
+            MigrationRefusal::RecipientReceiverSupportUnproven {
+                recipient,
+                source: Box::new(source),
+            }
+        })?;
+
+    if !affirms_erc165 || affirms_invalid {
+        return Err(MigrationRefusal::RecipientErc165Inconsistent {
+            recipient,
+        }
+        .into());
+    }
+
+    let supports_receiver = responder
+        .supportsInterface(ERC1155_RECEIVER_INTERFACE_ID.into())
+        .call()
+        .await
+        .map_err(|source| {
+            MigrationRefusal::RecipientReceiverSupportUnproven {
+                recipient,
+                source: Box::new(source),
+            }
+        })?;
+
+    if !supports_receiver {
+        return Err(MigrationRefusal::RecipientContractRefusesReceipts {
+            recipient,
+        }
+        .into());
+    }
+
+    Ok(RecipientKind::Erc1155Receiver)
 }
 
 impl std::fmt::Display for CorroboratedRecipient {
@@ -808,6 +995,29 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
         OnchainReceiptCustody::resolve(provider, identity.vault).await?;
 
     execute_migration(pool, &custody, identity, recipient).await
+}
+
+/// Tracked receipts with balance for this vault, for the driver's
+/// confirmation prompt.
+///
+/// Informational only: [`migrate_vault_receipts`]
+/// re-derives its own holdings under the quiescence gates before anything
+/// moves, so this count gates nothing.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened or the inventory fails to
+/// load.
+pub async fn tracked_receipt_count(
+    pool: &Pool<Sqlite>,
+    chain_id: u64,
+    vault: Address,
+) -> anyhow::Result<usize> {
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    Ok(inventory.receipts_with_balance().len())
 }
 
 /// Verified identity of the vault a custody operation addresses.
@@ -1265,6 +1475,33 @@ pub async fn recorded_migration_origin(
         anyhow::anyhow!(
             "vault {vault} on chain {chain_id} has no recorded custody \
              migration to reverse"
+        )
+    })
+}
+
+/// The wallet currently recorded as holding the vault's receipts.
+///
+/// The narrow read path for verifying custody state from outside the crate
+/// (e.g. after a `confirm-custody` re-confirmation): the confirmation's
+/// return value counts verified balances, while this reads the holder the
+/// aggregate actually persisted.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened or custody has never been
+/// observed for this vault.
+pub async fn recorded_custody_holder(
+    pool: &Pool<Sqlite>,
+    chain_id: u64,
+    vault: Address,
+) -> anyhow::Result<Address> {
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    inventory.custody().holder().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault {vault} on chain {chain_id} has no recorded custody holder"
         )
     })
 }
@@ -2919,9 +3156,20 @@ mod tests {
     /// something other than what the operator typed.
     mod recipient_corroboration {
         use alloy::providers::ProviderBuilder;
+        use alloy::providers::ext::AnvilApi;
 
         use super::*;
         use crate::test_utils::LocalEvm;
+
+        /// Runtime bytecode returning 32 bytes ending in `0x01` for ANY
+        /// call: a fallback that affirms every interface, which EIP-165's
+        /// `0xffffffff` probe exists to unmask.
+        const AFFIRMS_EVERYTHING: [u8; 10] =
+            [0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+        /// Runtime bytecode that is the INVALID opcode: every call reverts,
+        /// like a contract with no fallback and no ERC-165.
+        const REVERTS_EVERY_CALL: [u8; 1] = [0xfe];
 
         #[tokio::test]
         async fn the_current_holder_cannot_be_its_own_destination() {
@@ -2998,7 +3246,9 @@ mod tests {
             );
         }
 
-        /// A funded destination distinct from the holder clears the gate.
+        /// A funded destination distinct from the holder clears the gate,
+        /// and the witness records what was proven: an externally owned
+        /// account.
         #[tokio::test]
         async fn a_funded_wallet_is_corroborated() {
             let evm = LocalEvm::new().await.unwrap();
@@ -3014,6 +3264,139 @@ mod tests {
             .unwrap();
 
             assert_eq!(corroborated.address(), evm.wallet_address);
+            assert_eq!(corroborated.kind(), RecipientKind::ExternallyOwned);
+        }
+
+        /// The orchestrator is the one contract destination the migration
+        /// exists for: a consistent ERC-165 responder affirming
+        /// `IERC1155Receiver`, corroborated as such.
+        #[tokio::test]
+        async fn the_orchestrator_is_corroborated_as_a_receiver() {
+            let evm = LocalEvm::new().await.unwrap();
+            let orchestrator = evm.deploy_orchestrator().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+            let corroborated = CorroboratedRecipient::verify(
+                &provider,
+                evm.wallet_address,
+                orchestrator,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(corroborated.address(), orchestrator);
+            assert_eq!(corroborated.kind(), RecipientKind::Erc1155Receiver);
+        }
+
+        /// The vault's receipt contract is a genuine, consistent ERC-165
+        /// responder (an ERC-1155 token) that is NOT an ERC-1155 receiver —
+        /// transfers to it would revert, so it must be refused on its own
+        /// answer, before any transaction exists.
+        #[tokio::test]
+        async fn a_contract_that_answers_false_for_receiver_support_is_refused()
+        {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+            let receipt_contract: Address =
+                OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                    .receipt()
+                    .call()
+                    .await
+                    .unwrap()
+                    .0
+                    .into();
+
+            let error = CorroboratedRecipient::verify(
+                &provider,
+                evm.wallet_address,
+                receipt_contract,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::RecipientContractRefusesReceipts {
+                        recipient,
+                    }) if *recipient == receipt_contract
+                ),
+                "a non-receiver contract must be refused on its ERC-165 \
+                 answer, got: {error:?}"
+            );
+        }
+
+        /// A fallback answering true for everything claims `0xffffffff` too,
+        /// which a compliant ERC-165 responder must deny — its answers prove
+        /// nothing, so its receiver-support claim is not trusted.
+        #[tokio::test]
+        async fn a_contract_affirming_every_interface_is_refused() {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+            let stub = Address::random();
+            provider
+                .anvil_set_code(stub, AFFIRMS_EVERYTHING.to_vec().into())
+                .await
+                .unwrap();
+
+            let error = CorroboratedRecipient::verify(
+                &provider,
+                evm.wallet_address,
+                stub,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::RecipientErc165Inconsistent {
+                        recipient,
+                    }) if *recipient == stub
+                ),
+                "an affirm-everything fallback proves nothing and must be \
+                 refused, got: {error:?}"
+            );
+        }
+
+        /// A contract that reverts every call (no ERC-165 at all) cannot
+        /// prove receiver support, so it is refused before any transaction —
+        /// never discovered by the transfer's own revert.
+        #[tokio::test]
+        async fn a_contract_without_erc165_is_refused_as_unproven() {
+            let evm = LocalEvm::new().await.unwrap();
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+            let stub = Address::random();
+            provider
+                .anvil_set_code(stub, REVERTS_EVERY_CALL.to_vec().into())
+                .await
+                .unwrap();
+
+            let error = CorroboratedRecipient::verify(
+                &provider,
+                evm.wallet_address,
+                stub,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(
+                        MigrationRefusal::RecipientReceiverSupportUnproven {
+                            recipient,
+                            ..
+                        }
+                    ) if *recipient == stub
+                ),
+                "receiver support must be proven before submitting, never \
+                 discovered by a revert, got: {error:?}"
+            );
         }
 
         #[test]

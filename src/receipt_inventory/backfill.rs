@@ -244,15 +244,38 @@ where
                 })
             })?;
 
-        // Process reconciliation events (Withdraw + outbound transfers)
+        // Process reconciliation events (Withdraw + outbound transfers).
+        // Once a recorded migration moved this vault's custody away from the
+        // signing wallet, `balanceOf(bot_wallet)` readings mean nothing and
+        // could only be refused as `CustodyDisplaced` — the migration's own
+        // outbound transfers land here on post-cutover catch-up, so they are
+        // skipped at INFO until the subsystem retires (RAI-1223). The
+        // discovery path above needs no gate: a zero balance returns before
+        // any command is dispatched.
         let unique_reconciliation_ids: Vec<_> =
             all_reconciliation_ids.into_iter().unique().collect();
 
-        let reconciled_count = u64::try_from(unique_reconciliation_ids.len())?;
-
-        for receipt_id in unique_reconciliation_ids {
-            self.reconcile_receipt(receipt_id).await?;
-        }
+        let reconciled_count = if unique_reconciliation_ids.is_empty() {
+            0
+        } else if load_inventory(&self.store, self.chain_id, &self.vault)
+            .await?
+            .custody()
+            .moved_away_from(self.bot_wallet)
+        {
+            info!(target: "receipt", vault = %self.vault,
+                wallet = %self.bot_wallet,
+                skipped = unique_reconciliation_ids.len(),
+                "Custody recorded at a migrated destination; skipping \
+                 outbound-transfer reconciliation"
+            );
+            0
+        } else {
+            let reconciled = u64::try_from(unique_reconciliation_ids.len())?;
+            for receipt_id in unique_reconciliation_ids {
+                self.reconcile_receipt(receipt_id).await?;
+            }
+            reconciled
+        };
 
         advance_receipt_backfill(
             &self.pool,
@@ -1694,6 +1717,127 @@ mod tests {
             inventory.receipts_with_balance().is_empty(),
             "No receipts should be discovered from outbound/mint transfers"
         );
+    }
+
+    /// Post-cutover catch-up sees the migration's own outbound transfers.
+    /// Once recorded custody moved away from the signing wallet, those
+    /// reconciliation readings are skipped at INFO instead of manufacturing
+    /// `CustodyDisplaced` refusals — the mocked provider deliberately serves
+    /// no `balanceOf` response, so a dispatched reading would fail the test.
+    #[tokio::test]
+    #[traced_test]
+    async fn backfill_skips_outbound_reconciliation_for_a_migrated_vault() {
+        let (receipt_contract, bot_wallet, vault) = test_addresses();
+        let destination =
+            address!("0x5555555555555555555555555555555555555555");
+        let (store, pool) = setup_store().await;
+
+        let receipt_id = U256::from(7);
+        let tx_hash = b256!(
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+
+        let key = ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault);
+        store
+            .send(
+                &key,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(receipt_id),
+                    balance: Shares::from(U256::from(100)),
+                    block_number: 1,
+                    tx_hash,
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &key,
+                ReceiptInventoryCommand::ConfirmCustody { holder: bot_wallet },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &key,
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: bot_wallet,
+                    to: destination,
+                    tx_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The migration's own outbound transfer, observed on catch-up.
+        let outbound_log =
+            create_transfer_single_log(TransferSingleLogParams {
+                receipt_contract,
+                operator: bot_wallet,
+                from: bot_wallet,
+                to: destination,
+                id: receipt_id,
+                value: U256::from(100),
+                tx_hash,
+                block_number: 100,
+            });
+
+        let asserter = Asserter::new();
+        // Discovery queries: Deposit, inbound TransferSingle, inbound
+        // TransferBatch — all empty.
+        for _ in 0..3 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+        // Reconciliation queries: Withdraw empty, outbound TransferSingle
+        // carries the migration transfer, outbound TransferBatch empty.
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&vec![outbound_log]);
+        asserter.push_success(&Vec::<Log>::new());
+        // Deliberately NO balanceOf response.
+
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::random()))
+            .connect_mocked_client(asserter);
+
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider,
+            receipt_contract,
+            bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
+            vault,
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
+
+        let result = backfiller.backfill_receipts(0, 200).await.unwrap();
+
+        assert_eq!(
+            result.reconciled_count, 0,
+            "the migrated vault's outbound reconciliation must be skipped"
+        );
+
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
+        assert_eq!(
+            inventory.receipts_with_balance().len(),
+            1,
+            "the migrated inventory must survive the pass intact"
+        );
+        assert_eq!(
+            inventory.custody().holder(),
+            Some(destination),
+            "the skip must not touch recorded custody"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["skipping", "outbound-transfer reconciliation"]
+        ));
     }
 
     #[tokio::test]
