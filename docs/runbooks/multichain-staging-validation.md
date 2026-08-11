@@ -1,210 +1,274 @@
-# Multichain staging validation runbook (RAI-1210)
+# Ethereum multichain validation runbook (RAI-1210 / RAI-1508)
 
-Manual Alpaca **sandbox** end-to-end on a second ITN `network` wire (default:
-`ethereum`). CI Anvil tests cover routing logic; this runbook proves the
-deployed stack against real Alpaca + chain B infrastructure.
+Validate the deployed issuer against Alpaca and Ethereum without enabling
+multichain trading or rebalancing. CI Anvil tests prove routing logic; this
+runbook proves the configured artifact, issuer wallet, Alpaca request, and
+on-chain result together.
 
-## External gates (must be green before starting)
+Use this runbook for:
 
-| Issue                                                                                                               | What                                                              |
-| ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| [RAI-1099](https://linear.app/makeitrain/issue/RAI-1099)                                                            | Alpaca sandbox issuer enabled on target `network`                 |
-| [RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) / [RAI-1096](https://linear.app/makeitrain/issue/RAI-1096) | Chain B vault deployed and permissioned                           |
-| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100)-[RAI-1104](https://linear.app/makeitrain/issue/RAI-1104)   | RPC, Turnkey/local signing, gas, subgraph URL for chain B         |
-| [RAI-1212](https://linear.app/makeitrain/issue/RAI-1212)                                                            | Liquidity freeze guard sends `?network=` (lockstep with RAI-1205) |
+- Alpaca sandbox validation on staging ([RAI-1210](https://linear.app/makeitrain/issue/RAI-1210));
+- the bounded production Ethereum activation after the Turnkey Base soak
+  ([RAI-1508](https://linear.app/makeitrain/issue/RAI-1508)).
 
-Issuance multichain code (RAI-1204-1208) must be on the staging host. If
-upgrading an existing single-chain DB, run
-[`tokenized-asset-aggregate-rekey.md`](tokenized-asset-aggregate-rekey.md)
-first.
+The production activation must use the same pinned issuer artifact that passed
+the Base cutover. Do not use this runbook to change trading, hedging, wrapping,
+or Raindex orders.
 
-**Additionally:** production/staging parsing of multichain chain config
-(`CHAIN_ETHEREUM_*` / `[[chains]]` -> a second `ChainRegistry` entry) is **not
-yet implemented** -- `Config::chains` only ever holds the single Base entry
-mapped from the legacy env vars; extra entries are appended by the test harness
-alone. This runbook is not executable until that config path lands; treat it as
-a blocking gate alongside the table above.
+## Entry gates
 
-## 1. Staging config checklist
+Do not configure or register the Ethereum asset until every applicable gate is
+green.
 
-On the staging host, confirm:
+| Gate | Required evidence |
+| --- | --- |
+| [RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) / [RAI-1096](https://linear.app/makeitrain/issue/RAI-1096) | Ethereum vault deployed; issuer roles verified |
+| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100) | Ethereum RPC endpoint ready |
+| [RAI-1102](https://linear.app/makeitrain/issue/RAI-1102) | Turnkey policy and Ethereum DEPOSIT / WITHDRAW / CERTIFY grants verified for the active signer |
+| [RAI-1103](https://linear.app/makeitrain/issue/RAI-1103) | Active signer funded with Ethereum gas |
+| [RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) | Ethereum receipt subgraph/indexer ready |
+| [RAI-1099](https://linear.app/makeitrain/issue/RAI-1099) | Alpaca environment accepts `network=ethereum` |
+| [PR #284](https://app.graphite.com/github/pr/ST0x-Technology/st0x.issuance/284) | Issuer parses complete `CHAIN_ETHEREUM_*` groups |
+| [PR #1110](https://app.graphite.com/github/pr/ST0x-Technology/st0x.liquidity/1110) | Operator CLI sends Ethereum mint/redeem requests and observes the Ethereum wallet |
 
-- **Base (legacy block):** `RPC_URL`, `CHAIN_ID=8453`, `SUBGRAPH_URL`,
-  `BACKFILL_START_BLOCK` -- unchanged from pre-multichain.
-- **Ethereum registry entry:** second chain wired (via deploy secrets / planned
-  `CHAIN_ETHEREUM_*` env -- the shape is documented in `.env.secrets.example`
-  and the SPEC.md Multi-chain section). A live asset whose network has no
-  registry entry **aborts startup** (the process exits with a
-  `network ethereum is not configured` error in the failure chain) -- there is
-  no running-but-degraded state to grep for; if the service is up, this check
-  passed.
-- **Signing backend:** exactly one of Turnkey (`TURNKEY_ORG_ID`,
-  `TURNKEY_API_PRIVATE_KEY`, `TURNKEY_ADDRESS`) or local dev (`EVM_PRIVATE_KEY`)
-  — see `src/wallet/mod.rs` and `.env.secrets.example`. The bot address must be
-  permissioned to sign burns on **both** chains.
-- **Bot wallet** funded with native gas on **both** chains.
+For production, the Base-only Turnkey validation and soak must also be complete
+before RAI-1508 starts. Stop if the pinned revisions, active signer address,
+Ethereum vault/token addresses, canary symbol, or bounded quantity are not
+recorded and independently checked.
 
-Record the chain B vault address from
-[RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) deploy output -- needed
-for asset registration below.
+### Privileged operator handoff
 
-## 2. Preflight (issuance HTTP)
+The remaining work is operational, not a request to repair repository docs or
+implement another mint path. The operator executing this runbook needs access
+to:
 
-From a host that can reach staging with the internal API key. The preflight,
-register, and verify commands all hit `InternalAuth` endpoints, which require
-**both** a valid `X-API-KEY` **and** a client IP inside `INTERNAL_IP_RANGES`
-(default: localhost + Docker ranges only) -- a whitelisted key from a
-non-whitelisted host gets **403**, which the script reports as an unexpected
-status. Run from the staging host itself or a bastion whose IP is in
-`INTERNAL_IP_RANGES`:
+- the Ethereum Safe/Turnkey policy and role-grant evidence in RAI-1102;
+- the deployment environment and service lifecycle;
+- a consistent issuer database backup/restore mechanism;
+- the internal issuer API from an allowlisted host;
+- the Alpaca-authorized token-list endpoint and the liquidity operator CLI;
+- Base and Ethereum chain explorers/RPC evidence.
+
+That operator owns the ordered execution below and attaches only sanitized
+identifiers and evidence to Linear. Never paste API keys, signing material, or
+secret file contents into Linear, logs, or the handoff.
+
+The old RAI-1212 freeze-guard gate does not apply. The detail endpoint requires
+`?network=`, but `GET /tokenized-assets/{underlying}/status` remains
+underlying-scoped and has no network query parameter.
+
+## 1. Configure and validate the Ethereum runtime
+
+A second runtime is supported by the merged environment parser. Configure all
+four fields as one complete group:
+
+- `CHAIN_ETHEREUM_RPC_URL`
+- `CHAIN_ETHEREUM_CHAIN_ID=1`
+- `CHAIN_ETHEREUM_SUBGRAPH_URL`
+- `CHAIN_ETHEREUM_BACKFILL_START_BLOCK`
+
+Supplying only part of the group fails startup. The grouped Base form
+(`CHAIN_BASE_*`) overrides the legacy flat Base variables when both are present;
+never mix individual values from the two forms. The deployment unit runs the
+shipped `validate-config` binary against the exact decrypted environment before
+it allows a restart; preserve that gate rather than validating a reconstructed
+shell environment.
+
+Before restart, record:
+
+- pinned issuer revision and deployment identifier;
+- active Turnkey address;
+- Base and Ethereum chain IDs;
+- Ethereum vault and token addresses;
+- Ethereum backfill start block, set close enough to activation to avoid an
+  unintended historical scan while still covering registration/canary blocks;
+- pre-activation Base balances, checkpoints, `/admin/stuck`, and wallet nonce;
+- a consistent database backup identifier.
+
+Restart exactly one issuer instance. Runtime construction queries each RPC and
+rejects a chain ID that differs from the configured Base `8453` or Ethereum `1`;
+a failed start is a hard stop. Independently record the configured and
+RPC-reported IDs because the startup `Chain runtime configured` INFO line
+currently identifies Base only. A signer, role, RPC, or subgraph mismatch is
+also a hard stop.
+
+## 2. Issuance HTTP preflight
+
+Run from the deployment host or a bastion included in `INTERNAL_IP_RANGES`.
+Internal endpoints require both `X-API-KEY` and an allowed client IP.
 
 ```bash
-export ISSUER_BASE_URL=https://staging-issuance.example   # adjust
-export ISSUER_API_KEY=...                                   # internal key
+export ISSUER_BASE_URL=https://staging-issuance.example   # deployment URL
+export ISSUER_API_KEY=...                                 # internal key
+export STAGING_UNDERLYING=RKLB                            # agreed canary
+
 ./scripts/multichain-staging-smoke.nu preflight
-# If the execute bit is missing on the checkout, invoke through nu instead:
+# If the checkout has no execute bit:
 # nu ./scripts/multichain-staging-smoke.nu preflight
 ```
 
-Expect:
+The preflight verifies the current contracts:
 
-- `GET .../status?network=base` -> **200** for a known Base asset (**404** if
-  staging has no Base asset registered -- the script accepts either).
-- `GET .../status` without `?network=` -> **422**.
-- `GET .../status?network=ethereum` -> **200** or **404** (404 before
-  registration).
+- Base detail with `?network=base` returns 200 or 404;
+- detail without `?network=` returns 422;
+- Ethereum detail with `?network=ethereum` returns 200 or 404;
+- underlying freeze status without `?network=` returns 200 or 404.
 
-## 3. Base parity smoke
+A 403 means the key or source IP is not authorized. Any other status is a hard
+stop.
 
-Before exercising chain B, confirm Base-only behaviour is unchanged:
+## 3. Base parity canary
 
-1. Alpaca sandbox **mint on `base`** for an existing asset (e.g. smoke symbol
-   used in staging today).
-2. Confirm journal -> on-chain mint -> callback completes (existing monitoring).
-3. Optional: sandbox **redeem on `base`** and verify burn on Base.
+Before registering Ethereum, run the already-approved bounded Base canary on
+the pinned artifact. Confirm:
 
-If Base regresses, stop -- do not proceed to chain B.
+1. exactly one Base mint transaction and callback;
+2. expected Base balance delta;
+3. no Ethereum transaction or balance change; the configured Ethereum poller
+   remains healthy but has no Ethereum asset to act on yet;
+4. no unexplained `/admin/stuck` entry.
 
-## 4. Register chain B asset
+If Base regresses, stop. Do not register the Ethereum asset.
 
-**Do not register before the Ethereum chain config is live** (section 1
-checklist complete). `POST /tokenized-assets` rejects an unconfigured `network`
-with **422** before any event is written (`ConfiguredNetworks` guard in
-`src/tokenized_asset/api.rs`), so a failed registration attempt leaves nothing
-to remediate. Once config is present and registration succeeds, the
-`TokenizedAsset` is persisted immediately; on the next process start, startup
-validation requires every live asset's network to have a registry entry.
+## 4. Register the Ethereum asset
 
-**Back up the staging database first.** A successful registration is the first
-irreversible step of this runbook (see "If validation fails" below): copy the
-SQLite file (e.g. `cp issuance.db issuance.db.pre-chain-b`) while the service is
-stopped or idle, so a full back-out stays possible.
+Registration is the first persistent step. `POST /tokenized-assets` rejects an
+unconfigured network with 422 before writing an event, but a successful
+registration persists immediately and makes the Ethereum runtime mandatory on
+subsequent starts.
 
-Register the RAI-1095 vault on `ethereum` (replace symbols / vault):
+With the service idle and the database backup recorded:
 
 ```bash
-export STAGING_UNDERLYING=TSLA
-export STAGING_TOKEN=tTSLA
-export STAGING_ETHEREUM_VAULT=0x...   # chain B vault from RAI-1095
+export STAGING_UNDERLYING=RKLB
+export STAGING_TOKEN=tRKLB
+export STAGING_ETHEREUM_VAULT=0x...   # verified Ethereum vault
 
 ./scripts/multichain-staging-smoke.nu register-ethereum-asset
 ./scripts/multichain-staging-smoke.nu verify-ethereum-asset
 ```
 
-Optionally, from an Alpaca-whitelisted IP, run
-`./scripts/multichain-staging-smoke.nu verify-token-list` to confirm ITN list
-merge (`networks[]` includes `ethereum` for the test row).
+From an Alpaca-authorized source IP, also run:
 
-**Then restart the issuance service before proceeding.** Transfer pollers are
-spawned once at startup, per network that has at least one live listing on that
-network at boot (`list_enabled_assets` — same set startup validation walks;
-underlying freeze does not remove a listing from this set, so a frozen-only
-network still gets a poller and still blocks boot if unconfigured). The ethereum
-asset did not exist when the service came up, so no ethereum poller is running
-and the redeem in section 6 would never be detected. After the restart, confirm
-the startup log shows `Spawning transfer poller for network` with
-`network=ethereum`. Note the checkpoint behaviour: a first-ever ethereum poll
-has no `transfer_poll:ethereum` checkpoint and starts scanning from that chain's
-`backfill_start_block`, so set it near the current head block to avoid a long
-historic scan.
+```bash
+./scripts/multichain-staging-smoke.nu verify-token-list
+```
 
-## 5. Alpaca sandbox mint on `ethereum`
+The token-list row must include `ethereum` in `networks[]`.
 
-This step is **Alpaca-driven** -- issuance receives ITN callbacks; you do not
-POST mint initiate yourself.
+Restart exactly one issuer instance after registration. The transfer poller and
+periodic receipt backfill already re-read runtime-added assets, but this explicit
+restart forces the new vault through startup receipt backfill, reconciliation,
+and live-network validation before a canary can write to it. Confirm startup
+logs contain `Spawning dynamic transfer poller for network` with
+`network=ethereum`, and confirm the Ethereum vault's receipt-backfill checkpoint
+has initialized or advanced before any redemption test.
 
-1. In Alpaca sandbox, start a tokenization **mint** with `"network": "ethereum"`
-   for the registered `(underlying, token)`.
-2. Watch issuance logs for the mint progressing through submit, confirm, and
-   callback (entries carry the `issuer_request_id`). The mint path does not log
-   a `network` field, so the routing proof is the on-chain check below.
-3. Verify on-chain: share balance increased on the **Ethereum** vault
-   (Etherscan), not Base. This is the authoritative wrong-chain check.
-4. Confirm Alpaca received a successful mint callback.
+## 5. Bounded Ethereum mint canary
 
-Failure modes:
+Use the merged liquidity operator CLI. Ethereum requires the explicit token
+address because the liquidity config holds Base token addresses.
 
-| Symptom                       | Likely cause                                                 |
-| ----------------------------- | ------------------------------------------------------------ |
-| Mint stuck in `MintingFailed` | Wrong-chain RPC, signer misconfiguration, or gas on Ethereum |
-| Callback never sent           | Alpaca API error -- check issuance `alpaca` logs             |
-| Shares on wrong chain         | Registry misconfiguration -- see RAI-1206                    |
+```bash
+nix run .#st0x-cli -- \
+  --config <config-path> \
+  --secrets <secrets-path> \
+  alpaca-tokenize \
+  --symbol RKLB \
+  --quantity <approved-bounded-quantity> \
+  --network ethereum \
+  --token <ethereum-token-address>
+```
 
-Use `GET /admin/stuck` (see [`ops-recovery-guide.md`](../ops-recovery-guide.md))
-if a mint does not reach a terminal state.
+The CLI generates one issuer request ID and preserves it across bounded Alpaca
+backpressure retries. Do not start a second command while the first request is
+pending.
 
-## 6. Alpaca sandbox redeem on `ethereum`
+Record and verify all of the following:
 
-1. Ensure the test wallet holds chain B shares from step 5.
-2. In Alpaca sandbox, initiate **redeem** with `"network": "ethereum"`.
-3. User sends shares to the bot wallet on the **Ethereum** vault (Alpaca flow).
-4. Watch issuance logs:
-   - The post-registration restart (section 4) logged
-     `Spawning transfer poller for network` with `network=ethereum` at startup.
-   - Successful detection logs `Redemption transfer detected` with
-     `issuer_request_id` (the value is the tx hash; the field name is not
-     `tx_hash`) and `from`.
-   - `Alpaca redeem API call succeeded` carries `network=ethereum`.
-   - Burn submits on Ethereum RPC via the Turnkey/local signer, not Base —
-     confirmed by the on-chain balance check below.
-5. Confirm Alpaca redeem completes and on-chain balance decreased on Ethereum.
+1. CLI output reports `Network: Ethereum`, the expected token, receiving wallet,
+   request ID, and final Alpaca status.
+2. Issuer logs show the same request progressing through mint intent, submit,
+   confirmation, and callback exactly once.
+3. Ethereum shows exactly one expected vault transaction and the expected share
+   balance increase at the receiving wallet.
+4. Base shows no corresponding transaction or balance change.
+5. `/admin/stuck` has no new unexplained entry.
 
-## If validation fails
+The Ethereum transaction and Base non-event are the authoritative routing proof.
+A callback alone is insufficient.
 
-- **Stuck mint or redemption:** use `GET /admin/stuck` and the recovery
-  endpoints per [`ops-recovery-guide.md`](../ops-recovery-guide.md). Recovery
-  routes by the aggregate's persisted `network`, so recovering a chain B
-  aggregate acts on chain B — it cannot touch Base state.
-- **Retrying:** no de-registration is needed. `register-ethereum-asset` GETs the
-  asset first and skips POST when token/vault/network already match; it aborts
-  on mismatch (a different vault emits `VaultAddressUpdated` on re-POST, and
-  token typos are not compared server-side). A failed mint/redeem can be
-  re-driven after recovery without touching the asset.
-- **Do not remove the `CHAIN_ETHEREUM_*` config while the ethereum asset
-  exists.** There is no de-listing command, and freezing does not help: startup
-  validation checks every live asset — frozen included — against the registry,
-  so pulling the chain config after registration leaves the host unable to boot
-  (the premature-registration warning in section 4 applies in reverse).
-- **Full back-out:** stop the service, restore the database from the
-  pre-registration backup taken in section 4, and only then remove the chain B
-  config. This is the only supported way to unwind the registration itself.
+## 6. Bounded Ethereum redemption canary
 
-## 7. Close-out checklist (RAI-1210 done)
+Only continue after the mint canary is reconciled and the Ethereum poller is
+confirmed running.
 
-- [ ] Preflight script green on staging.
-- [ ] Base parity mint (and optionally redeem) unchanged.
-- [ ] Chain B asset registered; ITN list shows expected `networks[]`.
-- [ ] Alpaca sandbox mint on `ethereum` completed end-to-end.
-- [ ] Alpaca sandbox redeem on `ethereum` completed end-to-end.
-- [ ] No stuck mints/redemptions (`/admin/stuck` empty or explained).
-- [ ] Linear [RAI-1210](https://linear.app/makeitrain/issue/RAI-1210) updated
-      with date, staging host, and test asset symbols.
-- [ ] Umbrella [RAI-1098](https://linear.app/makeitrain/issue/RAI-1098) and gate
-      [RAI-1200](https://linear.app/makeitrain/issue/RAI-1200) closed with PR
-      links once all MVP success criteria on RAI-1098 are met.
+```bash
+nix run .#st0x-cli -- \
+  --config <config-path> \
+  --secrets <secrets-path> \
+  alpaca-redeem \
+  --symbol RKLB \
+  --quantity <approved-bounded-quantity> \
+  --network ethereum \
+  --token <ethereum-token-address>
+```
+
+Verify:
+
+1. the CLI sends the token from the Ethereum wallet and records the transfer
+   hash;
+2. issuer logs detect that transfer and report the Alpaca redeem call with
+   `network=ethereum`;
+3. exactly one Ethereum burn completes and the expected balance decreases;
+4. Base remains unchanged;
+5. Alpaca reaches the completed state and `/admin/stuck` remains explained.
+
+Do not retry the raw token transfer automatically. It has no issuer-side
+idempotency key; resolve an ambiguous submission from chain evidence first.
+
+## Failure and back-out
+
+- **Before Ethereum asset registration:** remove the incomplete Ethereum group,
+  fix the gate, and restart Base-only.
+- **After registration but before any Ethereum write:** stop the service,
+  restore the pre-registration database backup, then remove the Ethereum group.
+- **After any Ethereum mint/redeem write:** do not restore the old database or
+  remove the Ethereum group. Stop new traffic, preserve request/transaction
+  evidence, and roll forward. Restoring pre-write state can duplicate financial
+  side effects.
+- **Stuck aggregate:** use `/admin/stuck` and
+  [`ops-recovery-guide.md`](../ops-recovery-guide.md). Recovery routes by the
+  aggregate's persisted network; never substitute Base.
+- **Registration rerun:** the helper skips an exact existing token/vault/network
+  match and aborts on mismatch. Investigate mismatches; do not overwrite them.
+
+## Close-out evidence
+
+Attach the following to the issue that was actually executed:
+
+- deployment environment, date, pinned revisions, and canary symbol/quantity;
+- active signer, Ethereum vault/token, and verified role-grant references;
+- pre/post Base and Ethereum balances, checkpoints, and `/admin/stuck` output;
+- mint and redemption request IDs, transaction hashes, and callback outcomes;
+- confirmation that each side effect occurred exactly once and only on
+  Ethereum;
+- operator sign-off.
+
+Close staging [RAI-1210](https://linear.app/makeitrain/issue/RAI-1210) only
+after the sandbox mint and redemption were actually executed. Close production
+[RAI-1508](https://linear.app/makeitrain/issue/RAI-1508) only after activation,
+Base-isolation checks, receipt backfill, mint, and redemption are complete.
+Do not mark either issue done merely because this runbook or a supporting PR
+merged.
 
 ## References
 
-- [`docs/ops-recovery-guide.md`](../ops-recovery-guide.md) -- stuck tx recovery
-- [`tokenized-asset-aggregate-rekey.md`](tokenized-asset-aggregate-rekey.md) --
-  DB cutover before multichain deploy
+- [RAI-1098](https://linear.app/makeitrain/issue/RAI-1098) — issuance
+  multichain umbrella
+- [RAI-1213](https://linear.app/makeitrain/issue/RAI-1213) — broader CLI
+  inventory tooling; wrapping remains separate from these mint/redeem canaries
+- [`docs/ops-recovery-guide.md`](../ops-recovery-guide.md) — stuck transaction
+  recovery
+- [`tokenized-asset-aggregate-rekey.md`](tokenized-asset-aggregate-rekey.md) —
+  database cutover/rollback rules

@@ -15,11 +15,19 @@ def api-key []: nothing -> string {
 }
 
 def staging-underlying []: nothing -> string {
-    $env.STAGING_UNDERLYING? | default "TSLA"
+    let underlying = $env.STAGING_UNDERLYING?
+    if $underlying == null {
+        error make {msg: "set STAGING_UNDERLYING to the approved canary symbol"}
+    }
+    $underlying
 }
 
 def staging-token []: nothing -> string {
-    $env.STAGING_TOKEN? | default "tTSLA"
+    let token = $env.STAGING_TOKEN?
+    if $token == null {
+        error make {msg: "set STAGING_TOKEN to the approved canary token symbol"}
+    }
+    $token
 }
 
 def auth-headers []: nothing -> list<string> {
@@ -33,45 +41,53 @@ def fetch-status [url: string]: nothing -> int {
     ).status
 }
 
-# HTTP checks for the ?network= contract.
+# HTTP checks for network-keyed detail and underlying-keyed freeze status.
 def "main preflight" [] {
     let base = (base-url)
     let underlying = (staging-underlying)
     print $"== Preflight: ($base) =="
 
-    let status_base = (
-        fetch-status $"($base)/tokenized-assets/($underlying)/status?network=base"
+    let detail_base = (
+        fetch-status $"($base)/tokenized-assets/($underlying)?network=base"
     )
-    print $"GET .../status?network=base -> ($status_base) \(expect 200 or 404\)"
-    if $status_base not-in [200 404] {
-        error make {msg: "unexpected status for base network query"}
+    print $"GET ...?network=base -> ($detail_base) \(expect 200 or 404\)"
+    if $detail_base not-in [200 404] {
+        error make {msg: "unexpected status for Base detail query"}
     }
 
-    let status_missing = (
+    let detail_missing = (
+        fetch-status $"($base)/tokenized-assets/($underlying)"
+    )
+    print $"GET detail without ?network= -> ($detail_missing) \(expect 422\)"
+    if $detail_missing != 422 {
+        error make {msg: "detail query without ?network= must return 422"}
+    }
+
+    let detail_ethereum = (
+        fetch-status $"($base)/tokenized-assets/($underlying)?network=ethereum"
+    )
+    print $"GET ...?network=ethereum -> ($detail_ethereum) \(expect 200 or 404\)"
+    if $detail_ethereum not-in [200 404] {
+        error make {msg: "unexpected status for Ethereum detail query"}
+    }
+
+    let freeze_status = (
         fetch-status $"($base)/tokenized-assets/($underlying)/status"
     )
-    print $"GET .../status \(no ?network=\) -> ($status_missing) \(expect 422\)"
-    if $status_missing != 422 {
-        error make {msg: "missing ?network= must return 422"}
-    }
-
-    let status_eth = (
-        fetch-status $"($base)/tokenized-assets/($underlying)/status?network=ethereum"
-    )
-    print $"GET .../status?network=ethereum -> ($status_eth) \(expect 200 or 404\)"
-    if $status_eth not-in [200 404] {
-        error make {msg: "unexpected status for ethereum network query"}
+    print $"GET .../status -> ($freeze_status) \(expect 200 or 404\)"
+    if $freeze_status not-in [200 404] {
+        error make {msg: "unexpected status for underlying freeze-status query"}
     }
 
     print "Preflight OK"
 }
 
-# POST the chain B vault (needs STAGING_ETHEREUM_VAULT). GETs first and skips
+# POST the Ethereum vault (needs STAGING_ETHEREUM_VAULT). GETs first and skips
 # POST when token/vault/network already match; aborts on mismatch.
 def "main register-ethereum-asset" [] {
     let vault = $env.STAGING_ETHEREUM_VAULT?
     if $vault == null {
-        error make {msg: "set STAGING_ETHEREUM_VAULT to the chain B vault address"}
+        error make {msg: "set STAGING_ETHEREUM_VAULT to the approved Ethereum vault address"}
     }
 
     let base = (base-url)
@@ -87,11 +103,11 @@ def "main register-ethereum-asset" [] {
 
     if $existing.status == 200 {
         let body = $existing.body
-        let registered_vault = ($body.vault? | default "" | str downcase)
+        let registered_vault = ($body.vault? | default "" | str lowercase)
         let registered_token = ($body.token? | default "")
         let registered_network = ($body.network? | default "")
 
-        if $registered_vault != ($vault | str downcase) {
+        if $registered_vault != ($vault | str lowercase) {
             error make {
                 msg: $"ethereum asset already registered with vault ($registered_vault), refusing ($vault)"
             }
@@ -144,12 +160,12 @@ def "main register-ethereum-asset" [] {
 def "main verify-ethereum-asset" [] {
     let vault = $env.STAGING_ETHEREUM_VAULT?
     if $vault == null {
-        error make {msg: "set STAGING_ETHEREUM_VAULT to the chain B vault address"}
+        error make {msg: "set STAGING_ETHEREUM_VAULT to the approved Ethereum vault address"}
     }
 
     let base = (base-url)
     let underlying = (staging-underlying)
-    print "== Verify chain B asset registered =="
+    print "== Verify Ethereum asset registered =="
 
     let response = (
         http get --headers (auth-headers) --full --allow-errors
@@ -163,8 +179,8 @@ def "main verify-ethereum-asset" [] {
         }
     }
 
-    let registered_vault = ($response.body.vault? | default "" | str downcase)
-    if $registered_vault != ($vault | str downcase) {
+    let registered_vault = ($response.body.vault? | default "" | str lowercase)
+    if $registered_vault != ($vault | str lowercase) {
         error make {
             msg: $"registered vault ($registered_vault) does not match STAGING_ETHEREUM_VAULT ($vault)"
         }
@@ -232,8 +248,9 @@ def main [] {
     print -e "Usage: multichain-staging-smoke.nu <command>
 
 Commands:
-  preflight                 HTTP checks for the ?network= contract
-  register-ethereum-asset   POST chain B vault after GET pre-check (needs
+  preflight                 HTTP checks for network-keyed detail and
+                            underlying-keyed freeze status
+  register-ethereum-asset   POST Ethereum vault after GET pre-check (needs
                             STAGING_ETHEREUM_VAULT)
   verify-ethereum-asset     GET internal detail ?network=ethereum and check
                             token and vault (needs STAGING_ETHEREUM_VAULT)
@@ -242,8 +259,8 @@ Commands:
 Environment:
   ISSUER_BASE_URL           default http://localhost:8000
   ISSUER_API_KEY            required
-  STAGING_UNDERLYING        default TSLA
-  STAGING_TOKEN             default tTSLA
+  STAGING_UNDERLYING        required approved canary symbol
+  STAGING_TOKEN             required approved canary token symbol
   STAGING_ETHEREUM_VAULT    required for register/verify-ethereum-asset"
     exit 1
 }
