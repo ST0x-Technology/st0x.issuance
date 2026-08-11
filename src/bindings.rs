@@ -49,3 +49,17 @@ sol!(
     IERC1271,
     env!("IERC1271_ABI")
 );
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    IERC165,
+    env!("IERC165_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    IERC1155Receiver,
+    env!("IERC1155_RECEIVER_ABI")
+);

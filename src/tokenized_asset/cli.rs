@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Parser, Subcommand};
 use event_sorcery::{
@@ -27,6 +27,10 @@ use crate::config::{
     VaultMode, VaultModeConfig, load_vault_mode_config, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
+use crate::receipt_inventory::migration::{
+    CorroboratedRecipient, MigrationOutcome, VaultIdentity,
+    confirm_custody_holder, migrate_vault_receipts, tracked_receipt_count,
+};
 use crate::redemption::IssuerRedemptionRequestId;
 use crate::redemption::force_complete::{
     VerifiedCompletion, ensure_burn_unclaimed, landed_burn_evidence,
@@ -126,6 +130,31 @@ enum IssuerCommand {
     /// touch the operator's database — connecting runs any pending
     /// migrations and projection catch-up before the vault lookup.
     VerifyOrchestratorSigning(Box<VerifyOrchestratorSigningArgs>),
+    /// Moves one vault's tracked deposit receipts to a corroborated
+    /// destination through the Turnkey signer, driving the receipt-moving
+    /// engine (quiescence gates, tracked-vs-chain agreement, per-identifier
+    /// gain verification, idempotent re-runs). The destination is stated by
+    /// exactly one of --to-configured-orchestrator (read from the config,
+    /// never typed — the cutover path) or --to <ADDRESS> (the
+    /// wallet-rotation path); either way it only becomes reachable through
+    /// the kind-aware corroboration witness (EOA: on-chain history;
+    /// contract: proven ERC-1155 receiver support). Requires the deployment
+    /// hold armed and the service stopped (docs/runbooks/deploy-hold.md),
+    /// and the bot wallet funded for the transfer gas.
+    MoveReceipts(Box<MoveReceiptsArgs>),
+    /// Verifies on-chain that the Turnkey bot wallet holds exactly every
+    /// tracked receipt balance for the asset's vault, then records it as
+    /// the inventory's custody holder. The rollback counterpart of
+    /// move-receipts: after an EMERGENCY_ROLE withdrawReceipt returns a
+    /// token's receipts to the bot wallet, recorded custody still names the
+    /// old destination and reconciliation stays skipped until this
+    /// re-confirmation. The holder is always the Turnkey wallet — never
+    /// typed — and cannot be recorded wrongly: a wallet that does not hold
+    /// every tracked balance is refused with the first mismatch. Requires
+    /// the deployment hold armed and the service stopped
+    /// (docs/runbooks/deploy-hold.md); signs nothing and submits nothing
+    /// on-chain.
+    ConfirmCustody(Box<ConfirmCustodyArgs>),
 }
 
 #[derive(Args)]
@@ -318,6 +347,110 @@ struct VerifyOrchestratorSigningArgs {
     database_max_connections: u32,
 }
 
+/// Exactly one destination statement, enforced by clap: every field is a
+/// member of one required, mutually exclusive group.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct MoveDestination {
+    /// Explicit destination address — the wallet-rotation path. Refused if
+    /// it names the configured [orchestrator].address: the cutover path
+    /// must read the orchestrator from the config, never a typed address.
+    #[arg(long)]
+    to: Option<Address>,
+
+    /// Read the destination from [orchestrator].address in --config — the
+    /// cutover path, keeping the orchestrator address never-typed.
+    #[arg(long)]
+    to_configured_orchestrator: bool,
+}
+
+#[derive(Args)]
+struct MoveReceiptsArgs {
+    /// Underlying symbol whose vault's receipts move, e.g. RKLB.
+    /// Upper-cased like [`AssetArgs`].
+    #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
+    underlying: UnderlyingSymbol,
+
+    #[clap(flatten)]
+    destination: MoveDestination,
+
+    /// TOML config file; its `[orchestrator].address` is the only source of
+    /// the orchestrator address, matching what the deployed service
+    /// resolves.
+    #[arg(long, env = "CONFIG")]
+    config: PathBuf,
+
+    /// Network whose vault the receipts move on.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against, cross-checked against the chain the RPC
+    /// reports.
+    #[arg(long)]
+    chain_id: u64,
+
+    #[clap(flatten)]
+    signer: SignerEnv,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
+#[derive(Args)]
+struct ConfirmCustodyArgs {
+    /// Underlying symbol whose vault's custody is confirmed, e.g. RKLB.
+    /// Upper-cased like [`AssetArgs`].
+    #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
+    underlying: UnderlyingSymbol,
+
+    /// Network whose vault the custody is confirmed on.
+    #[arg(long, value_parser = Network::from_str)]
+    network: Network,
+
+    /// RPC endpoint for the network — the service's own `RPC_URL`.
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Url,
+
+    /// Chain this must run against, cross-checked against the chain the RPC
+    /// reports.
+    #[arg(long)]
+    chain_id: u64,
+
+    #[clap(flatten)]
+    signer: SignerEnv,
+
+    #[arg(
+        long = "database-url",
+        env = "DATABASE_URL",
+        default_value = DEFAULT_DATABASE_URL,
+        value_parser = parse_sqlite_url
+    )]
+    database_url: String,
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    database_max_connections: u32,
+}
+
 #[derive(Args)]
 struct AssetArgs {
     /// Underlying symbol, e.g. SGOV. Upper-cased so `"sgov"` resolves to the
@@ -367,6 +500,22 @@ impl IssuerCli {
             }
             IssuerCommand::VerifyOrchestratorSigning(args) => {
                 run_verify_orchestrator_signing(*args).await
+            }
+            IssuerCommand::MoveReceipts(args) => {
+                run_move_receipts(
+                    *args,
+                    Path::new(DEPLOY_RUNTIME_DIR),
+                    prompt_confirm,
+                )
+                .await
+            }
+            IssuerCommand::ConfirmCustody(args) => {
+                run_confirm_custody(
+                    *args,
+                    Path::new(DEPLOY_RUNTIME_DIR),
+                    prompt_confirm,
+                )
+                .await
             }
         }
     }
@@ -696,6 +845,276 @@ async fn run_verify_orchestrator_signing(
         proofs.len(),
         args.underlying
     );
+
+    Ok(())
+}
+
+/// The runtime directory of the deploy-hold protocol
+/// (docs/runbooks/deploy-hold.md); [`run_move_receipts`] verifies the hold
+/// there before an irreversible custody move.
+const DEPLOY_RUNTIME_DIR: &str = "/run/st0x";
+const DEPLOY_HOLD_FILE: &str = "st0x-issuance.hold";
+const DEPLOY_READY_FILE: &str = "st0x-issuance.ready";
+
+/// Gas ceiling for one receipt-batch transfer, used only to fail the move
+/// actionably BEFORE corroboration and prompting when the bot wallet cannot
+/// pay for it. Deliberately a generous upper bound for the engine's
+/// 14-receipt batch cap — a transfer that somehow needed more would fail at
+/// submission with the engine's own error, not silently proceed.
+const MOVE_RECEIPTS_GAS_CEILING: u64 = 3_000_000;
+
+/// Moves one vault's tracked receipts to a corroborated destination through
+/// the Turnkey signer. Everything outside the engine happens here, in order:
+/// destination resolution (config-read or stated, never a typed orchestrator
+/// address), the Turnkey-only signer requirement, the deploy-hold check, gas
+/// readiness, kind-aware destination corroboration, and the confirmation
+/// prompt stating what was proven. The engine then re-verifies identity,
+/// custody, quiescence, and balances before anything is submitted.
+async fn run_move_receipts(
+    args: MoveReceiptsArgs,
+    runtime_dir: &Path,
+    confirm: impl Fn(&str) -> io::Result<bool>,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    let configured_orchestrator =
+        load_vault_mode_config(&args.config)?.orchestrator_address();
+    let destination = match (
+        args.destination.to,
+        args.destination.to_configured_orchestrator,
+    ) {
+        (None, true) => configured_orchestrator.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no [orchestrator].address to move receipts to; add \
+                 the section, or state a wallet destination with --to",
+                args.config.display()
+            )
+        })?,
+        (Some(stated), false) => {
+            if configured_orchestrator == Some(stated) {
+                anyhow::bail!(
+                    "--to {stated} is the configured [orchestrator].address; \
+                     use --to-configured-orchestrator so the cutover \
+                     destination is read from {}, never typed",
+                    args.config.display()
+                );
+            }
+            stated
+        }
+        // Unreachable through clap (the destination group is required and
+        // mutually exclusive), but a refusal keeps this total without a
+        // panic path.
+        _ => anyhow::bail!(
+            "state exactly one destination: --to <ADDRESS> or \
+             --to-configured-orchestrator"
+        ),
+    };
+
+    let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
+    else {
+        anyhow::bail!(
+            "move-receipts requires the Turnkey signer configuration"
+        );
+    };
+    let bot = turnkey_config.settings.address;
+
+    verify_deploy_hold(runtime_dir)?;
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+    let vault = find_vault(&admin.pool, &args.underlying, &args.network)
+        .await?
+        .ok_or_else(|| AssetAdminError::NotFound {
+            underlying: args.underlying.clone(),
+        })?;
+
+    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let resolved = resolve_turnkey_signer(&turnkey_config, chain_id)?;
+    let provider = ProviderBuilder::new()
+        .with_chain_id(chain_id)
+        .wallet(resolved.wallet)
+        .connect(args.rpc_url.as_str())
+        .await?;
+
+    verify_gas_readiness(&provider, bot).await?;
+
+    let recipient =
+        CorroboratedRecipient::verify(&provider, bot, destination).await?;
+    let identity = VaultIdentity::verify(
+        &admin.pool,
+        &provider,
+        args.network,
+        chain_id,
+        vault,
+        &args.underlying,
+    )
+    .await?;
+    let receipts = tracked_receipt_count(&admin.pool, chain_id, vault).await?;
+
+    if !confirm(&format!(
+        "Move {receipts} tracked receipt(s) of {} vault {vault} from Turnkey \
+         wallet {bot} to {destination} ({})?",
+        args.underlying,
+        recipient.kind(),
+    ))? {
+        anyhow::bail!("aborted by operator");
+    }
+
+    match migrate_vault_receipts(&admin.pool, provider, identity, recipient)
+        .await?
+    {
+        MigrationOutcome::Migrated { transaction, receipts } => println!(
+            "Moved {receipts} receipt(s) of {} vault {vault} to \
+             {destination} in {transaction}.",
+            args.underlying
+        ),
+        MigrationOutcome::AlreadyMigrated { receipts } => println!(
+            "Already migrated: {destination} holds all {receipts} tracked \
+             receipt(s) of {} vault {vault}; nothing was submitted.",
+            args.underlying
+        ),
+    }
+
+    Ok(())
+}
+
+/// Verifies the deploy hold is armed: hold file present, readiness marker
+/// absent. The engine rebuilds projections and reads quiescence from the
+/// same store the service writes, so a running service — or a deploy that
+/// could restart one mid-move — must be excluded before an irreversible
+/// custody move. The file checks are the machine-checkable half of the
+/// protocol; stopping the unit is the runbook's job.
+fn verify_deploy_hold(runtime_dir: &Path) -> anyhow::Result<()> {
+    let hold = runtime_dir.join(DEPLOY_HOLD_FILE);
+    if !hold.exists() {
+        anyhow::bail!(
+            "deployment hold is not armed: {} does not exist; arm the hold \
+             and stop the service (docs/runbooks/deploy-hold.md) before \
+             moving receipts",
+            hold.display()
+        );
+    }
+
+    let ready = runtime_dir.join(DEPLOY_READY_FILE);
+    if ready.exists() {
+        anyhow::bail!(
+            "readiness marker {} still exists, so a deploy could restart the \
+             service mid-move; remove it when arming the hold \
+             (docs/runbooks/deploy-hold.md)",
+            ready.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Re-records the Turnkey bot wallet as a vault's custody holder after its
+/// receipts returned there (the `move-receipts` rollback path). Purely
+/// verify-and-record: the engine refuses unless the wallet holds exactly
+/// every tracked balance on-chain, and requires the same quiescence as a
+/// migration, so the checks here are only the ones outside the engine — the
+/// Turnkey-only holder source and the deploy hold. Nothing is signed, so no
+/// signing provider is built.
+async fn run_confirm_custody(
+    args: ConfirmCustodyArgs,
+    runtime_dir: &Path,
+    confirm: impl Fn(&str) -> io::Result<bool>,
+) -> anyhow::Result<()> {
+    if args.chain_id != args.network.chain_id() {
+        anyhow::bail!(
+            "--network {} is chain {} but --chain-id is {}",
+            args.network,
+            args.network.chain_id(),
+            args.chain_id
+        );
+    }
+
+    let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
+    else {
+        anyhow::bail!(
+            "confirm-custody requires the Turnkey signer configuration"
+        );
+    };
+    let bot = turnkey_config.settings.address;
+
+    verify_deploy_hold(runtime_dir)?;
+
+    println!("Using database: {}", args.database_url);
+    let admin =
+        AssetAdmin::connect(&args.database_url, args.database_max_connections)
+            .await?;
+    let vault = find_vault(&admin.pool, &args.underlying, &args.network)
+        .await?
+        .ok_or_else(|| AssetAdminError::NotFound {
+            underlying: args.underlying.clone(),
+        })?;
+
+    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let provider =
+        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+
+    let identity = VaultIdentity::verify(
+        &admin.pool,
+        &provider,
+        args.network,
+        chain_id,
+        vault,
+        &args.underlying,
+    )
+    .await?;
+    let receipts = tracked_receipt_count(&admin.pool, chain_id, vault).await?;
+
+    if !confirm(&format!(
+        "Confirm custody of {receipts} tracked receipt(s) of {} vault \
+         {vault} at Turnkey wallet {bot}? Recording only succeeds if the \
+         wallet holds every tracked balance on-chain.",
+        args.underlying
+    ))? {
+        anyhow::bail!("aborted by operator");
+    }
+
+    let confirmed =
+        confirm_custody_holder(&admin.pool, provider, identity, bot).await?;
+
+    println!(
+        "Confirmed custody of {confirmed} receipt(s) of {} vault {vault} at \
+         {bot}.",
+        args.underlying
+    );
+
+    Ok(())
+}
+
+/// Fails actionably when the bot wallet cannot pay for the transfer at the
+/// current gas price, before anything is corroborated or prompted.
+async fn verify_gas_readiness<P: Provider>(
+    provider: &P,
+    bot: Address,
+) -> anyhow::Result<()> {
+    let gas_price = provider.get_gas_price().await?;
+    let required = U256::from(gas_price)
+        .checked_mul(U256::from(MOVE_RECEIPTS_GAS_CEILING))
+        .ok_or_else(|| {
+            anyhow::anyhow!("gas price {gas_price} overflows the gas budget")
+        })?;
+    let balance = provider.get_balance(bot).await?;
+
+    if balance < required {
+        anyhow::bail!(
+            "bot wallet {bot} holds {balance} wei but the receipt transfer \
+             needs up to {required} wei at the current gas price \
+             ({gas_price}); fund the wallet before moving receipts"
+        );
+    }
 
     Ok(())
 }
@@ -1123,6 +1542,7 @@ fn parse_confirmation(input: &str) -> bool {
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::primitives::{U256, address, b256};
+    use alloy::providers::ext::AnvilApi;
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use cqrs_es::DomainEvent;
@@ -1959,6 +2379,41 @@ mod tests {
         );
     }
 
+    /// The gas gate's boundary is exact: a balance equal to the fixed
+    /// ceiling at the current gas price passes, one wei below it refuses
+    /// with the funding guidance.
+    #[tokio::test]
+    async fn gas_readiness_boundary_is_exact() {
+        let evm = LocalEvm::with_chain_id(8453).await.unwrap();
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let bot = address!("0x00000000000000000000000000000000000000d1");
+
+        let gas_price = provider.get_gas_price().await.unwrap();
+        let required =
+            U256::from(gas_price) * U256::from(MOVE_RECEIPTS_GAS_CEILING);
+
+        provider.anvil_set_balance(bot, required).await.unwrap();
+        verify_gas_readiness(&provider, bot)
+            .await
+            .expect("a balance equal to the ceiling must pass");
+
+        provider
+            .anvil_set_balance(bot, required - U256::from(1u8))
+            .await
+            .unwrap();
+        let error = verify_gas_readiness(&provider, bot).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fund the wallet before moving receipts"),
+            "one wei below the ceiling must refuse with funding guidance, \
+             got: {error}"
+        );
+    }
+
     /// The full preflight glue against a real orchestrator on Anvil: NOT
     /// READY (non-zero exit) while the approval is missing, READY after it is
     /// executed. Turnkey credentials are parse-only stand-ins — the preflight
@@ -2041,6 +2496,350 @@ mod tests {
         run_orchestrator_preflight(parse_args(&database_url))
             .await
             .expect("preflight must pass once the approval is unlimited");
+    }
+
+    fn move_receipts_args(
+        config_path: &str,
+        destination_flags: &[&str],
+        signer_flags: &[&str],
+    ) -> MoveReceiptsArgs {
+        let mut command_line = vec![
+            "issuer",
+            "move-receipts",
+            "rklb",
+            "--config",
+            config_path,
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--database-url",
+            "sqlite::memory:",
+        ];
+        command_line.extend_from_slice(destination_flags);
+        command_line.extend_from_slice(signer_flags);
+
+        let cli =
+            IssuerCli::try_parse_from(command_line).expect("arguments parse");
+        let IssuerCommand::MoveReceipts(args) = cli.command else {
+            panic!("expected the move-receipts subcommand")
+        };
+        *args
+    }
+
+    /// The destination group is clap-required and mutually exclusive:
+    /// stating none or both must fail at parse time, before any code runs.
+    #[test]
+    fn move_receipts_requires_exactly_one_destination() {
+        let base = [
+            "issuer",
+            "move-receipts",
+            "rklb",
+            "--config",
+            "issuance-config.toml",
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+        ];
+
+        let neither = IssuerCli::try_parse_from(base);
+        assert!(neither.is_err(), "a destination must be stated");
+
+        let both = IssuerCli::try_parse_from(base.iter().copied().chain([
+            "--to",
+            "0x00000000000000000000000000000000000000aa",
+            "--to-configured-orchestrator",
+        ]));
+        assert!(both.is_err(), "the two destination flags must conflict");
+
+        let stated = IssuerCli::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(["--to", "0x00000000000000000000000000000000000000aa"]),
+        );
+        assert!(stated.is_ok(), "--to alone must parse: {:?}", stated.err());
+
+        let configured = IssuerCli::try_parse_from(
+            base.iter().copied().chain(["--to-configured-orchestrator"]),
+        );
+        assert!(
+            configured.is_ok(),
+            "--to-configured-orchestrator alone must parse: {:?}",
+            configured.err()
+        );
+    }
+
+    /// A typed orchestrator address must be refused with the config-flag
+    /// alternative named, keeping the never-typed convention: the check runs
+    /// before the signer, hold, database, or network are touched — the
+    /// panicking confirm and unreachable RPC prove it.
+    #[tokio::test]
+    async fn move_receipts_refuses_a_typed_orchestrator_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = move_receipts_args(
+            config_path.to_str().unwrap(),
+            &["--to", "0x1234567890abcdef1234567890abcdef12345678"],
+            &TURNKEY_FLAGS,
+        );
+
+        let error = run_move_receipts(args, directory.path(), |_| {
+            panic!("must refuse the typed orchestrator before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("--to-configured-orchestrator"),
+            "the refusal must name the config-flag alternative, got {error}"
+        );
+    }
+
+    /// `--to-configured-orchestrator` against a config with no
+    /// `[orchestrator]` section must fail actionably, not guess.
+    #[tokio::test]
+    async fn move_receipts_refuses_a_dark_config_without_orchestrator() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("issuance-config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let args = move_receipts_args(
+            config_path.to_str().unwrap(),
+            &["--to-configured-orchestrator"],
+            &TURNKEY_FLAGS,
+        );
+
+        let error = run_move_receipts(args, directory.path(), |_| {
+            panic!("must refuse the missing section before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("[orchestrator].address"),
+            "the refusal must name the missing section, got {error}"
+        );
+    }
+
+    /// The receipts move from the production Turnkey wallet — the recorded
+    /// custody holder — so a local key is refused outright.
+    #[tokio::test]
+    async fn move_receipts_refuses_a_non_turnkey_signer() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = move_receipts_args(
+            config_path.to_str().unwrap(),
+            &["--to", "0x00000000000000000000000000000000000000aa"],
+            &["--evm-private-key", TEST_SIGNER_KEY],
+        );
+
+        let error = run_move_receipts(args, directory.path(), |_| {
+            panic!("must refuse the signer before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Turnkey signer configuration"),
+            "the refusal must name the Turnkey requirement, got {error}"
+        );
+    }
+
+    /// An un-armed hold means the service may be running (or a deploy may
+    /// restart it), racing the engine's projection rebuilds — refused before
+    /// the database or network are touched.
+    #[tokio::test]
+    async fn move_receipts_refuses_when_the_hold_is_not_armed() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let args = move_receipts_args(
+            config_path.to_str().unwrap(),
+            &["--to", "0x00000000000000000000000000000000000000aa"],
+            &TURNKEY_FLAGS,
+        );
+
+        let error = run_move_receipts(args, directory.path(), |_| {
+            panic!("must refuse the un-armed hold before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("deployment hold is not armed"),
+            "the refusal must say how to arm the hold, got {error}"
+        );
+    }
+
+    /// A lingering readiness marker lets a concurrent deploy restart the
+    /// service mid-move; armed means hold present AND marker absent.
+    #[tokio::test]
+    async fn move_receipts_refuses_when_the_readiness_marker_remains() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+        std::fs::write(directory.path().join(DEPLOY_HOLD_FILE), "").unwrap();
+        std::fs::write(directory.path().join(DEPLOY_READY_FILE), "").unwrap();
+
+        let args = move_receipts_args(
+            config_path.to_str().unwrap(),
+            &["--to", "0x00000000000000000000000000000000000000aa"],
+            &TURNKEY_FLAGS,
+        );
+
+        let error = run_move_receipts(args, directory.path(), |_| {
+            panic!("must refuse the readiness marker before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("readiness marker"),
+            "the refusal must name the marker, got {error}"
+        );
+    }
+
+    /// The chain-id/network redundancy check runs first, as in every other
+    /// network-scoped subcommand.
+    #[tokio::test]
+    async fn move_receipts_refuses_a_network_chain_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "move-receipts",
+            "rklb",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--network",
+            "base",
+            "--chain-id",
+            "1",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--to-configured-orchestrator",
+        ])
+        .expect("arguments parse");
+        let IssuerCommand::MoveReceipts(args) = cli.command else {
+            panic!("expected the move-receipts subcommand")
+        };
+
+        let error = run_move_receipts(*args, directory.path(), |_| {
+            panic!("must refuse the mismatch before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("--chain-id is 1"),
+            "the refusal must show the mismatch, got {error}"
+        );
+    }
+
+    fn confirm_custody_args(signer_flags: &[&str]) -> ConfirmCustodyArgs {
+        let mut command_line = vec![
+            "issuer",
+            "confirm-custody",
+            "rklb",
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--database-url",
+            "sqlite::memory:",
+        ];
+        command_line.extend_from_slice(signer_flags);
+
+        let cli =
+            IssuerCli::try_parse_from(command_line).expect("arguments parse");
+        let IssuerCommand::ConfirmCustody(args) = cli.command else {
+            panic!("expected the confirm-custody subcommand")
+        };
+        *args
+    }
+
+    /// The custody holder is always the Turnkey bot wallet — never typed and
+    /// never a local key — so a local signer is refused outright.
+    #[tokio::test]
+    async fn confirm_custody_refuses_a_non_turnkey_signer() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let args =
+            confirm_custody_args(&["--evm-private-key", TEST_SIGNER_KEY]);
+
+        let error = run_confirm_custody(args, directory.path(), |_| {
+            panic!("must refuse the signer before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Turnkey signer configuration"),
+            "the refusal must name the Turnkey requirement, got {error}"
+        );
+    }
+
+    /// Confirmation records custody the quiescence gates depend on, so a
+    /// running service (un-armed hold) must be excluded first.
+    #[tokio::test]
+    async fn confirm_custody_refuses_when_the_hold_is_not_armed() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let args = confirm_custody_args(&TURNKEY_FLAGS);
+
+        let error = run_confirm_custody(args, directory.path(), |_| {
+            panic!("must refuse the un-armed hold before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("deployment hold is not armed"),
+            "the refusal must say how to arm the hold, got {error}"
+        );
+    }
+
+    /// The chain-id/network redundancy check runs first, as in every other
+    /// network-scoped subcommand.
+    #[tokio::test]
+    async fn confirm_custody_refuses_a_network_chain_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "confirm-custody",
+            "rklb",
+            "--network",
+            "base",
+            "--chain-id",
+            "1",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+        ])
+        .expect("arguments parse");
+        let IssuerCommand::ConfirmCustody(args) = cli.command else {
+            panic!("expected the confirm-custody subcommand")
+        };
+
+        let error = run_confirm_custody(*args, directory.path(), |_| {
+            panic!("must refuse the mismatch before prompting")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("--chain-id is 1"),
+            "the refusal must show the mismatch, got {error}"
+        );
     }
 
     fn approve_orchestrator_args(
