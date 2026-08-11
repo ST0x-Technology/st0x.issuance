@@ -16,9 +16,11 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::{
     self, OffchainAssetReceiptVaultInstance,
 };
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
+use st0x_issuance::bindings::ST0xOrchestrator;
 use st0x_issuance::receipt_inventory::migration::{
-    CorroboratedRecipient, MigrationOutcome, VaultIdentity,
-    migrate_vault_receipts, recorded_migration_origin,
+    CorroboratedRecipient, MigrationOutcome, RecipientKind, VaultIdentity,
+    confirm_custody_holder, migrate_vault_receipts, recorded_custody_holder,
+    recorded_migration_origin,
 };
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::tokenized_asset::UnderlyingSymbol;
@@ -1256,6 +1258,249 @@ async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_sh
     );
 
     incoming_client.terminate().await;
+
+    Ok(())
+}
+
+/// Proves the cutover's receipt move end to end against a REAL orchestrator
+/// (RAI-1681): the destination is corroborated as an ERC-1155-receiving
+/// contract via its own ERC-165 answers, the engine moves the receipts, the
+/// orchestrator's burn pointer covers the transferred id (so the burn walk
+/// can reach it without any manual `setBurnIndex`), the recorded origin
+/// supports a later rollback, a re-run submits nothing — and the service
+/// then starts cleanly against the migrated store with its custody record
+/// intact (the expected-elsewhere reconciliation skip, until RAI-1223
+/// retires the subsystem).
+#[tokio::test]
+async fn test_receipt_custody_migrates_into_the_orchestrator()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
+    let orchestrator_address = evm.deploy_orchestrator().await?;
+    let mock_alpaca = MockServer::start();
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
+    let temp_dir = tempfile::tempdir()?;
+    let databases = CustodyDatabases::in_directory(temp_dir.path());
+    let bot_wallet = evm.wallet_address;
+
+    let provider = create_provider()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(
+            &evm.private_key,
+        )?))
+        .connect(&evm.endpoint)
+        .await?;
+
+    harness::preseed_tokenized_asset(
+        &databases.outgoing_url,
+        evm.vault_address,
+        CUSTODY_UNDERLYING,
+        CUSTODY_TOKEN,
+    )
+    .await?;
+    evm.grant_deposit_role(bot_wallet).await?;
+    evm.grant_certify_role(bot_wallet).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Run the service only long enough to discover the receipt into
+    // inventory, then restart so production startup reconciliation records
+    // the outgoing holder — the engine refuses unobserved custody.
+    let (config, _subgraph) = harness::create_config_with_db(
+        &databases.outgoing_url,
+        &mock_alpaca,
+        &evm,
+    )?;
+    let client = start_service(config.clone()).await?;
+    let vault =
+        OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider);
+    let receipt_shares = U256::from(40) * U256::from(10).pow(U256::from(18));
+    let share_ratio = U256::from(10).pow(U256::from(18));
+    let deposit = vault
+        .deposit(receipt_shares, bot_wallet, share_ratio, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let receipt_id = deposit
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| {
+            OffchainAssetReceiptVault::Deposit::decode_log(&log.inner).ok()
+        })
+        .ok_or("deposit must emit a Deposit event")?
+        .id;
+    let receipt_contract: Address = vault.receipt().call().await?.0.into();
+    let receipt = ReceiptInstance::new(receipt_contract, &provider);
+    wait_for_receipt_in_inventory(&databases.outgoing_url).await?;
+    client.terminate().await;
+
+    let client = start_service(config.clone()).await?;
+    client.terminate().await;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&databases.outgoing_url)
+        .await?;
+
+    let underlying: UnderlyingSymbol = CUSTODY_UNDERLYING.parse()?;
+    let identity = VaultIdentity::verify(
+        &pool,
+        &provider,
+        Network::Base,
+        evm.chain_id,
+        evm.vault_address,
+        &underlying,
+    )
+    .await?;
+
+    // The contract corroboration path: the orchestrator must prove ERC-1155
+    // receiver support through its own ERC-165 answers.
+    let destination = CorroboratedRecipient::verify(
+        &provider,
+        bot_wallet,
+        orchestrator_address,
+    )
+    .await?;
+    assert_eq!(
+        destination.kind(),
+        RecipientKind::Erc1155Receiver,
+        "the orchestrator must corroborate as an ERC-1155-receiving contract"
+    );
+
+    let outcome =
+        migrate_vault_receipts(&pool, &provider, identity, destination).await?;
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
+        "the migration must move receipts into the orchestrator, got \
+         {outcome:?}"
+    );
+
+    assert_eq!(
+        receipt.balanceOf(orchestrator_address, receipt_id).call().await?,
+        receipt_shares,
+        "the orchestrator must hold the full transferred receipt balance"
+    );
+    assert_eq!(
+        receipt.balanceOf(bot_wallet, receipt_id).call().await?,
+        U256::ZERO,
+        "the bot wallet must retain nothing after the move"
+    );
+
+    // The cutover verification from the runbook: the burn pointer must sit
+    // at or below the transferred id, so the transferred receipt is
+    // reachable by the orchestrator's burn walk without manual intervention.
+    let orchestrator = ST0xOrchestrator::new(orchestrator_address, &provider);
+    let burn_pointer =
+        orchestrator.nextBurnReceiptId(evm.vault_address).call().await?;
+    assert!(
+        burn_pointer <= receipt_id,
+        "the burn pointer ({burn_pointer}) must cover the transferred \
+         receipt ({receipt_id})"
+    );
+
+    // The rollback origin derives from the recorded migration, not a typed
+    // address — an EMERGENCY_ROLE withdrawReceipt would return receipts
+    // here.
+    assert_eq!(
+        recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
+            .await?,
+        bot_wallet,
+        "the recorded origin must support a rollback to the bot wallet"
+    );
+
+    let rerun =
+        migrate_vault_receipts(&pool, &provider, identity, destination).await?;
+    assert!(
+        matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
+        "re-running a completed move must submit nothing, got {rerun:?}"
+    );
+
+    pool.close().await;
+
+    // The service starts cleanly on the migrated store: startup
+    // reconciliation skips the vault whose custody a recorded migration
+    // moved away (asserted at the log level in the reconciler's unit tests;
+    // here the whole production startup path runs against the real store)
+    // and the custody record survives untouched.
+    let client = start_service(config.clone()).await?;
+    client.terminate().await;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&databases.outgoing_url)
+        .await?;
+    assert_eq!(
+        recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
+            .await?,
+        bot_wallet,
+        "post-migration startup must not clobber the recorded custody"
+    );
+    pool.close().await;
+
+    assert_eq!(
+        receipt.balanceOf(orchestrator_address, receipt_id).call().await?,
+        receipt_shares,
+        "the orchestrator's receipts must survive the service restart \
+         untouched"
+    );
+
+    // The rollback leg: an EMERGENCY_ROLE withdrawReceipt returns the
+    // receipts to the bot wallet, and confirm-custody re-records the holder
+    // so reconciliation resumes — the documented recovery a cutover
+    // rollback depends on.
+    let emergency_role = orchestrator.EMERGENCY_ROLE().call().await?;
+    orchestrator
+        .grantRole(emergency_role, bot_wallet)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    orchestrator
+        .withdrawReceipt(
+            evm.vault_address,
+            receipt_id,
+            receipt_shares,
+            bot_wallet,
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    assert_eq!(
+        receipt.balanceOf(bot_wallet, receipt_id).call().await?,
+        receipt_shares,
+        "the emergency withdrawal must return the receipt to the bot wallet"
+    );
+    assert_eq!(
+        receipt.balanceOf(orchestrator_address, receipt_id).call().await?,
+        U256::ZERO,
+        "the orchestrator must retain nothing after the withdrawal"
+    );
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&databases.outgoing_url)
+        .await?;
+    let confirmed =
+        confirm_custody_holder(&pool, &provider, identity, bot_wallet).await?;
+    assert_eq!(
+        confirmed, 1,
+        "re-confirmation must verify and record the returned receipt"
+    );
+    // The count above only proves verified balances; the persisted custody
+    // holder is the fact reconciliation actually reads.
+    assert_eq!(
+        recorded_custody_holder(&pool, evm.chain_id, evm.vault_address).await?,
+        bot_wallet,
+        "re-confirmation must record the bot wallet as the current holder"
+    );
+    pool.close().await;
+
+    // With custody re-recorded at the signing wallet, the service resumes
+    // ordinary reconciliation on the same store.
+    let client = start_service(config).await?;
+    client.terminate().await;
 
     Ok(())
 }
