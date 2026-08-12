@@ -80,6 +80,17 @@ impl CustodyDatabases {
 async fn wait_for_receipt_in_inventory(
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_discovered_receipts(database_url, 1).await
+}
+
+/// Waits until the running service has discovered at least `minimum`
+/// receipts into the vault's inventory — the multi-receipt counterpart of
+/// [`wait_for_receipt_in_inventory`], for scenarios seeding more deposits
+/// than one.
+async fn wait_for_discovered_receipts(
+    database_url: &str,
+    minimum: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(database_url)
@@ -104,7 +115,7 @@ async fn wait_for_receipt_in_inventory(
         .fetch_one(&pool)
         .await?;
 
-        if recorded > 0 {
+        if recorded >= minimum {
             pool.close().await;
             return Ok(());
         }
@@ -113,7 +124,8 @@ async fn wait_for_receipt_in_inventory(
     }
 
     pool.close().await;
-    Err("no receipt ever entered the inventory".into())
+    Err(format!("fewer than {minimum} receipts ever entered the inventory")
+        .into())
 }
 
 /// Waits until the running service has settled a redemption's burn
@@ -1501,6 +1513,368 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
     // ordinary reconciliation on the same store.
     let client = start_service(config).await?;
     client.terminate().await;
+
+    Ok(())
+}
+
+/// The chunked-migration scenario's tracked receipt count and the engine's
+/// proven per-transaction bound: 17 receipts split into a full chunk of 14
+/// plus a remainder of 3.
+const CHUNKED_TRACKED_RECEIPTS: usize = 17;
+const CHUNK_BOUND: usize = 14;
+
+/// Everything the chunked-migration phases share, so each phase reads as one
+/// focused step of the scenario.
+struct ChunkedMigrationStage<'a, P: Provider> {
+    pool: &'a sqlx::SqlitePool,
+    provider: &'a P,
+    identity: VaultIdentity<'a>,
+    destination: CorroboratedRecipient,
+    receipt_contract: Address,
+    receipt_ids: &'a [U256],
+    receipt_shares: U256,
+    orchestrator_address: Address,
+    bot_wallet: Address,
+    chain_id: u64,
+    vault_address: Address,
+}
+
+impl<P: Provider> ChunkedMigrationStage<'_, P> {
+    /// Phase 1: the full move must cross the bound as multiple bounded batch
+    /// transactions, each verified before the next, recording custody once —
+    /// and a re-run must report `AlreadyMigrated`.
+    async fn full_move_lands_in_bounded_batches(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let outcome = migrate_vault_receipts(
+            self.pool,
+            self.provider,
+            self.identity,
+            self.destination,
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                MigrationOutcome::Migrated { receipts, .. }
+                    if receipts == CHUNKED_TRACKED_RECEIPTS
+            ),
+            "the migration must move all {CHUNKED_TRACKED_RECEIPTS} \
+             receipts, got {outcome:?}"
+        );
+
+        let receipt =
+            ReceiptInstance::new(self.receipt_contract, self.provider);
+        let batches =
+            receipt.TransferBatch_filter().from_block(0).query().await?;
+        let engine_batches = batches
+            .iter()
+            .filter(|(event, _)| event.to == self.orchestrator_address)
+            .count();
+        assert_eq!(
+            engine_batches, 2,
+            "{CHUNKED_TRACKED_RECEIPTS} receipts must move as exactly two \
+             bounded batch transactions"
+        );
+
+        self.assert_orchestrator_holds_everything(
+            "the orchestrator must hold every receipt after the move",
+        )
+        .await?;
+        for receipt_id in self.receipt_ids {
+            assert_eq!(
+                receipt.balanceOf(self.bot_wallet, *receipt_id).call().await?,
+                U256::ZERO,
+                "the bot wallet must retain nothing of receipt {receipt_id}"
+            );
+        }
+        assert_eq!(
+            recorded_migration_origin(
+                self.pool,
+                self.chain_id,
+                self.vault_address,
+            )
+            .await?,
+            self.bot_wallet,
+            "custody must be recorded once, with the bot wallet as origin"
+        );
+
+        self.assert_rerun_reports_already_migrated(
+            "re-running the completed move must submit nothing",
+        )
+        .await
+    }
+
+    /// Phase 2: return every receipt (the rollback leg) and re-confirm
+    /// custody at the bot wallet, restoring the pre-migration state for the
+    /// interrupted-run phase.
+    async fn rollback_and_reconfirm_custody(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let orchestrator =
+            ST0xOrchestrator::new(self.orchestrator_address, self.provider);
+        let emergency_role = orchestrator.EMERGENCY_ROLE().call().await?;
+        orchestrator
+            .grantRole(emergency_role, self.bot_wallet)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        for receipt_id in self.receipt_ids {
+            orchestrator
+                .withdrawReceipt(
+                    self.vault_address,
+                    *receipt_id,
+                    self.receipt_shares,
+                    self.bot_wallet,
+                )
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+        }
+
+        let confirmed = confirm_custody_holder(
+            self.pool,
+            self.provider,
+            self.identity,
+            self.bot_wallet,
+        )
+        .await?;
+        assert_eq!(
+            confirmed, CHUNKED_TRACKED_RECEIPTS,
+            "re-confirmation must verify every returned receipt"
+        );
+        // The count above only proves verified balances; the persisted
+        // custody holder is the fact reconciliation actually reads.
+        assert_eq!(
+            recorded_custody_holder(
+                self.pool,
+                self.chain_id,
+                self.vault_address,
+            )
+            .await?,
+            self.bot_wallet,
+            "re-confirmation must record the bot wallet as the current holder"
+        );
+
+        Ok(())
+    }
+
+    /// Phase 3: fabricate the exact state a crash between chunks leaves —
+    /// the first bounded batch landed, the rest never submitted — then prove
+    /// a plain re-run resumes with only the remainder and a further re-run
+    /// reports `AlreadyMigrated`.
+    async fn crash_resume_moves_only_remainder(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut sorted_ids = self.receipt_ids.to_vec();
+        sorted_ids.sort();
+        let first_chunk: Vec<U256> =
+            sorted_ids.iter().take(CHUNK_BOUND).copied().collect();
+        let receipt =
+            ReceiptInstance::new(self.receipt_contract, self.provider);
+        receipt
+            .safeBatchTransferFrom(
+                self.bot_wallet,
+                self.orchestrator_address,
+                first_chunk.clone(),
+                vec![self.receipt_shares; first_chunk.len()],
+                Bytes::new(),
+            )
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let resumed = migrate_vault_receipts(
+            self.pool,
+            self.provider,
+            self.identity,
+            self.destination,
+        )
+        .await?;
+        assert!(
+            matches!(
+                resumed,
+                MigrationOutcome::Migrated { receipts, .. }
+                    if receipts == CHUNKED_TRACKED_RECEIPTS - CHUNK_BOUND
+            ),
+            "the resume must move only the remainder, got {resumed:?}"
+        );
+        self.assert_orchestrator_holds_everything(
+            "every receipt must reach the orchestrator exactly once across \
+             the interrupted run and its resume",
+        )
+        .await?;
+
+        self.assert_rerun_reports_already_migrated(
+            "a further re-run must report the completed migration",
+        )
+        .await
+    }
+
+    async fn assert_orchestrator_holds_everything(
+        &self,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let receipt =
+            ReceiptInstance::new(self.receipt_contract, self.provider);
+        for receipt_id in self.receipt_ids {
+            assert_eq!(
+                receipt
+                    .balanceOf(self.orchestrator_address, *receipt_id)
+                    .call()
+                    .await?,
+                self.receipt_shares,
+                "{message} (receipt {receipt_id})"
+            );
+        }
+        Ok(())
+    }
+
+    async fn assert_rerun_reports_already_migrated(
+        &self,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rerun = migrate_vault_receipts(
+            self.pool,
+            self.provider,
+            self.identity,
+            self.destination,
+        )
+        .await?;
+        assert!(
+            matches!(
+                rerun,
+                MigrationOutcome::AlreadyMigrated { receipts }
+                    if receipts == CHUNKED_TRACKED_RECEIPTS
+            ),
+            "{message}, got {rerun:?}"
+        );
+        Ok(())
+    }
+}
+
+/// RAI-1714: a vault above the proven 14-receipt single-transfer bound
+/// migrates into the orchestrator as a sequence of bounded batch
+/// transactions; a run interrupted between chunks resumes via a plain
+/// re-run, moving only the remainder and recording custody once; a further
+/// re-run reports `AlreadyMigrated` and submits nothing.
+#[tokio::test]
+async fn test_receipt_custody_chunked_migration_resumes_into_the_orchestrator()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::with_chain_id(Network::Base.chain_id()).await?;
+    let orchestrator_address = evm.deploy_orchestrator().await?;
+    let mock_alpaca = MockServer::start();
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
+    let temp_dir = tempfile::tempdir()?;
+    let databases = CustodyDatabases::in_directory(temp_dir.path());
+    let bot_wallet = evm.wallet_address;
+
+    let provider = create_provider()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(
+            &evm.private_key,
+        )?))
+        .connect(&evm.endpoint)
+        .await?;
+
+    harness::preseed_tokenized_asset(
+        &databases.outgoing_url,
+        evm.vault_address,
+        CUSTODY_UNDERLYING,
+        CUSTODY_TOKEN,
+    )
+    .await?;
+    evm.grant_deposit_role(bot_wallet).await?;
+    evm.grant_certify_role(bot_wallet).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    let (config, _subgraph) = harness::create_config_with_db(
+        &databases.outgoing_url,
+        &mock_alpaca,
+        &evm,
+    )?;
+    let client = start_service(config.clone()).await?;
+
+    let vault =
+        OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider);
+    let share_ratio = U256::from(10).pow(U256::from(18));
+    let receipt_shares = U256::from(10) * share_ratio;
+    let mut receipt_ids: Vec<U256> =
+        Vec::with_capacity(CHUNKED_TRACKED_RECEIPTS);
+    for _ in 0..CHUNKED_TRACKED_RECEIPTS {
+        let deposit = vault
+            .deposit(receipt_shares, bot_wallet, share_ratio, Bytes::new())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        let receipt_id = deposit
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                OffchainAssetReceiptVault::Deposit::decode_log(&log.inner).ok()
+            })
+            .ok_or("deposit must emit a Deposit event")?
+            .id;
+        receipt_ids.push(receipt_id);
+    }
+    let receipt_contract: Address = vault.receipt().call().await?.0.into();
+    wait_for_discovered_receipts(
+        &databases.outgoing_url,
+        i64::try_from(CHUNKED_TRACKED_RECEIPTS)?,
+    )
+    .await?;
+    client.terminate().await;
+
+    // Startup reconciliation records the outgoing holder — the engine
+    // refuses unobserved custody.
+    let client = start_service(config.clone()).await?;
+    client.terminate().await;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&databases.outgoing_url)
+        .await?;
+    let underlying: UnderlyingSymbol = CUSTODY_UNDERLYING.parse()?;
+    let identity = VaultIdentity::verify(
+        &pool,
+        &provider,
+        Network::Base,
+        evm.chain_id,
+        evm.vault_address,
+        &underlying,
+    )
+    .await?;
+    let destination = CorroboratedRecipient::verify(
+        &provider,
+        bot_wallet,
+        orchestrator_address,
+    )
+    .await?;
+
+    let stage = ChunkedMigrationStage {
+        pool: &pool,
+        provider: &provider,
+        identity,
+        destination,
+        receipt_contract,
+        receipt_ids: &receipt_ids,
+        receipt_shares,
+        orchestrator_address,
+        bot_wallet,
+        chain_id: evm.chain_id,
+        vault_address: evm.vault_address,
+    };
+
+    stage.full_move_lands_in_bounded_batches().await?;
+    stage.rollback_and_reconfirm_custody().await?;
+    stage.crash_resume_moves_only_remainder().await?;
+
+    pool.close().await;
 
     Ok(())
 }

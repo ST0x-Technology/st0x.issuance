@@ -1,16 +1,22 @@
-# Orchestrator onboarding: Turnkey policy, role grants, approvals (RAI-1221)
+# Orchestrator onboarding and per-asset cutover (RAI-1221 / RAI-1222)
 
-The ops procedure that must be complete for an asset **before** that asset's
-`vault_mode` flips to `"orchestrator"` (the per-asset cutover itself is
-RAI-1222's runbook; this one establishes its preconditions). Roles and the
-Turnkey policy are orchestrator-wide — done once, before the pilot. Approvals
-are per asset — RKLB's before the pilot cutover, each remaining asset's before
-its own.
+Two ordered procedures in one document. **Onboarding** (steps 1–6) is the ops
+work that must be complete for an asset before its `vault_mode` can flip to
+`"orchestrator"`: roles and the Turnkey policy are orchestrator-wide — done
+once, before the pilot — while approvals are per asset (RKLB's before the pilot
+cutover, each remaining asset's before its own). **Cutover** (steps 7–14) is the
+per-asset procedure that actually moves an asset onto the orchestrator, authored
+for the RKLB pilot (RAI-1222) and reused verbatim for every later asset
+(RAI-1246).
 
 There is no testnet or staging chain for this: every step below runs against
 prod (Base mainnet) and is verified by on-chain reads. The first live end-to-end
-mint/burn through Turnkey is the RKLB pilot's manual exercise, which everything
-here must fully precede.
+mint/burn through Turnkey is the RKLB pilot's manual exercise (step 13), which
+everything before it must fully precede. The full cutover cycle — migrate,
+operate, roll back, resume — is rehearsed by the Anvil end-to-end suite
+(`tests/receipt_custody.rs`,
+`test_receipt_custody_migrates_into_the_orchestrator`), the only pre-prod
+environment.
 
 ## Prerequisites
 
@@ -19,14 +25,23 @@ here must fully precede.
 - The orchestrator is deployed by st0x.deploy (PR #222/#223) and its address is
   known; the permissions scripts have run.
 - The liquidity-bot counterpart (RAI-1243) is tracked separately — it gates the
-  RAI-1222 cutover, not this procedure.
+  RAI-1222 cutover, not this procedure. Its release plumbing, once the issuance
+  orchestrator stack merges to main: cut the `st0x-issuance-client` /
+  `st0x-issuance-dto` tag `0.3.0` from main, swap the liquidity repo's
+  `Cargo.toml` git-branch pin back to that tag (the pin carries a swap-back
+  comment marking the spot), and deploy the liquidity bot from the swapped pin.
+  Step 7's cutover pre-check ("pin is on the release tag") verifies this
+  happened.
 
 All `issuer` subcommands below run on the issuer host (over SSH) with the
 service's own environment; they refuse a local-key signer because every fact
-they verify or establish is keyed to the Turnkey bot wallet. None of them takes
-an address argument — the orchestrator address comes from the TOML config file,
-the bot wallet from `TURNKEY_ADDRESS`, and vault/receipt addresses from the
-listing view and on-chain resolution.
+they verify or establish is keyed to the Turnkey bot wallet. The orchestrator
+address is never typed — it comes from the TOML config file — the bot wallet
+from `TURNKEY_ADDRESS`, and vault/receipt addresses from the listing view and
+on-chain resolution. The one address argument in this document,
+`move-receipts --to`, exists only for the wallet-rotation path, refuses the
+configured orchestrator address, and is guarded by the kind-aware corroboration
+witness (see SPEC "Receipt custody").
 
 ## 1. Ship the orchestrator address in the config (stays dark)
 
@@ -140,6 +155,169 @@ every check passes, so the RAI-1222 pre-checks gate on the exit code for the
 asset being cut over; `Overall: READY` is the human-readable rendering of the
 same verdict.
 
+## 7. Cutover pre-checks (gate on exit codes, not eyeballs)
+
+All of these must hold for the asset being cut over, immediately before its
+window. Every check is a command with an expected exit status — record each
+command's output with the cutover:
+
+- Step 6's preflight exits zero for this asset:
+  `issuer orchestrator-preflight --asset <SYM> …` → exit 0.
+- Step 4's signing proof exits zero for this asset (it covers the ERC-1155
+  `safeBatchTransferFrom` shape the receipt move, step 10, submits):
+  `issuer verify-orchestrator-signing <SYM> …` → exit 0.
+- `$ISSUANCE_URL` is the canonical HTTPS issuer origin before any check sends
+  `X-API-KEY` to it (a plain-`http://` or mistyped origin would leak the key in
+  cleartext or to the wrong host): `[[ "$ISSUANCE_URL" == https://* ]]` →
+  exit 0.
+- No stuck mints or redemptions for this asset:
+
+  ```sh
+  curl -fsS -H "X-API-KEY: $INTERNAL_API_KEY" "$ISSUANCE_URL/admin/stuck" \
+    | jq -e --arg sym <SYM> \
+        '[.stuck[] | select(.underlying == $sym)] | length == 0'
+  ```
+
+  → exit 0 (`jq -e` fails the check if any entry names the asset).
+- The status endpoint the liquidity bot polls serves the mode field, still
+  reading vault-direct pre-flip:
+
+  ```sh
+  curl -fsS -H "X-API-KEY: $INTERNAL_API_KEY" \
+    "$ISSUANCE_URL/tokenized-assets/<SYM>/status" \
+    | jq -e '.vault_mode == "vault_direct"'
+  ```
+
+  → exit 0.
+- The liquidity bot is deployed with MintAuthV1 delivery live (RAI-1243), each
+  fact checked in that repo's checkout at the DEPLOYED revision:
+  - The deployed revision contains RAI-1243:
+    `git merge-base --is-ancestor <rai-1243-merge-commit> <deployed-rev>` →
+    exit 0.
+  - BOTH issuance pins are on the release tag `0.3.0`, and neither is on a
+    branch — one check per dependency, so a single correct pin cannot vouch for
+    the other: `grep -E 'st0x-issuance-client.*tag *= *"0.3.0"' Cargo.toml` →
+    exit 0, `grep -E 'st0x-issuance-dto.*tag *= *"0.3.0"' Cargo.toml` → exit 0,
+    and `! grep -E 'st0x-issuance-(client|dto).*branch' Cargo.toml` → exit 0.
+  - Its deployed plaintext config carries the orchestrator section AND the exact
+    deployed orchestrator address from step 1 (the section existing with a stale
+    address would sign MintAuths for the wrong contract):
+    `grep -F '[orchestrator' <deployed config.toml>` → exit 0, and
+    `grep -iF '<orchestrator address>' <deployed config.toml>` → exit 0.
+  - Its Turnkey policy allows `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` (raw-payload
+    signing is a separate policy surface from transaction signing): run that
+    repo's ignored integration test against prod Turnkey,
+    `cargo test turnkey_digest_signing_integration -- --ignored` → exit 0.
+
+## 8. Freeze and drain
+
+Freeze the asset (`issuer freeze <SYM>`): `POST /inkind/issuance` rejects frozen
+assets before Alpaca journals shares, so nothing gets stranded mid-flow. Wait
+for this asset's in-flight mints and redemptions to reach terminal states
+(re-check `/admin/stuck` and step 7's preflight). The freeze-plus-drain is also
+what guarantees no aggregate straddles the mode flip — an operation's mode
+anchors once, at `Initiated` / `RedemptionDetected`.
+
+## 9. Deploy hold and snapshot
+
+Arm the deployment hold and stop the service per `docs/runbooks/deploy-hold.md`
+— `move-receipts` refuses without it, because the engine's projection rebuilds
+and quiescence reads must not race a running service. Then snapshot: record this
+token's per-receipt on-chain balances of BOTH wallets — the bot wallet
+(sanity-checked against `receipt_inventory_view`) and the orchestrator's
+pre-move balances for the same receipt ids (the engine deliberately allows a
+destination with pre-existing balances and verifies per-identifier GAINS, so the
+verification in step 11 needs the before-values) — and investigate any
+discrepancy before proceeding.
+
+## 10. Move the receipts
+
+```
+issuer move-receipts <SYM> \
+  --to-configured-orchestrator \
+  --config "$CONFIG" \
+  --network base --chain-id 8453 --rpc-url "$RPC_URL"
+```
+
+The destination is read from `[orchestrator].address` — never typed — and
+corroborated as an ERC-1155-receiving contract before anything is signed. The
+command prompts with the asset, vault, holder, destination and its corroborated
+kind, and the tracked receipt count. A vault tracking more than 14 receipts
+moves in multiple bounded transactions, each verified before the next. A re-run
+after any interruption is safe: an interrupted move resumes with only the
+remaining receipts, and a completed move reports "already migrated" and submits
+nothing.
+
+## 11. Verify the move
+
+- For every receipt id, the orchestrator's `balanceOf` GAIN over its step-9
+  pre-move balance equals the bot wallet's transferred amount from the same
+  snapshot; the bot wallet reads zero. (Final-balance equality with the bot's
+  snapshot is only correct when the orchestrator started at zero — the gain
+  check is the one the engine itself enforces.)
+- `nextBurnReceiptId(token)` sits at or below the lowest transferred id, so
+  every transferred receipt is reachable by the burn walk with no manual
+  `setBurnIndex` (`BurnIndexLowered` events appear only if the pointer had
+  previously advanced past a transferred id — their absence on a fresh
+  orchestrator is normal).
+- The recorded custody history shows the move bot → orchestrator (this is what a
+  later rollback derives its origin from).
+
+## 12. Flip, deploy, unfreeze
+
+Set `vault_mode = "orchestrator"` in the asset's `[assets.<SYM>]` table of the
+TOML config; release the hold and run the service deployment (the deploy
+activation restarts the unit). Verify `/admin/orchestrator-health` and the
+status endpoint report orchestrator mode for the asset, and that startup
+reconciliation logged the migrated vault as **skipped at INFO** ("custody
+recorded at a migrated destination") — a `CustodyDisplaced` ERROR here is a real
+problem, not cutover noise. Unfreeze.
+
+## 13. Pilot validation (manual, in prod)
+
+RKLB has essentially no organic flow — that is the point — so validation is
+actively driven. Manually trigger a small mint through the liquidity bot's
+rebalancing path (exercising the real MintAuthV1 delivery) and a small
+redemption (send tokens to the redemption wallet), and follow every stage
+end-to-end: authorization delivery, Turnkey signing, orchestrator
+`Minted`/`Burned` events, Alpaca journals/callbacks, `/admin` health. Repeat
+over a soak window (≥1 week with the asset left in orchestrator mode): every
+attempt completes, no unexplained `/admin/stuck` entries, and any transient
+failure exercises a recovery path observably. Record the go/no-go that gates the
+full rollout (RAI-1246).
+
+## 14. Rollback (per asset; rehearsed on Anvil)
+
+Touches only this asset:
+
+1. Freeze the asset and let in-flight work drain (step 8's procedure).
+2. Flip its `vault_mode` back to `"vault_direct"` in the TOML config.
+3. Arm the deployment hold and stop the service (per
+   `docs/runbooks/deploy-hold.md`) — **before** any receipt moves, for the same
+   reason step 9 requires it on the way in: projection rebuilds and custody
+   reads must not race a running service, and a live reconciliation pass must
+   never observe returned balances while persisted custody still names the
+   orchestrator.
+4. Page the `EMERGENCY_ROLE` holder (recorded below):
+   `withdrawReceipt(token, id, amount, bot_wallet)` for every migrated receipt
+   returns them on-chain. Verify bot-wallet `balanceOf` matches the step-9
+   snapshot.
+5. With the hold still armed, re-record custody:
+   `issuer confirm-custody <SYM> --network base --chain-id 8453
+   --rpc-url "$RPC_URL"`.
+   **Before** this command runs, recorded custody is EXPECTED to still name the
+   orchestrator — the on-chain withdrawal (step 4) does not touch the persisted
+   record, so that is not stale data to investigate. **After** it succeeds,
+   recorded custody must name the bot wallet: the command verifies on-chain that
+   the bot wallet holds every tracked balance and only then records it as
+   holder. Reconciliation stays skipped between the two states.
+6. Release the hold, deploy, verify startup reconciliation reads the vault
+   normally again, unfreeze.
+
+Redemptions already burned through the orchestrator keep their persisted
+`burn_mode`; their recovery and verification follow the persisted mode, so they
+stay recoverable after the flip back.
+
 ## Record of prod facts
 
 Fill in as the steps execute; this table is the standing record the acceptance
@@ -159,6 +337,12 @@ Per-asset approvals:
 | Asset | Approval tx hash | Date | Operator |
 | ----- | ---------------- | ---- | -------- |
 | RKLB  |                  |      |          |
+
+Per-asset cutovers (steps 7–13; RAI-1222 acceptance record):
+
+| Asset | Final receipt-move tx | Snapshot ref | Flip deploy | Validation mints/redemptions | Soak end | Go/no-go |
+| ----- | --------------------- | ------------ | ----------- | ---------------------------- | -------- | -------- |
+| RKLB  |                       |              |             |                              |          |          |
 
 ## Shortfall escalation (InsufficientReceipts)
 
