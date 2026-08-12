@@ -1490,9 +1490,13 @@ every vault instead of none. Beyond quiescence, the tracked inventory is
 cross-checked against on-chain balances, the vault's certification and
 owner-freeze gates are re-read immediately before submission, and a completed
 move observed again is recorded idempotently instead of being re-transferred
-(`AlreadyMigrated`). A single transfer is limited to the 14-receipt batch size
-proven in production; larger inventories refuse until resumable chunking exists
-(expected for the full rollout's high-volume assets, not the pilot). The
+(`AlreadyMigrated`). A single transfer transaction is limited to the 14-receipt
+batch size proven in production; larger inventories move as a sequence of
+bounded chunks, each verified per identifier before the next is submitted, with
+the custody migration recorded only on full completion. A run interrupted
+between chunks resumes via a plain re-run: completed chunks have left the source
+on-chain, so reconciliation re-derives exactly the remaining identifiers and can
+never re-select a moved one — no resume bookkeeping is persisted anywhere. The
 `move-receipts` driver performs the outside-the-engine checks before the generic
 engine is invoked: it verifies the deployment hold is armed (hold file present,
 readiness marker absent — see `docs/runbooks/deploy-hold.md`), binds the signing

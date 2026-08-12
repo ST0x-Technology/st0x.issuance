@@ -52,11 +52,11 @@ use crate::redemption::{
 use crate::tokenized_asset::view::find_vault;
 use crate::tokenized_asset::{Network, TokenizedAsset, UnderlyingSymbol};
 
-/// Largest receipt batch proven to fit the retired production transfer path.
-/// A 240-receipt batch exhausted gas while batches through 14 succeeded. Until
-/// a future driver introduces resumable chunking, refusing above the proven
-/// bound is safer than submitting an irreversible transaction with unverified
-/// gas behaviour.
+/// Largest receipt batch proven to fit a single transfer transaction. A
+/// 240-receipt batch exhausted gas in production while batches through 14
+/// succeeded, so larger inventories move as a sequence of bounded chunks
+/// (see [`MigratableHoldings::transfer_chunks`]) rather than one unverified
+/// oversized submission.
 const MAX_RECEIPTS_PER_TRANSFER: usize = 14;
 
 /// EIP-165 defines an interface's id as the XOR of all its function
@@ -314,6 +314,26 @@ impl MigratableHoldings {
     fn total(&self) -> Result<Shares, SharesOverflow> {
         total_of(self.holdings.iter().map(|held| held.balance))
     }
+
+    /// Splits the holdings into transfer-sized batches of at most
+    /// [`MAX_RECEIPTS_PER_TRANSFER`], preserving their canonical order.
+    ///
+    /// Chunk membership is positional over the sorted holdings, so it is
+    /// deterministic across re-runs — but nothing depends on that for
+    /// safety: an interrupted run's completed chunks have left the source
+    /// on-chain, and the next run's reconciliation re-derives exactly the
+    /// remaining identifiers before anything is submitted.
+    fn transfer_chunks(&self) -> Vec<Self> {
+        self.holdings
+            .chunks(MAX_RECEIPTS_PER_TRANSFER)
+            .map(|chunk| Self {
+                chain_id: self.chain_id,
+                vault: self.vault,
+                holder: self.holder,
+                holdings: chunk.to_vec(),
+            })
+            .collect()
+    }
 }
 
 /// Why a migration must not proceed.
@@ -434,13 +454,6 @@ enum MigrationRefusal {
 
     #[error("vault {vault} owner freeze blocks {from} -> {to} until {until}")]
     OwnerFrozen { vault: Address, from: Address, to: Address, until: U256 },
-
-    #[error(
-        "vault {vault} has {receipts} tracked receipts, exceeding the proven \
-         single-transfer maximum of {maximum}; a resumable chunking driver is \
-         required before custody can move"
-    )]
-    ReceiptBatchTooLarge { vault: Address, receipts: usize, maximum: usize },
 
     #[error(
         "receipt {receipt_id} on vault {vault} diverges: inventory tracks \
@@ -1730,6 +1743,23 @@ async fn reconcile_holdings(
     // transfer construction deterministic across retries.
     unmoved.sort_by_key(|held| held.receipt_id.inner());
 
+    // The third holdings state, made explicit: every tracked balance is
+    // accounted for per identifier across exactly source + destination, so
+    // an interrupted chunked move (or a retired execution path's partial
+    // move) resumes with only the remainder — never re-selecting an
+    // identifier that already left the source.
+    if migrated > 0 {
+        info!(
+            target: "receipt_inventory",
+            %vault,
+            %holder,
+            %recipient,
+            already_at_destination = migrated,
+            remaining = unmoved.len(),
+            "Resuming a partially migrated vault"
+        );
+    }
+
     debug!(
         target: "receipt_inventory",
         %vault,
@@ -1747,11 +1777,20 @@ async fn reconcile_holdings(
     }))
 }
 
-/// Moves one vault's receipts to the incoming wallet.
+/// Moves one vault's receipts to the incoming wallet, in transfer-sized
+/// chunks of at most [`MAX_RECEIPTS_PER_TRANSFER`], verifying each chunk's
+/// per-identifier movement before submitting the next.
 ///
-/// Re-reads the transfer permission immediately before submitting, because
-/// certification is maintained outside this service and can lapse between an
-/// earlier preflight and the transaction landing.
+/// A chunk failure returns immediately: completed chunks have already left
+/// the source on-chain, so a plain re-run reconciles the remainder and never
+/// re-selects a moved identifier — no resume bookkeeping is persisted
+/// anywhere. The caller records the custody migration only on the fully
+/// completed outcome.
+///
+/// Re-reads the transfer permission immediately before each submission,
+/// because certification is maintained outside this service and can lapse
+/// between an earlier preflight — or an earlier chunk — and the transaction
+/// landing.
 async fn migrate_vault_custody(
     custody: &(impl ReceiptCustody + Sync),
     holdings: &MigratableHoldings,
@@ -1763,62 +1802,79 @@ async fn migrate_vault_custody(
     }
 
     let receipts = holdings.holdings().len();
-    if receipts > MAX_RECEIPTS_PER_TRANSFER {
-        return Err(MigrationRefusal::ReceiptBatchTooLarge {
-            vault,
-            receipts,
-            maximum: MAX_RECEIPTS_PER_TRANSFER,
-        });
-    }
+    let chunks = holdings.transfer_chunks();
+    let transfers = chunks.len();
+    let mut last_transaction: Option<B256> = None;
 
-    let permit = match custody
-        .transfer_permission(vault, holdings.holder(), recipient)
-        .await?
-    {
-        TransferPermission::Permitted(permit) => permit,
-        TransferPermission::CertificationExpired => {
-            return Err(MigrationRefusal::CertificationExpired { vault });
-        }
-        TransferPermission::OwnerFrozen { until } => {
-            return Err(MigrationRefusal::OwnerFrozen {
+    for (position, chunk) in chunks.iter().enumerate() {
+        let permit = match custody
+            .transfer_permission(vault, chunk.holder(), recipient)
+            .await?
+        {
+            TransferPermission::Permitted(permit) => permit,
+            TransferPermission::CertificationExpired => {
+                return Err(MigrationRefusal::CertificationExpired { vault });
+            }
+            TransferPermission::OwnerFrozen { until } => {
+                return Err(MigrationRefusal::OwnerFrozen {
+                    vault,
+                    from: chunk.holder(),
+                    to: recipient,
+                    until,
+                });
+            }
+        };
+
+        // Captured before the transfer so the post-condition measures what
+        // this transfer delivered, not the recipient's absolute balance —
+        // which would wrongly pass if the recipient already held some of
+        // these identifiers.
+        let receipt_ids = chunk.receipt_ids();
+        let recipient_before =
+            custody.held_balances(vault, recipient, &receipt_ids).await?;
+
+        // Checked before submitting: a truncated response here would
+        // otherwise only surface in `verify_custody_moved`, after the
+        // irreversible transfer has already gone out.
+        if recipient_before.len() != receipt_ids.len() {
+            return Err(MigrationRefusal::BalanceCountMismatch {
                 vault,
-                from: holdings.holder(),
-                to: recipient,
-                until,
+                requested: receipt_ids.len(),
+                returned: recipient_before.len(),
             });
         }
-    };
 
-    // Captured before the transfer so the post-condition measures what this
-    // transfer delivered, not the recipient's absolute balance — which would
-    // wrongly pass if the recipient already held some of these identifiers.
-    let receipt_ids = holdings.receipt_ids();
-    let recipient_before =
-        custody.held_balances(vault, recipient, &receipt_ids).await?;
+        let expected = chunk.total()?;
+        let transaction = custody.transfer_custody(&permit, chunk).await?;
 
-    // Checked before submitting: a truncated response here would otherwise
-    // only surface in `verify_custody_moved`, after the irreversible
-    // transfer has already gone out.
-    if recipient_before.len() != receipt_ids.len() {
-        return Err(MigrationRefusal::BalanceCountMismatch {
-            vault,
-            requested: receipt_ids.len(),
-            returned: recipient_before.len(),
-        });
+        verify_custody_moved(
+            custody,
+            chunk,
+            recipient,
+            &recipient_before,
+            expected,
+            transaction,
+        )
+        .await?;
+
+        debug!(
+            target: "receipt_inventory",
+            chain_id = chunk.chain_id(),
+            %vault,
+            %transaction,
+            chunk = position + 1,
+            transfers,
+            receipts = chunk.holdings().len(),
+            "Migrated a receipt custody chunk"
+        );
+        last_transaction = Some(transaction);
     }
 
-    let expected = holdings.total()?;
-    let transaction = custody.transfer_custody(&permit, holdings).await?;
-
-    verify_custody_moved(
-        custody,
-        holdings,
-        recipient,
-        &recipient_before,
-        expected,
-        transaction,
-    )
-    .await?;
+    // The loop ran at least once (holdings verified non-empty above), so a
+    // missing hash is unreachable in practice — failed closed rather than
+    // panicking, per the no-panic rule.
+    let transaction = last_transaction
+        .ok_or(ReceiptCustodyError::NothingToTransfer { vault })?;
 
     info!(
         target: "receipt_inventory",
@@ -1826,6 +1882,7 @@ async fn migrate_vault_custody(
         %vault,
         %transaction,
         receipts,
+        transfers,
         holder = %holdings.holder(),
         %recipient,
         "Migrated receipt custody"
@@ -2212,6 +2269,14 @@ mod tests {
         /// Leave the recipient holding less than it did before the transfer,
         /// modelling a corrupt or reorganised observation.
         shrink_recipient_on_settle: bool,
+        /// Fail the transfer whose zero-based position equals this value,
+        /// moving nothing — a crash between chunks. Self-clearing, so the
+        /// same fake then serves the resuming re-run.
+        fail_transfer_at: Mutex<Option<usize>>,
+        /// Report `CertificationExpired` once this many transfers have been
+        /// submitted — a certification lapsing mid-move, between chunks.
+        /// Cleared by the test to model the operator renewing it.
+        expire_certification_after: Mutex<Option<usize>>,
     }
 
     /// The fake's scripted permission, kept separate from
@@ -2251,6 +2316,8 @@ mod tests {
                 truncate_for: None,
                 swap_on_settle: false,
                 shrink_recipient_on_settle: false,
+                fail_transfer_at: Mutex::new(None),
+                expire_certification_after: Mutex::new(None),
             }
         }
 
@@ -2304,6 +2371,17 @@ mod tests {
             from: Address,
             to: Address,
         ) -> Result<TransferPermission, ReceiptCustodyError> {
+            // A scripted mid-move lapse: once the scripted number of
+            // transfers has gone out, the certification reads as expired —
+            // exercising the loop's per-chunk permission re-read.
+            let value =
+                *self.expire_certification_after.lock().expect("expire lock");
+            if let Some(after) = value
+                && self.transfers.lock().expect("transfers lock").len() >= after
+            {
+                return Ok(TransferPermission::CertificationExpired);
+            }
+
             Ok(match self.permission {
                 Permission::Permitted => TransferPermission::Permitted(
                     TransferPermit::granted(vault, from, to),
@@ -2322,6 +2400,19 @@ mod tests {
             permit: &TransferPermit,
             holdings: &MigratableHoldings,
         ) -> Result<B256, ReceiptCustodyError> {
+            let submitted =
+                self.transfers.lock().expect("transfers lock").len();
+            let mut fail_at =
+                self.fail_transfer_at.lock().expect("fail_transfer_at lock");
+            if *fail_at == Some(submitted) {
+                *fail_at = None;
+                return Err(ReceiptCustodyError::Reverted {
+                    vault: permit.vault(),
+                    tx_hash: B256::repeat_byte(9),
+                });
+            }
+            drop(fail_at);
+
             self.transfers
                 .lock()
                 .expect("transfers lock")
@@ -2656,9 +2747,62 @@ mod tests {
         ));
     }
 
+    fn holdings_range(
+        range: std::ops::RangeInclusive<u64>,
+    ) -> MigratableHoldings {
+        MigratableHoldings {
+            chain_id: CHAIN_ID,
+            vault: VAULT,
+            holder: OUTGOING,
+            holdings: range.map(|id| FakeCustody::holding(id, 100)).collect(),
+        }
+    }
+
+    #[test]
+    fn transfer_chunks_pack_to_the_proven_bound_in_canonical_order() {
+        for (receipts, expected_sizes) in [
+            (1u64, vec![1usize]),
+            (14, vec![14]),
+            (15, vec![14, 1]),
+            (30, vec![14, 14, 2]),
+        ] {
+            let holdings = holdings_range(1..=receipts);
+
+            let chunks = holdings.transfer_chunks();
+
+            let sizes: Vec<usize> =
+                chunks.iter().map(|chunk| chunk.holdings().len()).collect();
+            assert_eq!(
+                sizes, expected_sizes,
+                "{receipts} holdings must pack into batches of at most 14"
+            );
+
+            let flattened: Vec<U256> = chunks
+                .iter()
+                .flat_map(MigratableHoldings::receipt_ids)
+                .map(|receipt_id| receipt_id.inner())
+                .collect();
+            let original: Vec<U256> = holdings
+                .receipt_ids()
+                .into_iter()
+                .map(|receipt_id| receipt_id.inner())
+                .collect();
+            assert_eq!(
+                flattened, original,
+                "chunking must preserve the canonical order and cover every \
+                 identifier exactly once"
+            );
+        }
+    }
+
+    /// Above the proven single-transfer bound, the migration submits a
+    /// sequence of bounded chunks instead of refusing — each verified
+    /// per identifier before the next goes out — and reports the full
+    /// receipt count on completion.
+    #[traced_test]
     #[tokio::test]
-    async fn migrate_refuses_more_receipts_than_the_proven_batch_limit() {
-        let source: Vec<(u64, u64)> = (1..=15).map(|id| (id, 100)).collect();
+    async fn migrate_transfers_above_the_batch_bound_in_chunks() {
+        let source: Vec<(u64, u64)> = (1..=30).map(|id| (id, 100)).collect();
         let custody = FakeCustody::at_source(&source);
         let tracked: Vec<ReceiptHolding> = source
             .iter()
@@ -2669,22 +2813,185 @@ mod tests {
         let holdings =
             holdings_of(reconcile(&custody, &tracked).await.unwrap());
 
+        let outcome =
+            migrate_vault_custody(&custody, &holdings, INCOMING).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated {
+                transaction: B256::repeat_byte(7),
+                receipts: 30
+            }
+        );
+        assert_eq!(
+            custody.transfers.lock().unwrap().as_slice(),
+            [(INCOMING, 14), (INCOMING, 14), (INCOMING, 2)],
+            "the move must submit bounded batches, largest first"
+        );
+        for held in &tracked {
+            let balances = custody.balances.lock().unwrap();
+            assert_eq!(
+                balances.get(&(INCOMING, held.receipt_id)).copied(),
+                Some(held.balance),
+                "receipt {} must reach the destination exactly once",
+                held.receipt_id
+            );
+            assert_eq!(
+                balances
+                    .get(&(OUTGOING, held.receipt_id))
+                    .copied()
+                    .unwrap_or(Shares::ZERO),
+                Shares::ZERO,
+                "receipt {} must leave the source",
+                held.receipt_id
+            );
+            drop(balances);
+        }
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Migrated a receipt custody chunk", "chunk=1", "transfers=3"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Migrated receipt custody", "receipts=30", "transfers=3"]
+        ));
+    }
+
+    /// A failure between chunks is a crash the engine must survive without
+    /// bookkeeping: the completed chunk has left the source on-chain, so a
+    /// plain re-run reconciles only the remainder and moves every balance
+    /// exactly once.
+    #[traced_test]
+    #[tokio::test]
+    async fn interrupted_chunked_migration_resumes_without_duplication() {
+        let source: Vec<(u64, u64)> = (1..=16).map(|id| (id, 100)).collect();
+        let custody = FakeCustody::at_source(&source);
+        let tracked: Vec<ReceiptHolding> = source
+            .iter()
+            .map(|(receipt_id, balance)| {
+                FakeCustody::holding(*receipt_id, *balance)
+            })
+            .collect();
+        *custody.fail_transfer_at.lock().unwrap() = Some(1);
+
+        let holdings =
+            holdings_of(reconcile(&custody, &tracked).await.unwrap());
         let refusal = migrate_vault_custody(&custody, &holdings, INCOMING)
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            refusal,
-            MigrationRefusal::ReceiptBatchTooLarge {
-                vault: VAULT,
-                receipts: 15,
-                maximum: 14,
-            }
-        ));
+        assert!(
+            matches!(
+                refusal,
+                MigrationRefusal::Custody(ref boxed)
+                    if matches!(**boxed, ReceiptCustodyError::Reverted { .. })
+            ),
+            "the failing chunk must surface its error, got {refusal:?}"
+        );
         assert_eq!(
-            custody.transfer_count(),
-            0,
-            "an unproven batch size must be refused before submission"
+            custody.transfers.lock().unwrap().as_slice(),
+            [(INCOMING, 14)],
+            "only the first chunk may have been submitted"
+        );
+
+        // The re-run: reconciliation resumes with exactly the remainder.
+        let resumed = holdings_of(reconcile(&custody, &tracked).await.unwrap());
+        assert_eq!(
+            resumed
+                .receipt_ids()
+                .iter()
+                .map(ReceiptId::inner)
+                .collect::<Vec<_>>(),
+            vec![U256::from(15), U256::from(16)],
+            "the resume must select only the identifiers still at the source"
+        );
+
+        let outcome =
+            migrate_vault_custody(&custody, &resumed, INCOMING).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated {
+                transaction: B256::repeat_byte(7),
+                receipts: 2
+            }
+        );
+        for held in &tracked {
+            let balances = custody.balances.lock().unwrap();
+            assert_eq!(
+                balances.get(&(INCOMING, held.receipt_id)).copied(),
+                Some(held.balance),
+                "receipt {} must reach the destination exactly once across \
+                 the interrupted run and its resume",
+                held.receipt_id
+            );
+            drop(balances);
+        }
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Resuming a partially migrated vault",
+                "already_at_destination=14",
+                "remaining=2"
+            ]
+        ));
+    }
+
+    /// Certification is maintained outside this service and can lapse
+    /// between chunks: the loop re-reads the transfer permission before
+    /// every chunk, so a mid-move lapse refuses the remaining chunks after
+    /// the completed one — and a plain re-run after renewal moves exactly
+    /// the remainder.
+    #[tokio::test]
+    async fn chunked_migration_stops_when_certification_lapses_mid_move() {
+        let source: Vec<(u64, u64)> = (1..=16).map(|id| (id, 100)).collect();
+        let custody = FakeCustody::at_source(&source);
+        let tracked: Vec<ReceiptHolding> = source
+            .iter()
+            .map(|(receipt_id, balance)| {
+                FakeCustody::holding(*receipt_id, *balance)
+            })
+            .collect();
+        *custody.expire_certification_after.lock().unwrap() = Some(1);
+
+        let holdings =
+            holdings_of(reconcile(&custody, &tracked).await.unwrap());
+        let refusal = migrate_vault_custody(&custody, &holdings, INCOMING)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                refusal,
+                MigrationRefusal::CertificationExpired { vault: VAULT }
+            ),
+            "the lapsed certification must refuse the second chunk, got \
+             {refusal:?}"
+        );
+        assert_eq!(
+            custody.transfers.lock().unwrap().as_slice(),
+            [(INCOMING, 14)],
+            "only the chunk submitted before the lapse may have gone out"
+        );
+
+        // The operator renews certification; a plain re-run moves exactly
+        // the remainder.
+        *custody.expire_certification_after.lock().unwrap() = None;
+        let resumed = holdings_of(reconcile(&custody, &tracked).await.unwrap());
+        let outcome =
+            migrate_vault_custody(&custody, &resumed, INCOMING).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated {
+                transaction: B256::repeat_byte(7),
+                receipts: 2
+            }
+        );
+        assert_eq!(
+            custody.transfers.lock().unwrap().as_slice(),
+            [(INCOMING, 14), (INCOMING, 2)],
+            "the renewed re-run must submit exactly the remainder"
         );
     }
 
