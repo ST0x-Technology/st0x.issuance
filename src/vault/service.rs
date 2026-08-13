@@ -104,7 +104,7 @@ impl RealBlockchainService {
     /// # Arguments
     ///
     /// * `provider` - Alloy provider for blockchain communication
-    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
+    /// * `oa_schema_cache` - Cache for reading OA schema hashes from the vault event
     pub(crate) fn new(
         provider: RealBlockchainServiceProvider,
         oa_schema_cache: Arc<OaSchemaCache>,

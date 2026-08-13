@@ -267,7 +267,8 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>, RainMetaError> {
 }
 
 /// Resolves the OA schema hash (IPFS CID) for receipt metadata encoding by
-/// querying the Goldsky subgraph. The schema hash rarely changes for a vault,
+/// reading the vault's on chain `ReceiptVaultInformation` event. The schema
+/// hash rarely changes for a vault,
 /// so successful results are cached for the lifetime of the process.
 /// Transient failures are NOT cached, allowing retries on subsequent calls.
 pub(crate) struct OaSchemaCache {
@@ -306,7 +307,7 @@ impl OaSchemaCache {
     /// Creates a cache that returns a fixed schema hash for any vault address.
     ///
     /// Prefer this for admin paths that always pass original deposit
-    /// `receipt_info_bytes` (no re-encoding) so the subgraph is not required.
+    /// `receipt_info_bytes` (no re-encoding) so no on chain read is required.
     pub(crate) fn fixed(schema_hash: &str) -> Self {
         Self {
             mode: OaSchemaCacheMode::Fixed(schema_hash.to_string()),
@@ -348,8 +349,8 @@ impl OaSchemaCache {
             }
 
             Ok(None) => {
-                // Don't cache negative results — the subgraph may not have
-                // indexed this vault's schema yet. Retry on next call.
+                // Don't cache negative results — the vault may not have emitted
+                // its schema event yet. Retry on next call.
                 None
             }
 
@@ -359,7 +360,7 @@ impl OaSchemaCache {
                     target: "vault",
                     %vault,
                     %error,
-                    "failed to fetch OA schema hash from subgraph, \
+                    "failed to read OA schema hash from the on chain event, \
                      receipt metadata will omit OA_SCHEMA"
                 );
                 None

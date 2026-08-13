@@ -183,7 +183,7 @@ pub(crate) async fn run_burn_excess_cli(
         .connect_http(http_url.clone());
 
     // receipt_info_bytes always present from deposit; fixed cache avoids
-    // subgraph dependency for burn-excess admin recovery.
+    // the on chain schema read for burn excess admin recovery.
     let vault_service = RealBlockchainService::new(
         signing_provider,
         Arc::new(OaSchemaCache::fixed(OA_SCHEMA_HASH)),
