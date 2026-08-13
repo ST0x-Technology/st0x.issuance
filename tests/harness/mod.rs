@@ -7,7 +7,6 @@
 
 pub mod alpaca_mocks;
 
-use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::fillers::{
@@ -534,152 +533,79 @@ pub async fn setup_account(
     link_body
 }
 
-/// Schema hash used by the mock subgraph in e2e tests.
-pub const TEST_OA_SCHEMA_HASH: &str =
-    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
-
-/// Builds a mock Rain meta v1 `information` hex string containing the given
-/// schema hash, suitable for the subgraph `receiptVaultInformations` response.
-fn mock_information_hex(schema_hash: &str) -> String {
-    let schema_hex = hex::encode(schema_hash);
-    let payload_hex = format!("78{:02x}{schema_hex}", schema_hash.len());
-
-    // Rain meta v1 prefix + OA_SCHEMA CBOR item + OA_HASH_LIST CBOR item
-    format!(
-        "0xff0a89c674ee7874\
-         a40058020000011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465\
-         a200{payload_hex}011bff9fae3cc645f463"
-    )
-}
-
-/// Sets up a mock subgraph server that returns `OA_SCHEMA` hashes for specific
-/// vaults. Each entry maps a vault address to a schema hash. The mock validates
-/// the request body contains the expected vault address (as lowercase hex),
-/// ensuring `OaSchemaCache` sends correct per-vault GraphQL queries.
-pub fn setup_mock_subgraph(
-    vault_schemas: &HashMap<Address, &str>,
-) -> MockServer {
-    let server = MockServer::start();
-
-    for (vault, schema_hash) in vault_schemas {
-        let vault_hex = format!("{vault:#x}");
-        let information = mock_information_hex(schema_hash);
-
-        server.mock(|when, then| {
-            when.method(POST).path("/").body_includes(&vault_hex);
-            then.status(200).json_body(json!({
-                "data": {
-                    "receiptVaultInformations": [{
-                        "information": information
-                    }]
-                }
-            }));
-        });
-    }
-
-    server
-}
-
-/// Returns `(Config, MockServer)` — the caller must keep the `MockServer` alive
-/// for the duration of the test so the subgraph mock remains reachable.
+/// Builds a [`Config`] wired to a single Anvil chain (Base), with the mock
+/// Alpaca server backing the brokerage API.
 pub fn create_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     evm: &LocalEvm,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+) -> Result<Config, Box<dyn std::error::Error>> {
     let rpc_url = Url::parse(&evm.endpoint)?;
 
-    Ok((
-        Config {
-            database_url: db_path.to_string(),
-            database_max_connections: 5,
-            rpc_url: rpc_url.clone(),
-            chain_id: evm.chain_id,
-            signer: SignerConfig::Local(evm.private_key),
-            backfill_start_block: 0,
-            receipt_poll_interval: tokio::time::Duration::from_millis(500),
-            auth: AuthConfig {
-                issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
-                alpaca_ip_ranges: IpWhitelist::single(
-                    "127.0.0.1/32".parse().expect("Valid IP range"),
-                ),
-                internal_ip_ranges: "127.0.0.0/8,::1/128"
-                    .parse()
-                    .expect("Valid IP ranges"),
-            },
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig {
-                api_base_url: mock_alpaca.base_url(),
-                account_id: "test-account".to_string(),
-                api_key: "test-key".to_string(),
-                api_secret: "test-secret".to_string(),
-                connect_timeout_secs: 10,
-                request_timeout_secs: 30,
-            },
-            subgraph_url: subgraph_url.clone(),
-            chains: vec![ChainConfig {
-                network: Network::Base,
-                chain_id: evm.chain_id,
-                rpc_url,
-                subgraph_url,
-                backfill_start_block: 0,
-            }],
-            vault_mode_config: VaultModeConfig::default(),
+    Ok(Config {
+        database_url: db_path.to_string(),
+        database_max_connections: 5,
+        rpc_url: rpc_url.clone(),
+        chain_id: evm.chain_id,
+        signer: SignerConfig::Local(evm.private_key),
+        backfill_start_block: 0,
+        receipt_poll_interval: tokio::time::Duration::from_millis(500),
+        auth: AuthConfig {
+            issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
         },
-        mock_subgraph,
-    ))
+        log_level: LogLevel::Debug,
+        environment: Environment::Development,
+        hyperdx: None,
+        alpaca: AlpacaConfig {
+            api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+        },
+        chains: vec![ChainConfig {
+            network: Network::Base,
+            chain_id: evm.chain_id,
+            rpc_url,
+            backfill_start_block: 0,
+        }],
+        vault_mode_config: VaultModeConfig::default(),
+    })
 }
 
 /// Builds a [`Config`] wired to two Anvil chains: Base and Ethereum, both
-/// entries in `Config::chains`. Both chains share the mock subgraph.
-/// `eth_vault_address` is passed explicitly rather than read from `eth_evm`:
-/// both Anvil chains deploy from the same key and nonce, so
-/// `eth_evm.vault_address` equals `base_evm.vault_address`, and twin
-/// addresses would make cross-chain routing assertions vacuous. Multichain
-/// tests deploy an additional vault on the Ethereum chain and use its address.
+/// entries in `Config::chains`.
 pub fn create_multichain_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     base_evm: &LocalEvm,
     eth_evm: &LocalEvm,
-    eth_vault_address: Address,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let vault_schemas = HashMap::from([
-        (base_evm.vault_address, TEST_OA_SCHEMA_HASH),
-        (eth_vault_address, TEST_OA_SCHEMA_HASH),
-    ]);
-    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
-
-    let (mut base_config, _) =
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut base_config =
         create_config_with_db(db_path, mock_alpaca, base_evm)?;
-    base_config.subgraph_url = subgraph_url.clone();
     base_config.chains = vec![
         ChainConfig {
             network: Network::Base,
             chain_id: base_evm.chain_id,
             rpc_url: Url::parse(&base_evm.endpoint)?,
-            subgraph_url: subgraph_url.clone(),
             backfill_start_block: 0,
         },
         ChainConfig {
             network: Network::Ethereum,
             chain_id: eth_evm.chain_id,
             rpc_url: Url::parse(&eth_evm.endpoint)?,
-            subgraph_url,
             backfill_start_block: 0,
         },
     ];
 
-    Ok((base_config, mock_subgraph))
+    Ok(base_config)
 }
 
 /// Same as [`create_config_with_db`] but with a per-asset `VaultModeConfig`
@@ -689,11 +615,10 @@ pub fn create_config_with_vault_modes(
     mock_alpaca: &MockServer,
     evm: &LocalEvm,
     vault_mode_config: VaultModeConfig,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let (mut config, mock_subgraph) =
-        create_config_with_db(db_path, mock_alpaca, evm)?;
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut config = create_config_with_db(db_path, mock_alpaca, evm)?;
     config.vault_mode_config = vault_mode_config;
-    Ok((config, mock_subgraph))
+    Ok(config)
 }
 
 /// Mints `amount` share-wei of the primary vault's token to

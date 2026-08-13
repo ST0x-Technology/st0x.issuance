@@ -45,7 +45,7 @@ async fn test_new_asset_triggers_backfills_and_monitors()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Pre-seed only AAPL — MSFT will be added at runtime via API
@@ -57,8 +57,7 @@ async fn test_new_asset_triggers_backfills_and_monitors()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -171,7 +170,7 @@ async fn test_address_change_picked_up_on_next_pass()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Pre-seed AAPL with vault A (the original)
@@ -183,8 +182,7 @@ async fn test_address_change_picked_up_on_next_pass()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

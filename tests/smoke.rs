@@ -66,7 +66,7 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
 
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let temp_dir = tempfile::tempdir()?;
@@ -81,8 +81,7 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 

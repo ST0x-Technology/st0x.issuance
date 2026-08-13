@@ -9,7 +9,6 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
-use std::collections::HashMap;
 use std::time::Duration;
 use url::Url;
 
@@ -107,13 +106,13 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
 
     // Step 1: Mint a receipt BEFORE the service starts (simulates historic receipt)
     let historic_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-    let (historic_receipt_id, _historic_shares) =
+    let historic_receipt_id =
         evm.mint_directly(historic_amount, bot_wallet).await?;
 
     // Setup mocks
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Preseed asset before starting service so backfill can discover receipts
@@ -131,8 +130,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     pool.close().await;
 
     // Step 2: Start service - backfill should discover the historic receipt
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = Client::tracked(rocket1).await?;
 
@@ -141,8 +139,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
 
     // Step 3: Mint another receipt while service is running (monitor should detect)
     let live_amount = U256::from(50) * U256::from(10).pow(U256::from(18));
-    let (live_receipt_id, _live_shares) =
-        evm.mint_directly(live_amount, bot_wallet).await?;
+    let live_receipt_id = evm.mint_directly(live_amount, bot_wallet).await?;
 
     // Give monitor time to detect the new receipt
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -151,8 +148,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     drop(client1);
 
     // Step 5: Restart service - backfill should use checkpoint, not monitor's block
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 = Client::tracked(rocket2).await?;
 
@@ -246,7 +242,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     // Mint directly on TSLA vault BEFORE service starts
     // This simulates a receipt that exists on-chain but the service doesn't know about
     let mint_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-    let (receipt_id, _shares) =
+    let receipt_id =
         evm.mint_directly_on_vault(tsla_vault, mint_amount, bot_wallet).await?;
 
     // Create a temp file database so we can preseed assets before rocket starts
@@ -281,13 +277,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     // Close the pool so rocket can open it
     pool.close().await;
 
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, harness::TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = harness::setup_mock_subgraph(&vault_schemas);
-
     let rpc_url = Url::parse(&evm.endpoint)?;
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
 
     let config = Config {
         database_url,
@@ -319,12 +309,10 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
-        subgraph_url: subgraph_url.clone(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             rpc_url,
-            subgraph_url,
             backfill_start_block: 0,
         }],
         vault_mode_config: VaultModeConfig::default(),
@@ -452,12 +440,11 @@ async fn test_startup_reconciliation_detects_stale_receipts()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Start service — reconciliation should detect stale receipt A (on-chain balance 0)
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = Client::tracked(rocket).await?;
 
@@ -550,7 +537,7 @@ async fn test_external_burn_detected_by_withdraw_monitor()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     harness::preseed_tokenized_asset(
@@ -562,8 +549,7 @@ async fn test_external_burn_detected_by_withdraw_monitor()
     .await?;
 
     // Step 2: Start service — backfill discovers receipt A
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = Client::tracked(rocket).await?;
 

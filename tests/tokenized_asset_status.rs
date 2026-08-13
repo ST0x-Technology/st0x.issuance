@@ -44,8 +44,7 @@ async fn tokenized_asset_status_via_client()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let base_url = harness::spawn_http_server(config).await?;
     let client = IssuanceClient::new(base_url, INTERNAL_API_KEY)?;

@@ -45,7 +45,7 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Pre-seed assets BEFORE starting the service so that initialize_rocket
@@ -60,8 +60,7 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
     harness::preseed_tokenized_asset(&db_url, vault2_address, "TSLA", "tTSLA")
         .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -212,7 +211,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
 
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
+    let _redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Only pre-seed AAPL — the first service will NOT spawn a detector for vault2.
@@ -226,8 +225,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     // === Phase 1: Start service, add TSLA via API, mint on vault2 ===
     let rocket = initialize_rocket(config).await?;
@@ -301,8 +299,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     // === Phase 4: Restart service ===
     // TSLA is now in the DB (added via API in phase 1). The second service
     // should detect it at startup and backfill the transfer.
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;

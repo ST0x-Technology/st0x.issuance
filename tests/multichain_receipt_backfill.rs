@@ -40,7 +40,7 @@ async fn test_multichain_receipt_backfill_uses_chain_provider()
     let mock_alpaca = MockServer::start();
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (redeem_mock, _poll_mock) =
+    let redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let user_private_key = b256!(
@@ -108,14 +108,12 @@ async fn test_multichain_receipt_backfill_uses_chain_provider()
     .await?;
     pool.close().await;
 
-    let (mut config, _mock_subgraph) =
-        harness::create_multichain_config_with_db(
-            &db_url,
-            &mock_alpaca,
-            &base_evm,
-            &eth_evm,
-            eth_vault_address,
-        )?;
+    let mut config = harness::create_multichain_config_with_db(
+        &db_url,
+        &mock_alpaca,
+        &base_evm,
+        &eth_evm,
+    )?;
     // The periodic receipt backfill must never fire within this test's
     // lifetime: it could discover the pre-start receipt and rescue a broken
     // STARTUP backfill, which is the path this test exists to prove.

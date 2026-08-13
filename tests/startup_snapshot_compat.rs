@@ -59,8 +59,7 @@ async fn initialize_server(
     let _mint_callback_mock = setup_mint_mocks(mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(mock_alpaca);
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(db_url, mock_alpaca, evm)?;
+    let config = harness::create_config_with_db(db_url, mock_alpaca, evm)?;
 
     initialize_rocket(config).await?;
 

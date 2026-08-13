@@ -292,7 +292,7 @@ enum OaSchemaCacheMode {
 /// OA schema hash the Rain vaults are deployed against.
 ///
 /// Admin paths that always carry the original deposit `receipt_info_bytes` pass
-/// this to [`OaSchemaCache::fixed`] so they need no subgraph.
+/// this to [`OaSchemaCache::fixed`] so they need no on chain read.
 pub(crate) const OA_SCHEMA_HASH: &str =
     "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
 

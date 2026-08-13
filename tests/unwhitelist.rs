@@ -7,7 +7,6 @@ use alloy::primitives::{U256, b256};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
-use std::collections::HashMap;
 use url::Url;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
@@ -35,16 +34,10 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (redeem_mock, _poll_mock) =
+    let redeem_mock =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, harness::TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = harness::setup_mock_subgraph(&vault_schemas);
-
     let rpc_url = Url::parse(&evm.endpoint)?;
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
 
     let config = Config {
         database_url: ":memory:".to_string(),
@@ -76,12 +69,10 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
-        subgraph_url: subgraph_url.clone(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             rpc_url,
-            subgraph_url,
             backfill_start_block: 0,
         }],
         vault_mode_config: VaultModeConfig::default(),
