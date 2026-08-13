@@ -262,7 +262,10 @@ async fn build_chain_runtime(
         });
     }
 
-    let oa_schema_cache = Arc::new(OaSchemaCache::new(subgraph_url.clone())?);
+    let oa_schema_cache = Arc::new(OaSchemaCache::new(
+        http_provider.clone().erased(),
+        backfill_start_block,
+    ));
 
     let resolved = match signer {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
