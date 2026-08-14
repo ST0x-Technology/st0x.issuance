@@ -2738,12 +2738,19 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
             tokenization_request_id,
             error,
             failed_at,
+            classification,
             ..
         } => Some(MintStuckSummary {
             class: TerminalFail,
             tokenization_request_id: Some(tokenization_request_id.clone()),
             state: "MintingFailed".to_string(),
-            detail: error.clone(),
+            // The typed classification leads the detail: it is the operator's
+            // retry-exclusion signal (a classified failure is never
+            // auto-retried), and the free-text error alone cannot convey it.
+            detail: match classification {
+                MintFailureClassification::Unclassified => error.clone(),
+                classified => format!("{classified:?}: {error}"),
+            },
             timestamp: *failed_at,
         }),
         MintView::CallbackPending {

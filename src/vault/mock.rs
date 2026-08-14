@@ -905,7 +905,8 @@ impl MockVaultService {
     }
 
     /// Overrides the `nonce_used` consumed flag, e.g. `true` with no (or a
-    /// non-matching) `minted_log` exercises the consumed-but-unproven path.
+    /// non-matching) `minted_log` to exercise the consumed-by-another-mint
+    /// path through the pre-submit gate.
     #[cfg(test)]
     pub(crate) fn with_nonce_used(self, consumed: bool) -> Self {
         *self.orchestrator.nonce_used.lock().unwrap() = Some(consumed);
@@ -945,7 +946,9 @@ impl MockVaultService {
     /// Binds the configured `minted_log` to an exact
     /// `(orchestrator, to, token)`: a lookup passing any other address must
     /// miss (or mismatch, for `token`), mirroring the address half of the
-    /// real scan's four-field full-match.
+    /// real scan's four-field full-match — so a test can prove the
+    /// production query passes the right recipient and orchestrator, not
+    /// merely the right nonce and amount.
     #[cfg(test)]
     pub(crate) fn with_minted_log_binding(
         self,

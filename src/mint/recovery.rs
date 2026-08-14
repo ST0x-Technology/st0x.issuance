@@ -1046,16 +1046,26 @@ async fn recover_mint_until_automatic_budget_exhausted(
                     return RecoveryConclusion::Resolved;
                 }
                 reconcile_attempted = true;
-                if let Err(error) =
-                    reconcile_unresolved_replay(ctx, &mint, issuer_request_id)
-                        .await
+                match reconcile_unresolved_replay(ctx, &mint, issuer_request_id)
+                    .await
                 {
-                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                        error = %error,
-                        "Unresolved-replay reconciliation failed; awaiting the next pass"
-                    );
+                    // The mint changed state — re-loop immediately so the
+                    // next iteration keeps driving it (the callback for a
+                    // recovery, the manual-only skip for an upgrade).
+                    Ok(ReconcileOutcome::Advanced) => {}
+                    // Unchanged (or unprovable): nothing more this pass can
+                    // do — the reconciler re-enqueues the next one.
+                    Ok(ReconcileOutcome::Parked) => {
+                        return RecoveryConclusion::Resolved;
+                    }
+                    Err(error) => {
+                        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                            error = %error,
+                            "Unresolved-replay reconciliation failed; awaiting the next pass"
+                        );
+                        return RecoveryConclusion::Resolved;
+                    }
                 }
-                tokio::time::sleep(backoff).await;
             }
             AutomaticRetryDecision::Wait(wait) => {
                 let receipt_exists =
@@ -1475,6 +1485,17 @@ async fn drive_minting_failed_step(
 /// Authorization" -> "Nonce"). ~23 days on Base's 2s blocks.
 const UNRESOLVED_REPLAY_LOOKBACK_BLOCKS: u64 = 1_000_000;
 
+/// What one widened reconciliation attempt concluded, so the recovery loop
+/// can react immediately: an `Advanced` mint changed state (recovered
+/// forward, or upgraded to the proven mismatch) and the next iteration
+/// keeps driving it without waiting out a backoff; a `Parked` mint is
+/// unchanged until the reconciler's next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    Advanced,
+    Parked,
+}
+
 /// One reconciliation attempt for a `NonceReplayUnresolved` mint: re-runs
 /// the `Minted`-log full-match over [`UNRESOLVED_REPLAY_LOOKBACK_BLOCKS`].
 /// A `FullMatch` resolves the mint forward
@@ -1486,7 +1507,7 @@ async fn reconcile_unresolved_replay(
     ctx: &MintRecoveryContext,
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
-) -> Result<(), MintRecoveryStepError> {
+) -> Result<ReconcileOutcome, MintRecoveryStepError> {
     let Mint::MintingFailed {
         underlying,
         network,
@@ -1497,7 +1518,7 @@ async fn reconcile_unresolved_replay(
         ..
     } = mint
     else {
-        return Ok(());
+        return Ok(ReconcileOutcome::Parked);
     };
     let (
         VaultMode::Orchestrator { address: orchestrator },
@@ -1507,7 +1528,7 @@ async fn reconcile_unresolved_replay(
         // `NonceReplayUnresolved` is only ever recorded for an
         // orchestrator mint holding an authorization; anything else is an
         // impossible replay and there is nothing to reconcile.
-        return Ok(());
+        return Ok(ReconcileOutcome::Parked);
     };
 
     let vault = resolve_vault(ctx, underlying, *network).await?;
@@ -1522,7 +1543,7 @@ async fn reconcile_unresolved_replay(
                 error = %error,
                 "Unresolved-replay quantity cannot convert to on-chain units"
             );
-            return Ok(());
+            return Ok(ReconcileOutcome::Parked);
         }
     };
 
@@ -1557,6 +1578,7 @@ async fn reconcile_unresolved_replay(
                     },
                 )
                 .await?;
+            Ok(ReconcileOutcome::Advanced)
         }
         Ok(MintedLogScan::Mismatch) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -1580,6 +1602,7 @@ async fn reconcile_unresolved_replay(
                     },
                 )
                 .await?;
+            Ok(ReconcileOutcome::Advanced)
         }
         Ok(MintedLogScan::NotFound) => {
             debug!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -1587,6 +1610,7 @@ async fn reconcile_unresolved_replay(
                 "Widened reconciliation still found no Minted log at the \
                  pair; the mint stays parked for the next pass"
             );
+            Ok(ReconcileOutcome::Parked)
         }
         Err(error) => {
             warn!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -1594,10 +1618,9 @@ async fn reconcile_unresolved_replay(
                 "Unresolved-replay reconciliation lookup failed; the mint \
                  stays parked for the next pass"
             );
+            Ok(ReconcileOutcome::Parked)
         }
     }
-
-    Ok(())
 }
 
 /// `RetryMint` + enqueue `SubmitMintJob` — shared by free-prepare-safe and

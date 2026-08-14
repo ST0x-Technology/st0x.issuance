@@ -295,10 +295,8 @@ pub(crate) trait VaultService: Send + Sync {
     /// `(token, to, amount, nonce)` from the authorization.
     async fn prepare_orchestrator_mint_tx(
         &self,
-        _params: &OrchestratorMintParams,
-    ) -> Result<PreparedMintTx, VaultError> {
-        Err(VaultError::InvalidReceipt)
-    }
+        params: &OrchestratorMintParams,
+    ) -> Result<PreparedMintTx, VaultError>;
 
     /// Confirms a previously submitted orchestrator mint, parsing the
     /// orchestrator's `Minted` event. A mined-but-reverted mint fails with
@@ -306,10 +304,8 @@ pub(crate) trait VaultService: Send + Sync {
     /// (`NonceReplayed`, `VaultLogicMismatch`, ...).
     async fn confirm_orchestrator_mint(
         &self,
-        _tx_id: &TxId,
-    ) -> Result<OrchestratorMintResult, VaultError> {
-        Err(VaultError::InvalidReceipt)
-    }
+        tx_id: &TxId,
+    ) -> Result<OrchestratorMintResult, VaultError>;
 
     /// Looks up a landed orchestrator mint by its `Minted` log and reports a
     /// three-way [`MintedLogScan`] verdict: `FullMatch` when a log at
@@ -320,13 +316,10 @@ pub(crate) trait VaultService: Send + Sync {
     /// nonce consumed, is an inconclusive chain view, never proof. Callers
     /// must never conflate the last two (SPEC "Recipient Authorization" ->
     /// "Nonce").
-    #[allow(dead_code)]
     async fn find_orchestrator_minted_log(
         &self,
-        _query: MintedLogQuery,
-    ) -> Result<MintedLogScan, VaultError> {
-        Err(VaultError::InvalidReceipt)
-    }
+        query: MintedLogQuery,
+    ) -> Result<MintedLogScan, VaultError>;
 
     /// Reads the orchestrator's `nonceUsed(to, nonce)` consumed flag — the
     /// single cheap read gating [`Self::find_orchestrator_minted_log`]'s
@@ -335,12 +328,10 @@ pub(crate) trait VaultService: Send + Sync {
     /// every ordinary first submission.
     async fn nonce_used(
         &self,
-        _orchestrator: Address,
-        _to: Address,
-        _nonce: B256,
-    ) -> Result<bool, VaultError> {
-        Err(VaultError::InvalidReceipt)
-    }
+        orchestrator: Address,
+        to: Address,
+        nonce: B256,
+    ) -> Result<bool, VaultError>;
 
     /// Validates a delivered recipient authorization before it is stored:
     /// the signature must recover to `query.to` over the orchestrator's own
@@ -356,11 +347,9 @@ pub(crate) trait VaultService: Send + Sync {
     /// will consume.
     async fn validate_mint_authorization(
         &self,
-        _query: MintedLogQuery,
-        _authorization: &MintAuthorization,
-    ) -> Result<(), VaultError> {
-        Err(VaultError::InvalidReceipt)
-    }
+        query: MintedLogQuery,
+        authorization: &MintAuthorization,
+    ) -> Result<(), VaultError>;
 }
 
 pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
