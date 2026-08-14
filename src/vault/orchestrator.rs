@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
+use crate::VaultMode;
 use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
 
 /// Parameters for a single `ST0xOrchestrator.burn()` call.
@@ -105,4 +106,42 @@ pub(crate) enum OrchestratorRevertReason {
     /// Revert data was unavailable or did not decode to one of the
     /// orchestrator's typed errors.
     Unknown,
+}
+
+/// Which on-chain proof shape [`super::verify_burn_tx`] must accept when
+/// verifying a burn transaction.
+///
+/// The two [`crate::VaultMode`]s emit structurally different burn proofs, and
+/// a proof of one shape must never satisfy the other: a vault-direct
+/// redemption's burn is never confirmed by an orchestrator-shaped
+/// transaction, or vice versa. Callers always derive this from the
+/// redemption's own persisted `burn_mode` (captured on `RedemptionDetected`),
+/// never re-resolved from the asset's current `VaultMode` — that per-redemption
+/// mode stays authoritative even while both modes are live side by side
+/// during the incremental per-asset cutover (see `From<VaultMode>` below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurnProofKind {
+    /// A single `Transfer(owner -> 0x0)` of vault shares, emitted directly by
+    /// `ReceiptVault.withdraw()`.
+    VaultDirect,
+    /// Two legs in the same transaction: `Transfer(owner -> address)` (the
+    /// orchestrator's `transferFrom` pull) followed by
+    /// `Transfer(address -> 0x0)` (the orchestrator's burn). The pull total
+    /// must equal the burn total, or the proof is rejected.
+    Orchestrator {
+        /// The `ST0xOrchestrator` contract address that performed the pull
+        /// and burn.
+        address: Address,
+    },
+}
+
+impl From<VaultMode> for BurnProofKind {
+    fn from(value: VaultMode) -> Self {
+        match value {
+            VaultMode::VaultDirect => Self::VaultDirect,
+            VaultMode::Orchestrator { address } => {
+                Self::Orchestrator { address }
+            }
+        }
+    }
 }

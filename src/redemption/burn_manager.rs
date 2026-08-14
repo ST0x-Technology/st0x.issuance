@@ -23,6 +23,9 @@ use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
     Shares,
 };
+use crate::redemption::force_complete::{
+    ForceCompleteRefusal, bind_verified_burns,
+};
 use crate::redemption::{
     BurnFailureClassification, BurnRecord, RedemptionMetadata,
     has_unresolved_signer_intent,
@@ -341,12 +344,25 @@ impl BurnManager {
                 acknowledged_unresolved_burn_tx_hash,
             )?;
 
-        let (underlying, network) = match &redemption {
-            Redemption::Burning { metadata, .. }
-            | Redemption::BurnIntended { metadata, .. }
-            | Redemption::BurnSubmitted { metadata, .. } => {
-                (metadata.underlying.clone(), metadata.network)
+        let (metadata, planned_burns, alpaca_quantity) = match &redemption {
+            // Burning carries no persisted transaction, so the
+            // `persisted_burn_tx` guard above already rejected it; the arm
+            // exists only to keep the state match exhaustive.
+            Redemption::Burning { metadata, alpaca_quantity, .. } => {
+                (metadata, &[][..], alpaca_quantity)
             }
+            Redemption::BurnIntended {
+                metadata,
+                planned_burns,
+                alpaca_quantity,
+                ..
+            }
+            | Redemption::BurnSubmitted {
+                metadata,
+                planned_burns,
+                alpaca_quantity,
+                ..
+            } => (metadata, planned_burns.as_slice(), alpaca_quantity),
             other => {
                 return Err(BurnManagerError::InvalidAggregateState {
                     current_state: aggregate_state_name(other).to_string(),
@@ -354,15 +370,68 @@ impl BurnManager {
             }
         };
 
-        let vault =
-            find_vault(&self.view_pool, &underlying, &network).await?.ok_or(
-                BurnManagerError::AssetNotFound { underlying, network },
-            )?;
+        let vault = find_vault(
+            &self.view_pool,
+            &metadata.underlying,
+            &metadata.network,
+        )
+        .await?
+        .ok_or_else(|| BurnManagerError::AssetNotFound {
+            network: metadata.network,
+            underlying: metadata.underlying.clone(),
+        })?;
 
         let verification = self
-            .vault_for(network)?
-            .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
+            .vault_for(metadata.network)?
+            .verify_burn_tx(
+                vault,
+                self.bot_wallet,
+                burn_tx_hash,
+                metadata.burn_mode.into(),
+            )
             .await?;
+
+        // SPEC "ForceCompleteBurn": the proving transaction's signer nonce
+        // must equal the persisted transaction's nonce — an alternate proof
+        // must be the mined replacement at that exact nonce, ensuring the
+        // acknowledged transaction can never land and another redemption's
+        // same-vault burn can never be used as proof.
+        if verification.nonce != persisted_burn_tx.nonce {
+            return Err(BurnManagerError::ForceCompleteNonceMismatch {
+                proof_nonce: verification.nonce,
+                persisted_nonce: persisted_burn_tx.nonce,
+            });
+        }
+
+        // Bind the proof to this redemption's persisted burn semantics: the
+        // per-receipt plan for vault-direct (the same rule the offline CLI
+        // enforces), and the burned amount plus transfer-free shape for
+        // orchestrator mode, which has no receipt plan — the amount is its
+        // only binding, and an orchestrator burn moves nothing besides the
+        // pull-and-burn legs (dust is retained, never returned on-chain).
+        match metadata.burn_mode {
+            VaultMode::VaultDirect => {
+                bind_verified_burns(planned_burns, &verification.burns)?;
+            }
+            VaultMode::Orchestrator { .. } => {
+                let required_shares =
+                    alpaca_quantity.to_u256_with_18_decimals()?;
+                if verification.shares_burned != required_shares {
+                    return Err(
+                        BurnManagerError::ForceCompleteAmountMismatch {
+                            proof_shares: verification.shares_burned,
+                            required_shares,
+                        },
+                    );
+                }
+                if let Some(stray) = verification.share_transfers.first() {
+                    return Err(BurnManagerError::ForceCompleteStrayTransfer {
+                        recipient: stray.recipient,
+                        shares: stray.shares,
+                    });
+                }
+            }
+        }
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_tx_hash = ?burn_tx_hash,
@@ -386,8 +455,12 @@ impl BurnManager {
             )
             .await?;
 
-        let chain_id = self.chain_id_for(network)?;
-        self.settle_reserved_burn(chain_id, vault, issuer_request_id).await;
+        // Orchestrator redemptions never reserved receipts, so there is
+        // nothing to settle and the receipt service must not be touched.
+        let chain_id = self.chain_id_for(metadata.network)?;
+        if matches!(metadata.burn_mode, VaultMode::VaultDirect) {
+            self.settle_reserved_burn(chain_id, vault, issuer_request_id).await;
+        }
 
         Ok(verification)
     }
@@ -2675,6 +2748,25 @@ pub(crate) enum BurnManagerError {
     QuantityConversion(#[from] QuantityConversionError),
     #[error("Insufficient balance: required {required}, available {available}")]
     InsufficientBalance { required: Shares, available: Shares },
+    #[error(transparent)]
+    ForceCompleteRefusal(#[from] ForceCompleteRefusal),
+    #[error(
+        "Force-complete proof nonce {proof_nonce} does not match the \
+         persisted burn transaction's nonce {persisted_nonce}; an alternate \
+         proof must be the mined replacement at that exact nonce"
+    )]
+    ForceCompleteNonceMismatch { proof_nonce: u64, persisted_nonce: u64 },
+    #[error(
+        "Force-complete proof burned {proof_shares} share-wei but this \
+         redemption requires exactly {required_shares}"
+    )]
+    ForceCompleteAmountMismatch { proof_shares: U256, required_shares: U256 },
+    #[error(
+        "Force-complete proof also transferred {shares} share-wei to \
+         {recipient}; an orchestrator burn moves nothing besides the \
+         pull-and-burn legs"
+    )]
+    ForceCompleteStrayTransfer { recipient: Address, shares: U256 },
     #[error("Receipt inventory error: {0}")]
     BurnTracking(#[from] BurnTrackingError),
     #[error("Redemption view error: {0}")]
@@ -2744,6 +2836,7 @@ mod tests {
         BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
         OrchestratorBurnReadiness, OrchestratorRevertReason,
         ReceiptInformation, SendableTxWithHash, TxId, VaultError, VaultService,
+        VerifiedBurn, VerifiedShareTransfer,
     };
 
     const TEST_WALLET: Address =
@@ -4184,7 +4277,20 @@ mod tests {
         let owner = persisted_tx.signer_for_test();
         let vault_mock = Arc::new(
             MockVaultService::new_success()
-                .with_verified_burn(45_989_009, uint!(17_U256))
+                // The proof must carry the persisted transaction's nonce and
+                // the exact per-receipt plan — force-complete binds both.
+                .with_verified_burns_and_total(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    uint!(17_U256),
+                    vec![VerifiedBurn {
+                        sender: owner,
+                        receiver: owner,
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_U256),
+                    }],
+                    vec![],
+                )
                 .with_prepared_tx(persisted_tx.clone()),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
@@ -4277,6 +4383,368 @@ mod tests {
             tracing::Level::INFO,
             &["Force-completing stuck Burning redemption", "verified on-chain"]
         ));
+    }
+
+    /// Amount an orchestrator redemption seeded by
+    /// [`create_orchestrator_redemption_in_burning_state`] burns:
+    /// `alpaca_quantity` (100) converted to 18-decimal share-wei.
+    const ORCHESTRATOR_BURN_AMOUNT: U256 = uint!(100_000000000000000000_U256);
+
+    async fn persist_test_orchestrator_burn_intent(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        token: Address,
+        owner: Address,
+    ) {
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token,
+                        amount: ORCHESTRATOR_BURN_AMOUNT,
+                        owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("orchestrator burn intent should persist");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_orchestrator_persisted_hash_skips_receipt_lifecycle()
+     {
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns_and_total(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    ORCHESTRATOR_BURN_AMOUNT,
+                    vec![],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let recording = Arc::new(RecordingReceiptService::new(
+            harness.receipt_service.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            recording.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_orchestrator_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        persist_test_orchestrator_burn_intent(
+            &harness.store,
+            &issuer_request_id,
+            vault,
+            owner,
+        )
+        .await;
+
+        let verification = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                persisted_tx.hash,
+                "orchestrator burn confirmed".to_string(),
+                None,
+            )
+            .await
+            .expect("orchestrator force-complete should succeed");
+
+        assert_eq!(verification.shares_burned, ORCHESTRATOR_BURN_AMOUNT);
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert_eq!(
+            recording.call_count(),
+            0,
+            "orchestrator force-complete must never touch the receipt service"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Force-completing stuck Burning redemption", "verified on-chain"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn force_complete_orchestrator_accepts_matching_alternate_hash() {
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns_and_total(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    ORCHESTRATOR_BURN_AMOUNT,
+                    vec![],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let recording = Arc::new(RecordingReceiptService::new(
+            harness.receipt_service.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            recording.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_orchestrator_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        persist_test_orchestrator_burn_intent(
+            &harness.store,
+            &issuer_request_id,
+            vault,
+            owner,
+        )
+        .await;
+
+        manager
+            .force_complete_burn(
+                &issuer_request_id,
+                B256::random(),
+                "alternate orchestrator burn".to_string(),
+                Some(persisted_tx.hash),
+            )
+            .await
+            .expect("matching alternate orchestrator burn should complete");
+
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert_eq!(recording.call_count(), 0);
+    }
+
+    /// Force-complete binds an orchestrator proof to this redemption per
+    /// SPEC "ForceCompleteBurn": a proof at the wrong nonce (could be
+    /// another redemption's burn, and the acknowledged transaction could
+    /// still land), with the wrong burned amount, or carrying stray share
+    /// transfers (an orchestrator burn moves nothing besides the
+    /// pull-and-burn legs) is rejected before any state change — and the
+    /// receipt service is never touched either way.
+    #[tokio::test]
+    async fn force_complete_orchestrator_rejects_unbound_proofs() {
+        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
+        for (scenario, verified_nonce, verified_shares, verified_transfers) in [
+            ("nonce mismatch", 8, ORCHESTRATOR_BURN_AMOUNT, vec![]),
+            ("amount mismatch", 7, uint!(99_000000000000000000_U256), vec![]),
+            (
+                "stray share transfer",
+                7,
+                ORCHESTRATOR_BURN_AMOUNT,
+                vec![VerifiedShareTransfer {
+                    recipient,
+                    shares: uint!(1_U256),
+                }],
+            ),
+        ] {
+            let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            let persisted_tx = SendableTxWithHash::valid_for_test(
+                7,
+                vault,
+                Bytes::from_static(&[0xde, 0xad]),
+            );
+            let owner = persisted_tx.signer_for_test();
+            let vault_mock = Arc::new(
+                MockVaultService::new_success()
+                    .with_verified_burns_and_total(
+                        45_989_009,
+                        verified_nonce,
+                        verified_shares,
+                        vec![],
+                        verified_transfers,
+                    )
+                    .with_prepared_tx(persisted_tx.clone()),
+            );
+            let harness =
+                TestHarness::with_vault_mock(vault_mock.clone()).await;
+            harness
+                .add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault)
+                .await;
+            let recording = Arc::new(RecordingReceiptService::new(
+                harness.receipt_service.clone(),
+            ));
+            let manager = BurnManager::new_for_tests(
+                vault_mock.clone(),
+                harness.pool.clone(),
+                harness.store.clone(),
+                recording.clone(),
+                owner,
+                ANVIL_CHAIN_ID,
+            );
+
+            let issuer_request_id = IssuerRedemptionRequestId::random();
+            create_orchestrator_redemption_in_burning_state(
+                &harness.store,
+                &issuer_request_id,
+            )
+            .await;
+            persist_test_orchestrator_burn_intent(
+                &harness.store,
+                &issuer_request_id,
+                vault,
+                owner,
+            )
+            .await;
+
+            let err = manager
+                .force_complete_burn(
+                    &issuer_request_id,
+                    B256::random(),
+                    scenario.to_string(),
+                    Some(persisted_tx.hash),
+                )
+                .await
+                .unwrap_err();
+
+            let rejected_as_expected = match scenario {
+                "nonce mismatch" => matches!(
+                    err,
+                    BurnManagerError::ForceCompleteNonceMismatch {
+                        proof_nonce: 8,
+                        persisted_nonce: 7,
+                    }
+                ),
+                "amount mismatch" => matches!(
+                    err,
+                    BurnManagerError::ForceCompleteAmountMismatch { .. }
+                ),
+                "stray share transfer" => matches!(
+                    err,
+                    BurnManagerError::ForceCompleteStrayTransfer { .. }
+                ),
+                _ => false,
+            };
+            assert!(
+                rejected_as_expected,
+                "scenario {scenario}: unexpected error {err:?}"
+            );
+
+            assert!(
+                matches!(
+                    load_aggregate(&harness.store, &issuer_request_id).await,
+                    Redemption::BurnIntended { .. }
+                ),
+                "scenario {scenario} must leave the redemption BurnIntended"
+            );
+            assert_eq!(
+                recording.call_count(),
+                0,
+                "scenario {scenario} touched the receipt service"
+            );
+        }
+    }
+
+    /// An orchestrator force-complete whose burn does not verify on-chain is
+    /// rejected before any state change: `verify_burn_tx` fails, so the
+    /// `ForceCompleteBurn` command is never sent, the redemption stays
+    /// `BurnIntended`, and the receipt service is never touched.
+    #[tokio::test]
+    async fn force_complete_orchestrator_rejects_unverifiable_burn() {
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_unverifiable_burn()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let recording = Arc::new(RecordingReceiptService::new(
+            harness.receipt_service.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            recording.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_orchestrator_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        persist_test_orchestrator_burn_intent(
+            &harness.store,
+            &issuer_request_id,
+            vault,
+            owner,
+        )
+        .await;
+
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                persisted_tx.hash,
+                "operator hash is not a burn".to_string(),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            BurnManagerError::Vault(VaultError::NotABurn { .. })
+        ));
+        assert!(
+            matches!(
+                load_aggregate(&harness.store, &issuer_request_id).await,
+                Redemption::BurnIntended { .. }
+            ),
+            "an unverifiable burn must leave the redemption BurnIntended"
+        );
+        assert_eq!(
+            recording.call_count(),
+            0,
+            "a rejected force-complete must not touch the receipt service"
+        );
     }
 
     #[tokio::test]

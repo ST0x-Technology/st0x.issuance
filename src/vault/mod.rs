@@ -25,6 +25,7 @@ use crate::mint::{
     IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
+use crate::vault::orchestrator::BurnProofKind;
 
 pub(crate) mod mock;
 pub(crate) mod network_services;
@@ -164,6 +165,7 @@ pub(crate) trait VaultService: Send + Sync {
         vault: Address,
         owner: Address,
         tx_hash: B256,
+        expected_proof: BurnProofKind,
     ) -> Result<BurnVerification, VaultError>;
 
     /// Prepares a signed raw transaction for `eth_sendRawTransaction`.
@@ -490,6 +492,12 @@ pub(crate) struct SendableTxWithHash {
 
 /// Proof that a burn transaction landed on-chain, returned by
 /// [`VaultService::verify_burn_tx`].
+///
+/// Field semantics depend on the [`BurnProofKind`] the verification was
+/// checked against: for [`BurnProofKind::VaultDirect`] the "burner" is the
+/// owner (bot wallet) itself; for [`BurnProofKind::Orchestrator`] the burner
+/// is the orchestrator contract, which receives the owner's shares via
+/// `transferFrom` and burns them in the same transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BurnVerification {
     /// Block number the burn transaction was included in.
@@ -497,15 +505,19 @@ pub(crate) struct BurnVerification {
     /// Signer nonce of the mined transaction. An alternate proof must replace
     /// the persisted transaction at this exact nonce.
     pub(crate) nonce: u64,
-    /// Total shares burned by the owner in this transaction (sum of all
-    /// matching `Transfer(owner -> 0x0)` events). Alternate-burn recovery
-    /// requires this to equal the persisted burn plan's aggregate total.
+    /// Total shares burned by the burner in this transaction (sum of all
+    /// matching `Transfer(burner -> 0x0)` events — `burner` is the owner for
+    /// `VaultDirect`, the orchestrator for `Orchestrator`). Alternate-burn
+    /// recovery requires this to equal the persisted burn plan's aggregate
+    /// total.
     pub(crate) shares_burned: U256,
-    /// Per-receipt withdrawals emitted for this owner. Admin recovery uses
+    /// Per-receipt withdrawals emitted for the burner (owner for
+    /// `VaultDirect`, orchestrator for `Orchestrator`). Admin recovery uses
     /// these to bind an alternate proving transaction to the redemption's
     /// persisted burn plan.
     pub(crate) burns: Vec<VerifiedBurn>,
-    /// Non-burn share transfers sent by the owner in the same transaction.
+    /// Non-burn share transfers sent by the owner in the same transaction
+    /// (excludes the orchestrator pull leg, which is verified separately).
     /// A redemption's dust return must match these exactly.
     pub(crate) share_transfers: Vec<VerifiedShareTransfer>,
 }
@@ -524,20 +536,32 @@ pub(crate) struct VerifiedShareTransfer {
     pub(crate) shares: U256,
 }
 
-/// Verifies that `receipt` proves `owner` burned shares of the `vault` share
-/// token (one or more `Transfer(owner -> 0x0)` events emitted by `vault`).
+/// Verifies that `receipt` proves a burn of `vault` shares matching
+/// `expected_proof`.
 ///
-/// A burn emits an ERC-20 `Transfer(owner, address(0), shares)` from the vault
-/// share token. Reference chain: `redeem()` -> `ReceiptVault._withdraw()` ->
+/// For [`BurnProofKind::VaultDirect`], a burn emits an ERC-20
+/// `Transfer(owner, address(0), shares)` from the vault share token directly.
+/// Reference chain: `redeem()` -> `ReceiptVault._withdraw()` ->
 /// `_burn(owner, shares)` -> `ERC20Upgradeable._update(owner, 0x0, shares)`
 /// emits `Transfer(owner, 0x0, shares)`. Mirrors the mint-skip check in
 /// `redemption/transfer.rs`, which treats `from == 0x0` as a mint.
+///
+/// For [`BurnProofKind::Orchestrator`], the proof is two legs in the same
+/// transaction: `Transfer(owner, address, shares)` (the orchestrator's
+/// `transferFrom` pull) followed by `Transfer(address, 0x0, shares)` (the
+/// orchestrator burning what it pulled). Verification fails closed unless
+/// the pull total equals the burn total AND every pull precedes the first
+/// burn leg (receipt logs preserve execution order), so a transaction that
+/// only partially matches the orchestrator shape, matches the other mode's
+/// shape, or burns pre-existing orchestrator shares with the pull trailing
+/// the burn is rejected as [`VaultError::NotABurn`].
 pub(crate) fn verify_burn_in_receipt(
     receipt: &TransactionReceipt,
     vault: Address,
     owner: Address,
     tx_hash: B256,
     nonce: u64,
+    expected_proof: BurnProofKind,
 ) -> Result<BurnVerification, VaultError> {
     if !receipt.status() {
         return Err(VaultError::Reverted { tx_hash });
@@ -547,6 +571,12 @@ pub(crate) fn verify_burn_in_receipt(
     let mut found_burn = false;
     let mut burns = Vec::new();
     let mut share_transfers = Vec::new();
+    let mut pulled = U256::ZERO;
+
+    let burner = match expected_proof {
+        BurnProofKind::VaultDirect => owner,
+        BurnProofKind::Orchestrator { address } => address,
+    };
 
     for log in receipt.inner.logs() {
         if log.address() != vault {
@@ -557,9 +587,28 @@ pub(crate) fn verify_burn_in_receipt(
             log.log_decode::<OffchainAssetReceiptVault::Transfer>()
         {
             let transfer = decoded.data();
-            if transfer.from == owner && transfer.to == Address::ZERO {
+            if transfer.from == burner && transfer.to == Address::ZERO {
                 found_burn = true;
                 shares_burned = shares_burned
+                    .checked_add(transfer.value)
+                    .ok_or(VaultError::InvalidReceipt)?;
+            } else if matches!(
+                expected_proof,
+                BurnProofKind::Orchestrator { .. }
+            ) && transfer.from == owner
+                && transfer.to == burner
+            {
+                // Receipt logs preserve execution order, and the
+                // orchestrator's burn pulls the owner's shares BEFORE
+                // burning them (`transferFrom` then the receipt walk's
+                // burn legs). A pull appearing after a burn leg means the
+                // burn consumed shares the orchestrator already held while
+                // the owner's shares merely moved to the orchestrator —
+                // totals match, but nothing of the owner's was burned.
+                if found_burn {
+                    return Err(VaultError::NotABurn { tx_hash });
+                }
+                pulled = pulled
                     .checked_add(transfer.value)
                     .ok_or(VaultError::InvalidReceipt)?;
             } else if transfer.from == owner {
@@ -574,7 +623,7 @@ pub(crate) fn verify_burn_in_receipt(
             log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
         {
             let withdrawal = decoded.data();
-            if withdrawal.owner == owner {
+            if withdrawal.owner == burner {
                 burns.push(VerifiedBurn {
                     sender: withdrawal.sender,
                     receiver: withdrawal.receiver,
@@ -585,7 +634,10 @@ pub(crate) fn verify_burn_in_receipt(
         }
     }
 
-    if !found_burn {
+    if !found_burn
+        || (matches!(expected_proof, BurnProofKind::Orchestrator { .. })
+            && (pulled != shares_burned || shares_burned.is_zero()))
+    {
         return Err(VaultError::NotABurn { tx_hash });
     }
 
@@ -1171,6 +1223,9 @@ mod tests {
     const VAULT: Address = alloy::primitives::address!(
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
+    const ORCHESTRATOR: Address = alloy::primitives::address!(
+        "0xcccccccccccccccccccccccccccccccccccccccc"
+    );
     const BURN_TX: B256 = alloy::primitives::b256!(
         "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
     );
@@ -1246,9 +1301,15 @@ mod tests {
             vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
         );
 
-        let verification =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
-                .unwrap();
+        let verification = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap();
 
         assert_eq!(verification.block_number, 45_989_009);
         assert_eq!(verification.shares_burned, U256::from(17u64));
@@ -1295,9 +1356,15 @@ mod tests {
         .collect();
         let receipt = receipt_with_logs(true, 45_989_009, logs);
 
-        let verification =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
-                .unwrap();
+        let verification = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap();
 
         assert_eq!(
             verification.burns,
@@ -1343,9 +1410,15 @@ mod tests {
             ],
         );
 
-        let verification =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
-                .unwrap();
+        let verification = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap();
 
         assert_eq!(verification.shares_burned, U256::from(15u64));
     }
@@ -1358,9 +1431,15 @@ mod tests {
             vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
         );
 
-        let err =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
-                .unwrap_err();
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, VaultError::Reverted { .. }));
     }
@@ -1375,9 +1454,206 @@ mod tests {
             vec![(VAULT, BOT_WALLET, user, U256::from(17u64))],
         );
 
-        let err =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
-                .unwrap_err();
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_accepts_orchestrator_pull_and_burn_legs() {
+        let pull = OffchainAssetReceiptVault::Transfer {
+            from: BOT_WALLET,
+            to: ORCHESTRATOR,
+            value: U256::from(17u64),
+        };
+        let burn = OffchainAssetReceiptVault::Transfer {
+            from: ORCHESTRATOR,
+            to: Address::ZERO,
+            value: U256::from(17u64),
+        };
+        let withdrawal = OffchainAssetReceiptVault::Withdraw {
+            sender: ORCHESTRATOR,
+            receiver: address!("0x3333333333333333333333333333333333333333"),
+            owner: ORCHESTRATOR,
+            assets: U256::from(17u64),
+            shares: U256::from(17u64),
+            id: U256::from(42u64),
+            receiptInformation: Bytes::new(),
+        };
+        let logs = [
+            pull.into_log_data(),
+            burn.into_log_data(),
+            withdrawal.into_log_data(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, data)| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: VAULT, data },
+            block_hash: None,
+            block_number: Some(45_989_009),
+            block_timestamp: None,
+            transaction_hash: Some(BURN_TX),
+            transaction_index: Some(0),
+            log_index: Some(index as u64),
+            removed: false,
+        })
+        .collect();
+        let receipt = receipt_with_logs(true, 45_989_009, logs);
+
+        let verification = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::Orchestrator { address: ORCHESTRATOR },
+        )
+        .unwrap();
+
+        assert_eq!(verification.shares_burned, U256::from(17u64));
+        assert_eq!(
+            verification.burns,
+            vec![VerifiedBurn {
+                sender: ORCHESTRATOR,
+                receiver: address!(
+                    "0x3333333333333333333333333333333333333333"
+                ),
+                receipt_id: U256::from(42u64),
+                shares_burned: U256::from(17u64),
+            }]
+        );
+        assert!(verification.share_transfers.is_empty());
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_vault_direct_tx_under_orchestrator_proof()
+    {
+        // Vault-direct shape: Transfer(owner -> 0x0) with no orchestrator legs.
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
+        );
+
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::Orchestrator { address: ORCHESTRATOR },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_orchestrator_tx_under_vault_direct_proof()
+    {
+        // Orchestrator shape: pull + burn legs, no direct owner-burn.
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![
+                (VAULT, BOT_WALLET, ORCHESTRATOR, U256::from(17u64)),
+                (VAULT, ORCHESTRATOR, Address::ZERO, U256::from(17u64)),
+            ],
+        );
+
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::VaultDirect,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_orchestrator_pull_burn_mismatch() {
+        // Pulled 10, but burned 17 — the orchestrator's receipt walk cannot
+        // have consumed more than it pulled from the owner.
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![
+                (VAULT, BOT_WALLET, ORCHESTRATOR, U256::from(10u64)),
+                (VAULT, ORCHESTRATOR, Address::ZERO, U256::from(17u64)),
+            ],
+        );
+
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::Orchestrator { address: ORCHESTRATOR },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_orchestrator_pull_after_burn() {
+        // Totals match, but the burn precedes the pull: the burn consumed
+        // shares the orchestrator ALREADY held, and the owner's shares
+        // merely moved to the orchestrator afterwards — nothing of the
+        // owner's was burned, so this is not the pull-then-burn proof
+        // shape.
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![
+                (VAULT, ORCHESTRATOR, Address::ZERO, U256::from(17u64)),
+                (VAULT, BOT_WALLET, ORCHESTRATOR, U256::from(17u64)),
+            ],
+        );
+
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::Orchestrator { address: ORCHESTRATOR },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_orchestrator_zero_value_burn() {
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![(VAULT, ORCHESTRATOR, Address::ZERO, U256::ZERO)],
+        );
+
+        let err = verify_burn_in_receipt(
+            &receipt,
+            VAULT,
+            BOT_WALLET,
+            BURN_TX,
+            7,
+            BurnProofKind::Orchestrator { address: ORCHESTRATOR },
+        )
+        .unwrap_err();
 
         assert!(matches!(err, VaultError::NotABurn { .. }));
     }
