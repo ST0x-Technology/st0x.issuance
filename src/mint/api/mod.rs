@@ -22,10 +22,7 @@ mod initiate;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-pub(crate) use authorize::{
-    __path_authorize_mint, MintAuthorizationRequest, MintAuthorizationResponse,
-    authorize_mint,
-};
+pub(crate) use authorize::{__path_authorize_mint, authorize_mint};
 pub(crate) use confirm::confirm_journal;
 pub(crate) use initiate::initiate_mint;
 

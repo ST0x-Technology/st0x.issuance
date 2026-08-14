@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, Bytes};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -350,6 +350,45 @@ pub struct TokenizedAssetStatusResponse {
     pub vault_mode: VaultModeTag,
 }
 
+/// Request body of `POST /internal/mints/<tokenization_request_id>/authorization`.
+///
+/// The liquidity bot's signed `MintAuthV1` recipient authorization for one
+/// orchestrator-mode mint, correlated by the path's `tokenization_request_id`
+/// which is the only mint identifier the liquidity bot holds.
+///
+/// Internal service-to-service wire type deliberately not exported to the
+/// dashboard TypeScript bindings (no `TS` derive) — the dashboard never
+/// sees this channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct MintAuthorizationRequest {
+    /// Recipient-chosen random 32-byte nonce, hex-encoded. Fixed per mint:
+    /// a retried delivery MUST carry the same nonce byte-identically.
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub nonce: B256,
+    /// EIP-712 `MintAuthV1` signature over `(token, to, amount, nonce)` by
+    /// the recipient wallet key, hex-encoded. May be `"0x"` (empty) for
+    /// contract recipients authorized via the orchestrator's
+    /// `authorizeMint` callback.
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub signature: Bytes,
+}
+
+/// Response body of a successful (`200`) mint-authorization delivery.
+///
+/// Internal service-to-service wire type; not exported to the dashboard
+/// bindings (see [`MintAuthorizationRequest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct MintAuthorizationResponse {
+    /// The issuance bot's own id for the resolved mint. Opaque to callers —
+    /// informational only; the wire correlation key remains the
+    /// `tokenization_request_id`.
+    pub issuer_request_id: String,
+    /// `"authorized"` on success.
+    pub status: String,
+}
+
 /// One entry in the `GET /tokenized-assets` list.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct TokenizedAssetResponse {
@@ -597,6 +636,59 @@ mod tests {
         assert_eq!(response.underlying, UnderlyingSymbol::new("SGOV").unwrap());
         assert_eq!(response.status, TokenizedAssetStatus::Enabled);
         assert_eq!(response.vault_mode, VaultModeTag::VaultDirect);
+    }
+
+    /// The authorization wire shape is the cross-repo contract the liquidity
+    /// bot signs against — pin it to exact JSON literals (hex-encoded
+    /// `nonce`/`signature`), not just a round-trip, so a field rename or
+    /// encoding change fails here.
+    #[test]
+    fn mint_authorization_request_pins_hex_wire_format() {
+        let request = MintAuthorizationRequest {
+            nonce: B256::repeat_byte(0x07),
+            signature: Bytes::from(vec![0xab, 0xcd]),
+        };
+
+        let wire = json!({
+            "nonce": "0x0707070707070707070707070707070707070707070707070707070707070707",
+            "signature": "0xabcd"
+        });
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<MintAuthorizationRequest>(wire).unwrap(),
+            request
+        );
+    }
+
+    /// `"0x"` is a valid signature on the wire: contract recipients
+    /// authorize via the orchestrator's `authorizeMint` callback and send an
+    /// empty signature (SPEC "Recipient Authorization", staged scope).
+    #[test]
+    fn mint_authorization_request_accepts_empty_signature() {
+        let request: MintAuthorizationRequest = serde_json::from_value(json!({
+            "nonce": "0x0707070707070707070707070707070707070707070707070707070707070707",
+            "signature": "0x"
+        }))
+        .unwrap();
+
+        assert!(request.signature.is_empty());
+    }
+
+    #[test]
+    fn mint_authorization_response_round_trips_wire_format() {
+        let wire = json!({
+            "issuer_request_id": "550e8400-e29b-41d4-a716-446655440000",
+            "status": "authorized"
+        });
+
+        let response: MintAuthorizationResponse =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            response.issuer_request_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(response.status, "authorized");
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
     }
 
     /// A response from a server that predates `vault_mode` still parses —

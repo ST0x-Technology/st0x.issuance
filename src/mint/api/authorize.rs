@@ -1,4 +1,3 @@
-use alloy::primitives::{B256, Bytes};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
@@ -6,8 +5,8 @@ use rocket::http::{ContentType, Status};
 use rocket::post;
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
-use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::{MintAuthorizationRequest, MintAuthorizationResponse};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -25,28 +24,6 @@ use crate::tokenized_asset::view::find_vault;
 use crate::vault::{
     MintAuthorization, MintedLogQuery, NetworkVaultServices, VaultError,
 };
-
-/// Wire shape of the liquidity bot's mint-authorization delivery
-/// (RAI-1243). The signature is opaque bytes; `"0x"` (empty) is valid input
-/// for recipients authorized via the orchestrator's `authorizeMint`
-/// callback.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct MintAuthorizationRequest {
-    /// Recipient-chosen random 32-byte nonce, hex-encoded.
-    #[schema(value_type = String)]
-    pub(crate) nonce: B256,
-    /// EIP-712 `MintAuthV1` signature over `(token, to, amount, nonce)` by
-    /// the recipient wallet key, hex-encoded; may be `"0x"`.
-    #[schema(value_type = String)]
-    pub(crate) signature: Bytes,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct MintAuthorizationResponse {
-    #[schema(value_type = String)]
-    pub(crate) issuer_request_id: IssuerMintRequestId,
-    pub(crate) status: String,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MintAuthorizationApiError {
@@ -308,7 +285,7 @@ pub(crate) async fn authorize_mint(
         )
         .await;
         return Ok(Json(MintAuthorizationResponse {
-            issuer_request_id,
+            issuer_request_id: issuer_request_id.to_string(),
             status: "authorized".to_string(),
         }));
     }
@@ -386,7 +363,7 @@ pub(crate) async fn authorize_mint(
         .await;
 
     Ok(Json(MintAuthorizationResponse {
-        issuer_request_id,
+        issuer_request_id: issuer_request_id.to_string(),
         status: "authorized".to_string(),
     }))
 }
