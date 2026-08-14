@@ -1191,6 +1191,28 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   with Turnkey without broadcasting it. `--smoke` additionally submits a
   zero-amount transfer through the full Fireblocks path. Temporary, like
   `migrate-receipts`.
+- `issuer orchestrator-preflight` — the on-chain read-only pre-cutover gate for
+  the orchestrator rollout: verifies the Turnkey bot wallet holds `MINT_ROLE`
+  and `BURN_ROLE` on the orchestrator, `vaultLogicIsExpected()` is healthy, the
+  orchestrator holds `DEPOSIT` and `WITHDRAW` on each vault's authorizer, and
+  each checked asset's one-time unlimited approval has been executed. Defaults
+  to the assets whose configured `vault_mode` resolves to orchestrator;
+  `--asset` narrows or widens the scope. Exits non-zero unless every check
+  passes, so runbook steps gate on it.
+- `issuer approve-orchestrator <UNDERLYING>` — executes the asset's one-time
+  unlimited ERC-20 approval (bot wallet → orchestrator, on the vault share
+  token) through the Turnkey signer, after verifying the configured address
+  answers as an orchestrator. Idempotent: an already-unlimited allowance sends
+  nothing.
+- `issuer verify-orchestrator-signing <UNDERLYING>` — signs, WITHOUT
+  broadcasting, one transaction per shape the Turnkey signing policy must allow
+  before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
+  `receipt.safeBatchTransferFrom`), so a policy gap surfaces as a named signing
+  refusal instead of during the pilot's first live mint.
+
+The orchestrator onboarding subcommands take the orchestrator address from the
+TOML vault-mode config (`--config`) — never typed — and require the Turnkey
+signer configuration from the service's own environment.
 
 The custody subcommands are listing-scoped and therefore take `--network`, plus
 `--rpc-url` (the service's own `RPC_URL`) and `--chain-id` (cross-checked
