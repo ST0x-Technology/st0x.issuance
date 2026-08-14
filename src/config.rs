@@ -23,7 +23,20 @@ use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
 /// behaviour). `Orchestrator` routes through the `ST0xOrchestrator` contract
 /// at the given address, which handles the EIP-712 mint-auth and the
 /// receipt-walk for burns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The serde representation (`"VaultDirect"` /
+/// `{"Orchestrator":{"address":"0x…"}}`) is embedded in persisted redemption
+/// events and is therefore a permanent event schema — it must never change.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum VaultMode {
     #[default]
     VaultDirect,
@@ -40,6 +53,26 @@ pub struct VaultModeConfig {
     per_asset: HashMap<String, VaultMode>,
     /// Fallback used for any asset not listed in `per_asset`.
     default: VaultMode,
+}
+
+impl VaultModeConfig {
+    #[must_use]
+    pub const fn new(
+        per_asset: HashMap<String, VaultMode>,
+        default: VaultMode,
+    ) -> Self {
+        Self { per_asset, default }
+    }
+
+    /// Returns the `VaultMode` for the given underlying asset symbol.
+    ///
+    /// Uses the per-asset override from the TOML config if present, otherwise
+    /// falls back to the configured default (which itself defaults to
+    /// `VaultDirect` when no TOML file is provided).
+    #[must_use]
+    pub fn mode_for(&self, underlying: &UnderlyingSymbol) -> VaultMode {
+        self.per_asset.get(underlying.as_str()).copied().unwrap_or(self.default)
+    }
 }
 
 /// Default chain ID (Base mainnet)
@@ -103,17 +136,9 @@ impl Config {
     }
 
     /// Returns the `VaultMode` for the given underlying asset symbol.
-    ///
-    /// Uses the per-asset override from the TOML config if present, otherwise
-    /// falls back to the configured default (which itself defaults to
-    /// `VaultDirect` when no TOML file is provided).
     #[must_use]
     pub fn vault_mode_for(&self, underlying: &UnderlyingSymbol) -> VaultMode {
-        self.vault_mode_config
-            .per_asset
-            .get(underlying.as_str())
-            .copied()
-            .unwrap_or(self.vault_mode_config.default)
+        self.vault_mode_config.mode_for(underlying)
     }
 }
 
@@ -1544,6 +1569,55 @@ mod tests {
             resolve_vault_modes(&toml),
             Err(ConfigError::InvalidOrchestratorAddress(_))
         ));
+    }
+
+    #[test]
+    fn vault_mode_serde_wire_format_is_stable() {
+        assert_eq!(
+            serde_json::to_value(VaultMode::VaultDirect).unwrap(),
+            serde_json::json!("VaultDirect")
+        );
+        assert_eq!(
+            serde_json::to_value(VaultMode::Orchestrator {
+                address: orch_address()
+            })
+            .unwrap(),
+            serde_json::json!({"Orchestrator": {"address": ORCH_ADDR}})
+        );
+    }
+
+    #[test]
+    fn vault_mode_serde_round_trips() {
+        for mode in [
+            VaultMode::VaultDirect,
+            VaultMode::Orchestrator { address: orch_address() },
+        ] {
+            let json = serde_json::to_value(mode).unwrap();
+            assert_eq!(
+                serde_json::from_value::<VaultMode>(json).unwrap(),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn mode_for_prefers_per_asset_override_and_falls_back_to_default() {
+        let cfg = VaultModeConfig::new(
+            HashMap::from([(
+                "AAPL".to_string(),
+                VaultMode::Orchestrator { address: orch_address() },
+            )]),
+            VaultMode::VaultDirect,
+        );
+
+        assert_eq!(
+            cfg.mode_for(&UnderlyingSymbol::new("AAPL").unwrap()),
+            VaultMode::Orchestrator { address: orch_address() }
+        );
+        assert_eq!(
+            cfg.mode_for(&UnderlyingSymbol::new("TSLA").unwrap()),
+            VaultMode::VaultDirect
+        );
     }
 
     #[test]

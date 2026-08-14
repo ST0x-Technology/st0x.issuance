@@ -355,6 +355,7 @@ mod tests {
         AlpacaError, AlpacaService, Fees, RedeemRequest, RedeemRequestStatus,
         RedeemResponse, TokenizationRequest, TokenizationRequestType,
     };
+    use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
@@ -499,6 +500,7 @@ mod tests {
                             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                         ),
                         block_number: 12345,
+                        burn_mode: VaultMode::VaultDirect,
                     },
                 )
                 .await
@@ -569,6 +571,7 @@ mod tests {
                     quantity,
                     tx_hash,
                     block_number,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -702,6 +705,7 @@ mod tests {
                     quantity,
                     tx_hash,
                     block_number: 12345,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await

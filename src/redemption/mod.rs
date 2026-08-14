@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::Quantity;
+use crate::config::VaultMode;
 use crate::mint::TokenizationRequestId;
 use crate::redemption::burn_manager::{
     extract_tx_hash, is_pending_burn_confirmation, should_release_reserved_burn,
@@ -231,7 +232,9 @@ impl RedemptionServices {
 }
 
 pub(crate) use cmd::RedemptionCommand;
-pub(crate) use event::{BurnRecord, RedemptionEvent, TokensBurnedData};
+pub(crate) use event::{
+    BurnFailureClassification, BurnRecord, RedemptionEvent, TokensBurnedData,
+};
 pub(crate) use view::{
     RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
     find_stuck,
@@ -249,6 +252,11 @@ pub(crate) struct RedemptionMetadata {
     pub(crate) detected_tx_hash: B256,
     pub(crate) block_number: u64,
     pub(crate) detected_at: DateTime<Utc>,
+    /// Mode anchor captured on `Detected`. Every mode-dependent burn step
+    /// derives from this persisted value, never from live config. Snapshots
+    /// and states persisted before orchestrator mode default to `VaultDirect`.
+    #[serde(default)]
+    pub(crate) burn_mode: VaultMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,6 +650,7 @@ impl Redemption {
         error: String,
         tx_id: Option<TxId>,
         planned_burns: Vec<BurnRecord>,
+        classification: BurnFailureClassification,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(
             self,
@@ -661,6 +670,7 @@ impl Redemption {
             failed_at: Utc::now(),
             tx_id,
             planned_burns,
+            classification,
         }])
     }
 
@@ -697,6 +707,7 @@ impl Redemption {
             detected_at: metadata.detected_at,
             previous_state: self.state_name().to_string(),
             reprocessed_at: Utc::now(),
+            burn_mode: metadata.burn_mode,
         }])
     }
 
@@ -738,6 +749,7 @@ impl Redemption {
             alpaca_journal_completed_at: input.alpaca_journal_completed_at,
             external_tx_id: input.external_tx_id,
             resumed_at: Utc::now(),
+            burn_mode: input.metadata.burn_mode,
         }])
     }
 
@@ -1473,6 +1485,7 @@ impl EventSourced for Redemption {
                 tx_hash,
                 block_number,
                 detected_at,
+                burn_mode,
             } => Some(Self::Detected {
                 metadata: RedemptionMetadata {
                     issuer_request_id: issuer_request_id.clone(),
@@ -1484,6 +1497,7 @@ impl EventSourced for Redemption {
                     detected_tx_hash: *tx_hash,
                     block_number: *block_number,
                     detected_at: *detected_at,
+                    burn_mode: *burn_mode,
                 },
             }),
             _ => None,
@@ -1513,6 +1527,7 @@ impl EventSourced for Redemption {
                 quantity,
                 tx_hash,
                 block_number,
+                burn_mode,
             } => Ok(vec![RedemptionEvent::Detected {
                 issuer_request_id,
                 underlying,
@@ -1523,6 +1538,7 @@ impl EventSourced for Redemption {
                 tx_hash,
                 block_number,
                 detected_at: Utc::now(),
+                burn_mode,
             }]),
             RedemptionCommand::RecordAlpacaCall { .. }
             | RedemptionCommand::RecordAlpacaFailure { .. } => {
@@ -1674,11 +1690,13 @@ impl EventSourced for Redemption {
                 error,
                 tx_id,
                 planned_burns,
+                classification,
             } => self.handle_record_burn_failure(
                 issuer_request_id,
                 error,
                 tx_id,
                 planned_burns,
+                classification,
             ),
             RedemptionCommand::RecordExistingBurn {
                 issuer_request_id,
@@ -1871,6 +1889,7 @@ impl Redemption {
             tx_hash,
             block_number,
             detected_at,
+            burn_mode,
         }
         | RedemptionEvent::Reprocessed {
             issuer_request_id,
@@ -1882,6 +1901,7 @@ impl Redemption {
             tx_hash,
             block_number,
             detected_at,
+            burn_mode,
             ..
         }) = event
         else {
@@ -1899,6 +1919,7 @@ impl Redemption {
                 detected_tx_hash: tx_hash,
                 block_number,
                 detected_at,
+                burn_mode,
             },
         };
     }
@@ -2009,6 +2030,7 @@ impl Redemption {
             called_at,
             alpaca_journal_completed_at,
             external_tx_id,
+            burn_mode,
             ..
         } = event
         else {
@@ -2026,6 +2048,7 @@ impl Redemption {
                 detected_tx_hash: tx_hash,
                 block_number,
                 detected_at,
+                burn_mode,
             },
             tokenization_request_id,
             alpaca_quantity,
@@ -2205,8 +2228,10 @@ mod tests {
         RedemptionServices, TokensBurnedData, has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
+    use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
+    use crate::redemption::BurnFailureClassification;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
@@ -2636,6 +2661,7 @@ mod tests {
                 submitted_at: Utc::now(),
             },
             RedemptionEvent::BurnResumed {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: IssuerRedemptionRequestId::new(
                     detected_tx_hash,
                 ),
@@ -2681,6 +2707,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::Detect {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -2704,6 +2731,7 @@ mod tests {
             tx_hash: event_tx_hash,
             block_number: event_block_number,
             detected_at,
+            burn_mode: event_burn_mode,
             ..
         } = &events[0]
         else {
@@ -2718,6 +2746,7 @@ mod tests {
         assert_eq!(event_tx_hash, &tx_hash);
         assert_eq!(event_block_number, &block_number);
         assert!(detected_at.timestamp() > 0);
+        assert_eq!(event_burn_mode, &VaultMode::VaultDirect);
     }
 
     #[tokio::test]
@@ -2734,6 +2763,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -2745,6 +2775,7 @@ mod tests {
                 detected_at: Utc::now(),
             }])
             .when(RedemptionCommand::Detect {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
@@ -2783,6 +2814,7 @@ mod tests {
 
         let redemption =
             replay::<Redemption>(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -2800,6 +2832,7 @@ mod tests {
             redemption,
             Redemption::Detected {
                 metadata: RedemptionMetadata {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id,
                     underlying,
                     token,
@@ -2814,6 +2847,218 @@ mod tests {
         );
     }
 
+    fn orchestrator_mode() -> VaultMode {
+        VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_with_orchestrator_mode_anchors_it_on_the_event() {
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given_no_previous_events()
+            .when(RedemptionCommand::Detect {
+                issuer_request_id: IssuerRedemptionRequestId::random(),
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: B256::random(),
+                block_number: 1,
+                burn_mode: orchestrator_mode(),
+                network: Network::Base,
+            })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RedemptionEvent::Detected { burn_mode, .. }]
+                    if *burn_mode == orchestrator_mode()
+            ),
+            "Detected must carry the orchestrator anchor, got {events:?}"
+        );
+    }
+
+    /// The mode anchor must survive replay through the whole pre-burn
+    /// lifecycle: an orchestrator-detected redemption stays orchestrator in
+    /// `Burning` state regardless of what the asset's config says later.
+    #[test]
+    fn burn_mode_anchor_survives_replay_to_burning() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let redemption = replay::<Redemption>(vec![
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: B256::random(),
+                block_number: 1,
+                detected_at: Utc::now(),
+                burn_mode: orchestrator_mode(),
+                network: Network::Base,
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok-1"),
+                alpaca_quantity: Quantity::new(Decimal::from(10)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id,
+                alpaca_journal_completed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        let Redemption::Burning { metadata, .. } = redemption else {
+            panic!("Expected Burning state, got {redemption:?}");
+        };
+        assert_eq!(metadata.burn_mode, orchestrator_mode());
+    }
+
+    /// `Reprocessed` and `BurnResumed` flatten metadata into the event; both
+    /// must preserve the orchestrator anchor so a recovered redemption never
+    /// silently falls back to vault-direct.
+    #[test]
+    fn burn_mode_anchor_survives_reprocess_and_resume_replay() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let detected_tx_hash = B256::random();
+        let detected = RedemptionEvent::Detected {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+            token: TokenSymbol::new("tRKLB"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: Quantity::new(Decimal::from(10)),
+            tx_hash: detected_tx_hash,
+            block_number: 1,
+            detected_at: Utc::now(),
+            burn_mode: orchestrator_mode(),
+            network: Network::Base,
+        };
+        let failed = RedemptionEvent::RedemptionFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "alpaca timeout".to_string(),
+            failed_at: Utc::now(),
+        };
+
+        let reprocessed = replay::<Redemption>(vec![
+            detected.clone(),
+            failed.clone(),
+            RedemptionEvent::Reprocessed {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: detected_tx_hash,
+                block_number: 1,
+                detected_at: Utc::now(),
+                previous_state: "Failed".to_string(),
+                reprocessed_at: Utc::now(),
+                burn_mode: orchestrator_mode(),
+                network: Network::Base,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        let Redemption::Detected { metadata } = reprocessed else {
+            panic!("Expected Detected state, got {reprocessed:?}");
+        };
+        assert_eq!(metadata.burn_mode, orchestrator_mode());
+
+        let resumed = replay::<Redemption>(vec![
+            detected,
+            failed,
+            RedemptionEvent::BurnResumed {
+                issuer_request_id,
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: detected_tx_hash,
+                block_number: 1,
+                detected_at: Utc::now(),
+                tokenization_request_id: TokenizationRequestId::new("tok-1"),
+                alpaca_quantity: Quantity::new(Decimal::from(10)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+                alpaca_journal_completed_at: Utc::now(),
+                external_tx_id: None,
+                resumed_at: Utc::now(),
+                burn_mode: orchestrator_mode(),
+                network: Network::Base,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        let Redemption::Burning { metadata, .. } = resumed else {
+            panic!("Expected Burning state, got {resumed:?}");
+        };
+        assert_eq!(metadata.burn_mode, orchestrator_mode());
+    }
+
+    /// `Reprocess` and `ResumeBurn` handlers copy the caller-supplied
+    /// metadata's anchor onto the emitted event, so the persisted history
+    /// keeps the orchestrator mode across admin recovery.
+    #[tokio::test]
+    async fn reprocess_command_preserves_orchestrator_burn_mode() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let detected_tx_hash = B256::random();
+        let metadata = RedemptionMetadata {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+            token: TokenSymbol::new("tRKLB"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: Quantity::new(Decimal::from(10)),
+            detected_tx_hash,
+            block_number: 1,
+            detected_at: Utc::now(),
+            burn_mode: orchestrator_mode(),
+            network: Network::Base,
+        };
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                    token: TokenSymbol::new("tRKLB"),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    quantity: Quantity::new(Decimal::from(10)),
+                    tx_hash: detected_tx_hash,
+                    block_number: 1,
+                    detected_at: Utc::now(),
+                    burn_mode: orchestrator_mode(),
+                    network: Network::Base,
+                },
+                RedemptionEvent::RedemptionFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "alpaca timeout".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Reprocess { issuer_request_id, metadata })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RedemptionEvent::Reprocessed { burn_mode, .. }]
+                    if *burn_mode == orchestrator_mode()
+            ),
+            "Reprocessed must carry the orchestrator anchor, got {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_record_alpaca_call_from_detected_state() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -2821,6 +3066,7 @@ mod tests {
 
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
@@ -2896,6 +3142,7 @@ mod tests {
 
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("TSLA").unwrap(),
                 token: TokenSymbol::new("tTSLA"),
@@ -2967,6 +3214,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
@@ -3058,6 +3306,7 @@ mod tests {
 
         let redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -3087,6 +3336,7 @@ mod tests {
             redemption,
             Redemption::Burning {
                 metadata: RedemptionMetadata {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id,
                     underlying,
                     token,
@@ -3117,6 +3367,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
@@ -3173,6 +3424,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
@@ -3240,6 +3492,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("NVDA").unwrap(),
                 token: TokenSymbol::new("tNVDA"),
@@ -3288,6 +3541,7 @@ mod tests {
     ) -> Vec<RedemptionEvent> {
         vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
@@ -3597,6 +3851,7 @@ mod tests {
 
         let redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -3631,6 +3886,7 @@ mod tests {
             redemption,
             Redemption::BurnIntended {
                 metadata: RedemptionMetadata {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id,
                     underlying,
                     token,
@@ -3666,6 +3922,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("TSLA").unwrap(),
                     token: TokenSymbol::new("tTSLA"),
@@ -3737,6 +3994,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("NVDA").unwrap(),
                 token: TokenSymbol::new("tNVDA"),
@@ -3885,6 +4143,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("GOOG").unwrap(),
                     token: TokenSymbol::new("tGOOG"),
@@ -3912,6 +4171,7 @@ mod tests {
                 },
             ])
             .when(RedemptionCommand::RecordBurnFailure {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
                 tx_id: None,
@@ -3944,6 +4204,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::RecordBurnFailure {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id,
                 error: "Some error".to_string(),
                 tx_id: None,
@@ -3971,6 +4232,7 @@ mod tests {
     ) -> Vec<RedemptionEvent> {
         vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("ARKK").unwrap(),
                 token: TokenSymbol::new("tARKK"),
@@ -4115,6 +4377,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(burn_intended_given_events(&issuer_request_id, tx_hash))
             .when(RedemptionCommand::RecordBurnFailure {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id,
                 error: "receipt reverted".to_string(),
                 tx_id: Some(TxId::Hash(tx_hash)),
@@ -4214,6 +4477,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let mut given = burning_given_events(&issuer_request_id);
         given.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: issuer_request_id.clone(),
             error: "burn reverted".to_string(),
             failed_at: Utc::now(),
@@ -4350,6 +4614,7 @@ mod tests {
         let mut history =
             burn_intended_given_events(&issuer_request_id, burn_tx_hash);
         history.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: issuer_request_id.clone(),
             error: "confirmation was ambiguous".to_string(),
             failed_at: Utc::now(),
@@ -4449,6 +4714,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("ARKK").unwrap(),
                 token: TokenSymbol::new("tARKK"),
@@ -4551,6 +4817,7 @@ mod tests {
                 receipt_id: uint!(3_U256),
                 shares_burned: uint!(40_000000000000000_U256),
             }],
+            classification: BurnFailureClassification::Unclassified,
         });
         history.push(RedemptionEvent::RedemptionFailed {
             issuer_request_id: issuer_request_id.clone(),
@@ -4602,6 +4869,7 @@ mod tests {
                 receipt_id: uint!(3_U256),
                 shares_burned: uint!(40_000000000000000_U256),
             }],
+            classification: BurnFailureClassification::Unclassified,
         });
         history.push(RedemptionEvent::RedemptionFailed {
             issuer_request_id: issuer_request_id.clone(),
@@ -4657,6 +4925,7 @@ mod tests {
                 receipt_id: uint!(3_U256),
                 shares_burned: uint!(40_000000000000000_U256),
             }],
+            classification: BurnFailureClassification::Unclassified,
         });
         history.push(RedemptionEvent::RedemptionFailed {
             issuer_request_id: issuer_request_id.clone(),
@@ -4709,6 +4978,7 @@ mod tests {
             failed_at: Utc::now(),
             tx_id: None,
             planned_burns: vec![],
+            classification: BurnFailureClassification::Unclassified,
         });
 
         let error = TestHarness::<Redemption>::with(mock_services())
@@ -4753,6 +5023,7 @@ mod tests {
             failed_at: Utc::now(),
             tx_id: None,
             planned_burns: vec![],
+            classification: BurnFailureClassification::Unclassified,
         });
         history.push(RedemptionEvent::RedemptionClosed {
             issuer_request_id: issuer_request_id.clone(),
@@ -4802,6 +5073,7 @@ mod tests {
             failed_at: Utc::now(),
             tx_id: None,
             planned_burns: vec![],
+            classification: BurnFailureClassification::Unclassified,
         });
         history.push(RedemptionEvent::RedemptionClosed {
             issuer_request_id: issuer_request_id.clone(),
@@ -5081,6 +5353,7 @@ mod tests {
 
         let redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
@@ -5146,6 +5419,7 @@ mod tests {
 
         let redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
@@ -5168,6 +5442,7 @@ mod tests {
                 alpaca_journal_completed_at,
             },
             RedemptionEvent::BurningFailed {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
                 failed_at,
@@ -5203,6 +5478,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -5386,6 +5662,7 @@ mod tests {
 
     fn test_metadata() -> RedemptionMetadata {
         RedemptionMetadata {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: IssuerRedemptionRequestId::random(),
             underlying: UnderlyingSymbol::new("RKLB").unwrap(),
             token: TokenSymbol::new("tRKLB"),
@@ -5409,6 +5686,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: expected_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -5456,6 +5734,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
@@ -5490,6 +5769,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -5538,6 +5818,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -5622,6 +5903,7 @@ mod tests {
 
         let mut redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
@@ -5644,6 +5926,7 @@ mod tests {
         assert!(matches!(redemption, Redemption::Failed { .. }));
 
         redemption.apply_event(RedemptionEvent::Reprocessed {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
@@ -5670,6 +5953,7 @@ mod tests {
                     detected_tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
                     detected_at: metadata.detected_at,
+                    burn_mode: VaultMode::VaultDirect,
                 }
             }
         );
@@ -5697,6 +5981,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -5752,6 +6037,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
@@ -5809,6 +6095,7 @@ mod tests {
 
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: metadata.issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
@@ -5842,6 +6129,7 @@ mod tests {
 
         let mut redemption = replay::<Redemption>(vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: metadata.issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
@@ -5864,6 +6152,7 @@ mod tests {
         assert!(matches!(redemption, Redemption::Failed { .. }));
 
         redemption.apply_event(RedemptionEvent::BurnResumed {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id: metadata.issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
@@ -5906,6 +6195,7 @@ mod tests {
         let mut history =
             intended_burn_history(&issuer_request_id, persisted_tx.clone());
         history.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: issuer_request_id.clone(),
             error: "replacement preparation failed".to_string(),
             failed_at: Utc::now(),
@@ -5924,6 +6214,7 @@ mod tests {
         ));
 
         history.push(RedemptionEvent::BurnResumed {
+            burn_mode: VaultMode::VaultDirect,
             issuer_request_id,
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
@@ -6180,6 +6471,7 @@ mod tests {
         let mut history =
             intended_burn_history(&issuer_request_id, persisted_tx.clone());
         history.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: issuer_request_id.clone(),
             error: "ambiguous confirmation".to_string(),
             failed_at: Utc::now(),
