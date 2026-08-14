@@ -15,7 +15,7 @@ pub(crate) const REDEEM_CALLBACK_OPENAPI_REFERENCE: &str =
 /// (`components.schemas.TokenizationNetwork.enum`).
 pub(crate) const TOKENIZATION_NETWORK_WIRE_STRINGS: &[&str] = &[
     "solana", "arbitrum", "ethereum", "binance", "base", "ton", "tron",
-    "mantle",
+    "mantle", "hyperevm",
 ];
 
 /// Returns whether `wire` is a published Alpaca ITN `TokenizationNetwork` value.
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn issued_network_wire_strings_are_alpaca_itn_values() {
-        for network in [Network::Base, Network::Ethereum] {
+        for network in [Network::Base, Network::Ethereum, Network::HyperEvm] {
             let wire = network.as_str();
             assert!(
                 accepts_network_wire_string(wire),
