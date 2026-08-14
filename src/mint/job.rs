@@ -1054,6 +1054,11 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::BurnReplacementDestinationMismatch { .. }
         | VaultError::BurnReplacementValueMismatch { .. }
         | VaultError::BurnReplacementInputMismatch { .. }
+        | VaultError::MintAuthSignerMismatch { .. }
+        | VaultError::MintAuthNonceUsed { .. }
+        | VaultError::MintAuthRejectedByContract { .. }
+        | VaultError::MintAuthEmptySignatureForEoa { .. }
+        | VaultError::Signature(_)
         | VaultError::SignerRecovery(_)
         | VaultError::Eip2718(_)
         | VaultError::Contract(_)
@@ -1094,6 +1099,11 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         | VaultError::BurnReplacementDestinationMismatch { .. }
         | VaultError::BurnReplacementValueMismatch { .. }
         | VaultError::BurnReplacementInputMismatch { .. }
+        | VaultError::MintAuthSignerMismatch { .. }
+        | VaultError::MintAuthNonceUsed { .. }
+        | VaultError::MintAuthRejectedByContract { .. }
+        | VaultError::MintAuthEmptySignatureForEoa { .. }
+        | VaultError::Signature(_)
         | VaultError::SignerRecovery(_)
         | VaultError::Eip2718(_)
         | VaultError::Contract(_)
