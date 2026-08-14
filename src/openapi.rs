@@ -33,6 +33,7 @@ expressed as an OpenAPI scheme."
         crate::admin::close_mint,
         crate::admin::list_stuck,
         crate::admin::schedule_freeze_window,
+        crate::admin::orchestrator_health,
     ),
     components(schemas(
         st0x_issuance_dto::TokenizedAssetDetailResponse,
@@ -56,6 +57,12 @@ expressed as an OpenAPI scheme."
         crate::admin::CloseMintRequest,
         crate::admin::ScheduleFreezeWindowRequest,
         crate::admin::ScheduleFreezeWindowResponse,
+        crate::admin::AssetVaultMode,
+        crate::admin::VaultLogicStatus,
+        crate::admin::NextBurnReceiptIdStatus,
+        crate::admin::OrchestratorHealth,
+        crate::admin::AssetVaultModeStatus,
+        crate::admin::OrchestratorHealthResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
