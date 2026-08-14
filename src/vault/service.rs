@@ -22,12 +22,12 @@ use tracing::debug;
 
 use super::rain_meta::OaSchemaCache;
 use super::{
-    BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnResult,
-    MultiBurnResultEntry, OrchestratorBurnParams, OrchestratorBurnReadiness,
-    OrchestratorBurnResult, OrchestratorRevertReason, PreparedMintTx,
-    ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
-    VaultService, WalletNonceGuard, classify_checked_receipt,
-    verify_burn_in_receipt,
+    BurnRange, BurnTxStatus, BurnVerification, MintResult, MintTxStatus,
+    MultiBurnResult, MultiBurnResultEntry, OrchestratorBurnParams,
+    OrchestratorBurnReadiness, OrchestratorBurnResult,
+    OrchestratorRevertReason, PreparedMintTx, ReceiptInformation,
+    SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
+    WalletNonceGuard, classify_checked_receipt, verify_burn_in_receipt,
 };
 use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
 use crate::redemption::BurnExternalTxId;
@@ -978,7 +978,10 @@ impl VaultService for RealBlockchainService {
         Ok(OrchestratorBurnResult {
             tx_hash,
             shares_burned: burned.amount,
-            burn_range: (burned.firstReceiptId, burned.nextBurnReceiptIdAfter),
+            burn_range: BurnRange {
+                first_receipt_id: burned.firstReceiptId,
+                next_burn_receipt_id_after: burned.nextBurnReceiptIdAfter,
+            },
             gas_used: receipt.gas_used,
             block_number,
         })
@@ -1012,7 +1015,9 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
-    use super::{RealBlockchainService, RealBlockchainServiceProvider};
+    use super::{
+        BurnRange, RealBlockchainService, RealBlockchainServiceProvider,
+    };
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
@@ -2830,7 +2835,13 @@ mod tests {
             .expect("expected OrchestratorBurnResult");
         assert_eq!(result.tx_hash, prepared.hash);
         assert_eq!(result.shares_burned, params.amount);
-        assert_eq!(result.burn_range, (U256::from(3u8), U256::from(6u8)));
+        assert_eq!(
+            result.burn_range,
+            BurnRange {
+                first_receipt_id: U256::from(3u8),
+                next_burn_receipt_id_after: U256::from(6u8),
+            }
+        );
         assert_eq!(result.gas_used, 0x8000);
         assert_eq!(result.block_number, 0x9c4);
     }

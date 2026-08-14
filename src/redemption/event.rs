@@ -9,7 +9,7 @@ use super::{
 use crate::config::VaultMode;
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
-use crate::vault::{SendableTxWithHash, TxId};
+use crate::vault::{BurnRange, SendableTxWithHash, TxId};
 
 /// Typed classification of an on-chain or pre-submit burn failure.
 ///
@@ -296,6 +296,35 @@ pub(crate) enum RedemptionEvent {
         sendable_tx: SendableTxWithHash,
         planned_burns: Vec<BurnRecord>,
     },
+    /// Orchestrator-mode burn transaction broadcast (the counterpart of
+    /// `BurnTxSubmitted`). Carries no `planned_burns` — there is no
+    /// per-receipt plan to reserve; the orchestrator walks receipts on-chain.
+    OrchestratorBurnSubmitted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: BurnExternalTxId,
+        tx_id: TxId,
+        submitted_at: DateTime<Utc>,
+    },
+    /// Orchestrator-mode burn succeeded on-chain, redemption complete
+    /// (terminal success). Carries the consumed receipt pointer range from
+    /// the orchestrator's `Burned` event instead of a per-receipt `burns`
+    /// list.
+    OrchestratorTokensBurned {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        shares_burned: U256,
+        /// Consumed receipt-pointer range from the `Burned` event
+        /// (`firstReceiptId` / `nextBurnReceiptIdAfter`), half-open.
+        burn_range: BurnRange,
+        /// Sub-10⁻⁹-token residue retained in the bot wallet, derived from
+        /// this redemption's own persisted `AlpacaCalled.dust_quantity`
+        /// converted to share-wei — the orchestrator has no multicall to
+        /// atomically return dust through (SPEC Decision 6).
+        dust_retained: U256,
+        gas_used: u64,
+        block_number: u64,
+        burned_at: DateTime<Utc>,
+    },
     BurnRecoveryAttempted {
         issuer_request_id: IssuerRedemptionRequestId,
         tx_hash: B256,
@@ -364,6 +393,12 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnIntended { .. } => {
                 "RedemptionEvent::BurnIntended".to_string()
+            }
+            Self::OrchestratorBurnSubmitted { .. } => {
+                "RedemptionEvent::OrchestratorBurnSubmitted".to_string()
+            }
+            Self::OrchestratorTokensBurned { .. } => {
+                "RedemptionEvent::OrchestratorTokensBurned".to_string()
             }
             Self::BurnRecoveryAttempted { .. } => {
                 "RedemptionEvent::BurnRecoveryAttempted".to_string()
@@ -847,6 +882,49 @@ mod tests {
             serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn orchestrator_event_types_and_round_trips() {
+        let submitted = RedemptionEvent::OrchestratorBurnSubmitted {
+            issuer_request_id: test_redemption_id(),
+            external_tx_id: BurnExternalTxId::from_string(
+                "burn-0xabcd".to_string(),
+            ),
+            tx_id: TxId::random(),
+            submitted_at: Utc::now(),
+        };
+        let burned = RedemptionEvent::OrchestratorTokensBurned {
+            issuer_request_id: test_redemption_id(),
+            tx_hash: B256::random(),
+            shares_burned: uint!(17_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: uint!(3_U256),
+                next_burn_receipt_id_after: uint!(6_U256),
+            },
+            dust_retained: uint!(1_000_000_000_U256),
+            gas_used: 50_000,
+            block_number: 45_000_100,
+            burned_at: Utc::now(),
+        };
+
+        assert_eq!(
+            submitted.event_type(),
+            "RedemptionEvent::OrchestratorBurnSubmitted"
+        );
+        assert_eq!(
+            burned.event_type(),
+            "RedemptionEvent::OrchestratorTokensBurned"
+        );
+        assert_eq!(submitted.event_version(), "1.0");
+        assert_eq!(burned.event_version(), "1.0");
+
+        for event in [submitted, burned] {
+            let serialized = serde_json::to_string(&event).unwrap();
+            let deserialized: RedemptionEvent =
+                serde_json::from_str(&serialized).unwrap();
+            assert_eq!(event, deserialized);
+        }
     }
 
     /// Tests that old BurnResumed events without external_tx_id default to None.

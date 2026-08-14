@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use super::{
-    BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnParams,
-    MultiBurnResult, MultiBurnResultEntry, OrchestratorBurnParams,
-    OrchestratorBurnReadiness, OrchestratorBurnResult, PreparedMintTx,
-    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    BurnRange, BurnTxStatus, BurnVerification, MintResult, MintTxStatus,
+    MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
+    OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
+    PreparedMintTx, ReceiptInformation, SubmittedTx, VaultError, VaultService,
     WalletNonceGuard,
 };
 #[cfg(test)]
@@ -674,6 +674,17 @@ impl MockVaultService {
         *self.pending_burn_result.lock().unwrap() = Some(result);
         self
     }
+
+    /// Configures `confirm_orchestrator_burn` to fail with
+    /// `VaultError::OrchestratorReverted` carrying the given typed reason.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_confirm_revert(
+        self,
+        reason: OrchestratorRevertReason,
+    ) -> Self {
+        *self.orchestrator.confirm_revert.lock().unwrap() = Some(reason);
+        self
+    }
 }
 
 const MOCK_MINT_TX_HASH: alloy::primitives::B256 =
@@ -682,11 +693,18 @@ const MOCK_MINT_TX_HASH: alloy::primitives::B256 =
 const MOCK_BURN_TX_HASH: alloy::primitives::B256 =
     b256!("0x4545454545454545454545454545454545454545454545454545454545454545");
 
+/// Matches the canonical orchestrator test fixture's `alpaca_quantity` of
+/// 17 tokens in share-wei: the confirm handler rejects a `shares_burned`
+/// that diverges from the persisted quantity, so the fallback result must
+/// agree with the fixture for confirm-path tests that never ran prepare.
 fn default_orchestrator_burn_result() -> OrchestratorBurnResult {
     OrchestratorBurnResult {
         tx_hash: MOCK_BURN_TX_HASH,
-        shares_burned: U256::from(100_000_000_000_000_000_000u128),
-        burn_range: (U256::from(1u8), U256::from(2u8)),
+        shares_burned: U256::from(17_000_000_000_000_000_000u128),
+        burn_range: BurnRange {
+            first_receipt_id: U256::from(1u8),
+            next_burn_receipt_id_after: U256::from(2u8),
+        },
         gas_used: 50000,
         block_number: 5000,
     }
@@ -1286,7 +1304,10 @@ impl VaultService for MockVaultService {
                 *pending = Some(OrchestratorBurnResult {
                     tx_hash: MOCK_BURN_TX_HASH,
                     shares_burned: params.amount,
-                    burn_range: (U256::from(1u8), U256::from(2u8)),
+                    burn_range: BurnRange {
+                        first_receipt_id: U256::from(1u8),
+                        next_burn_receipt_id_after: U256::from(2u8),
+                    },
                     gas_used: 50000,
                     block_number: 5000,
                 });

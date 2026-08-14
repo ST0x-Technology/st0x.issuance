@@ -1721,6 +1721,7 @@ fn redemption_history_summary_from_events(
                 summary.tokenization_request_id = Some(tokenization_request_id);
             }
             RedemptionEvent::BurnTxSubmitted { tx_id, .. }
+            | RedemptionEvent::OrchestratorBurnSubmitted { tx_id, .. }
             | RedemptionEvent::ExistingBurnRecovered { tx_id, .. }
             | RedemptionEvent::BurningFailed { tx_id: Some(tx_id), .. } => {
                 summary.tx_id = Some(tx_id);
@@ -2077,6 +2078,7 @@ mod tests {
         AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
         recover_post_alpaca,
     };
+    use crate::VaultModeConfig;
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -2093,7 +2095,7 @@ mod tests {
     };
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
-        BurnFailureClassification, BurnRecord, BurnRecoveryAction,
+        BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
@@ -2672,17 +2674,19 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(99),
+                            burn_shares: U256::from(100),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: Some(BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     )),
@@ -2696,17 +2700,19 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(99),
+                            burn_shares: U256::from(100),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: Some(BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     )),
@@ -3263,12 +3269,14 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: burns.clone(),
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: burns.clone(),
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: external_tx_id.clone(),
                 },
             )
@@ -3280,12 +3288,14 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns,
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns,
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id,
                 },
             )
@@ -4352,7 +4362,7 @@ mod tests {
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
+            vault_mode_config: VaultModeConfig::default(),
         };
 
         rocket::build()
@@ -4411,15 +4421,17 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(42),
-                        burn_shares: U256::from(17),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: persisted_tx.signer_for_test(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(42),
+                            burn_shares: U256::from(17),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: persisted_tx.signer_for_test(),
+                    },
                     external_tx_id: None,
                 },
             )
@@ -5162,6 +5174,37 @@ mod tests {
         );
         // tokenization_request_id is preserved (it doesn't reset).
         assert_eq!(summary.tokenization_request_id, Some(tok_id));
+    }
+
+    /// `OrchestratorBurnSubmitted` leaves the view in `Burning` exactly like
+    /// `BurnTxSubmitted`, so the stuck-row detail branches on the history
+    /// summary's `tx_id` alone. The summary must therefore extract the
+    /// orchestrator submission's `tx_id` too — otherwise a submitted
+    /// orchestrator burn reads "Waiting for burn submission" with no
+    /// transaction id.
+    #[test]
+    fn redemption_history_summary_records_orchestrator_submission_tx_id() {
+        use crate::redemption::{BurnExternalTxId, RedemptionEvent};
+
+        let issuer = IssuerRedemptionRequestId::random();
+        let tx_id = TxId::random();
+
+        let events = vec![RedemptionEvent::OrchestratorBurnSubmitted {
+            issuer_request_id: issuer,
+            external_tx_id: BurnExternalTxId::from_string(
+                "burn-orch-1".to_string(),
+            ),
+            tx_id: tx_id.clone(),
+            submitted_at: Utc::now(),
+        }];
+
+        let summary = super::redemption_history_summary_from_events(events);
+
+        assert_eq!(
+            summary.tx_id,
+            Some(tx_id),
+            "orchestrator submission must surface its tx_id in the summary"
+        );
     }
 
     fn freeze_schedule_rocket(

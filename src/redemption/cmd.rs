@@ -9,6 +9,31 @@ use crate::redemption::event::BurnFailureClassification;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{MultiBurnEntry, TxId};
 
+/// Mode-specific burn parameters carried by `IntendBurn` and `BurnTokens`.
+///
+/// The handler cross-checks the variant against the redemption's persisted
+/// `burn_mode` anchor and rejects a mismatch, so a caller can never drive a
+/// vault-direct redemption down the orchestrator path or vice versa.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum BurnParams {
+    VaultDirect {
+        vault: Address,
+        /// Burns to execute (receipt_id + amount for each)
+        burns: Vec<MultiBurnEntry>,
+        /// Dust to return to user
+        dust_shares: U256,
+        owner: Address,
+    },
+    Orchestrator {
+        /// The vault contract, which is also the ERC-20 share token.
+        token: Address,
+        /// Burn amount in 18-decimal share-wei (dust stays in the bot
+        /// wallet).
+        amount: U256,
+        owner: Address,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum RedemptionCommand {
     Detect {
@@ -46,16 +71,13 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     },
-    /// Submits burn transaction to the signing backend.
-    /// Produces `BurnTxSubmitted` on success, or the caller records failure.
+    /// Broadcasts the exact transaction persisted by `IntendBurn`.
+    /// Produces `BurnTxSubmitted` (vault-direct) or
+    /// `OrchestratorBurnSubmitted` (orchestrator) on success, or the caller
+    /// records failure.
     BurnTokens {
         issuer_request_id: IssuerRedemptionRequestId,
-        vault: Address,
-        /// Burns to execute (receipt_id + amount for each)
-        burns: Vec<MultiBurnEntry>,
-        /// Dust to return to user
-        dust_shares: U256,
-        owner: Address,
+        params: BurnParams,
         /// Optional deterministic transaction `externalTxId` override.
         /// Used when retrying a replacement burn after a prior accepted
         /// transaction burn terminally failed.
@@ -148,12 +170,7 @@ pub(crate) enum RedemptionCommand {
     },
     IntendBurn {
         issuer_request_id: IssuerRedemptionRequestId,
-        vault: Address,
-        /// Burns to execute (receipt_id + amount for each)
-        burns: Vec<MultiBurnEntry>,
-        /// Dust to return to user
-        dust_shares: U256,
-        owner: Address,
+        params: BurnParams,
         /// Optional deterministic `externalTxId` override.
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
