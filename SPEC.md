@@ -1197,12 +1197,44 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
   `receipt.safeBatchTransferFrom`), so a policy gap surfaces as a named signing
   refusal instead of during the pilot's first live mint.
+- `issuer move-receipts <UNDERLYING>` — moves one vault's tracked deposit
+  receipts to a corroborated destination through the Turnkey signer, driving the
+  receipt-moving engine (see "Receipt custody"). The destination is stated by
+  exactly one of two mutually exclusive flags: `--to-configured-orchestrator`
+  reads `[orchestrator].address` from `--config` (the cutover path — the
+  orchestrator address is never typed), while `--to <ADDRESS>` states an
+  explicit destination (the wallet-rotation path). `--to` naming the configured
+  orchestrator address is refused: the cutover path must state it through the
+  config flag, so a hand-typed orchestrator address never enters the flow.
+  Either way the stated address only becomes reachable as a transfer destination
+  through the corroboration witness described under "Receipt custody". Before
+  anything is signed the command verifies the deployment hold is armed (the hold
+  file present and the readiness marker absent — the engine's projection
+  rebuilds must not race a running service), verifies the bot wallet's native
+  balance covers a fixed transfer-gas ceiling at the current gas price (no
+  per-transaction estimate — estimating a transfer of receipts the destination
+  does not hold yet would revert), corroborates the destination, and then
+  prompts with the asset, vault, holder, destination and its corroborated kind,
+  and the tracked receipt count — the operator confirms what was proven, not
+  what was typed. A re-run after a completed move reports the already-migrated
+  observation distinctly and submits nothing.
+- `issuer confirm-custody <UNDERLYING>` — verifies on-chain that the Turnkey bot
+  wallet holds exactly every tracked receipt balance for the asset's vault, then
+  records it as the inventory's custody holder. The rollback counterpart of
+  `move-receipts`: after an `EMERGENCY_ROLE` `withdrawReceipt` returns a token's
+  receipts to the bot wallet, recorded custody still names the old destination,
+  so reconciliation stays skipped until this re-confirmation. The holder is
+  always the Turnkey wallet (`TURNKEY_ADDRESS`) — never typed — and it cannot be
+  recorded wrongly: a wallet that does not hold every tracked balance is refused
+  with the first mismatch. Requires the deployment hold armed (the engine's
+  quiescence gates and projection rebuilds must not race a running service);
+  signs nothing and submits nothing on-chain.
 
-`burn-excess` is listing/network-scoped and takes
-`--network` / `--chain-id` (cross-checked against the RPC-reported chain); its
-RPC endpoint is **not** a CLI flag — it uses the service environment for that
-network (`CHAIN_<NETWORK>_RPC_URL`, with legacy `RPC_URL` as Base fallback), the
-same secrets the long-running bot loads.
+`burn-excess` is listing/network-scoped and takes `--network` / `--chain-id`
+(cross-checked against the RPC-reported chain); its RPC endpoint is **not** a
+CLI flag — it uses the service environment for that network
+(`CHAIN_<NETWORK>_RPC_URL`, with legacy `RPC_URL` as Base fallback), the same
+secrets the long-running bot loads.
 
 ### Burn excess shares
 
@@ -1367,27 +1399,54 @@ addresses as free-form operator targets):**
 | Receipt ID              | `7`                                                                  |
 | Shares                  | `0.750` (`750000000000000000` raw)                                   |
 
-The orchestrator onboarding subcommands (`orchestrator-preflight`,
-`approve-orchestrator`, `verify-orchestrator-signing`) take the same network
-flags plus `--config` (the TOML configuration file; its `[orchestrator].address`
-is the only source of the orchestrator address — never typed) and require the
-`TURNKEY_*` group: the readiness facts they verify or establish are keyed to the
-Turnkey bot wallet, so a local-key signer is refused. See
-`docs/runbooks/orchestrator-onboarding.md` for the ordered procedure.
+The orchestrator onboarding and custody subcommands (`orchestrator-preflight`,
+`approve-orchestrator`, `verify-orchestrator-signing`, `move-receipts`,
+`confirm-custody`) take the same network flags and require the `TURNKEY_*`
+group: the facts they verify or establish are keyed to the Turnkey bot wallet,
+so a local-key signer is refused. All but `confirm-custody` also take `--config`
+(the TOML configuration file; its `[orchestrator].address` is the only source of
+the orchestrator address — never typed); `confirm-custody` involves no
+orchestrator address at all. See `docs/runbooks/orchestrator-onboarding.md` for
+the ordered onboarding and per-asset cutover procedures.
 
 ### Receipt custody
 
-The receipt-moving engine is vendor-neutral and deliberately has no operator
-entry point. It remains reusable library code until
-[RAI-1681](https://linear.app/makeitrain/issue/RAI-1681) supplies a dedicated
-driver with a signing provider and stated destination. The engine and custody
+The receipt-moving engine is vendor-neutral; its operator driver is
+`issuer move-receipts`
+([RAI-1681](https://linear.app/makeitrain/issue/RAI-1681)), which supplies the
+Turnkey signing provider and the stated destination. The engine and custody
 state are exercised by end-to-end tests in `tests/receipt_custody.rs`.
 
 An ERC-1155 transfer to a wrong address is final — no counterparty, no recovery,
-and the receipts back tokens that are still outstanding. The engine therefore
-requires a `CorroboratedRecipient` witness before a transfer can be reached. The
-witness refuses the zero address, the current holder itself, and a destination
-with neither transaction history nor native balance on the target chain.
+and the receipts back tokens that are still outstanding. **The destination
+safety guarantee**: a destination is reachable as a transfer target only through
+a `CorroboratedRecipient` witness the transfer cannot be constructed without,
+and the corroboration is as strong as the kind of address it names. The witness
+first refuses the zero address and the current holder itself, then splits on
+what the chain says the address is:
+
+- **Externally owned account** (no deployed code): refused unless the chain has
+  independent evidence it exists — transaction history or native balance. An
+  address with neither is precisely what a fat-fingered address looks like,
+  since the odds of a typo landing on a used address are negligible. Both
+  legitimate EOA destinations clear it: an incoming signing wallet has to be
+  funded for gas before it can run the service, and a prior signing wallet has
+  already been active on-chain.
+- **Contract** (non-empty code): a deployed contract passes the EOA evidence for
+  the wrong reason — deployment proves nothing about its ability to receive
+  receipts, and ERC-1155 `safeTransferFrom` / `safeBatchTransferFrom` revert
+  unless the recipient implements the receiver hooks. So a contract destination
+  is refused unless it proves ERC-1155 receiver support up front via ERC-165
+  (`supportsInterface(IERC1155Receiver)` returning true; a revert or a false — a
+  bare ERC-20, say — is a refusal). Receiver support must be proven before
+  submitting, never discovered by a revert. The `ST0xOrchestrator` clears this:
+  it implements the receiver hooks (its receiver lowers the per-token burn
+  pointer when a receipt arrives below it, which is the documented migration
+  path) and answers ERC-165.
+
+The witness records which kind it corroborated, so the driver's confirmation
+prompt and the audit trail state the destination's proven kind rather than
+assuming one.
 
 `VaultIdentity` is also a corroborated witness rather than a caller-assembled
 tuple. Its network must name the requested chain, the provider must report that
@@ -1432,12 +1491,15 @@ cross-checked against on-chain balances, the vault's certification and
 owner-freeze gates are re-read immediately before submission, and a completed
 move observed again is recorded idempotently instead of being re-transferred
 (`AlreadyMigrated`). A single transfer is limited to the 14-receipt batch size
-proven in production; larger inventories refuse until a future driver supplies
-resumable chunking. That driver must verify the deployment hold, bind the
-signing provider to the recorded holder, and add destination-type-specific proof
-of control and gas readiness before the generic engine is invoked. Use
-`docs/runbooks/deploy-hold.md` when the service must remain stopped across a
-deploy.
+proven in production; larger inventories refuse until resumable chunking exists
+(expected for the full rollout's high-volume assets, not the pilot). The
+`move-receipts` driver performs the outside-the-engine checks before the generic
+engine is invoked: it verifies the deployment hold is armed (hold file present,
+readiness marker absent — see `docs/runbooks/deploy-hold.md`), binds the signing
+provider to the Turnkey bot wallet (which the engine then independently
+corroborates against recorded aggregate custody as the stated holder), verifies
+the wallet's native balance covers a fixed transfer-gas ceiling at the current
+gas price, and corroborates the destination by kind as described above.
 
 Custody is therefore part of the `ReceiptInventory` aggregate's own state,
 maintained by two events. `CustodyConfirmed { holder }` records the wallet the
@@ -1458,16 +1520,38 @@ every balance reading carries the wallet it was taken against, and the handler
 refuses readings from any wallet other than the recorded holder — and refuses a
 destructive zero reading outright while no holder has ever been confirmed.
 Custody is confirmed automatically when startup reconciliation reads every
-tracked balance without error; `confirm_custody_holder` remains available to a
-future custody driver for holders that are not the signing wallet. Confirmation
-is not retried periodically: after a startup read failure, correct the cause and
-restart the service. Every balance reader goes through this handler, so no code
-path can apply a wrong-wallet reading. The refusal is per vault and writes
-nothing: the service keeps serving vaults whose custody matches while a
-displaced vault fails loudly at ERROR. A pass that cannot read every balance
-confirms nothing, so one flaky call cannot disarm the guard. An empty inventory
-also confirms no custody and leaves the vault `Unobserved`; confirmation
-requires at least one tracked receipt to be read successfully.
+tracked balance without error; `issuer confirm-custody` drives the same
+`confirm_custody_holder` verification manually when automatic confirmation
+cannot run (the rollback path below). Confirmation is not retried periodically:
+after a startup read failure, correct the cause and restart the service. Every
+balance reader goes through this handler, so no code path can apply a
+wrong-wallet reading. The refusal is per vault and writes nothing: the service
+keeps serving vaults whose custody matches while a displaced vault fails loudly
+at ERROR. A pass that cannot read every balance confirms nothing, so one flaky
+call cannot disarm the guard. An empty inventory also confirms no custody and
+leaves the vault `Unobserved`; confirmation requires at least one tracked
+receipt to be read successfully.
+
+**Custody moved by a recorded migration is expected, not displacement.** After
+`move-receipts` lands, the vault's recorded holder is the destination (e.g. the
+orchestrator), which is not the signing wallet — and that state persists until
+the receipt-inventory subsystem retires
+([RAI-1223](https://linear.app/makeitrain/issue/RAI-1223)). The periodic
+reconciliation and backfill paths therefore skip balance reads for a vault whose
+recorded custody holder differs from the signing wallet **when a recorded
+`CustodyMigrated` from the signing wallet explains the mismatch**, logging the
+skip once at INFO — dispatching those readings would only manufacture
+`CustodyDisplaced` errors for a state the operator deliberately created. A
+holder mismatch with no recorded migration explaining it is true displacement
+and still fails loudly at ERROR.
+
+The skip also defines the rollback recovery: after an `EMERGENCY_ROLE`
+`withdrawReceipt` returns a token's receipts to the bot wallet, recorded custody
+still names the orchestrator, so reconciliation keeps skipping the vault (and
+cannot auto-confirm, since it never reads). The operator runs
+`issuer confirm-custody` — which verifies the bot wallet holds exactly every
+tracked balance and records it as holder — and reconciliation resumes normally
+on the next startup.
 
 Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
 network argument: one freeze covers every listing of the underlying. The CLI

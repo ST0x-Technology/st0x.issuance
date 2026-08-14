@@ -86,6 +86,28 @@ where
         let inventory =
             load_inventory(&self.store, self.chain_id, &self.vault).await?;
 
+        // A recorded migration moved this vault's custody away from the
+        // signing wallet (receipts sit at the destination — the
+        // orchestrator, during the cutover): readings taken against this
+        // wallet mean nothing and could only be refused as
+        // `CustodyDisplaced` for a state the operator deliberately created.
+        // Skipped at INFO until the subsystem retires (RAI-1223). A holder
+        // mismatch with NO recorded migration from this wallet is true
+        // displacement and still fails loudly below.
+        if inventory.custody().moved_away_from(self.bot_wallet) {
+            info!(target: "receipt", vault = %self.vault,
+                wallet = %self.bot_wallet,
+                holder = ?inventory.custody().holder(),
+                "Custody recorded at a migrated destination; skipping \
+                 balance reconciliation"
+            );
+            return Ok(ReconcileResult {
+                checked: 0,
+                mismatches: 0,
+                errors: 0,
+            });
+        }
+
         let receipts: Vec<_> = inventory
             .receipts_with_balance()
             .into_iter()
@@ -823,6 +845,161 @@ mod tests {
                     "receipt_count=2"
                 ]
             ));
+        }
+
+        /// Records a completed migration the way the engine does, so the
+        /// expected-elsewhere skip is tested against real recorded state.
+        async fn seed_migration(
+            store: &Arc<Store<ReceiptInventory>>,
+            vault: Address,
+            from: Address,
+            to: Address,
+        ) {
+            send_receipt_inventory_command(
+                store,
+                ANVIL_CHAIN_ID,
+                &vault,
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from,
+                    to,
+                    tx_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        /// After a recorded migration moved custody away (receipts sitting
+        /// in the orchestrator during cutover), zero readings against the
+        /// signing wallet are the EXPECTED state until RAI-1223 retires the
+        /// subsystem — the vault is skipped quietly at INFO instead of
+        /// manufacturing a `CustodyDisplaced` error every pass.
+        #[traced_test]
+        #[tokio::test]
+        async fn a_recorded_migration_away_is_skipped_quietly() {
+            let evm = LocalEvm::new().await.unwrap();
+            let store = setup_store().await;
+
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+            let vault_contract =
+                crate::bindings::OffchainAssetReceiptVault::new(
+                    evm.vault_address,
+                    &provider,
+                );
+            let receipt_contract =
+                Address::from(vault_contract.receipt().call().await.unwrap().0);
+
+            let balance = U256::from(100) * U256::from(10).pow(U256::from(18));
+            seed_receipt(&store, evm.vault_address, uint!(0xaa_U256), balance)
+                .await;
+            seed_receipt(&store, evm.vault_address, uint!(0xbb_U256), balance)
+                .await;
+
+            seed_custody(&store, evm.vault_address, evm.wallet_address).await;
+            let destination = Address::random();
+            seed_migration(
+                &store,
+                evm.vault_address,
+                evm.wallet_address,
+                destination,
+            )
+            .await;
+
+            let reconciler = ReceiptReconciler::new(
+                provider,
+                receipt_contract,
+                evm.wallet_address,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                store.clone(),
+            );
+
+            let result = reconciler.reconcile().await.unwrap();
+
+            assert_eq!(result.checked, 0, "no balances may be read");
+            assert_eq!(result.mismatches, 0);
+            assert_eq!(result.errors, 0);
+
+            let inventory =
+                load_inventory(&store, ANVIL_CHAIN_ID, &evm.vault_address)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                inventory.receipts_with_balance().len(),
+                2,
+                "the migrated inventory must survive the pass intact"
+            );
+            assert_eq!(
+                inventory.custody().holder(),
+                Some(destination),
+                "the skip must not re-confirm custody at the signing wallet"
+            );
+
+            assert!(logs_contain_at!(
+                tracing::Level::INFO,
+                &["skipping", "balance reconciliation"]
+            ));
+            assert!(
+                !logs_contain("Refusing to deplete"),
+                "an expected state must not be reported as displacement"
+            );
+        }
+
+        /// `moved_from` names one specific origin: a migration recorded from
+        /// some OTHER wallet explains nothing about this signing wallet's
+        /// zero readings, so the pass still refuses as displacement.
+        #[traced_test]
+        #[tokio::test]
+        async fn a_migration_from_another_wallet_does_not_excuse_the_mismatch()
+        {
+            let evm = LocalEvm::new().await.unwrap();
+            let store = setup_store().await;
+
+            let provider =
+                ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+            let vault_contract =
+                crate::bindings::OffchainAssetReceiptVault::new(
+                    evm.vault_address,
+                    &provider,
+                );
+            let receipt_contract =
+                Address::from(vault_contract.receipt().call().await.unwrap().0);
+
+            let balance = U256::from(100) * U256::from(10).pow(U256::from(18));
+            seed_receipt(&store, evm.vault_address, uint!(0xaa_U256), balance)
+                .await;
+
+            let unrelated_origin = Address::random();
+            let destination = Address::random();
+            seed_custody(&store, evm.vault_address, unrelated_origin).await;
+            seed_migration(
+                &store,
+                evm.vault_address,
+                unrelated_origin,
+                destination,
+            )
+            .await;
+
+            let reconciler = ReceiptReconciler::new(
+                provider,
+                receipt_contract,
+                evm.wallet_address,
+                ANVIL_CHAIN_ID,
+                evm.vault_address,
+                store.clone(),
+            );
+
+            let error = reconciler.reconcile().await.unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    ReconcileError::CustodyDisplaced { receipt_count: 1, .. }
+                ),
+                "an unexplained mismatch must stay displacement, got: \
+                 {error:?}"
+            );
         }
 
         /// Only the depletion is refused, not the whole cutover: once custody
