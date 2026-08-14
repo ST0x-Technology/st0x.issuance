@@ -47,6 +47,21 @@ struct BurnRecoveryBudget {
     last_transaction: Option<(B256, u64)>,
 }
 
+/// Shares the bot wallet must hold on-chain before a recovery-driven burn can
+/// proceed. Vault-direct's multicall moves both the burned shares and the
+/// dust in one transaction, so both must be present; the orchestrator burns
+/// only `burn_shares` and never moves the dust (it stays in the bot wallet).
+const fn required_recovery_shares(
+    burn_mode: VaultMode,
+    burn_shares: U256,
+    total_with_dust: U256,
+) -> U256 {
+    match burn_mode {
+        VaultMode::VaultDirect => total_with_dust,
+        VaultMode::Orchestrator { .. } => burn_shares,
+    }
+}
+
 fn recovery_burn_entries(planned_burns: &[BurnRecord]) -> Vec<MultiBurnEntry> {
     planned_burns
         .iter()
@@ -97,6 +112,13 @@ pub(crate) enum RecoveryOutcome {
     /// Burn skipped: the bot's on-chain balance is insufficient, so the burn
     /// likely already landed but was never recorded. Needs manual review.
     SkippedManualIntervention,
+    /// Orchestrator burn deferred: the wallet's balance is below the burn
+    /// amount, and nothing was ever submitted (persist-before-broadcast), so
+    /// a prior unrecorded burn is impossible. The redemption stays `Burning`
+    /// and the next recovery pass retries automatically once the wallet is
+    /// funded — an ops funding action, never the force-complete/close
+    /// runbook.
+    DeferredUnderfunded,
     /// The redemption already advanced past `Burning`/`BurnSubmitted`; there
     /// was nothing to burn.
     AlreadyAdvanced,
@@ -686,31 +708,65 @@ impl BurnManager {
         let on_chain_balance =
             vault_service.get_share_balance(vault, self.bot_wallet).await?;
 
-        if on_chain_balance < total_shares {
-            let reason = format!(
-                "On-chain balance insufficient for BurnFailed recovery: \
-                 balance={on_chain_balance}, required={total_shares}"
-            );
+        let required_shares =
+            required_recovery_shares(*burn_mode, burn_shares, total_shares);
 
-            info!(target: "redemption", issuer_request_id = %issuer_request_id,
-                on_chain_balance = %on_chain_balance,
-                total_shares = %total_shares,
-                "Auto-failing BurnFailed redemption with insufficient on-chain balance"
-            );
+        if on_chain_balance < required_shares {
+            match burn_mode {
+                // Vault-direct reaches this path with no captured tx id, but a
+                // broadcast that landed without recording its id is possible,
+                // so a low balance is read as "the burn likely already
+                // succeeded on-chain": auto-fail to avoid double-burning and
+                // leave any reservation in place (releasing would over-credit
+                // inventory against a stale-high mirror). Manual intervention
+                // resolves it.
+                VaultMode::VaultDirect => {
+                    let reason = format!(
+                        "On-chain balance insufficient for BurnFailed recovery: \
+                         balance={on_chain_balance}, required={required_shares}"
+                    );
 
-            let command = RedemptionCommand::MarkFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason,
-            };
+                    info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        on_chain_balance = %on_chain_balance,
+                        required_shares = %required_shares,
+                        "Auto-failing BurnFailed redemption with insufficient on-chain balance"
+                    );
 
-            self.store.send(issuer_request_id, command).await?;
+                    self.store
+                        .send(
+                            issuer_request_id,
+                            RedemptionCommand::MarkFailed {
+                                issuer_request_id: issuer_request_id.clone(),
+                                reason,
+                            },
+                        )
+                        .await?;
 
-            // The burn likely already landed (on-chain balance is too low to
-            // burn again), so any reservation from a prior attempt is LEFT in
-            // place: releasing would over-credit inventory against a stale-high
-            // mirror and risk a duplicate burn. It is resolved by on-chain
-            // settlement or manual intervention.
-            return Ok(());
+                    return Ok(());
+                }
+                // Orchestrator burns move shares only atomically inside
+                // `burn()`, and this path runs with no submitted tx, so a
+                // prior unrecorded burn for this redemption is impossible — a
+                // low balance means the wallet is underfunded or its shares
+                // were consumed elsewhere. Auto-failing would record a false
+                // "burn landed" claim, so defer instead: the redemption stays
+                // BurnFailed (visible in /admin/stuck) and the next pass
+                // retries once the wallet is funded.
+                VaultMode::Orchestrator { .. } => {
+                    // ERROR: funding the wallet is an ops action — the retry
+                    // loop cannot resolve this on its own.
+                    error!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        on_chain_balance = %on_chain_balance,
+                        burn_shares = %burn_shares,
+                        "Insufficient wallet balance for orchestrator burn recovery; \
+                         no burn was submitted, so a prior unrecorded burn is \
+                         impossible — wallet underfunded or shares consumed \
+                         elsewhere; deferring"
+                    );
+
+                    return Ok(());
+                }
+            }
         }
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -1492,29 +1548,62 @@ impl BurnManager {
                     }
                 };
 
+                let required_shares = required_recovery_shares(
+                    metadata.burn_mode,
+                    burn_shares,
+                    total_shares_needed,
+                );
+
                 let on_chain_balance = vault_service
                     .get_share_balance(vault, self.bot_wallet)
                     .await?;
 
-                if on_chain_balance < total_shares_needed {
-                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                        on_chain_balance = %on_chain_balance,
-                        burn_shares = %burn_shares,
-                        dust_shares = %dust_shares,
-                        total_shares_needed = %total_shares_needed,
-                        "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
-                         Burn likely already succeeded but was not recorded. \
-                         Skipping to avoid recording false failure."
-                    );
-
-                    // The redemption stays Burning for manual review. Any
-                    // reservation from the crashed attempt is LEFT in place:
-                    // the burn likely already landed, so releasing would
-                    // over-credit inventory and risk a duplicate burn against
-                    // the stale-high mirror. Leaving it keeps availability
-                    // conservatively correct until manual intervention resolves
-                    // the redemption.
-                    return Ok(RecoveryOutcome::SkippedManualIntervention);
+                if on_chain_balance < required_shares {
+                    match metadata.burn_mode {
+                        // Vault-direct: a crashed broadcast may have landed
+                        // without recording, so a low balance is read as "the
+                        // burn likely already succeeded". Skip to avoid a false
+                        // failure; leave any reservation in place (releasing
+                        // would over-credit the stale-high mirror). Resolve via
+                        // the admin `force-complete` (landed) or `close`
+                        // (ambiguous) endpoint.
+                        VaultMode::VaultDirect => {
+                            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                                on_chain_balance = %on_chain_balance,
+                                burn_shares = %burn_shares,
+                                dust_shares = %dust_shares,
+                                required_shares = %required_shares,
+                                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
+                                 Burn likely already succeeded but was not recorded. \
+                                 Skipping to avoid recording false failure."
+                            );
+                            return Ok(
+                                RecoveryOutcome::SkippedManualIntervention,
+                            );
+                        }
+                        // Orchestrator burns move shares only atomically inside
+                        // `burn()`, and this arm runs before anything is signed
+                        // (persist-before-broadcast), so a prior unrecorded
+                        // burn is impossible — a low balance means the wallet
+                        // is underfunded or its shares were consumed elsewhere.
+                        // Defer: the redemption stays Burning (visible in
+                        // /admin/stuck as a stuck Burning entry once past the
+                        // threshold; this ERROR log is the signal
+                        // distinguishing underfunding from other stuck-Burning
+                        // causes) and the next pass retries once the wallet is
+                        // funded.
+                        VaultMode::Orchestrator { .. } => {
+                            error!(target: "redemption", issuer_request_id = %issuer_request_id,
+                                on_chain_balance = %on_chain_balance,
+                                burn_shares = %burn_shares,
+                                "Insufficient wallet balance for orchestrator burn recovery; \
+                                 no burn was submitted, so a prior unrecorded burn is \
+                                 impossible — wallet underfunded or shares consumed \
+                                 elsewhere; deferring"
+                            );
+                            return Ok(RecoveryOutcome::DeferredUnderfunded);
+                        }
+                    }
                 }
 
                 debug!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -4085,6 +4174,53 @@ mod tests {
         ));
     }
 
+    /// An underfunded wallet defers an orchestrator `Burning` recovery with
+    /// the DISTINCT `DeferredUnderfunded` outcome — funding the wallet lets
+    /// the next pass retry automatically, so the operator must not be sent
+    /// to the manual force-complete/close runbook
+    /// (`SkippedManualIntervention`'s story).
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_burning_orchestrator_underfunded_defers() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                // Below the redemption's 100-token burn amount.
+                .with_share_balance(uint!(50_000000000000000000_U256)),
+        );
+        let setup = setup_orchestrator_burning(vault_mock.clone()).await;
+
+        let outcome = setup
+            .manager
+            .recover_single_burning(&setup.issuer_request_id)
+            .await;
+
+        assert!(
+            matches!(outcome, Ok(RecoveryOutcome::DeferredUnderfunded)),
+            "an underfunded orchestrator wallet must defer with the \
+             distinct outcome, got {outcome:?}"
+        );
+        assert_eq!(
+            vault_mock.orchestrator_submit_call_count(),
+            0,
+            "nothing may be submitted while the wallet is underfunded"
+        );
+        let aggregate =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await;
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "the deferral must leave the redemption in Burning, \
+             got {aggregate:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &[
+                "Insufficient wallet balance for orchestrator burn recovery",
+                "deferring"
+            ]
+        ));
+    }
+
     /// A confirmed orchestrator burn whose `Burned.amount` diverges from the
     /// redemption's own persisted `alpaca_quantity` must never terminalize:
     /// the recovery refuses before `RecordExistingBurn`, the redemption stays
@@ -6621,6 +6757,241 @@ mod tests {
         ));
     }
 
+    /// Seeds an orchestrator-mode redemption in `Burning` state with the given
+    /// Alpaca and dust quantities, so balance-heuristic tests can vary the
+    /// burn/dust split.
+    async fn seed_orchestrator_burning_with_amounts(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+    ) {
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Detect {
+                    burn_mode: VaultMode::Orchestrator {
+                        address: test_orchestrator_address(),
+                    },
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    quantity: alpaca_quantity.clone(),
+                    tx_hash: b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                    block_number: 12345,
+                    network: Network::Base,
+                },
+            )
+            .await
+            .expect("Detect failed");
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-orch-bal",
+                    ),
+                    alpaca_quantity,
+                    dust_quantity,
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete failed");
+    }
+
+    /// An orchestrator `BurnFailed` redemption with no submitted tx and a
+    /// balance below `burn_shares` is deferred (WARN, stays Failed), never
+    /// auto-failed: no burn was submitted, so a prior unrecorded burn is
+    /// impossible and a "burn landed" claim would be false.
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_burn_failed_orchestrator_defers_on_insufficient_balance() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_share_balance(uint!(0_U256)),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_orchestrator_burning_with_amounts(
+            store,
+            &issuer_request_id,
+            Quantity::new(Decimal::from(100)),
+            Quantity::new(Decimal::ZERO),
+        )
+        .await;
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "orchestrator burn preparation failed".to_string(),
+                    tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::Failed { reason, .. } = &aggregate else {
+            panic!("expected Failed state, got {aggregate:?}");
+        };
+        assert!(
+            !reason.contains("On-chain balance insufficient"),
+            "orchestrator recovery must not auto-fail with a balance reason, \
+             got: {reason}"
+        );
+        assert_eq!(
+            vault_mock.orchestrator_submit_call_count(),
+            0,
+            "a deferred recovery must not submit a burn"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Insufficient wallet balance for orchestrator burn recovery"]
+        ));
+    }
+
+    /// The orchestrator balance check ignores dust: a wallet holding exactly
+    /// `burn_shares` (less than `burn_shares + dust`) still recovers, because
+    /// the orchestrator never moves the dust on-chain.
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_burn_failed_orchestrator_ignores_dust_in_balance_check() {
+        // Balance equals burn_shares (100e18) exactly — below burn + dust.
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_share_balance(uint!(100_000000000000000000_U256)),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_orchestrator_burning_with_amounts(
+            store,
+            &issuer_request_id,
+            Quantity::new(Decimal::from(100)),
+            Quantity::new(Decimal::new(1, 9)),
+        )
+        .await;
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "orchestrator burn preparation failed".to_string(),
+                    tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::Completed { .. }),
+            "recovery must proceed when the wallet holds burn_shares, \
+             got {aggregate:?}"
+        );
+        assert_eq!(vault_mock.orchestrator_submit_call_count(), 1);
+    }
+
+    /// An orchestrator redemption stuck in `Burning` with a balance below
+    /// `burn_shares` defers (WARN, stays Burning) without submitting a burn —
+    /// the persist-before-broadcast invariant means nothing was signed, so a
+    /// low balance is an underfunded wallet, not a landed burn.
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_burning_orchestrator_defers_on_insufficient_balance() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_share_balance(uint!(50_000000000000000000_U256)),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_orchestrator_burning_with_amounts(
+            store,
+            &issuer_request_id,
+            Quantity::new(Decimal::from(100)),
+            Quantity::new(Decimal::ZERO),
+        )
+        .await;
+
+        manager.recover_burning_redemptions().await;
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "an underfunded orchestrator burn stays Burning, got {aggregate:?}"
+        );
+        assert_eq!(
+            vault_mock.orchestrator_submit_call_count(),
+            0,
+            "a deferred recovery must not submit a burn"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Insufficient wallet balance for orchestrator burn recovery"]
+        ));
+    }
+
     /// A `BurnFailed` redemption with a `tx_id` means the signing backend
     /// already submitted a transaction before the failure was recorded.
     /// On recovery, `recover_burn_failed_with_existing_tx` must confirm the
@@ -8763,6 +9134,113 @@ mod tests {
                 .is_empty(),
             "GC must settle the reservation of a completed redemption"
         );
+    }
+
+    /// A vault mid-cutover holds both a vault-direct redemption (which reserved
+    /// receipts) and an orchestrator redemption (which never reserves). The
+    /// reservation sweep must still settle the vault-direct one while never
+    /// surfacing the orchestrator one — proving it must keep running unchanged
+    /// while any asset is vault-direct.
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_stuck_reservations_settles_vault_direct_ignoring_orchestrator()
+     {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+        );
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(1_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(2_U256),
+                uint!(50_000000000000000000_U256),
+            )
+            .await;
+
+        // Vault-direct redemption: complete it, then seed a dangling
+        // reservation the sweep must settle.
+        let vault_direct_id = IssuerRedemptionRequestId::random();
+        let vault_direct_aggregate = create_test_redemption_in_burning_state(
+            &harness.store,
+            &vault_direct_id,
+        )
+        .await;
+        manager
+            .handle_burning_started(&vault_direct_id, &vault_direct_aggregate)
+            .await
+            .unwrap();
+        seed_stuck_reservation(
+            &harness,
+            vault,
+            &vault_direct_id,
+            uint!(2_U256),
+            uint!(50_000000000000000000_U256),
+        )
+        .await;
+
+        // Orchestrator redemption on the same vault: completes without ever
+        // reserving receipts.
+        let orchestrator_id = IssuerRedemptionRequestId::random();
+        let orchestrator_aggregate =
+            create_orchestrator_redemption_in_burning_state(
+                &harness.store,
+                &orchestrator_id,
+            )
+            .await;
+        manager
+            .handle_burning_started(&orchestrator_id, &orchestrator_aggregate)
+            .await
+            .unwrap();
+
+        let reserved_before = harness
+            .receipt_service
+            .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+            .await
+            .unwrap();
+        assert!(
+            reserved_before.contains(&vault_direct_id),
+            "the vault-direct redemption's reservation must be pending"
+        );
+        assert!(
+            !reserved_before.contains(&orchestrator_id),
+            "the orchestrator redemption must never reserve receipts"
+        );
+
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
+
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the sweep must settle the vault-direct reservation"
+        );
+        assert!(matches!(
+            load_aggregate(&harness.store, &vault_direct_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert!(matches!(
+            load_aggregate(&harness.store, &orchestrator_id).await,
+            Redemption::Completed { .. }
+        ));
     }
 
     /// A settlement failure during reservation recovery must surface (logged)
