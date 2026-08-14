@@ -28,11 +28,17 @@ use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
 
 pub(crate) mod mock;
 pub(crate) mod network_services;
+pub(crate) mod orchestrator;
 pub(crate) mod rain_meta;
 pub(crate) mod service;
 
 pub(crate) use network_services::{
     NetworkVault, NetworkVaultServices, UnconfiguredNetworkError,
+};
+
+pub(crate) use orchestrator::{
+    OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
+    OrchestratorRevertReason,
 };
 
 /// Service abstraction for vault operations.
@@ -204,6 +210,59 @@ pub(crate) trait VaultService: Send + Sync {
     /// Serializes the local wallet's nonce assignment through broadcast.
     async fn lock_wallet(&self) -> WalletNonceGuard {
         None
+    }
+
+    /// Runs the pre-submit orchestrator burn gates: the ERC-20 allowance
+    /// check, then `vaultLogicIsExpected()`. See
+    /// [`OrchestratorBurnReadiness`] for the outcome semantics.
+    ///
+    /// The default implementation fails closed for implementations without
+    /// orchestrator support (mirroring
+    /// [`VaultService::prepare_replacement_burn_tx`]).
+    #[allow(dead_code)]
+    async fn check_orchestrator_burn_readiness(
+        &self,
+        _orchestrator: Address,
+        _token: Address,
+        _owner: Address,
+        _amount: U256,
+    ) -> Result<OrchestratorBurnReadiness, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Builds and signs the `ST0xOrchestrator.burn()` transaction without
+    /// broadcasting it. The returned bytes must be persisted (via
+    /// `BurnIntended`) before [`VaultService::submit_orchestrator_burn`].
+    #[allow(dead_code)]
+    async fn prepare_orchestrator_burn_tx(
+        &self,
+        _params: &OrchestratorBurnParams,
+    ) -> Result<SendableTxWithHash, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Broadcasts the exact signed orchestrator burn persisted before this
+    /// call. Repeated calls must rebroadcast the same bytes rather than sign
+    /// a replacement.
+    #[allow(dead_code)]
+    async fn submit_orchestrator_burn(
+        &self,
+        _params: &OrchestratorBurnParams,
+        _sendable_tx: &SendableTxWithHash,
+    ) -> Result<SubmittedTx, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Confirms a previously submitted orchestrator burn, parsing the
+    /// orchestrator's `Burned` event. A mined-but-reverted burn fails with
+    /// [`VaultError::OrchestratorReverted`] carrying the decoded typed
+    /// reason.
+    #[allow(dead_code)]
+    async fn confirm_orchestrator_burn(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<OrchestratorBurnResult, VaultError> {
+        Err(VaultError::InvalidReceipt)
     }
 }
 
@@ -756,11 +815,25 @@ pub(crate) enum VaultError {
          transaction {tx_hash:?}"
     )]
     ContradictoryDeathSignals { tx_hash: B256, nonce: u64 },
+    /// An orchestrator transaction was mined but reverted, with the revert
+    /// data decoded into a typed reason. Like [`VaultError::Reverted`], this
+    /// is a definitive on-chain failure.
+    #[error(
+        "Orchestrator transaction reverted on-chain: {tx_hash:?} ({reason:?})"
+    )]
+    OrchestratorReverted { tx_hash: B256, reason: OrchestratorRevertReason },
     /// Transaction was mined and succeeded but does not prove the expected
     /// burn — it contains no `Transfer(owner -> 0x0)` of the vault's shares.
     /// The operator-supplied hash cannot terminalize the redemption.
     #[error("Transaction is not a burn of the expected shares: {tx_hash:?}")]
     NotABurn { tx_hash: B256 },
+    /// The mined burn's `Burned` event names a token or amount different
+    /// from the transaction's own decoded calldata. The hash pins our
+    /// persisted bytes, so a divergence means the orchestrator emitted an
+    /// event our burn never requested — accounting must not terminalize on
+    /// it.
+    #[error("Burned event diverges from the mined burn calldata: {tx_hash:?}")]
+    BurnedEventMismatch { tx_hash: B256 },
     #[error(
         "Node returned transaction hash {returned:?} for persisted transaction {expected:?}"
     )]

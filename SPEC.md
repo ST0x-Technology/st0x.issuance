@@ -1695,15 +1695,14 @@ st0x.deploy audit report covering the orchestrator.
   its economic value. `burn_range` is audit-trail provenance only: no burned
   quantity may ever be derived from the range width.
 
-  **RAI-1220 acceptance criterion.** This reading is the one the spec requires,
-  inferred from the field name `nextBurnReceiptIdAfter` and the
-  `nextBurnReceiptId(token)` view — it is **not yet verified against the merged
-  contract**. Before wiring the `Burned` decoder, assert against the merged
-  `IST0xOrchestratorV1.sol` that (a) `nextBurnReceiptIdAfter` is exclusive of
-  the receipts this burn fully drained, and (b) it names the receipt a
-  subsequent burn resumes from. Encode both in a decoder test against a real
-  `Burned` log. If the merged ABI disagrees, correct this section first — do not
-  work around it in the decoder.
+  **RAI-1220 acceptance criterion — verified.** This reading is asserted against
+  a real `Burned` log emitted by the deployed contract on Anvil
+  (`tests/orchestrator_smoke.rs`, `orchestrator_mint_burn_roundtrip`): (a)
+  `nextBurnReceiptIdAfter` is exclusive of the receipts the burn fully drained,
+  and (b) it equals the post-burn `nextBurnReceiptId(token)` — the receipt the
+  subsequent burn resumes from. The same run pins `firstReceiptId` as the
+  **pre-burn pointer value** (0 on a fresh orchestrator, where receipt ids start
+  at 1), consistent with the pointer-movement reading above.
 - Roles: `MINT_ROLE` and `BURN_ROLE` (held by the bot wallet, gating the two
   entry points above), `EMERGENCY_ROLE` (manual recovery: moving receipts
   between wallets, adjusting the burn pointer).
