@@ -20,7 +20,8 @@
 use alloy::primitives::{Address, U256};
 use apalis_sqlite::SqlitePool;
 use chrono::{DateTime, Utc};
-use event_sorcery::{SendError, Store};
+use cqrs_es::AggregateError;
+use event_sorcery::{LifecycleError, SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -28,9 +29,10 @@ use tracing::{debug, error, info, warn};
 
 use super::recovery::{enqueue_scheduled_mint_recovery, release_terminal_job};
 use super::{
-    IssuerMintRequestId, Mint, MintCommand, MintFailureClassification,
-    Quantity, TokenizationRequestId, UnderlyingSymbol,
-    has_unresolved_signer_intent, orchestrator_mint_failure_classification,
+    IssuerMintRequestId, Mint, MintCommand, MintError,
+    MintFailureClassification, Quantity, TokenizationRequestId,
+    UnderlyingSymbol, has_unresolved_signer_intent,
+    orchestrator_mint_failure_classification,
 };
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::burn_excess::has_unresolved_excess_burn_intent;
@@ -2274,7 +2276,7 @@ async fn record_existing_receipt_from_inventory(
         block_number = receipt.block_number,
         "Found existing receipt, recording recovery"
     );
-    mint_store
+    match mint_store
         .send(
             issuer_request_id,
             MintCommand::RecordExistingMint {
@@ -2285,7 +2287,30 @@ async fn record_existing_receipt_from_inventory(
                 block_number: receipt.block_number,
             },
         )
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        // The aggregate's mode guard is a permanent domain refusal — a
+        // receipt mis-attributed to an orchestrator-anchored mint. Retry
+        // cannot fix it, so stop this drive loudly instead of surfacing a
+        // retryable job error that burns the budget and reports
+        // retry-exhausted instead of the real anomaly.
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            MintError::MintModeMismatch { .. },
+        ))) => {
+            error!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %receipt.tx_hash,
+                receipt_id = %receipt.receipt_id,
+                "Vault receipt mis-attributed to an orchestrator-anchored \
+                 mint; refusing vault-direct completion — manual \
+                 investigation required"
+            );
+            return Ok(true);
+        }
+        Err(error) => return Err(error.into()),
+    }
     callback_queue
         .clone()
         .push_with_idempotency_key(

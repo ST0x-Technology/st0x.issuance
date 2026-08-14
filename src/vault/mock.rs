@@ -205,6 +205,17 @@ struct OrchestratorMockState {
     /// (`nonce`, `shares_minted`) cannot express.
     #[cfg(test)]
     minted_log_binding: Mutex<Option<(Address, Address, Address)>>,
+    /// Override for `nonce_used`; `None` mirrors the chain by deriving from
+    /// whether the configured `minted_log` carries the queried nonce.
+    #[cfg(test)]
+    nonce_used: Mutex<Option<bool>>,
+    /// When set, `nonce_used` fails with an RPC-style error.
+    #[cfg(test)]
+    nonce_used_should_error: Mutex<bool>,
+    /// When set, `find_orchestrator_minted_log` fails with an RPC-style
+    /// error.
+    #[cfg(test)]
+    find_minted_log_should_error: Mutex<bool>,
     /// When set, `validate_mint_authorization` fails with this outcome.
     #[cfg(test)]
     mint_auth_failure: Mutex<Option<MockMintAuthFailure>>,
@@ -567,6 +578,9 @@ impl MockVaultService {
         *self.orchestrator.mint_confirm_revert.lock().unwrap() = None;
         *self.orchestrator.minted_log.lock().unwrap() = None;
         *self.orchestrator.minted_log_binding.lock().unwrap() = None;
+        *self.orchestrator.nonce_used.lock().unwrap() = None;
+        *self.orchestrator.nonce_used_should_error.lock().unwrap() = false;
+        *self.orchestrator.find_minted_log_should_error.lock().unwrap() = false;
         *self.orchestrator.mint_auth_failure.lock().unwrap() = None;
         *self.orchestrator.mint_auth_hang.lock().unwrap() = false;
         *self.orchestrator.last_mint_params.lock().unwrap() = None;
@@ -887,6 +901,29 @@ impl MockVaultService {
         result: OrchestratorMintResult,
     ) -> Self {
         *self.orchestrator.pending_mint_result.lock().unwrap() = Some(result);
+        self
+    }
+
+    /// Overrides the `nonce_used` consumed flag, e.g. `true` with no (or a
+    /// non-matching) `minted_log` exercises the consumed-but-unproven path.
+    #[cfg(test)]
+    pub(crate) fn with_nonce_used(self, consumed: bool) -> Self {
+        *self.orchestrator.nonce_used.lock().unwrap() = Some(consumed);
+        self
+    }
+
+    /// Configures `nonce_used` to fail with an RPC-style error.
+    #[cfg(test)]
+    pub(crate) fn with_nonce_used_error(self) -> Self {
+        *self.orchestrator.nonce_used_should_error.lock().unwrap() = true;
+        self
+    }
+
+    /// Configures `find_orchestrator_minted_log` to fail with an RPC-style
+    /// error.
+    #[cfg(test)]
+    pub(crate) fn with_find_minted_log_error(self) -> Self {
+        *self.orchestrator.find_minted_log_should_error.lock().unwrap() = true;
         self
     }
 
@@ -1913,6 +1950,9 @@ impl VaultService for MockVaultService {
             self.orchestrator
                 .find_minted_log_call_count
                 .fetch_add(1, Ordering::Relaxed);
+            if *self.orchestrator.find_minted_log_should_error.lock().unwrap() {
+                return Err(VaultError::InvalidReceipt);
+            }
             // Mirror the real scan's three-way verdict. The stored log
             // carries `nonce`/`shares_minted`; the optional
             // `(orchestrator, to, token)` binding stands in for the address
@@ -1949,6 +1989,39 @@ impl VaultService for MockVaultService {
         {
             let _ = (nonce, amount);
             Ok(MintedLogScan::NotFound)
+        }
+    }
+
+    async fn nonce_used(
+        &self,
+        _orchestrator: Address,
+        _to: Address,
+        nonce: B256,
+    ) -> Result<bool, VaultError> {
+        #[cfg(test)]
+        {
+            if *self.orchestrator.nonce_used_should_error.lock().unwrap() {
+                return Err(VaultError::InvalidReceipt);
+            }
+            let value = *self.orchestrator.nonce_used.lock().unwrap();
+            if let Some(overridden) = value {
+                return Ok(overridden);
+            }
+            // Mirror the chain by default: a configured landed log carrying
+            // this nonce means the nonce is consumed.
+            return Ok(self
+                .orchestrator
+                .minted_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|log| log.nonce == nonce));
+        }
+
+        #[cfg(not(test))]
+        {
+            let _ = nonce;
+            Ok(false)
         }
     }
 
