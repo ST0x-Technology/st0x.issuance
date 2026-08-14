@@ -879,31 +879,31 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command -> Event Mappings:**
 
-| Command                                  | Events                             | Notes                                                                                          |
-| ---------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                              |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                                                              |
-| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                               |
-| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                               |
-| `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                    |
-| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction                                                        |
-| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                                                                |
-| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                  |
-| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                        |
-| `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                              |
-| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                |
-| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                               |
-| `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                 |
-| `RecordExistingBurn`                     | `ExistingBurnRecovered`            | Recovery from Failed with known tx                                                             |
-| `MarkFailed`                             | `RedemptionFailed`                 | Marks or reclassifies a failed redemption                                                      |
-| `Reprocess`                              | `Reprocessed`                      | Reset to Detected for reprocessing                                                             |
-| `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery                                                     |
-| `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption                                                           |
-| `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a burn verified against this redemption's persisted `burn_mode`              |
-| `IntendBurn` (orchestrator mode)         | `BurnIntended`                     | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                  |
-| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | Broadcasts the persisted bytes; no per-receipt plan to reserve first                           |
-| `ConfirmBurn` (orchestrator mode)        | `OrchestratorTokensBurned`         | New success event; carries the consumed pointer range and `dust_retained`                      |
-| `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`        | Recovery via the orchestrator's `Burned` log; carries `dust_retained` for success-event parity |
+| Command                                  | Events                             | Notes                                                                                                                                                                                                                                              |
+| ---------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                  |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                                                                                                                                                                                                                  |
+| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                                                                                                                                                                                   |
+| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                                                                                                                                                                                   |
+| `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
+| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction                                                                                                                                                                                                            |
+| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                                                                                                                                                                                                                    |
+| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                                                                                                                                                                      |
+| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                                                                                                                                                                            |
+| `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
+| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                                                                                                                                                                    |
+| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                                                                                                                                                                                   |
+| `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                                                                                                                                                                     |
+| `RecordExistingBurn`                     | `ExistingBurnRecovered`            | Recovery from Failed with known tx; carries an `ExistingBurnProof::VaultDirect { burns }` payload cross-checked against the `Failed` state's persisted `burn_mode` anchor                                                                          |
+| `MarkFailed`                             | `RedemptionFailed`                 | Marks or reclassifies a failed redemption                                                                                                                                                                                                          |
+| `Reprocess`                              | `Reprocessed`                      | Reset to Detected for reprocessing                                                                                                                                                                                                                 |
+| `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery                                                                                                                                                                                                         |
+| `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption                                                                                                                                                                                                               |
+| `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a burn verified against this redemption's persisted `burn_mode`                                                                                                                                                                  |
+| `IntendBurn` (orchestrator mode)         | `BurnIntended`                     | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                                                                                                                                                                      |
+| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | Broadcasts the persisted bytes; no per-receipt plan to reserve first                                                                                                                                                                               |
+| `ConfirmBurn` (orchestrator mode)        | `OrchestratorTokensBurned`         | New success event; carries the consumed pointer range and `dust_retained`                                                                                                                                                                          |
+| `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`        | Recovery via the orchestrator's `Burned` log; carries an `ExistingBurnProof::Orchestrator { shares_burned, burn_range, dust_retained }` payload (cross-checked against the `Failed` state's `burn_mode`); `dust_retained` for success-event parity |
 
 Burn transaction recovery runs once during startup and every five minutes while
 the service is running. Before any recovery side effect, the issuer classifies
@@ -2126,8 +2126,10 @@ the pool is drained between the simulation and the mined transaction.
 - Affected redemptions are individually visible today via the existing
   `GET /admin/stuck` (`Failed` state) and are identifiable by their
   `classification: BurnFailureClassification::InsufficientReceipts` field. A
-  dedicated per-token grouped admin view is **not yet specified** — deferred to
-  RAI-1219 (admin/recovery surface work).
+  dedicated admin view that _groups_ these stuck redemptions per token remains
+  future work; the RAI-1219 health surface (`GET /admin/orchestrator-health`,
+  see "Failure States") reports per-token `nextBurnReceiptId` and orchestrator
+  health but does not group stuck redemptions.
 
 #### `AllowanceInsufficient` — pre-submit gate, ops-recoverable
 
@@ -2215,11 +2217,17 @@ recovery on any other chain.
   re-drive resumes it, exactly as it does for
   `InsufficientReceipts`/`AllowanceInsufficient`.
 - **Observable signal:** `vaultLogicIsExpected()` (plus per-token
-  `nextBurnReceiptId`) is the concrete data an admin health surface should
-  expose so a halted orchestrator is visibly distinct from an ordinary stuck
-  transaction. No such endpoint is specified by this document today — it is
-  **deferred to RAI-1219** (admin/recovery surface work), which owns the
-  concrete route and response shape.
+  `nextBurnReceiptId`) is the concrete data the admin health surface exposes so
+  a halted orchestrator is visibly distinct from an ordinary stuck transaction.
+  `GET /admin/orchestrator-health` reports, per distinct orchestrator, its
+  `vaultLogicIsExpected()` result, and per enabled asset its resolved
+  (live-config) `vault_mode` plus — for orchestrator-mode assets — the
+  orchestrator address and its `nextBurnReceiptId`. A halted orchestrator shows
+  `vault_logic: { "status": "unexpected" }` there (while its redemptions sit
+  deferred in `Burning`, not as stuck transactions). An on-chain read failure
+  degrades only the affected row to an explicit
+  `{ "status": "unavailable", "error": ... }` — never a fabricated health flag —
+  so the rest of the surface stays visible during an RPC outage.
 
 #### `BadRecipientSignature` / `RecipientCallbackRejected` / `VaultAmountMismatch` — mint-path on-chain failures
 
