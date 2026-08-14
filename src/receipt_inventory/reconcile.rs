@@ -36,8 +36,8 @@ pub(crate) enum ReconcileError {
         "Wallet {wallet} holds none of the {receipt_count} receipts the \
          inventory claims for vault {vault}; refusing to deplete them. The \
          receipts are most likely still held by the previous signing wallet — \
-         point the service at the wallet that holds them, or migrate custody \
-         with `issuer migrate-receipts`."
+         point the service at the wallet that holds them, or use the approved \
+         custody-migration procedure."
     )]
     CustodyDisplaced { vault: Address, wallet: Address, receipt_count: usize },
 }
@@ -409,7 +409,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Mirrors the `issuer confirm-custody` bootstrap: depletion from a zero
+    /// Mirrors the custody-confirmation bootstrap: depletion from a zero
     /// reading only applies once the holder is on record.
     async fn seed_custody(
         store: &Arc<Store<ReceiptInventory>>,

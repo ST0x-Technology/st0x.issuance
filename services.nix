@@ -23,13 +23,6 @@ let
   # its own machine.
   issuanceFields = name: {
     decryptedEnvPath = "/run/agenix/${name}.env";
-    # Temporary while receipt custody migrates off Fireblocks: the migration
-    # CLI's forward leg reads the Fireblocks RSA key from this path. The
-    # `issuer` operator wrapper (os.nix), the service unit's static
-    # environment (nix/upgradeable-services.nix), and the deploy-time
-    # validate-config invocation (deploy.nix) all export
-    # FIREBLOCKS_SECRET_PATH pointing here. Leaves with src/fireblocks.
-    decryptedFireblocksKeyPath = "/run/agenix/fireblocks-secret-issuance.key";
   };
 
   withPaths =

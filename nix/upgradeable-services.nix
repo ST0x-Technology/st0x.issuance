@@ -31,9 +31,6 @@ let
     if cfg.kind == "st0x" then
       [
         "DATABASE_URL=sqlite:///mnt/data/issuance.db"
-        # Fireblocks RSA key for the receipt-custody migration window; the
-        # deploy activation installs it. Temporary; leaves with src/fireblocks.
-        "FIREBLOCKS_SECRET_PATH=${cfg.decryptedFireblocksKeyPath}"
         # Gates dev-only surfaces (OpenAPI docs). "production" hides them;
         # "staging" exposes them for easier debugging on the staging host.
         "ENVIRONMENT=${

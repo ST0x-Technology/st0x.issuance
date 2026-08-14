@@ -666,14 +666,14 @@ impl BurnManager {
         // deciding whether to confirm, wait, or submit a replacement. The
         // confirm path is mode-scoped: each mode confirms via its own
         // on-chain shape and records its own success event.
-        let retry_external_tx_id = if let Some(existing_tx_id) = tx_id {
+        let retry_external_tx_id = if let Some(persisted_tx_id) = tx_id {
             return match burn_mode {
                 VaultMode::VaultDirect => {
                     self.recover_burn_failed_with_existing_tx(
                         issuer_request_id,
                         network,
                         vault,
-                        existing_tx_id,
+                        persisted_tx_id,
                         dust_quantity,
                     )
                     .await
@@ -682,7 +682,7 @@ impl BurnManager {
                     self.recover_orchestrator_burn_failed_with_existing_tx(
                         *network,
                         issuer_request_id,
-                        existing_tx_id,
+                        persisted_tx_id,
                         alpaca_quantity,
                         dust_quantity,
                     )

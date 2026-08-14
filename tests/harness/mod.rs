@@ -36,8 +36,8 @@ use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
 };
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, VaultMode, VaultModeConfig,
+    AlpacaConfig, AuthConfig, ChainConfig, Config, Environment, IpWhitelist,
+    LogLevel, Network, SignerConfig, VaultMode, VaultModeConfig,
 };
 
 /// The internal API key every harness-built config and request header share:
@@ -599,7 +599,7 @@ pub fn create_config_with_db(
             database_url: db_path.to_string(),
             database_max_connections: 5,
             rpc_url: rpc_url.clone(),
-            chain_id: ANVIL_CHAIN_ID,
+            chain_id: evm.chain_id,
             signer: SignerConfig::Local(evm.private_key),
             backfill_start_block: 0,
             receipt_poll_interval: tokio::time::Duration::from_millis(500),
@@ -626,7 +626,7 @@ pub fn create_config_with_db(
             subgraph_url: subgraph_url.clone(),
             chains: vec![ChainConfig {
                 network: Network::Base,
-                chain_id: ANVIL_CHAIN_ID,
+                chain_id: evm.chain_id,
                 rpc_url,
                 subgraph_url,
                 backfill_start_block: 0,
@@ -665,7 +665,7 @@ pub fn create_multichain_config_with_db(
     base_config.chains = vec![
         ChainConfig {
             network: Network::Base,
-            chain_id: ANVIL_CHAIN_ID,
+            chain_id: base_evm.chain_id,
             rpc_url: Url::parse(&base_evm.endpoint)?,
             subgraph_url: subgraph_url.clone(),
             backfill_start_block: 0,

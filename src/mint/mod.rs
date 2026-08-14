@@ -594,8 +594,8 @@ impl Mint {
     /// Traverses the `failed_from` chain to find the last state before
     /// any failure. A `Minting` state that resumed from a failure delegates
     /// to the preserved chain so retry derivations (attempt number, known
-    /// Fireblocks tx) survive the retry transition. If this mint carries no
-    /// failure history, returns `self`.
+    /// submitted transaction) survive the retry transition. If this mint
+    /// carries no failure history, returns `self`.
     fn non_failed_predecessor(&self) -> &Self {
         match self {
             Self::MintingFailed { failed_from, .. } => {
@@ -608,9 +608,10 @@ impl Mint {
         }
     }
 
-    /// The `external_tx_id` of the latest persisted `FireblocksSubmitted`
-    /// predecessor, traversing any failure chain. `None` when no submission
-    /// ever reached the signing backend.
+    /// The `external_tx_id` of the latest persisted `TxSubmitted` predecessor,
+    /// traversing any failure chain. `None` when no submission ever reached
+    /// the signing backend. Legacy `FireblocksSubmitted` events replay as this
+    /// state through their retained serde alias.
     fn latest_known_external_tx_id(&self) -> Option<String> {
         match self.non_failed_predecessor() {
             Self::TxSubmitted { external_tx_id, .. } => {
@@ -700,9 +701,9 @@ impl Mint {
     }
 
     /// `external_tx_id` override for a durable `SubmitMintJob`: `Some(retry-N)`
-    /// when this `Minting` state resumed from a failure (so Fireblocks does not
-    /// dedupe the retry against the failed submission), `None` for a first
-    /// submission (the backend derives the base deterministic id).
+    /// when this `Minting` state resumed from a failure, giving the retry a
+    /// distinct durable submission identifier; `None` for a first submission
+    /// (the backend derives the base deterministic id).
     pub(super) fn retry_submission_external_tx_id(
         &self,
     ) -> Option<MintExternalTxId> {
