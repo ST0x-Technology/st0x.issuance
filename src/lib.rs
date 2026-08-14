@@ -97,7 +97,9 @@ pub mod bindings;
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use chain::ChainConfig;
-pub use config::{Config, Environment, LogLevel, setup_tracing};
+pub use config::{
+    Config, Environment, LogLevel, VaultMode, VaultModeConfig, setup_tracing,
+};
 pub use st0x_issuance_dto::Network;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::{

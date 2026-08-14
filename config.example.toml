@@ -1,0 +1,26 @@
+# Template for the optional TOML configuration file, passed via
+# `--config <path>` (or the CONFIG environment variable).
+#
+# The flag is optional: with no config file (or one containing no orchestrator
+# entries) every asset is vault-direct, which is the dark-deploy default.
+#
+# Parsing is strict — unknown keys and invalid vault_mode strings are startup
+# errors, and any asset resolving to orchestrator mode while
+# [orchestrator].address is missing or malformed is a startup error.
+
+[orchestrator]
+# ST0xOrchestrator contract address. Required when any asset resolves to
+# orchestrator mode; rejected as a startup error if that is the case and it
+# is missing, malformed, or the zero address.
+address = "0x1234567890abcdef1234567890abcdef12345678"
+
+# Mode for assets without a per-asset override below:
+# "vault_direct" (the default when omitted) | "orchestrator".
+# The full-rollout end state sets this to "orchestrator" and drops the
+# per-asset overrides, so newly onboarded assets default to the orchestrator.
+default_vault_mode = "vault_direct"
+
+# Per-asset override, keyed by underlying symbol. During the pilot exactly one
+# asset carries this; every other asset stays on the default.
+[assets.RKLB]
+vault_mode = "orchestrator"
