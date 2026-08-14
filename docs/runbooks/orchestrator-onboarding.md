@@ -209,10 +209,61 @@ command's output with the cutover:
     address would sign MintAuths for the wrong contract):
     `grep -F '[orchestrator' <deployed config.toml>` → exit 0, and
     `grep -iF '<orchestrator address>' <deployed config.toml>` → exit 0.
-  - Its Turnkey policy allows `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` (raw-payload
-    signing is a separate policy surface from transaction signing): run that
-    repo's ignored integration test against prod Turnkey,
-    `cargo test turnkey_digest_signing_integration -- --ignored` → exit 0.
+  - Its Turnkey policy allows EIP-712 typed-data signing scoped via
+    `eth.eip_712` conditions — `primary_type == "MintAuth"` (the EIP-712 struct
+    name the orchestrator hashes; `MintAuthV1` is the delivery payload's wire
+    label, NOT the struct — a policy conditioned on it would never match a real
+    signing request), `domain.verifying_contract == <orchestrator address>`
+    written as lowercase `0x` hex (the payload serializes addresses lowercase,
+    so a checksummed literal can fail a string comparison; use the same
+    lowercase form in the cutover evidence), and the deployment chain's
+    `domain.chain_id`. Turnkey has no separate typed-data activity type: EIP-712
+    signing arrives as `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` with
+    `PAYLOAD_ENCODING_EIP712`, so that activity type necessarily appears in the
+    policy — but because policies are default-deny and the `eth.eip_712`
+    conditions are unset for a bare-digest (hexadecimal-encoded) request, this
+    grant does NOT permit raw digest signing: anything that is not an EIP-712
+    payload with exactly our domain and struct is refused. Two checks, one per
+    side of that claim:
+    - **Allow side** — the scoped grant admits our exact payload; executable
+      proof against prod Turnkey:
+      `ST0X_ORCHESTRATOR_ADDRESS=<orchestrator address> cargo test
+      turnkey_typed_signing_integration -- --ignored`
+      → exit 0. (This test only exercises the permitted path — an overly broad
+      policy would also pass it, which is why the deny side needs its own
+      check.)
+    - **Deny side** — default-deny only holds if no OTHER policy can approve
+      signing for this wallet. Two parts:
+      1. Review EVERY effective allow policy in the org that names the bot
+         wallet, its private key, or any of their tags — conditional policies
+         included (a condition that a bare-digest request can satisfy is a
+         grant, "unconditioned" is not the bar), across all policy versions and
+         any categorical signing allowances. Confirm the scoped MintAuth policy
+         above is the ONLY one whose condition a raw-payload signing activity
+         for this wallet can satisfy — checking the whole activity family, not
+         just `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2`: earlier raw-payload versions
+         and the batch `SIGN_RAW_PAYLOADS` variants are the same signing
+         surface. Record the reviewed policy IDs with the cutover record.
+      2. Executable negative probes, each submitted for the bot wallet with the
+         bot's own API key via Turnkey's API/SDK, and each of which must be
+         DENIED by policy (nothing is broadcast even if signed; a signature
+         would only prove the policy gap). Record every denied activity ID with
+         the cutover; ANY signed result is a cutover blocker — some policy
+         grants more than the scoped MintAuth shape:
+         - Bare digest: `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` with
+           `PAYLOAD_ENCODING_HEXADECIMAL`, `HASH_FUNCTION_NO_OP`, any 32-byte
+           payload — proves no raw-digest grant exists.
+         - Three `PAYLOAD_ENCODING_EIP712` payloads, each the real MintAuth
+           payload with exactly ONE fact wrong, so each probe isolates one
+           policy condition (a policy that omits a condition passes the allow
+           test and the bare-digest probe, yet signs unintended requests — these
+           catch that):
+           - wrong `primaryType` (rename the struct, e.g. `NotMintAuth`) —
+             proves the `primary_type` condition exists;
+           - correct struct, `verifyingContract` set to any other address —
+             proves the `verifying_contract` condition exists;
+           - correct struct and contract, `chainId` set to another chain —
+             proves the `chain_id` condition exists.
 
 ## 8. Freeze and drain
 
