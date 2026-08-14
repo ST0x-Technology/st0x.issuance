@@ -15,12 +15,17 @@ use crate::account::{AccountView, view::find_by_client_id};
 use crate::tokenized_asset::view::load_asset_by_network;
 use crate::underlying::load_freeze_status;
 
+mod authorize;
 mod confirm;
 mod initiate;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+pub(crate) use authorize::{
+    __path_authorize_mint, MintAuthorizationRequest, MintAuthorizationResponse,
+    authorize_mint,
+};
 pub(crate) use confirm::confirm_journal;
 pub(crate) use initiate::initiate_mint;
 

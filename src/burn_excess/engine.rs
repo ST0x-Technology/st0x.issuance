@@ -1599,7 +1599,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::Quantity;
     use crate::account::ClientId;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::burn_excess::exclusion::is_excluded_funding_log;
@@ -1620,6 +1619,7 @@ mod tests {
     use crate::vault::{
         BurnTxStatus, MultiBurnResult, MultiBurnResultEntry, SendableTxWithHash,
     };
+    use crate::{Quantity, VaultMode};
 
     const TEST_OA_SCHEMA: &str =
         "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
@@ -1693,6 +1693,7 @@ mod tests {
             client_id: ClientId::new(),
             wallet: address!("0xA9C16673F65AE808688cB18952AFE3d9658C808f"),
             initiated_at: Utc::now(),
+            mint_mode: VaultMode::VaultDirect,
         };
         sqlx::query(
             "
