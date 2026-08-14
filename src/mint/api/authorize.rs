@@ -1,4 +1,5 @@
 use alloy::primitives::{B256, Bytes};
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use rocket::http::{ContentType, Status};
@@ -15,6 +16,7 @@ use tracing::{error, info, warn};
 use super::ErrorResponse;
 use crate::auth::InternalAuth;
 use crate::config::VaultMode;
+use crate::mint::recovery::enqueue_scheduled_mint_recovery;
 use crate::mint::view::find_issuer_id_by_tokenization_request_id;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, MintError, TokenizationRequestId,
@@ -173,6 +175,7 @@ pub(crate) async fn authorize_mint(
     tokenization_request_id: &str,
     mint_store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
     vault_services: &rocket::State<NetworkVaultServices>,
     request: Json<MintAuthorizationRequest>,
 ) -> Result<Json<MintAuthorizationResponse>, MintAuthorizationApiError> {
@@ -294,6 +297,16 @@ pub(crate) async fn authorize_mint(
             "Identical mint authorization already recorded; redelivery is a \
              no-op"
         );
+        // The first delivery's wake may have failed after the authorization
+        // was recorded, leaving the mint parked; the bot's redelivery is the
+        // caller-driven repair vector, and the enqueue's idempotency key
+        // collapses duplicates when the first wake did land.
+        wake_mint_recovery(
+            pool.inner(),
+            apalis_pool.inner(),
+            &issuer_request_id,
+        )
+        .await;
         return Ok(Json(MintAuthorizationResponse {
             issuer_request_id,
             status: "authorized".to_string(),
@@ -367,10 +380,40 @@ pub(crate) async fn authorize_mint(
         "Mint authorization validated and recorded"
     );
 
+    // The authorization's arrival is what unblocks a mint that deferred its
+    // submission waiting for it, so wake recovery now.
+    wake_mint_recovery(pool.inner(), apalis_pool.inner(), &issuer_request_id)
+        .await;
+
     Ok(Json(MintAuthorizationResponse {
         issuer_request_id,
         status: "authorized".to_string(),
     }))
+}
+
+/// Wakes mint recovery for a recorded authorization. Needed because the
+/// periodic reconciler dedups against a terminal recovery row, so a mint
+/// whose recovery job already exhausted its no-progress budget would stay
+/// parked until the next restart without this kick. An enqueue failure is
+/// tolerable — the authorization is recorded, the bot's redelivery re-drives
+/// this wake, and the startup re-scan is the last-resort fallback.
+async fn wake_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    issuer_request_id: &IssuerMintRequestId,
+) {
+    if let Err(error) = enqueue_scheduled_mint_recovery(
+        pool,
+        apalis_pool,
+        issuer_request_id.clone(),
+    )
+    .await
+    {
+        warn!(target: "mint", issuer_request_id = %issuer_request_id,
+            error = %error,
+            "Failed to enqueue mint recovery after recording the authorization"
+        );
+    }
 }
 
 fn map_authorize_command_error(
@@ -432,6 +475,7 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
+    use std::any::type_name;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
@@ -439,6 +483,7 @@ mod tests {
     use crate::auth::FailedAuthRateLimiter;
     use crate::config::VaultMode;
     use crate::mint::api::test_utils::{TestHarness, test_config};
+    use crate::mint::recovery::MintRecoveryJob;
     use crate::mint::{
         ClientId, IssuerMintRequestId, Mint, MintCommand, Network, Quantity,
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
@@ -517,6 +562,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(harness.mint_store.clone())
             .manage(harness.pool.clone())
+            .manage(harness.apalis_pool.clone())
             .manage(vault_services)
             .mount("/", routes![authorize_mint])
     }
@@ -621,6 +667,32 @@ mod tests {
             tracing::Level::INFO,
             &["Mint authorization validated and recorded", "tok-auth-1"]
         ));
+
+        // The recorded authorization must wake recovery: a mint whose
+        // deferred submission already exhausted its recovery job would
+        // otherwise stay parked until restart (the reconciler dedups
+        // against terminal rows). The redelivery short-circuit re-drives
+        // the wake (repairing a first delivery whose enqueue failed), and
+        // the idempotency key collapses the duplicate down to one row.
+        let recovery_jobs: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE
+                job_type = ?
+                AND idempotency_key = ?
+            ",
+        )
+        .bind(type_name::<MintRecoveryJob>())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recovery_jobs, 1,
+            "recording the authorization must enqueue exactly one mint \
+             recovery job"
+        );
     }
 
     #[traced_test]

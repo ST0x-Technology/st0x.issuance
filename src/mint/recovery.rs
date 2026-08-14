@@ -1457,8 +1457,9 @@ mod tests {
     };
     use crate::mint::tests::VAULT;
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, MintExternalTxId, Network,
-        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, MintExternalTxId,
+        MintFailureClassification, Network, Quantity, TokenSymbol,
+        TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::receipt_inventory::{
         BurnPlan, BurnTrackingError, CqrsReceiptService, MintedReceiptParams,
@@ -1706,6 +1707,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             error: "prepare or pre-submit failure".to_string(),
             failed_at,
+            classification: MintFailureClassification::Unclassified,
         });
 
         events
@@ -1723,6 +1725,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             error: "terminal signer failure".to_string(),
             failed_at,
+            classification: MintFailureClassification::Unclassified,
         });
 
         events
@@ -1756,6 +1759,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             error: "prior confirm uncertain or reverted".to_string(),
             failed_at,
+            classification: MintFailureClassification::Unclassified,
         });
         events
     }
@@ -2157,6 +2161,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         let fixture = MintRecoveryFixture::new().await;
@@ -2201,6 +2206,7 @@ mod tests {
                 issuer_request_id: lookup_failure_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         fixture
@@ -2250,6 +2256,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         let fixture = MintRecoveryFixture::new().await;
@@ -2314,6 +2321,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "submission rejected".to_string(),
                 failed_at,
+                classification: MintFailureClassification::Unclassified,
             });
         }
         let fixture = MintRecoveryFixture::new().await;
@@ -2551,6 +2559,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     error: "Turnkey HTTP response was not successful: 403"
                         .to_string(),
+                    classification: MintFailureClassification::Unclassified,
                 },
             )
             .await
@@ -2635,6 +2644,7 @@ mod tests {
                 MintCommand::RecordMintFailed {
                     issuer_request_id: issuer_request_id.clone(),
                     error: "prepare failed".to_string(),
+                    classification: MintFailureClassification::Unclassified,
                 },
             )
             .await
@@ -2715,6 +2725,7 @@ mod tests {
                 MintCommand::RecordMintFailed {
                     issuer_request_id: issuer_request_id.clone(),
                     error: "prepare failed".to_string(),
+                    classification: MintFailureClassification::Unclassified,
                 },
             )
             .await
@@ -2835,6 +2846,7 @@ mod tests {
                 MintCommand::RecordMintFailed {
                     issuer_request_id: issuer_request_id.clone(),
                     error: "confirmation timed out".to_string(),
+                    classification: MintFailureClassification::Unclassified,
                 },
             )
             .await
