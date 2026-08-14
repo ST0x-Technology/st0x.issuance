@@ -69,8 +69,10 @@ pub(crate) async fn initiate_mint(
     // Resolve the asset's mode from config exactly once, here at initiate
     // time: the persisted anchor on `Initiated` is what every later
     // mode-dependent step derives from, even if the asset's configured
-    // vault_mode flips mid-flight.
-    let mint_mode = config.vault_mode_for(&request.underlying);
+    // vault_mode flips mid-flight. The address resolves per the request's
+    // network — each chain carries its own orchestrator deployment.
+    let mint_mode =
+        config.vault_mode_for(&request.underlying, request.network)?;
 
     let command = MintCommand::Initiate {
         issuer_request_id: issuer_request_id.clone(),
@@ -119,7 +121,7 @@ mod tests {
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
     use crate::auth::FailedAuthRateLimiter;
-    use crate::config::{Config, VaultMode, VaultModeConfig};
+    use crate::config::{Config, VaultMode, VaultModeConfig, VaultModeKind};
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, test_config,
     };
@@ -280,9 +282,10 @@ mod tests {
             vault_mode_config: VaultModeConfig::new(
                 HashMap::from([(
                     underlying.as_str().to_string(),
-                    VaultMode::Orchestrator { address: orchestrator_address },
+                    VaultModeKind::Orchestrator,
                 )]),
-                VaultMode::VaultDirect,
+                VaultModeKind::VaultDirect,
+                HashMap::from([(Network::Base, orchestrator_address)]),
             ),
             ..test_config()
         };
@@ -363,6 +366,104 @@ mod tests {
             "default-mode asset must anchor VaultDirect, \
              got {vault_direct_mint:?}"
         );
+    }
+
+    /// An orchestrator-kind asset whose network has no
+    /// `[orchestrator.addresses]` entry must refuse the mint with a 500 —
+    /// no `Initiated` event may anchor a mode without its address, and the
+    /// response body must not leak the network detail (it stays in the
+    /// server log). Unreachable in a validated deploy (the startup
+    /// cross-check requires an entry per configured chain); this pins the
+    /// fail-loud behavior of the gap.
+    #[traced_test]
+    #[tokio::test]
+    async fn initiate_missing_orchestrator_address_refuses_the_mint() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, .. } =
+            harness.setup_account_and_asset().await;
+
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+            ..
+        } = harness;
+
+        let config = Config {
+            vault_mode_config: VaultModeConfig::new(
+                HashMap::from([(
+                    underlying.as_str().to_string(),
+                    VaultModeKind::Orchestrator,
+                )]),
+                VaultModeKind::VaultDirect,
+                HashMap::new(),
+            ),
+            ..test_config()
+        };
+
+        let rocket = rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool.clone())
+            .mount("/", routes![initiate_mint]);
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-no-address-1",
+            "qty": "100.5",
+            "underlying_symbol": underlying.as_str(),
+            "token_symbol": "tAAPL",
+            "network": "base",
+            "client_id": client_id,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(
+            response.status(),
+            Status::InternalServerError,
+            "a missing per-network address must refuse the mint"
+        );
+        let body = response.into_string().await.expect("valid response body");
+        assert!(
+            !body.to_ascii_lowercase().contains("base"),
+            "the refusal body must not leak the network detail, got: {body}"
+        );
+
+        let mint_events: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Mint'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            mint_events, 0,
+            "no Initiated event may anchor a mode without its address"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Orchestrator address missing for mint network"]
+        ));
     }
 
     #[traced_test]

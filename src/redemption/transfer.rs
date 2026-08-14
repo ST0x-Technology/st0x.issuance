@@ -15,7 +15,7 @@ use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
 use crate::burn_excess::exclusion::is_excluded_funding_log;
-use crate::config::VaultModeConfig;
+use crate::config::{MissingOrchestratorAddress, VaultModeConfig};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
 };
@@ -55,6 +55,13 @@ pub(crate) enum TransferProcessingError {
     AccountView(#[from] AccountViewError),
     #[error("No asset found for vault {vault}")]
     NoMatchingAsset { vault: Address },
+    /// Deliberately absent from `is_non_transient`: a missing address is a
+    /// deploy-config error while the transfer is a real burn, so detection
+    /// retries and the vault's checkpoint holds until the config is fixed —
+    /// never skipping the redemption. The startup cross-check in
+    /// `Env::into_config` makes this unreachable in a validated deploy.
+    #[error(transparent)]
+    MissingOrchestratorAddress(#[from] MissingOrchestratorAddress),
     #[error(
         "Multiple enabled assets are bound to vault {vault}; refusing to \
          attribute its redemptions to an arbitrary underlying"
@@ -160,7 +167,10 @@ pub(crate) async fn detect_transfer(
     // Anchor the asset's currently-configured mode on the Detected event:
     // every later burn step derives from this persisted value, so an asset
     // cutover mid-redemption never switches an in-flight redemption's path.
-    let burn_mode = vault_modes.mode_for(&underlying);
+    // The address resolves per the asset's network; a missing entry errors
+    // loudly here (the startup cross-check makes it unreachable in a
+    // validated deploy) rather than anchoring a wrong mode.
+    let burn_mode = vault_modes.mode_for(&underlying, network)?;
 
     let command = RedemptionCommand::Detect {
         issuer_request_id: issuer_request_id.clone(),
@@ -379,7 +389,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
-    use crate::config::{VaultMode, VaultModeConfig};
+    use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::Redemption;
     use crate::redemption::RedemptionServices;
@@ -467,9 +477,10 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
-        let orchestrator_mode = VaultMode::Orchestrator {
-            address: address!("0x00000000000000000000000000000000000000aa"),
-        };
+        let orchestrator_address =
+            address!("0x00000000000000000000000000000000000000aa");
+        let orchestrator_mode =
+            VaultMode::Orchestrator { address: orchestrator_address };
 
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
         let store = setup_test_store(&pool);
@@ -478,9 +489,13 @@ mod tests {
         let vault_modes = VaultModeConfig::new(
             std::collections::HashMap::from([(
                 "AAPL".to_string(),
-                orchestrator_mode,
+                VaultModeKind::Orchestrator,
             )]),
-            VaultMode::VaultDirect,
+            VaultModeKind::VaultDirect,
+            std::collections::HashMap::from([(
+                Network::Base,
+                orchestrator_address,
+            )]),
         );
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();

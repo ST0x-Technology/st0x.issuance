@@ -1201,23 +1201,23 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   receipts to a corroborated destination through the Turnkey signer, driving the
   receipt-moving engine (see "Receipt custody"). The destination is stated by
   exactly one of two mutually exclusive flags: `--to-configured-orchestrator`
-  reads `[orchestrator].address` from `--config` (the cutover path — the
-  orchestrator address is never typed), while `--to <ADDRESS>` states an
-  explicit destination (the wallet-rotation path). `--to` naming the configured
-  orchestrator address is refused: the cutover path must state it through the
-  config flag, so a hand-typed orchestrator address never enters the flow.
-  Either way the stated address only becomes reachable as a transfer destination
-  through the corroboration witness described under "Receipt custody". Before
-  anything is signed the command verifies the deployment hold is armed (the hold
-  file present and the readiness marker absent — the engine's projection
-  rebuilds must not race a running service), verifies the bot wallet's native
-  balance covers a fixed transfer-gas ceiling at the current gas price (no
-  per-transaction estimate — estimating a transfer of receipts the destination
-  does not hold yet would revert), corroborates the destination, and then
-  prompts with the asset, vault, holder, destination and its corroborated kind,
-  and the tracked receipt count — the operator confirms what was proven, not
-  what was typed. A re-run after a completed move reports the already-migrated
-  observation distinctly and submits nothing.
+  reads the `--network`'s `[orchestrator.addresses]` entry from `--config` (the
+  cutover path — the orchestrator address is never typed), while
+  `--to <ADDRESS>` states an explicit destination (the wallet-rotation path).
+  `--to` naming the configured orchestrator address is refused: the cutover path
+  must state it through the config flag, so a hand-typed orchestrator address
+  never enters the flow. Either way the stated address only becomes reachable as
+  a transfer destination through the corroboration witness described under
+  "Receipt custody". Before anything is signed the command verifies the
+  deployment hold is armed (the hold file present and the readiness marker
+  absent — the engine's projection rebuilds must not race a running service),
+  verifies the bot wallet's native balance covers a fixed transfer-gas ceiling
+  at the current gas price (no per-transaction estimate — estimating a transfer
+  of receipts the destination does not hold yet would revert), corroborates the
+  destination, and then prompts with the asset, vault, holder, destination and
+  its corroborated kind, and the tracked receipt count — the operator confirms
+  what was proven, not what was typed. A re-run after a completed move reports
+  the already-migrated observation distinctly and submits nothing.
 - `issuer confirm-custody <UNDERLYING>` — verifies on-chain that the Turnkey bot
   wallet holds exactly every tracked receipt balance for the asset's vault, then
   records it as the inventory's custody holder. The rollback counterpart of
@@ -1404,10 +1404,11 @@ The orchestrator onboarding and custody subcommands (`orchestrator-preflight`,
 `confirm-custody`) take the same network flags and require the `TURNKEY_*`
 group: the facts they verify or establish are keyed to the Turnkey bot wallet,
 so a local-key signer is refused. All but `confirm-custody` also take `--config`
-(the TOML configuration file; its `[orchestrator].address` is the only source of
-the orchestrator address — never typed); `confirm-custody` involves no
-orchestrator address at all. See `docs/runbooks/orchestrator-onboarding.md` for
-the ordered onboarding and per-asset cutover procedures.
+(the TOML configuration file; its per-network `[orchestrator.addresses]` map is
+the only source of the orchestrator address — never typed); `confirm-custody`
+involves no orchestrator address at all. See
+`docs/runbooks/orchestrator-onboarding.md` for the ordered onboarding and
+per-asset cutover procedures.
 
 ### Receipt custody
 
@@ -2037,6 +2038,10 @@ File"): an asset whose `[assets.<UNDERLYING>]` table sets
 `vault_mode = "orchestrator"` routes its mints and burns through the
 orchestrator; an asset without an override takes
 `[orchestrator].default_vault_mode`, which itself defaults to `"vault_direct"`.
+The mode is keyed by symbol alone (it applies on every network the asset is
+listed on); the orchestrator **address** is keyed by network via
+`[orchestrator.addresses]` — each chain carries its own deployment — and is
+resolved at the operation's anchoring point from the operation's own network.
 The mapping is loaded once at startup (changing it is a config change + restart,
 like any other deploy-time setting) and threaded to the two call sites that
 resolve it — `MintServices` and `BurnManager`, each of which resolves a given
@@ -4454,15 +4459,19 @@ default.
 
 ```toml
 [orchestrator]
-# ST0xOrchestrator contract address. Required when any asset resolves to
-# orchestrator mode; rejected as a startup error if that is the case and it
-# is missing or malformed.
-address = "0x..."
 # Mode for assets without a per-asset override below:
 # "vault_direct" (the default when omitted) | "orchestrator".
 # The full-rollout end state sets this to "orchestrator" and drops the
 # per-asset overrides, so newly onboarded assets default to the orchestrator.
 default_vault_mode = "vault_direct"
+
+# ST0xOrchestrator contract addresses, one per network — each chain carries
+# its own deployment. Keys are network wire names (base | ethereum |
+# hyperevm). Required when any asset resolves to orchestrator mode: startup
+# then demands an entry for EVERY configured chain, and rejects unknown
+# network keys and missing, malformed, or zero addresses.
+[orchestrator.addresses]
+base = "0x..."
 
 # Per-asset override, keyed by underlying symbol. During the pilot exactly one
 # asset carries this; every other asset stays on the default.

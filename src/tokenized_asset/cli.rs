@@ -24,7 +24,7 @@ use crate::burn_excess::cli::{
 };
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
-    VaultMode, VaultModeConfig, load_vault_mode_config, setup_tracing,
+    VaultModeConfig, VaultModeKind, load_vault_mode_config, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -213,9 +213,10 @@ struct ForceCompleteRedemptionArgs {
 
 #[derive(Args)]
 struct OrchestratorPreflightArgs {
-    /// TOML config file whose `[orchestrator].address` names the orchestrator
-    /// to check — the config file is the single source of truth for the
-    /// address, matching what the deployed service resolves.
+    /// TOML config file whose `[orchestrator.addresses]` entry for
+    /// `--network` names the orchestrator to check — the config file is the
+    /// single source of truth for the address, matching what the deployed
+    /// service resolves.
     #[arg(long, env = "CONFIG")]
     config: PathBuf,
 
@@ -265,9 +266,10 @@ struct ApproveOrchestratorArgs {
     #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
     underlying: UnderlyingSymbol,
 
-    /// TOML config file whose `[orchestrator].address` names the approval's
-    /// spender — the config file is the single source of truth for the
-    /// address, matching what the deployed service resolves.
+    /// TOML config file whose `[orchestrator.addresses]` entry for
+    /// `--network` names the approval's spender — the config file is the
+    /// single source of truth for the address, matching what the deployed
+    /// service resolves.
     #[arg(long, env = "CONFIG")]
     config: PathBuf,
 
@@ -311,9 +313,10 @@ struct VerifyOrchestratorSigningArgs {
     #[arg(value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
     underlying: UnderlyingSymbol,
 
-    /// TOML config file whose `[orchestrator].address` names the orchestrator
-    /// the shapes target — the config file is the single source of truth for
-    /// the address, matching what the deployed service resolves.
+    /// TOML config file whose `[orchestrator.addresses]` entry for
+    /// `--network` names the orchestrator the shapes target — the config
+    /// file is the single source of truth for the address, matching what
+    /// the deployed service resolves.
     #[arg(long, env = "CONFIG")]
     config: PathBuf,
 
@@ -355,13 +358,14 @@ struct VerifyOrchestratorSigningArgs {
 #[group(required = true, multiple = false)]
 struct MoveDestination {
     /// Explicit destination address — the wallet-rotation path. Refused if
-    /// it names the configured [orchestrator].address: the cutover path
+    /// it names the configured orchestrator address: the cutover path
     /// must read the orchestrator from the config, never a typed address.
     #[arg(long)]
     to: Option<Address>,
 
-    /// Read the destination from [orchestrator].address in --config — the
-    /// cutover path, keeping the orchestrator address never-typed.
+    /// Read the destination from the network's [orchestrator.addresses]
+    /// entry in --config — the cutover path, keeping the orchestrator
+    /// address never-typed.
     #[arg(long)]
     to_configured_orchestrator: bool,
 }
@@ -376,9 +380,9 @@ struct MoveReceiptsArgs {
     #[clap(flatten)]
     destination: MoveDestination,
 
-    /// TOML config file; its `[orchestrator].address` is the only source of
-    /// the orchestrator address, matching what the deployed service
-    /// resolves.
+    /// TOML config file; its `[orchestrator.addresses]` entry for
+    /// `--network` is the only source of the orchestrator address, matching
+    /// what the deployed service resolves.
     #[arg(long, env = "CONFIG")]
     config: PathBuf,
 
@@ -650,7 +654,8 @@ async fn run_orchestrator_preflight(
     }
 
     let vault_modes = load_vault_mode_config(&args.config)?;
-    let orchestrator = orchestrator_address_from(&vault_modes, &args.config)?;
+    let orchestrator =
+        orchestrator_address_from(&vault_modes, &args.config, args.network)?;
 
     // Only the wallet address is used — the readiness facts (roles,
     // approvals) are keyed to the Turnkey bot wallet, and requiring the full
@@ -706,7 +711,8 @@ async fn run_approve_orchestrator(
         );
     }
 
-    let orchestrator = required_orchestrator_address(&args.config)?;
+    let orchestrator =
+        required_orchestrator_address(&args.config, args.network)?;
 
     let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
     else {
@@ -800,7 +806,8 @@ async fn run_verify_orchestrator_signing(
         );
     }
 
-    let orchestrator = required_orchestrator_address(&args.config)?;
+    let orchestrator =
+        required_orchestrator_address(&args.config, args.network)?;
 
     let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
     else {
@@ -886,25 +893,28 @@ async fn run_move_receipts(
         );
     }
 
-    let configured_orchestrator =
-        load_vault_mode_config(&args.config)?.orchestrator_address();
+    let configured_orchestrator = load_vault_mode_config(&args.config)?
+        .orchestrator_address_for(args.network);
     let destination = match (
         args.destination.to,
         args.destination.to_configured_orchestrator,
     ) {
         (None, true) => configured_orchestrator.ok_or_else(|| {
             anyhow::anyhow!(
-                "{} has no [orchestrator].address to move receipts to; add \
-                 the section, or state a wallet destination with --to",
-                args.config.display()
+                "{} has no [orchestrator.addresses] entry for '{}' to move \
+                 receipts to; add it, or state a wallet destination with \
+                 --to",
+                args.config.display(),
+                args.network
             )
         })?,
         (Some(stated), false) => {
             if configured_orchestrator == Some(stated) {
                 anyhow::bail!(
-                    "--to {stated} is the configured [orchestrator].address; \
-                     use --to-configured-orchestrator so the cutover \
-                     destination is read from {}, never typed",
+                    "--to {stated} is the configured orchestrator address \
+                     for '{}'; use --to-configured-orchestrator so the \
+                     cutover destination is read from {}, never typed",
+                    args.network,
                     args.config.display()
                 );
             }
@@ -1127,26 +1137,32 @@ async fn verify_gas_readiness<P: Provider>(
 /// address is refused: the config may stay dark (no asset needs
 /// `vault_mode = "orchestrator"`) and still carry the address these commands
 /// work against.
-fn required_orchestrator_address(config: &Path) -> anyhow::Result<Address> {
+fn required_orchestrator_address(
+    config: &Path,
+    network: Network,
+) -> anyhow::Result<Address> {
     let vault_modes = load_vault_mode_config(config)?;
-    orchestrator_address_from(&vault_modes, config)
+    orchestrator_address_from(&vault_modes, config, network)
 }
 
 fn orchestrator_address_from(
     vault_modes: &VaultModeConfig,
     config: &Path,
+    network: Network,
 ) -> anyhow::Result<Address> {
-    let Some(orchestrator) = vault_modes.orchestrator_address() else {
+    let Some(orchestrator) = vault_modes.orchestrator_address_for(network)
+    else {
         anyhow::bail!(
-            "{} has no [orchestrator].address; add the section — the config \
-             may stay dark (no asset needs vault_mode = \"orchestrator\")",
+            "{} has no [orchestrator.addresses] entry for '{network}'; add \
+             it — the config may stay dark (no asset needs \
+             vault_mode = \"orchestrator\")",
             config.display()
         );
     };
 
     // No zero-address guard here: `load_vault_mode_config` already refuses a
-    // zero `[orchestrator].address` at parse time, for the service and these
-    // commands alike.
+    // zero `[orchestrator.addresses]` entry at parse time, for the service
+    // and these commands alike.
     Ok(orchestrator)
 }
 
@@ -1178,10 +1194,7 @@ async fn preflight_assets(
         let orchestrator_scoped: Vec<(UnderlyingSymbol, Address)> = listed
             .into_iter()
             .filter(|(underlying, _)| {
-                matches!(
-                    vault_modes.mode_for(underlying),
-                    VaultMode::Orchestrator { .. }
-                )
+                vault_modes.kind_for(underlying) == VaultModeKind::Orchestrator
             })
             .collect();
         if orchestrator_scoped.is_empty() {
@@ -2245,7 +2258,11 @@ mod tests {
     fn all_orchestrator_modes() -> VaultModeConfig {
         VaultModeConfig::new(
             std::collections::HashMap::new(),
-            VaultMode::Orchestrator { address: Address::repeat_byte(0xdd) },
+            VaultModeKind::Orchestrator,
+            std::collections::HashMap::from([(
+                Network::Base,
+                Address::repeat_byte(0xdd),
+            )]),
         )
     }
 
@@ -2281,9 +2298,13 @@ mod tests {
         let sgov_only = VaultModeConfig::new(
             std::collections::HashMap::from([(
                 "SGOV".to_string(),
-                VaultMode::Orchestrator { address: Address::repeat_byte(0xdd) },
+                VaultModeKind::Orchestrator,
             )]),
-            VaultMode::VaultDirect,
+            VaultModeKind::VaultDirect,
+            std::collections::HashMap::from([(
+                Network::Base,
+                Address::repeat_byte(0xdd),
+            )]),
         );
         let assets =
             preflight_assets(&admin.pool, Network::Base, &[], &sgov_only)
@@ -2296,7 +2317,8 @@ mod tests {
 
         let all_vault_direct = VaultModeConfig::new(
             std::collections::HashMap::new(),
-            VaultMode::VaultDirect,
+            VaultModeKind::VaultDirect,
+            std::collections::HashMap::new(),
         );
         let error = preflight_assets(
             &admin.pool,
@@ -2438,7 +2460,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[orchestrator]\naddress = \"{orchestrator}\"\n\n\
+                "[orchestrator.addresses]\nbase = \"{orchestrator}\"\n\n\
                  [assets.RKLB]\nvault_mode = \"orchestrator\"\n"
             ),
         )
@@ -2624,7 +2646,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("[orchestrator].address"),
+            error.to_string().contains("[orchestrator.addresses]"),
             "the refusal must name the missing section, got {error}"
         );
     }
@@ -2887,8 +2909,8 @@ mod tests {
         let config_path = directory.join("issuance-config.toml");
         std::fs::write(
             &config_path,
-            "[orchestrator]\n\
-             address = \"0x1234567890abcdef1234567890abcdef12345678\"\n",
+            "[orchestrator.addresses]\n\
+             base = \"0x1234567890abcdef1234567890abcdef12345678\"\n",
         )
         .unwrap();
         config_path
@@ -3028,10 +3050,31 @@ mod tests {
 
         let dark = directory.path().join("dark.toml");
         std::fs::write(&dark, "# dark: no [orchestrator] section\n").unwrap();
-        let error = required_orchestrator_address(&dark).unwrap_err();
+        let error =
+            required_orchestrator_address(&dark, Network::Base).unwrap_err();
         assert!(
-            error.to_string().contains("[orchestrator].address"),
-            "the refusal must name the missing key, got {error}"
+            error.to_string().contains("[orchestrator.addresses]")
+                && error.to_string().contains("base"),
+            "the refusal must name the missing entry and network, got {error}"
+        );
+
+        // An entry for a DIFFERENT network must not satisfy the requested
+        // one — each chain carries its own orchestrator deployment.
+        let wrong_network = directory.path().join("wrong-network.toml");
+        std::fs::write(
+            &wrong_network,
+            format!(
+                "[orchestrator.addresses]\nethereum = \"{}\"\n",
+                Address::repeat_byte(0xdd)
+            ),
+        )
+        .unwrap();
+        let error =
+            required_orchestrator_address(&wrong_network, Network::Base)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("base"),
+            "the refusal must name the requested network, got {error}"
         );
 
         // The zero address is refused by the config loader itself (before
@@ -3040,10 +3083,11 @@ mod tests {
         let zeroed = directory.path().join("zero.toml");
         std::fs::write(
             &zeroed,
-            format!("[orchestrator]\naddress = \"{}\"\n", Address::ZERO),
+            format!("[orchestrator.addresses]\nbase = \"{}\"\n", Address::ZERO),
         )
         .unwrap();
-        let error = required_orchestrator_address(&zeroed).unwrap_err();
+        let error =
+            required_orchestrator_address(&zeroed, Network::Base).unwrap_err();
         assert!(
             error.to_string().contains("not a valid EVM address"),
             "a zero address must be refused by the config loader, got {error}"
@@ -3063,7 +3107,7 @@ mod tests {
         let error = run_verify_orchestrator_signing(args).await.unwrap_err();
 
         assert!(
-            error.to_string().contains("[orchestrator].address"),
+            error.to_string().contains("[orchestrator.addresses]"),
             "the refusal must name the missing address, got {error}"
         );
     }

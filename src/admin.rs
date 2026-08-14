@@ -2231,7 +2231,17 @@ pub(crate) async fn orchestrator_health(
     let mut orchestrators_seen: Vec<(Network, Address)> = Vec::new();
 
     for asset in &enabled_assets {
-        match config.vault_mode_for(&asset.underlying) {
+        let mode = config
+            .vault_mode_for(&asset.underlying, asset.network)
+            .map_err(|err| {
+                error!(target: "admin", network = %asset.network,
+                    underlying = %asset.underlying,
+                    error = %err,
+                    "Orchestrator address missing for asset's network"
+                );
+                Status::InternalServerError
+            })?;
+        match mode {
             VaultMode::VaultDirect => {
                 assets.push(AssetVaultModeStatus {
                     underlying: asset.underlying.clone(),
@@ -3020,7 +3030,7 @@ mod tests {
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
-    use crate::config::{VaultMode, VaultModeConfig};
+    use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
     use crate::mint::test_utils::{
         TestHarness, network_vault_services, test_config,
     };
@@ -6865,11 +6875,9 @@ mod tests {
         seed_enabled_asset(&pool, "TSLA", tsla_vault).await;
 
         let vault_mode_config = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orchestrator },
-            )]),
-            VaultMode::VaultDirect,
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orchestrator)]),
         );
         let vault_service: Arc<dyn VaultService> = Arc::new(
             MockVaultService::new_success()
@@ -6928,11 +6936,9 @@ mod tests {
         .await;
 
         let vault_mode_config = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orchestrator },
-            )]),
-            VaultMode::VaultDirect,
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orchestrator)]),
         );
         let vault_service: Arc<dyn VaultService> = Arc::new(
             MockVaultService::new_success().with_vault_logic_expected(false),
@@ -6951,6 +6957,49 @@ mod tests {
             json["orchestrators"][0]["vault_logic"]["status"], "unexpected",
             "a halted orchestrator must report vault_logic status=unexpected"
         );
+    }
+
+    /// An orchestrator-kind asset whose network has no
+    /// `[orchestrator.addresses]` entry must surface as a 500 with an ERROR
+    /// log — never silently report as vault-direct. Unreachable in a
+    /// validated deploy (the startup cross-check requires an entry per
+    /// configured chain), so this pins the fail-loud behavior of the gap.
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_health_missing_address_is_an_internal_error() {
+        let pool = setup_pool().await;
+        seed_enabled_asset(
+            &pool,
+            "AAPL",
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .await;
+
+        let vault_mode_config = VaultModeConfig::new(
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::new(),
+        );
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let rocket = orchestrator_health_rocket(
+            pool,
+            health_config(vault_mode_config),
+            vault_service,
+        );
+
+        let (status, _body) = dispatch_orchestrator_health(rocket, true).await;
+
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "a missing per-network address must fail loudly, not report \
+             vault-direct"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["Orchestrator address missing for asset's network"]
+        ));
     }
 
     #[traced_test]
@@ -6974,7 +7023,8 @@ mod tests {
 
         let vault_mode_config = VaultModeConfig::new(
             HashMap::new(),
-            VaultMode::Orchestrator { address: orchestrator },
+            VaultModeKind::Orchestrator,
+            HashMap::from([(Network::Base, orchestrator)]),
         );
         let mock = Arc::new(MockVaultService::new_success());
         let vault_service: Arc<dyn VaultService> = mock.clone();
@@ -7015,11 +7065,9 @@ mod tests {
         .await;
 
         let vault_mode_config = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orchestrator },
-            )]),
-            VaultMode::VaultDirect,
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orchestrator)]),
         );
         let vault_service: Arc<dyn VaultService> =
             Arc::new(MockVaultService::new_success().with_vault_logic_error());
@@ -7066,11 +7114,9 @@ mod tests {
         .await;
 
         let vault_mode_config = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orchestrator },
-            )]),
-            VaultMode::VaultDirect,
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orchestrator)]),
         );
         let vault_service: Arc<dyn VaultService> = Arc::new(
             MockVaultService::new_success().with_next_burn_receipt_id_error(),

@@ -18,16 +18,16 @@ use super::{
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
-use crate::config::{Config, VaultMode};
+use crate::config::{Config, VaultModeKind};
 use crate::underlying::load_freeze_status;
 
-impl From<VaultMode> for VaultModeTag {
-    fn from(mode: VaultMode) -> Self {
-        match mode {
-            VaultMode::VaultDirect => Self::VaultDirect,
+impl From<VaultModeKind> for VaultModeTag {
+    fn from(kind: VaultModeKind) -> Self {
+        match kind {
+            VaultModeKind::VaultDirect => Self::VaultDirect,
             // The tag deliberately drops the orchestrator address — the
             // liquidity bot only needs to know an authorization is required.
-            VaultMode::Orchestrator { .. } => Self::Orchestrator,
+            VaultModeKind::Orchestrator => Self::Orchestrator,
         }
     }
 }
@@ -190,7 +190,9 @@ pub(crate) async fn get_tokenized_asset_status(
             Status::InternalServerError
         })?;
 
-    let vault_mode = config.vault_mode_for(&underlying).into();
+    // Only the kind crosses the wire (the tag drops the address), so this
+    // stays network-free: the mode is keyed by symbol alone.
+    let vault_mode = config.vault_mode_kind_for(&underlying).into();
 
     Ok(Json(TokenizedAssetStatusResponse {
         underlying,
@@ -1266,13 +1268,13 @@ mod tests {
             vault_mode_config: VaultModeConfig::new(
                 HashMap::from([(
                     "AAPL".to_string(),
-                    VaultMode::Orchestrator {
-                        address: address!(
-                            "0xdddddddddddddddddddddddddddddddddddddddd"
-                        ),
-                    },
+                    VaultModeKind::Orchestrator,
                 )]),
-                VaultMode::VaultDirect,
+                VaultModeKind::VaultDirect,
+                HashMap::from([(
+                    Network::Base,
+                    address!("0xdddddddddddddddddddddddddddddddddddddddd"),
+                )]),
             ),
             ..test_config()
         };
