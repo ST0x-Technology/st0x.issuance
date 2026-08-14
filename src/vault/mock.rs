@@ -702,6 +702,16 @@ impl MockVaultService {
         self
     }
 
+    /// Replaces the configured readiness on a live mock, e.g. to flip a
+    /// halted orchestrator back to healthy between recovery passes.
+    #[cfg(test)]
+    pub(crate) fn set_orchestrator_readiness(
+        &self,
+        readiness: OrchestratorBurnReadiness,
+    ) {
+        *self.orchestrator.readiness.lock().unwrap() = Some(readiness);
+    }
+
     #[cfg(test)]
     pub(crate) fn last_orchestrator_burn_params(
         &self,

@@ -32,8 +32,9 @@ use crate::redemption::burn_manager::{
     RecoveryOutcome,
 };
 use crate::redemption::{
-    BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, RedemptionCommand,
-    RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
+    BurnExternalTxId, BurnFailureClassification, BurnRecord,
+    IssuerRedemptionRequestId, RedemptionCommand, RedemptionError,
+    RedemptionEvent, RedemptionMetadata, RedemptionView,
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
@@ -157,6 +158,12 @@ struct AlpacaCalledData {
 struct BurningFailedData {
     tx_id: Option<TxId>,
     planned_burns: Vec<BurnRecord>,
+    /// Typed cause from the latest `BurningFailed`. A non-`Unclassified`
+    /// value means the automatic loop is deliberately skipping this
+    /// redemption; the operator re-drive still runs (the burn path's
+    /// readiness gates re-park it without submitting unless the cause was
+    /// fixed), but the response must say so.
+    classification: BurnFailureClassification,
 }
 
 struct ReprocessContext {
@@ -268,10 +275,16 @@ async fn load_reprocess_context(
                     called_at: *called_at,
                 });
             }
-            RedemptionEvent::BurningFailed { tx_id, planned_burns, .. } => {
+            RedemptionEvent::BurningFailed {
+                tx_id,
+                planned_burns,
+                classification,
+                ..
+            } => {
                 burning_failed = Some(BurningFailedData {
                     tx_id: tx_id.clone(),
                     planned_burns: planned_burns.clone(),
+                    classification: classification.clone(),
                 });
             }
             _ => {}
@@ -488,6 +501,27 @@ async fn recover_post_alpaca(
         burning_failed,
         burn_retry_external_tx_id,
     } = input;
+
+    // A typed classification means the automatic loop is deliberately
+    // skipping this redemption. The operator re-drive is still the documented
+    // resume path (the burn path's readiness gates re-park it without
+    // submitting unless the cause was fixed), but both the logs and the
+    // response must name the classification so "recovery initiated" is never
+    // read as "the classified cause went away".
+    let classified_failure = burning_failed
+        .as_ref()
+        .map(|failed| failed.classification.clone())
+        .filter(|classification| {
+            *classification != BurnFailureClassification::Unclassified
+        });
+    if let Some(classification) = &classified_failure {
+        warn!(target: "admin", aggregate_id = %aggregate_id,
+            classification = ?classification,
+            "Re-driving a burn failure with a typed classification; the \
+             readiness gates will re-park it unless the underlying cause \
+             was fixed"
+        );
+    }
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
     // without receiving the underlying shares.
@@ -645,12 +679,21 @@ async fn recover_post_alpaca(
         })?;
 
     let message = report_recovery_outcome(outcome, &aggregate_id);
+    let message = classified_failure.as_ref().map_or_else(
+        || message.to_string(),
+        |classification| {
+            format!(
+                "{message} (re-driving typed failure {classification:?}: it \
+              re-parks unless its cause was fixed)"
+            )
+        },
+    );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Redemption,
         aggregate_id: aggregate_id.clone(),
         previous_state: "Failed".to_string(),
-        message: message.to_string(),
+        message,
     }))
 }
 
@@ -1570,11 +1613,19 @@ fn stuck_redemption_entry(
             error,
             failed_at,
             tx_id,
+            classification,
             ..
         } => (
             Some(tokenization_request_id),
             "BurnFailed".to_string(),
-            error,
+            // The typed classification is what keys retry-exclusion and the
+            // operator playbook, so the stuck surface must show it — the raw
+            // error string alone cannot distinguish InsufficientReceipts
+            // from an ordinary failure.
+            match &classification {
+                BurnFailureClassification::Unclassified => error,
+                classified => format!("{classified:?}: {error}"),
+            },
             failed_at,
             Some(underlying),
             Some(quantity),
@@ -2515,6 +2566,61 @@ mod tests {
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
         assert_eq!(entry.network, Some(metadata.network));
+        assert_eq!(
+            entry.detail, "burn failed",
+            "an unclassified failure must keep the bare error as detail"
+        );
+    }
+
+    /// The typed classification keys retry-exclusion and the operator
+    /// playbook, so a classified `BurnFailed` entry must surface it in
+    /// `detail` — the raw error string alone cannot distinguish
+    /// `InsufficientReceipts` from an ordinary failure.
+    #[test]
+    fn burn_failed_stuck_entry_prefixes_classification() {
+        let metadata = test_metadata();
+        let view = RedemptionView::BurnFailed {
+            burn_mode: VaultMode::VaultDirect,
+            classification: BurnFailureClassification::InsufficientReceipts {
+                shortfall: U256::from(5u8),
+            },
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("tok-red-3"),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            network: metadata.network,
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            alpaca_quantity: metadata.quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            called_at: Utc::now(),
+            alpaca_journal_completed_at: Utc::now(),
+            error: "burn failed".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        };
+
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            view,
+            super::RedemptionHistorySummary::default(),
+        )
+        .expect("burn failed redemption should produce stuck entry");
+
+        assert!(
+            entry.detail.starts_with("InsufficientReceipts"),
+            "the typed classification must lead the detail, got: {}",
+            entry.detail
+        );
+        assert!(
+            entry.detail.ends_with(": burn failed"),
+            "the raw error must remain in the detail, got: {}",
+            entry.detail
+        );
     }
 
     async fn setup_pool() -> sqlx::Pool<sqlx::Sqlite> {
@@ -2798,6 +2904,76 @@ mod tests {
         assert!(logs_contain_at!(Level::INFO, &["burn", "executed"]));
     }
 
+    /// A typed classification means the automatic loop deliberately skips
+    /// this redemption; the operator re-drive still runs (the readiness
+    /// gates re-park it without submitting unless the cause was fixed), but
+    /// the response and logs must name the classification so "recovery
+    /// initiated" is never read as "the classified cause went away".
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_post_alpaca_names_classified_failure() {
+        let (store, _pool, metadata, alpaca_data) =
+            setup_failed_redemption().await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let result = recover_post_alpaca(
+            &store,
+            &alpaca,
+            &mock_vault_service(),
+            &burn_recovery_state,
+            PostAlpacaRecoveryInput {
+                aggregate_id: metadata.issuer_request_id.to_string(),
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                metadata: metadata.clone(),
+                alpaca_data,
+                burning_failed: Some(super::BurningFailedData {
+                    tx_id: None,
+                    planned_burns: vec![],
+                    classification:
+                        BurnFailureClassification::InsufficientReceipts {
+                            shortfall: U256::from(7u8),
+                        },
+                }),
+                burn_retry_external_tx_id: None,
+            },
+        )
+        .await;
+
+        let response = result.expect("Expected Ok response");
+        assert!(
+            response.message.contains("InsufficientReceipts"),
+            "the response must name the typed classification, got: {}",
+            response.message
+        );
+        assert!(
+            response.message.contains("re-parks unless its cause was fixed"),
+            "the response must say the re-drive re-parks on an unfixed \
+             cause, got: {}",
+            response.message
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            1,
+            "the re-drive must still run — the readiness gates, not the \
+             endpoint, decide whether anything is submitted"
+        );
+
+        let test = "test_recover_post_alpaca_names_classified_failure";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "typed classification", "re-park"]
+        ));
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_persists_retry_external_tx_id() {
@@ -2883,6 +3059,7 @@ mod tests {
                 burning_failed: Some(BurningFailedData {
                     tx_id: Some(prior_tx_id),
                     planned_burns: vec![],
+                    classification: BurnFailureClassification::Unclassified,
                 }),
                 burn_retry_external_tx_id: None,
             },
