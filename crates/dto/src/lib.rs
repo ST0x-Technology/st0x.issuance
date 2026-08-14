@@ -310,6 +310,28 @@ pub enum TokenizedAssetStatus {
     Frozen,
 }
 
+/// Which minting path the issuance bot uses for an asset.
+///
+/// The liquidity bot's cue for which assets need a signed `MintAuthV1`
+/// delivered before their mints can submit: `Orchestrator` assets do,
+/// `VaultDirect` assets do not. Deliberately omits the orchestrator address —
+/// consumers only need the tag; the issuance bot's config stays the single
+/// source of truth for addresses during the cutover.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VaultModeTag {
+    /// Mints deposit directly into the vault; no recipient authorization.
+    /// The default: a server that predates the field can only vault-direct.
+    #[default]
+    VaultDirect,
+    /// Mints go through the ST0xOrchestrator and require a recipient
+    /// authorization before submission.
+    Orchestrator,
+}
+
 /// Per-asset status, returned by
 /// `GET /tokenized-assets/<underlying>/status` and consumed by the liquidity
 /// rebalance guard.
@@ -318,6 +340,14 @@ pub enum TokenizedAssetStatus {
 pub struct TokenizedAssetStatusResponse {
     pub underlying: UnderlyingSymbol,
     pub status: TokenizedAssetStatus,
+    /// Additive: absent in responses from servers that predate the field,
+    /// which only ever mint vault-direct — so the default is truthful. The
+    /// TS binding mirrors that absence-tolerance as an optional field
+    /// (`vault_mode?`), so a consumer generated from it handles the
+    /// rolling-deploy window where a pre-field server omits the value.
+    #[serde(default)]
+    #[ts(as = "Option<VaultModeTag>", optional)]
+    pub vault_mode: VaultModeTag,
 }
 
 /// One entry in the `GET /tokenized-assets` list.
@@ -366,6 +396,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     AssetKey::export_all_to(out_dir)?;
     TokenizedAssetDetailResponse::export_all_to(out_dir)?;
     TokenizedAssetStatus::export_all_to(out_dir)?;
+    VaultModeTag::export_all_to(out_dir)?;
     TokenizedAssetStatusResponse::export_all_to(out_dir)?;
     TokenizedAssetResponse::export_all_to(out_dir)?;
     TokenizedAssetsListResponse::export_all_to(out_dir)?;
@@ -540,23 +571,70 @@ mod tests {
         let response = TokenizedAssetStatusResponse {
             underlying: UnderlyingSymbol::new("SGOV").unwrap(),
             status: TokenizedAssetStatus::Frozen,
+            vault_mode: VaultModeTag::Orchestrator,
         };
 
         assert_eq!(
             serde_json::to_value(&response).unwrap(),
-            json!({"underlying": "SGOV", "status": "frozen"})
+            json!({
+                "underlying": "SGOV",
+                "status": "frozen",
+                "vault_mode": "orchestrator"
+            })
         );
     }
 
     #[test]
     fn status_response_deserializes_from_wire() {
+        let response: TokenizedAssetStatusResponse =
+            serde_json::from_value(json!({
+                "underlying": "SGOV",
+                "status": "enabled",
+                "vault_mode": "vault_direct"
+            }))
+            .unwrap();
+
+        assert_eq!(response.underlying, UnderlyingSymbol::new("SGOV").unwrap());
+        assert_eq!(response.status, TokenizedAssetStatus::Enabled);
+        assert_eq!(response.vault_mode, VaultModeTag::VaultDirect);
+    }
+
+    /// A response from a server that predates `vault_mode` still parses —
+    /// and defaults to `VaultDirect`, the only mode such a server can mint.
+    #[test]
+    fn status_response_without_vault_mode_defaults_to_vault_direct() {
         let response: TokenizedAssetStatusResponse = serde_json::from_value(
             json!({"underlying": "SGOV", "status": "enabled"}),
         )
         .unwrap();
 
-        assert_eq!(response.underlying, UnderlyingSymbol::new("SGOV").unwrap());
-        assert_eq!(response.status, TokenizedAssetStatus::Enabled);
+        assert_eq!(response.vault_mode, VaultModeTag::VaultDirect);
+    }
+
+    /// The wire format is snake_case, mirroring `TokenizedAssetStatus`: the
+    /// PascalCase domain spelling and unknown variants must fail loudly.
+    #[test]
+    fn vault_mode_tag_rejects_non_snake_case_and_unknown_variants() {
+        for invalid in
+            [json!("VaultDirect"), json!("Orchestrator"), json!("direct")]
+        {
+            assert!(
+                serde_json::from_value::<VaultModeTag>(invalid.clone())
+                    .is_err(),
+                "{invalid} must not deserialize as VaultModeTag"
+            );
+        }
+
+        assert_eq!(
+            serde_json::from_value::<VaultModeTag>(json!("vault_direct"))
+                .unwrap(),
+            VaultModeTag::VaultDirect
+        );
+        assert_eq!(
+            serde_json::from_value::<VaultModeTag>(json!("orchestrator"))
+                .unwrap(),
+            VaultModeTag::Orchestrator
+        );
     }
 
     // The wire format is snake_case: the PascalCase domain spelling (`Enabled`,
@@ -739,6 +817,22 @@ mod tests {
             status_enum_ts.contains("\"enabled\"")
                 && status_enum_ts.contains("\"frozen\""),
             "TokenizedAssetStatus must be an \"enabled\" | \"frozen\" union in TS:\n{status_enum_ts}"
+        );
+
+        // Optional (`vault_mode?`), mirroring the serde default: a pre-field
+        // server omits the value, and a generated consumer must not assume
+        // it is always present during that rolling-deploy window.
+        assert!(
+            status_ts.contains("vault_mode?: VaultModeTag"),
+            "vault_mode must be an OPTIONAL reference to the VaultModeTag \
+             union in TS:\n{status_ts}"
+        );
+        let vault_mode_ts =
+            std::fs::read_to_string(out_dir.join("VaultModeTag.ts")).unwrap();
+        assert!(
+            vault_mode_ts.contains("\"vault_direct\"")
+                && vault_mode_ts.contains("\"orchestrator\""),
+            "VaultModeTag must be a \"vault_direct\" | \"orchestrator\" union in TS:\n{vault_mode_ts}"
         );
 
         // `Network` is a closed enum, so ts_rs must emit a string-literal union
