@@ -161,6 +161,8 @@ struct OrchestratorMockState {
     submit_call_count: AtomicUsize,
     #[cfg(test)]
     readiness_call_count: AtomicUsize,
+    #[cfg(test)]
+    confirm_call_count: AtomicUsize,
 }
 
 /// Mock blockchain service for testing.
@@ -473,8 +475,20 @@ impl MockVaultService {
         self.orchestrator.preparation_call_count.store(0, Ordering::Relaxed);
         self.orchestrator.submit_call_count.store(0, Ordering::Relaxed);
         self.orchestrator.readiness_call_count.store(0, Ordering::Relaxed);
+        self.orchestrator.confirm_call_count.store(0, Ordering::Relaxed);
         *self.orchestrator.pending_result.lock().unwrap() = None;
         *self.last_burn_proof_kind.lock().unwrap() = None;
+    }
+
+    /// Pre-seeds the orchestrator confirm result; `submit_orchestrator_burn`
+    /// preserves a seeded value instead of overwriting it, so tests can make
+    /// confirm report facts diverging from the submitted params.
+    #[cfg(test)]
+    pub(crate) fn seed_orchestrator_burn_result(
+        &self,
+        result: OrchestratorBurnResult,
+    ) {
+        *self.orchestrator.pending_result.lock().unwrap() = Some(result);
     }
 
     #[cfg(test)]
@@ -728,6 +742,11 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn orchestrator_submit_call_count(&self) -> usize {
         self.orchestrator.submit_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestrator_confirm_call_count(&self) -> usize {
+        self.orchestrator.confirm_call_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1388,6 +1407,9 @@ impl VaultService for MockVaultService {
     ) -> Result<OrchestratorBurnResult, VaultError> {
         #[cfg(test)]
         {
+            self.orchestrator
+                .confirm_call_count
+                .fetch_add(1, Ordering::Relaxed);
             let reason_opt = *self.orchestrator.confirm_revert.lock().unwrap();
             if let Some(reason) = reason_opt {
                 return Err(VaultError::OrchestratorReverted {
