@@ -37,7 +37,7 @@ use st0x_issuance::test_utils::{
 };
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, ChainConfig, Config, Environment, IpWhitelist,
-    LogLevel, Network, SignerConfig, VaultMode, VaultModeConfig,
+    LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
 };
 
 /// The internal API key every harness-built config and request header share:
@@ -1053,17 +1053,16 @@ pub fn tokens(amount: u64) -> U256 {
 }
 
 /// A `VaultModeConfig` putting one underlying in orchestrator mode over a
-/// vault-direct default — the single-asset-pilot shape.
+/// vault-direct default — the single-asset-pilot shape, with the
+/// orchestrator address registered for the harness's Base network.
 pub fn orchestrator_vault_modes(
     underlying: &str,
     orchestrator_address: Address,
 ) -> VaultModeConfig {
     VaultModeConfig::new(
-        HashMap::from([(
-            underlying.to_string(),
-            VaultMode::Orchestrator { address: orchestrator_address },
-        )]),
-        VaultMode::VaultDirect,
+        HashMap::from([(underlying.to_string(), VaultModeKind::Orchestrator)]),
+        VaultModeKind::VaultDirect,
+        HashMap::from([(Network::Base, orchestrator_address)]),
     )
 }
 

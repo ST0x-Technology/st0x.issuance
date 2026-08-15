@@ -12,6 +12,7 @@ use super::{
     UnderlyingSymbol,
 };
 use crate::account::{AccountView, view::find_by_client_id};
+use crate::config::MissingOrchestratorAddress;
 use crate::tokenized_asset::view::load_asset_by_network;
 use crate::underlying::load_freeze_status;
 
@@ -68,6 +69,9 @@ pub(crate) enum MintApiError {
     #[error("Failed to execute mint command")]
     CommandExecutionFailed(#[source] AggregateError<LifecycleError<Mint>>),
 
+    #[error("Orchestrator address not configured for the asset's network")]
+    OrchestratorAddressMissing(#[from] MissingOrchestratorAddress),
+
     #[error("Failed to query mint view")]
     MintViewQueryFailed(#[source] super::view::MintViewError),
 
@@ -123,6 +127,17 @@ impl<'r> Responder<'r, 'static> for MintApiError {
             }
             Self::UnexpectedMintState => {
                 error!(target: "mint", "Unexpected mint state");
+                MintErrorResponse::internal_server_error(
+                    "Internal server error",
+                )
+            }
+            // Deploy-validation gap (the startup cross-check requires an
+            // address per configured chain): refuse the mint loudly rather
+            // than anchor a mode without its address.
+            Self::OrchestratorAddressMissing(e) => {
+                error!(target: "mint", error = %e,
+                    "Orchestrator address missing for mint network"
+                );
                 MintErrorResponse::internal_server_error(
                     "Internal server error",
                 )

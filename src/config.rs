@@ -55,14 +55,23 @@ impl VaultMode {
     }
 }
 
-/// The backend kind of a [`VaultMode`], without the orchestrator's address
-/// payload — for mode-mismatch errors and logs where only the kind matters
-/// and a free-form string would let call sites invent labels the compiler
-/// cannot check.
+/// The backend kind of a [`VaultMode`]
+///
+/// Without the orchestrator's address payload — for mode-mismatch errors
+/// and logs where only the kind matters and a free-form string would let
+/// call sites invent labels the compiler cannot check.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum VaultModeKind {
+    #[default]
     VaultDirect,
     Orchestrator,
 }
@@ -78,48 +87,107 @@ impl std::fmt::Display for VaultModeKind {
 
 /// Resolved per-asset vault-mode configuration loaded from the optional TOML
 /// config file. Defaults to all-`VaultDirect` when no file is provided.
+///
+/// Modes are keyed by underlying symbol; orchestrator **addresses** are keyed
+/// by network, because each chain carries its own orchestrator deployment.
+/// The two are joined at query time by [`Self::mode_for`], so a symbol's mode
+/// flip applies on every network the asset is listed on while each network's
+/// operations target that network's contract.
 #[derive(Debug, Clone, Default)]
 pub struct VaultModeConfig {
-    /// Per-asset overrides keyed by the underlying symbol string (e.g. "AAPL").
-    per_asset: HashMap<String, VaultMode>,
+    /// Per-asset mode overrides keyed by the underlying symbol string
+    /// (e.g. "AAPL").
+    per_asset: HashMap<String, VaultModeKind>,
     /// Fallback used for any asset not listed in `per_asset`.
-    default: VaultMode,
-    /// `[orchestrator].address` as parsed from the TOML file, retained even
+    default: VaultModeKind,
+    /// `[orchestrator.addresses]` as parsed from the TOML file, retained even
     /// while every asset still resolves to vault-direct: the onboarding ops
     /// tooling (role/allowance preflight, approval execution) needs the
-    /// address before the first asset's cutover, and the config file is its
-    /// single source of truth.
-    orchestrator_address: Option<Address>,
+    /// addresses before the first asset's cutover, and the config file is
+    /// their single source of truth.
+    orchestrator_addresses: HashMap<Network, Address>,
+}
+
+/// An asset resolved to orchestrator mode on a network that has no
+/// `[orchestrator.addresses]` entry. Never silently falls back to
+/// vault-direct — the startup cross-check in `Env::into_config` makes this
+/// unreachable in a validated deploy, and unvalidated paths must fail loudly.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "no [orchestrator.addresses] entry for network '{network}'; add it to \
+     the TOML config (every configured chain needs one while any asset \
+     resolves to orchestrator mode)"
+)]
+pub struct MissingOrchestratorAddress {
+    pub network: Network,
 }
 
 impl VaultModeConfig {
-    /// Programmatic constructor for tests and harnesses. Configs built this
-    /// way carry no `[orchestrator].address` (`orchestrator_address()` is
-    /// `None`); orchestrator addresses live inside the `VaultMode` variants.
+    /// Programmatic constructor for tests and harnesses.
     #[must_use]
     pub const fn new(
-        per_asset: HashMap<String, VaultMode>,
-        default: VaultMode,
+        per_asset: HashMap<String, VaultModeKind>,
+        default: VaultModeKind,
+        orchestrator_addresses: HashMap<Network, Address>,
     ) -> Self {
-        Self { per_asset, default, orchestrator_address: None }
+        Self { per_asset, default, orchestrator_addresses }
     }
 
-    /// The `[orchestrator].address` from the TOML file, if one was configured.
-    /// Present as soon as the section carries an address — deliberately not
-    /// gated on any asset resolving to orchestrator mode.
+    /// The `[orchestrator.addresses]` entry for `network`, if one was
+    /// configured. Present as soon as the map carries the network —
+    /// deliberately not gated on any asset resolving to orchestrator mode.
     #[must_use]
-    pub const fn orchestrator_address(&self) -> Option<Address> {
-        self.orchestrator_address
+    pub fn orchestrator_address_for(
+        &self,
+        network: Network,
+    ) -> Option<Address> {
+        self.orchestrator_addresses.get(&network).copied()
     }
 
-    /// Returns the `VaultMode` for the given underlying asset symbol.
-    ///
-    /// Uses the per-asset override from the TOML config if present, otherwise
-    /// falls back to the configured default (which itself defaults to
-    /// `VaultDirect` when no TOML file is provided).
+    /// Whether the default or any per-asset override resolves to
+    /// orchestrator kind — the trigger for the startup requirement that
+    /// every configured chain has an `[orchestrator.addresses]` entry.
     #[must_use]
-    pub fn mode_for(&self, underlying: &UnderlyingSymbol) -> VaultMode {
+    pub fn has_orchestrator_kind(&self) -> bool {
+        self.default == VaultModeKind::Orchestrator
+            || self
+                .per_asset
+                .values()
+                .any(|kind| *kind == VaultModeKind::Orchestrator)
+    }
+
+    /// Returns the mode **kind** for the given underlying asset symbol —
+    /// per-asset override first, then the configured default. Infallible:
+    /// use where only the kind matters (status surfaces); address-carrying
+    /// resolution is [`Self::mode_for`].
+    #[must_use]
+    pub fn kind_for(&self, underlying: &UnderlyingSymbol) -> VaultModeKind {
         self.per_asset.get(underlying.as_str()).copied().unwrap_or(self.default)
+    }
+
+    /// Returns the `VaultMode` for the given underlying asset symbol on the
+    /// given network.
+    ///
+    /// The mode kind comes from the per-asset override (falling back to the
+    /// configured default); an orchestrator kind then resolves the network's
+    /// address from `[orchestrator.addresses]`. A missing entry is a typed
+    /// error, never a silent vault-direct fallback.
+    ///
+    /// # Errors
+    ///
+    /// If the orchestrator address is missing
+    pub fn mode_for(
+        &self,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+    ) -> Result<VaultMode, MissingOrchestratorAddress> {
+        match self.kind_for(underlying) {
+            VaultModeKind::VaultDirect => Ok(VaultMode::VaultDirect),
+            VaultModeKind::Orchestrator => self
+                .orchestrator_address_for(network)
+                .map(|address| VaultMode::Orchestrator { address })
+                .ok_or(MissingOrchestratorAddress { network }),
+        }
     }
 }
 
@@ -183,10 +251,30 @@ impl Config {
             .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
     }
 
-    /// Returns the `VaultMode` for the given underlying asset symbol.
+    /// Returns the `VaultMode` for the given underlying asset symbol on the
+    /// given network. See [`VaultModeConfig::mode_for`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MissingOrchestratorAddress`] when the asset resolves to
+    /// orchestrator kind and `network` has no `[orchestrator.addresses]`
+    /// entry.
+    pub fn vault_mode_for(
+        &self,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+    ) -> Result<VaultMode, MissingOrchestratorAddress> {
+        self.vault_mode_config.mode_for(underlying, network)
+    }
+
+    /// Returns the mode **kind** for the given underlying asset symbol.
+    /// See [`VaultModeConfig::kind_for`].
     #[must_use]
-    pub fn vault_mode_for(&self, underlying: &UnderlyingSymbol) -> VaultMode {
-        self.vault_mode_config.mode_for(underlying)
+    pub fn vault_mode_kind_for(
+        &self,
+        underlying: &UnderlyingSymbol,
+    ) -> VaultModeKind {
+        self.vault_mode_config.kind_for(underlying)
     }
 }
 
@@ -403,6 +491,27 @@ impl Env {
         } else {
             VaultModeConfig::default()
         };
+
+        // While anything resolves to orchestrator kind, every configured
+        // chain must carry an `[orchestrator.addresses]` entry — a missing
+        // address is a deploy error here, not a runtime surprise at
+        // initiation/detection time. Deliberately over-strict (an
+        // orchestrator asset listed only on Base still demands an entry for
+        // every other configured chain): assets live in the database, so
+        // parse time cannot narrow the requirement per asset.
+        if vault_mode_config.has_orchestrator_kind() {
+            for chain in &chains {
+                if vault_mode_config
+                    .orchestrator_address_for(chain.network)
+                    .is_none()
+                {
+                    return Err(MissingOrchestratorAddress {
+                        network: chain.network,
+                    }
+                    .into());
+                }
+            }
+        }
 
         Ok(Config {
             database_url: self.database_url,
@@ -717,11 +826,21 @@ pub enum ConfigError {
     #[error("Failed to parse toml config file: {0}")]
     Toml(#[from] toml::de::Error),
     #[error(
-        "[orchestrator].address is required when any asset resolves to \
-         orchestrator mode"
+        "[orchestrator.addresses] must have at least one entry when any \
+         asset resolves to orchestrator mode"
     )]
-    MissingOrchestratorAddress,
-    #[error("Invalid [orchestrator].address '{0}': not a valid EVM address")]
+    MissingOrchestratorAddresses,
+    #[error(transparent)]
+    MissingOrchestratorAddressForNetwork(#[from] MissingOrchestratorAddress),
+    #[error(
+        "Invalid [orchestrator.addresses] key '{key}': not a known network \
+         (expected one of: base, ethereum, hyperevm)"
+    )]
+    UnknownOrchestratorNetwork { key: String },
+    #[error(
+        "Invalid [orchestrator.addresses] entry '{0}': not a valid EVM \
+         address"
+    )]
     InvalidOrchestratorAddress(String),
     #[error("Invalid [assets] key '{symbol}': {error}")]
     InvalidAssetSymbol {
@@ -751,7 +870,12 @@ struct TomlFile {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OrchestratorSection {
-    address: Option<String>,
+    /// Per-network orchestrator contract addresses, keyed by the network's
+    /// wire name (`base`, `ethereum`, `hyperevm`). Each chain carries its
+    /// own deployment; keys and addresses are validated in
+    /// `resolve_vault_modes` (unknown networks and zero/malformed addresses
+    /// are startup errors).
+    addresses: Option<HashMap<String, String>>,
     default_vault_mode: Option<VaultModeStr>,
 }
 
@@ -791,9 +915,13 @@ pub(crate) fn load_vault_mode_config(
 /// Converts the raw TOML file into a validated `VaultModeConfig`.
 ///
 /// Validation rules:
-/// - `default_vault_mode = "orchestrator"` requires `[orchestrator].address`.
-/// - Any `[assets.<X>].vault_mode = "orchestrator"` requires
-///   `[orchestrator].address`.
+/// - `default_vault_mode = "orchestrator"` requires a non-empty
+///   `[orchestrator.addresses]` map.
+/// - Any `[assets.<X>].vault_mode = "orchestrator"` requires a non-empty
+///   `[orchestrator.addresses]` map (the per-configured-chain requirement is
+///   enforced at startup, where the chain list is known).
+/// - `[orchestrator.addresses]` keys must be known network wire names and
+///   values must be non-zero EVM addresses.
 /// - An unknown `vault_mode` string fails via serde (see `VaultModeStr`).
 /// - `[assets.<X>]` keys are validated as underlying symbols and normalized
 ///   to upper case (matching how assets are keyed everywhere else), so
@@ -805,30 +933,37 @@ pub(crate) fn load_vault_mode_config(
 fn resolve_vault_modes(
     toml: &TomlFile,
 ) -> Result<VaultModeConfig, ConfigError> {
-    let orchestrator_address =
-        match toml.orchestrator.as_ref().and_then(|o| o.address.as_ref()) {
-            Some(addr_str) => {
-                let address = addr_str.parse::<Address>().map_err(|_| {
-                    ConfigError::InvalidOrchestratorAddress(addr_str.clone())
-                })?;
-                if address.is_zero() {
-                    return Err(ConfigError::InvalidOrchestratorAddress(
-                        addr_str.clone(),
-                    ));
+    let mut orchestrator_addresses = HashMap::new();
+    if let Some(entries) =
+        toml.orchestrator.as_ref().and_then(|o| o.addresses.as_ref())
+    {
+        for (network_key, addr_str) in entries {
+            let network = network_key.parse::<Network>().map_err(|_| {
+                ConfigError::UnknownOrchestratorNetwork {
+                    key: network_key.clone(),
                 }
-                Some(address)
+            })?;
+            let address = addr_str.parse::<Address>().map_err(|_| {
+                ConfigError::InvalidOrchestratorAddress(addr_str.clone())
+            })?;
+            if address.is_zero() {
+                return Err(ConfigError::InvalidOrchestratorAddress(
+                    addr_str.clone(),
+                ));
             }
-            None => None,
-        };
+            orchestrator_addresses.insert(network, address);
+        }
+    }
 
-    let resolve_mode =
-        |mode_str: &VaultModeStr| -> Result<VaultMode, ConfigError> {
+    let resolve_kind =
+        |mode_str: &VaultModeStr| -> Result<VaultModeKind, ConfigError> {
             match mode_str {
-                VaultModeStr::VaultDirect => Ok(VaultMode::VaultDirect),
+                VaultModeStr::VaultDirect => Ok(VaultModeKind::VaultDirect),
                 VaultModeStr::Orchestrator => {
-                    let address = orchestrator_address
-                        .ok_or(ConfigError::MissingOrchestratorAddress)?;
-                    Ok(VaultMode::Orchestrator { address })
+                    if orchestrator_addresses.is_empty() {
+                        return Err(ConfigError::MissingOrchestratorAddresses);
+                    }
+                    Ok(VaultModeKind::Orchestrator)
                 }
             }
         };
@@ -838,8 +973,8 @@ fn resolve_vault_modes(
         .as_ref()
         .and_then(|o| o.default_vault_mode.as_ref())
     {
-        None => VaultMode::VaultDirect,
-        Some(mode_str) => resolve_mode(mode_str)?,
+        None => VaultModeKind::VaultDirect,
+        Some(mode_str) => resolve_kind(mode_str)?,
     };
 
     let mut per_asset = HashMap::new();
@@ -852,15 +987,15 @@ fn resolve_vault_modes(
             .as_str()
             .to_string();
 
-        let mode = resolve_mode(&asset_section.vault_mode)?;
-        if per_asset.insert(normalized.clone(), mode).is_some() {
+        let kind = resolve_kind(&asset_section.vault_mode)?;
+        if per_asset.insert(normalized.clone(), kind).is_some() {
             return Err(ConfigError::DuplicateAssetSymbol {
                 symbol: normalized,
             });
         }
     }
 
-    Ok(VaultModeConfig { per_asset, default, orchestrator_address })
+    Ok(VaultModeConfig { per_asset, default, orchestrator_addresses })
 }
 
 /// RPC URL uses a scheme that cannot be mapped to HTTP.
@@ -1460,17 +1595,26 @@ mod tests {
     }
 
     const ORCH_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
+    const ETH_ORCH_ADDR: &str = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
     fn orch_address() -> Address {
         ORCH_ADDR.parse().unwrap()
     }
 
+    fn eth_orch_address() -> Address {
+        ETH_ORCH_ADDR.parse().unwrap()
+    }
+
+    fn base_addresses() -> HashMap<String, String> {
+        HashMap::from([("base".to_string(), ORCH_ADDR.to_string())])
+    }
+
     #[test]
     fn no_config_file_every_asset_vault_direct() {
         let cfg = VaultModeConfig::default();
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
         assert!(cfg.per_asset.is_empty());
-        assert_eq!(cfg.orchestrator_address(), None);
+        assert_eq!(cfg.orchestrator_address_for(Network::Base), None);
     }
 
     // Pins the committed per-environment deploy configs (baked into the
@@ -1489,7 +1633,11 @@ mod tests {
             let cfg = resolve_vault_modes(&toml_file)
                 .unwrap_or_else(|error| panic!("{name} must resolve: {error}"));
 
-            assert_eq!(cfg.default, VaultMode::VaultDirect, "{name} not dark");
+            assert_eq!(
+                cfg.default,
+                VaultModeKind::VaultDirect,
+                "{name} not dark"
+            );
             assert!(cfg.per_asset.is_empty(), "{name} has asset overrides");
         }
     }
@@ -1505,17 +1653,20 @@ mod tests {
 
         assert_eq!(
             cfg.per_asset.get("RKLB").copied(),
-            Some(VaultMode::Orchestrator { address: orch_address() })
+            Some(VaultModeKind::Orchestrator)
         );
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
-        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
+        assert_eq!(
+            cfg.orchestrator_address_for(Network::Base),
+            Some(orch_address())
+        );
     }
 
     #[test]
     fn per_asset_override_to_orchestrator() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: None,
             }),
             assets: HashMap::from([(
@@ -1528,16 +1679,16 @@ mod tests {
 
         assert_eq!(
             cfg.per_asset.get("AAPL").copied(),
-            Some(VaultMode::Orchestrator { address: orch_address() })
+            Some(VaultModeKind::Orchestrator)
         );
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
     }
 
     #[test]
     fn per_asset_override_to_vault_direct_ignores_default() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
             }),
             assets: HashMap::from([(
@@ -1550,19 +1701,16 @@ mod tests {
 
         assert_eq!(
             cfg.per_asset.get("TSLA").copied(),
-            Some(VaultMode::VaultDirect)
+            Some(VaultModeKind::VaultDirect)
         );
-        assert_eq!(
-            cfg.default,
-            VaultMode::Orchestrator { address: orch_address() }
-        );
+        assert_eq!(cfg.default, VaultModeKind::Orchestrator);
     }
 
     #[test]
     fn no_per_asset_override_uses_default_vault_mode() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
             }),
             assets: HashMap::new(),
@@ -1570,10 +1718,7 @@ mod tests {
 
         let cfg = resolve_vault_modes(&toml).unwrap();
 
-        assert_eq!(
-            cfg.default,
-            VaultMode::Orchestrator { address: orch_address() }
-        );
+        assert_eq!(cfg.default, VaultModeKind::Orchestrator);
     }
 
     #[test]
@@ -1582,16 +1727,16 @@ mod tests {
 
         let cfg = resolve_vault_modes(&toml).unwrap();
 
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
         assert!(cfg.per_asset.is_empty());
-        assert_eq!(cfg.orchestrator_address(), None);
+        assert_eq!(cfg.orchestrator_address_for(Network::Base), None);
     }
 
     #[test]
-    fn orchestrator_asset_without_address_is_startup_error() {
+    fn orchestrator_asset_without_addresses_is_startup_error() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: None,
+                addresses: None,
                 default_vault_mode: None,
             }),
             assets: HashMap::from([(
@@ -1602,15 +1747,15 @@ mod tests {
 
         assert!(matches!(
             resolve_vault_modes(&toml),
-            Err(ConfigError::MissingOrchestratorAddress)
+            Err(ConfigError::MissingOrchestratorAddresses)
         ));
     }
 
     #[test]
-    fn default_orchestrator_without_address_is_startup_error() {
+    fn default_orchestrator_without_addresses_is_startup_error() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: None,
+                addresses: Some(HashMap::new()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
             }),
             assets: HashMap::new(),
@@ -1618,7 +1763,7 @@ mod tests {
 
         assert!(matches!(
             resolve_vault_modes(&toml),
-            Err(ConfigError::MissingOrchestratorAddress)
+            Err(ConfigError::MissingOrchestratorAddresses)
         ));
     }
 
@@ -1626,7 +1771,10 @@ mod tests {
     fn invalid_orchestrator_address_is_startup_error() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some("not-an-address".to_string()),
+                addresses: Some(HashMap::from([(
+                    "base".to_string(),
+                    "not-an-address".to_string(),
+                )])),
                 default_vault_mode: None,
             }),
             assets: HashMap::new(),
@@ -1636,6 +1784,41 @@ mod tests {
             resolve_vault_modes(&toml),
             Err(ConfigError::InvalidOrchestratorAddress(_))
         ));
+    }
+
+    #[test]
+    fn unknown_orchestrator_network_key_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                addresses: Some(HashMap::from([(
+                    "solana".to_string(),
+                    ORCH_ADDR.to_string(),
+                )])),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::new(),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::UnknownOrchestratorNetwork { key }) if key == "solana"
+        ));
+    }
+
+    // The pre-multichain `[orchestrator].address` form must fail loudly at
+    // startup (deny_unknown_fields), never parse as a dark config that
+    // silently dropped the address.
+    #[test]
+    fn legacy_single_address_key_is_parse_error() {
+        let legacy = r#"
+            [orchestrator]
+            address = "0x1234567890abcdef1234567890abcdef12345678"
+        "#;
+
+        assert!(
+            toml::from_str::<TomlFile>(legacy).is_err(),
+            "the retired [orchestrator].address key must be rejected"
+        );
     }
 
     #[test]
@@ -1670,31 +1853,81 @@ mod tests {
     #[test]
     fn mode_for_prefers_per_asset_override_and_falls_back_to_default() {
         let cfg = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orch_address() },
-            )]),
-            VaultMode::VaultDirect,
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orch_address())]),
         );
 
         assert_eq!(
-            cfg.mode_for(&UnderlyingSymbol::new("AAPL").unwrap()),
+            cfg.mode_for(
+                &UnderlyingSymbol::new("AAPL").unwrap(),
+                Network::Base
+            )
+            .unwrap(),
             VaultMode::Orchestrator { address: orch_address() }
         );
         assert_eq!(
-            cfg.mode_for(&UnderlyingSymbol::new("TSLA").unwrap()),
+            cfg.mode_for(
+                &UnderlyingSymbol::new("TSLA").unwrap(),
+                Network::Base
+            )
+            .unwrap(),
             VaultMode::VaultDirect
         );
     }
 
-    // The address must survive resolution even while no asset resolves to
+    // The whole point of the per-network map: the same symbol's orchestrator
+    // mode resolves each network's own contract address.
+    #[test]
+    fn mode_for_resolves_a_different_address_per_network() {
+        let cfg = VaultModeConfig::new(
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([
+                (Network::Base, orch_address()),
+                (Network::Ethereum, eth_orch_address()),
+            ]),
+        );
+        let aapl = UnderlyingSymbol::new("AAPL").unwrap();
+
+        assert_eq!(
+            cfg.mode_for(&aapl, Network::Base).unwrap(),
+            VaultMode::Orchestrator { address: orch_address() }
+        );
+        assert_eq!(
+            cfg.mode_for(&aapl, Network::Ethereum).unwrap(),
+            VaultMode::Orchestrator { address: eth_orch_address() }
+        );
+    }
+
+    // Never a silent vault-direct fallback: an orchestrator-kind asset on a
+    // network with no address entry is a typed error.
+    #[test]
+    fn mode_for_missing_network_address_is_an_error() {
+        let cfg = VaultModeConfig::new(
+            HashMap::from([("AAPL".to_string(), VaultModeKind::Orchestrator)]),
+            VaultModeKind::VaultDirect,
+            HashMap::from([(Network::Base, orch_address())]),
+        );
+
+        assert_eq!(
+            cfg.mode_for(
+                &UnderlyingSymbol::new("AAPL").unwrap(),
+                Network::Ethereum
+            )
+            .unwrap_err(),
+            MissingOrchestratorAddress { network: Network::Ethereum }
+        );
+    }
+
+    // The addresses must survive resolution even while no asset resolves to
     // orchestrator mode: the onboarding ops tooling (preflight, approvals)
     // runs against exactly this dark configuration, before the first cutover.
     #[test]
-    fn orchestrator_address_exposed_while_all_assets_vault_direct() {
+    fn orchestrator_addresses_exposed_while_all_assets_vault_direct() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: None,
             }),
             assets: HashMap::new(),
@@ -1702,22 +1935,13 @@ mod tests {
 
         let cfg = resolve_vault_modes(&toml).unwrap();
 
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
         assert!(cfg.per_asset.is_empty());
-        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
-    }
-
-    #[test]
-    fn programmatic_config_carries_no_orchestrator_address() {
-        let cfg = VaultModeConfig::new(
-            HashMap::from([(
-                "AAPL".to_string(),
-                VaultMode::Orchestrator { address: orch_address() },
-            )]),
-            VaultMode::VaultDirect,
+        assert_eq!(
+            cfg.orchestrator_address_for(Network::Base),
+            Some(orch_address())
         );
-
-        assert_eq!(cfg.orchestrator_address(), None);
+        assert_eq!(cfg.orchestrator_address_for(Network::Ethereum), None);
     }
 
     #[test]
@@ -1726,8 +1950,9 @@ mod tests {
         std::fs::write(
             file.path(),
             r#"
-            [orchestrator]
-            address = "0x1234567890abcdef1234567890abcdef12345678"
+            [orchestrator.addresses]
+            base = "0x1234567890abcdef1234567890abcdef12345678"
+            ethereum = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
             [assets.RKLB]
             vault_mode = "orchestrator"
@@ -1739,10 +1964,17 @@ mod tests {
 
         assert_eq!(
             cfg.per_asset.get("RKLB").copied(),
-            Some(VaultMode::Orchestrator { address: orch_address() })
+            Some(VaultModeKind::Orchestrator)
         );
-        assert_eq!(cfg.default, VaultMode::VaultDirect);
-        assert_eq!(cfg.orchestrator_address(), Some(orch_address()));
+        assert_eq!(cfg.default, VaultModeKind::VaultDirect);
+        assert_eq!(
+            cfg.orchestrator_address_for(Network::Base),
+            Some(orch_address())
+        );
+        assert_eq!(
+            cfg.orchestrator_address_for(Network::Ethereum),
+            Some(eth_orch_address())
+        );
     }
 
     #[test]
@@ -1759,7 +1991,10 @@ mod tests {
     fn zero_orchestrator_address_is_startup_error() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(Address::ZERO.to_string()),
+                addresses: Some(HashMap::from([(
+                    "base".to_string(),
+                    Address::ZERO.to_string(),
+                )])),
                 default_vault_mode: None,
             }),
             assets: HashMap::from([(
@@ -1783,7 +2018,7 @@ mod tests {
     fn lowercase_asset_key_normalizes_to_the_stored_symbol() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: None,
             }),
             assets: HashMap::from([(
@@ -1796,7 +2031,7 @@ mod tests {
 
         assert_eq!(
             cfg.per_asset.get("RKLB").copied(),
-            Some(VaultMode::Orchestrator { address: orch_address() })
+            Some(VaultModeKind::Orchestrator)
         );
         assert!(!cfg.per_asset.contains_key("rklb"));
     }
@@ -1844,8 +2079,8 @@ mod tests {
     #[test]
     fn unknown_vault_mode_string_in_toml_is_parse_error() {
         let bad_toml = r#"
-            [orchestrator]
-            address = "0x1234567890abcdef1234567890abcdef12345678"
+            [orchestrator.addresses]
+            base = "0x1234567890abcdef1234567890abcdef12345678"
 
             [assets.AAPL]
             vault_mode = "not_a_valid_mode"
@@ -1859,8 +2094,10 @@ mod tests {
     fn unknown_toml_key_is_parse_error() {
         let bad_toml = r#"
             [orchestrator]
-            address = "0x1234567890abcdef1234567890abcdef12345678"
             unexpected_key = "oops"
+
+            [orchestrator.addresses]
+            base = "0x1234567890abcdef1234567890abcdef12345678"
         "#;
 
         let result = toml::from_str::<TomlFile>(bad_toml);
@@ -1871,7 +2108,7 @@ mod tests {
     fn vault_mode_for_uses_per_asset_override_then_default() {
         let toml = TomlFile {
             orchestrator: Some(OrchestratorSection {
-                address: Some(ORCH_ADDR.to_string()),
+                addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
             }),
             assets: HashMap::from([(
@@ -1886,14 +2123,168 @@ mod tests {
 
         // Explicit VaultDirect override wins over the orchestrator default
         assert_eq!(
-            config.vault_mode_for(&UnderlyingSymbol::new("TSLA").unwrap()),
+            config
+                .vault_mode_for(
+                    &UnderlyingSymbol::new("TSLA").unwrap(),
+                    Network::Base
+                )
+                .unwrap(),
             VaultMode::VaultDirect
         );
 
         // Asset not in per_asset falls back to default (orchestrator)
         assert_eq!(
-            config.vault_mode_for(&UnderlyingSymbol::new("AAPL").unwrap()),
+            config
+                .vault_mode_for(
+                    &UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base
+                )
+                .unwrap(),
             VaultMode::Orchestrator { address: orch_address() }
+        );
+    }
+
+    // The startup cross-check: while anything resolves to orchestrator kind,
+    // every configured chain needs an `[orchestrator.addresses]` entry — a
+    // missing one is a deploy error, not a runtime surprise.
+    #[tokio::test]
+    async fn startup_requires_an_address_for_every_configured_chain() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [orchestrator.addresses]
+            ethereum = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+
+            [assets.RKLB]
+            vault_mode = "orchestrator"
+            "#,
+        )
+        .unwrap();
+
+        let config_path = file.path().display().to_string();
+        let mut args = minimal_args();
+        args.push("--config");
+        args.push(&config_path);
+        let env = Env::try_parse_from(args).unwrap();
+
+        // minimal_args configures the Base chain, which has no entry above.
+        let error = env.into_config().map(|_| ()).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::MissingOrchestratorAddressForNetwork(
+                MissingOrchestratorAddress { network: Network::Base }
+            )
+        ));
+    }
+
+    // The dark config (nothing orchestrator-kind) must NOT demand addresses:
+    // that is the standing prod deployment until the first cutover.
+    #[tokio::test]
+    async fn startup_dark_config_needs_no_addresses() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [assets.RKLB]
+            vault_mode = "vault_direct"
+            "#,
+        )
+        .unwrap();
+
+        let config_path = file.path().display().to_string();
+        let mut args = minimal_args();
+        args.push("--config");
+        args.push(&config_path);
+        let env = Env::try_parse_from(args).unwrap();
+
+        env.into_config().expect("a dark config must not demand addresses");
+    }
+
+    /// Enables the Ethereum chain group on top of `minimal_args`, so the
+    /// startup cross-check iterates two configured chains.
+    fn two_chain_args() -> Vec<&'static str> {
+        let mut args = minimal_args();
+        args.extend([
+            "--chain-ethereum-rpc-url",
+            "wss://localhost:8546",
+            "--chain-ethereum-chain-id",
+            "1",
+            "--chain-ethereum-subgraph-url",
+            "http://localhost:0/eth-subgraph",
+            "--chain-ethereum-backfill-start-block",
+            "1",
+        ]);
+        args
+    }
+
+    /// The cross-check must cover EVERY configured chain, not just Base: with
+    /// Base and Ethereum both configured, a map carrying only the Base entry
+    /// must name Ethereum as the missing network.
+    #[tokio::test]
+    async fn startup_two_chains_reject_a_single_address_entry() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [orchestrator.addresses]
+            base = "0x1234567890abcdef1234567890abcdef12345678"
+
+            [assets.RKLB]
+            vault_mode = "orchestrator"
+            "#,
+        )
+        .unwrap();
+
+        let config_path = file.path().display().to_string();
+        let mut args = two_chain_args();
+        args.push("--config");
+        args.push(&config_path);
+        let env = Env::try_parse_from(args).unwrap();
+
+        let error = env.into_config().map(|_| ()).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::MissingOrchestratorAddressForNetwork(
+                MissingOrchestratorAddress { network: Network::Ethereum }
+            )
+        ));
+    }
+
+    /// The valid multichain shape: an entry per configured chain passes the
+    /// startup cross-check and each network resolves its own address.
+    #[tokio::test]
+    async fn startup_two_chains_accept_an_entry_per_chain() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [orchestrator.addresses]
+            base = "0x1234567890abcdef1234567890abcdef12345678"
+            ethereum = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+
+            [assets.RKLB]
+            vault_mode = "orchestrator"
+            "#,
+        )
+        .unwrap();
+
+        let config_path = file.path().display().to_string();
+        let mut args = two_chain_args();
+        args.push("--config");
+        args.push(&config_path);
+        let env = Env::try_parse_from(args).unwrap();
+
+        let config =
+            env.into_config().expect("an entry per chain must pass startup");
+        let rklb = UnderlyingSymbol::new("RKLB").unwrap();
+        assert_eq!(
+            config.vault_mode_for(&rklb, Network::Base).unwrap(),
+            VaultMode::Orchestrator { address: orch_address() }
+        );
+        assert_eq!(
+            config.vault_mode_for(&rklb, Network::Ethereum).unwrap(),
+            VaultMode::Orchestrator { address: eth_orch_address() }
         );
     }
 }

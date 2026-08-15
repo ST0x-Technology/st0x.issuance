@@ -43,20 +43,25 @@ on-chain resolution. The one address argument in this document,
 configured orchestrator address, and is guarded by the kind-aware corroboration
 witness (see SPEC "Receipt custody").
 
-## 1. Ship the orchestrator address in the config (stays dark)
+## 1. Ship the orchestrator addresses in the config (stays dark)
 
 Add to `config.prod.toml`:
 
 ```toml
-[orchestrator]
-address = "0x…"   # from st0x.deploy
+[orchestrator.addresses]
+base = "0x…"   # from st0x.deploy; one entry per network — each chain has
+               # its own orchestrator deployment
 ```
 
 Do **not** add any `[assets.<SYM>]` section — with no `vault_mode` overrides
 every asset stays vault-direct, so this deploys dark. Parsing is strict (unknown
-keys and a malformed or zero address are startup errors, even while dark).
-Verify locally with `cargo run --bin validate-config`, then deploy. The config
-file is baked into the systemd unit (`CONFIG=<nix store path>`, see
+keys, unknown network names, and malformed or zero addresses are startup errors,
+even while dark), and once any asset resolves to orchestrator mode, startup
+requires an entry for **every** configured chain. Every `issuer` verification
+below runs per `--network` against that network's entry, and an asset's cutover
+(steps 7–14) runs per chain it is listed on. Verify locally with
+`cargo run --bin validate-config`, then deploy. The config file is baked into
+the systemd unit (`CONFIG=<nix store path>`, see
 `nix/upgradeable-services.nix`). Every command below passes `--config "$CONFIG"`
 — the unit's own value — so the CLI provably validates and approves against the
 exact file the running service resolves, never a stray local copy.
@@ -122,13 +127,13 @@ One-time unlimited ERC-20 approval, bot wallet → orchestrator, on the asset's
 vault share token, signed by Turnkey after an explicit confirmation. Before
 sending, the command verifies the configured address answers as an orchestrator
 (interface reads plus a healthy `vaultLogicIsExpected()`), so a typo'd or stale
-`[orchestrator].address` is refused rather than granted an unlimited allowance.
-Idempotent: a re-run reports "already unlimited" and sends nothing, so batching
-every asset's approval early is safe — approvals are inert until the asset's
-`vault_mode` flips. Success is re-verified by an on-chain allowance read. When
-this step actually submits, the transaction is also live proof that the policy's
-`approve` allowance works; the idempotent no-op path proves nothing new — step
-4's signing proof covers `approve` in that case.
+`[orchestrator.addresses]` entry is refused rather than granted an unlimited
+allowance. Idempotent: a re-run reports "already unlimited" and sends nothing,
+so batching every asset's approval early is safe — approvals are inert until the
+asset's `vault_mode` flips. Success is re-verified by an on-chain allowance
+read. When this step actually submits, the transaction is also live proof that
+the policy's `approve` allowance works; the idempotent no-op path proves nothing
+new — step 4's signing proof covers `approve` in that case.
 
 Record each executed approval in the table below.
 
@@ -239,14 +244,14 @@ issuer move-receipts <SYM> \
   --network base --chain-id 8453 --rpc-url "$RPC_URL"
 ```
 
-The destination is read from `[orchestrator].address` — never typed — and
-corroborated as an ERC-1155-receiving contract before anything is signed. The
-command prompts with the asset, vault, holder, destination and its corroborated
-kind, and the tracked receipt count. A vault tracking more than 14 receipts
-moves in multiple bounded transactions, each verified before the next. A re-run
-after any interruption is safe: an interrupted move resumes with only the
-remaining receipts, and a completed move reports "already migrated" and submits
-nothing.
+The destination is read from the `--network`'s `[orchestrator.addresses]` entry
+— never typed — and corroborated as an ERC-1155-receiving contract before
+anything is signed. The command prompts with the asset, vault, holder,
+destination and its corroborated kind, and the tracked receipt count. A vault
+tracking more than 14 receipts moves in multiple bounded transactions, each
+verified before the next. A re-run after any interruption is safe: an
+interrupted move resumes with only the remaining receipts, and a completed move
+reports "already migrated" and submits nothing.
 
 ## 11. Verify the move
 
