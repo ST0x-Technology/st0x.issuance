@@ -251,8 +251,9 @@ where
         Ok(())
     }
 
-    /// Runs a single poll pass: re-read the enabled asset set, then scan each
-    /// of its vaults from its own checkpoint to the chain head.
+    /// Runs a single poll pass: re-read this network's enabled asset set,
+    /// then scan each of its vaults from its own checkpoint to the chain
+    /// head.
     ///
     /// The asset list is loaded ONCE per pass and that same snapshot drives
     /// both the vault set and per-log asset attribution
@@ -262,8 +263,14 @@ where
     /// the snapshot the pass was built from).
     async fn poll_once(&self) -> Result<(), TransferPollError> {
         // Re-read the monitored asset set every pass so assets added or
-        // re-pointed at runtime are covered without a restart.
-        let assets = list_enabled_assets(&self.pool).await?;
+        // re-pointed at runtime are covered without a restart — scoped to
+        // this poller's network, so no pass scans (or checkpoints) another
+        // chain's vault addresses against this chain's RPC.
+        let assets = list_enabled_assets(&self.pool)
+            .await?
+            .into_iter()
+            .filter(|asset| asset.network == self.network)
+            .collect::<Vec<_>>();
         let vaults = enabled_vaults(&assets);
         if vaults.is_empty() {
             return Ok(());
@@ -684,6 +691,22 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
+        build_poller_on_network(
+            Network::Base,
+            bot_wallet,
+            asserter,
+            backfill_start_block,
+            pool,
+        )
+    }
+
+    fn build_poller_on_network(
+        network: Network,
+        bot_wallet: Address,
+        asserter: &Asserter,
+        backfill_start_block: u64,
+        pool: SqlitePool,
+    ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
         let (store, receipt_service) = setup_test_store(&pool);
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -720,7 +743,7 @@ mod tests {
             .connect_mocked_client(asserter.clone());
 
         let poller = super::TransferPoller::new(super::TransferPollerConfig {
-            network: Network::Base,
+            network,
             provider,
             bot_wallet,
             backfill_start_block,
@@ -751,6 +774,29 @@ mod tests {
                     underlying: msft.clone(),
                     token: TokenSymbol::new("tMSFT"),
                     network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Adds an enabled Ethereum-network asset (TSLA/tTSLA) bound to `vault`,
+    /// alongside the Base AAPL asset `setup_test_db_with_asset` seeds.
+    async fn add_ethereum_asset(pool: &SqlitePool, vault: Address) {
+        let (asset_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let tsla = UnderlyingSymbol::new("TSLA").unwrap();
+        asset_store
+            .send(
+                &AssetKey::new(tsla.clone(), Network::Ethereum),
+                TokenizedAssetCommand::Add {
+                    underlying: tsla.clone(),
+                    token: TokenSymbol::new("tTSLA"),
+                    network: Network::Ethereum,
                     vault,
                 },
             )
@@ -835,6 +881,145 @@ mod tests {
             tracing::Level::DEBUG,
             &["Polling vault for transfer events"]
         ));
+    }
+
+    /// Each per-network poller must scan only its OWN network's vaults: with
+    /// one Base and one Ethereum asset listed, a Base pass polls exactly the
+    /// Base vault and writes no checkpoint for the Ethereum vault. (The
+    /// asserter deliberately queues a getLogs response for BOTH vaults — the
+    /// regression this pins would consume the second one and checkpoint the
+    /// Ethereum vault under the base network.)
+    #[traced_test]
+    #[tokio::test]
+    async fn poll_once_skips_other_networks_vaults() {
+        // Vault addresses unique to this test: the log buffer is global
+        // across concurrently running tests, so an address another test
+        // polls (on any network) could satisfy or poison the line
+        // assertions below.
+        let base_vault = address!("0x5555555555555555555555555555555555555555");
+        let eth_vault = address!("0x6666666666666666666666666666666666666666");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let pool = setup_test_db_with_asset(base_vault, None).await;
+        add_ethereum_asset(&pool, eth_vault).await;
+
+        let asserter = Asserter::new();
+        // eth_blockNumber
+        asserter.push_success(&U256::from(200u64));
+        // One eth_getLogs per vault the pass COULD scan.
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Vec::<Log>::new());
+
+        let setup = build_poller(bot_wallet, &asserter, 0, pool);
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, base_vault)
+                .await
+                .unwrap(),
+            Some(200),
+            "the Base poller must checkpoint its own network's vault"
+        );
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, eth_vault)
+                .await
+                .unwrap(),
+            None,
+            "the Base poller must not poll or checkpoint the Ethereum vault"
+        );
+
+        // The `base` network snippet pins the line assertions to a Base
+        // pass, so the claim stays "never polled on Base" rather than
+        // "never polled anywhere".
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Polling vault for transfer events",
+                &base_vault.to_string(),
+                "base",
+            ]
+        ));
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::DEBUG,
+                &[
+                    "Polling vault for transfer events",
+                    &eth_vault.to_string(),
+                    "base",
+                ]
+            ),
+            "the Ethereum vault must never appear in a Base polling pass"
+        );
+    }
+
+    /// The mirror of `poll_once_skips_other_networks_vaults`: an Ethereum
+    /// pass polls exactly the Ethereum vault — so the network scoping is a
+    /// real filter on `self.network`, not something that happens to hold for
+    /// Base.
+    #[traced_test]
+    #[tokio::test]
+    async fn poll_once_scopes_the_ethereum_poller_to_its_own_vault() {
+        // Vault addresses deliberately disjoint from the mirror test's: the
+        // log buffer is global across concurrently running tests, so shared
+        // addresses would let one test's polling lines satisfy (or poison)
+        // the other's log assertions.
+        let base_vault = address!("0x3333333333333333333333333333333333333333");
+        let eth_vault = address!("0x4444444444444444444444444444444444444444");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let pool = setup_test_db_with_asset(base_vault, None).await;
+        add_ethereum_asset(&pool, eth_vault).await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(300u64));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Vec::<Log>::new());
+
+        let setup = build_poller_on_network(
+            Network::Ethereum,
+            bot_wallet,
+            &asserter,
+            0,
+            pool,
+        );
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Ethereum, eth_vault)
+                .await
+                .unwrap(),
+            Some(300),
+            "the Ethereum poller must checkpoint its own network's vault"
+        );
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Ethereum, base_vault)
+                .await
+                .unwrap(),
+            None,
+            "the Ethereum poller must not poll or checkpoint the Base vault"
+        );
+
+        // Scoped by the `ethereum` network snippet for the same reason the
+        // mirror test scopes by `base`.
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Polling vault for transfer events",
+                &eth_vault.to_string(),
+                "ethereum",
+            ]
+        ));
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::DEBUG,
+                &[
+                    "Polling vault for transfer events",
+                    &base_vault.to_string(),
+                    "ethereum",
+                ]
+            ),
+            "the Base vault must never appear in an Ethereum polling pass"
+        );
     }
 
     #[traced_test]
