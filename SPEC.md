@@ -4549,7 +4549,9 @@ update and restart.
 
 Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
-`receipt_backfill:<network>:<vault_address_lowercase>`. The pre-multichain
+`receipt_backfill:<network>:<vault_address_lowercase>`. Each network's transfer
+poller scans only its own network's enabled vaults — a pass never polls (or
+checkpoints) another chain's vault addresses against its RPC. The pre-multichain
 `transfer_poll` row is migrated once by
 `TransferPoller::seed_per_vault_checkpoints` (then deleted); receipt backfill
 still reads `receipt_backfill:<vault_lowercase>` as a Base-only load-time
