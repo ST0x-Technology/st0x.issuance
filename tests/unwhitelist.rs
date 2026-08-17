@@ -34,7 +34,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let redeem_mock =
+    let (redeem_mock, _poll_mock) =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let rpc_url = Url::parse(&evm.endpoint)?;

@@ -408,7 +408,7 @@ impl OaSchemaCache {
             .log_decode::<OffchainAssetReceiptVault::ReceiptVaultInformation>(
             )?;
 
-        parse_schema_hash_from_bytes(&decoded.inner.data.vaultInformation)
+        Ok(parse_schema_hash_from_bytes(&decoded.inner.data.vaultInformation))
     }
 }
 
@@ -439,7 +439,7 @@ fn parse_schema_hash_from_information(
 ) -> Result<Option<String>, OaSchemaFetchError> {
     let hex_str = info_hex.strip_prefix("0x").unwrap_or(info_hex);
     let raw_bytes = hex::decode(hex_str)?;
-    parse_schema_hash_from_bytes(&raw_bytes)
+    Ok(parse_schema_hash_from_bytes(&raw_bytes))
 }
 
 /// Parses the schema IPFS CID from a decoded `vaultInformation` byte payload.
@@ -447,11 +447,9 @@ fn parse_schema_hash_from_information(
 /// The payload is a Rain meta v1 CBOR sequence. We iterate the items looking
 /// for one whose magic (key 1) equals `OA_HASH_LIST`, then extract key 0 as
 /// the schema hash string.
-fn parse_schema_hash_from_bytes(
-    raw_bytes: &[u8],
-) -> Result<Option<String>, OaSchemaFetchError> {
+fn parse_schema_hash_from_bytes(raw_bytes: &[u8]) -> Option<String> {
     if raw_bytes.len() <= 8 || raw_bytes[..8] != RAIN_META_DOCUMENT_V1 {
-        return Ok(None);
+        return None;
     }
 
     let cbor_data = &raw_bytes[8..];
@@ -483,12 +481,12 @@ fn parse_schema_hash_from_bytes(
                 && !hash.is_empty()
                 && !hash.contains(',')
             {
-                return Ok(Some(hash));
+                return Some(hash);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(test)]

@@ -6778,7 +6778,6 @@ mod tests {
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             chains: Vec::new(),
             vault_mode_config: crate::config::VaultModeConfig::default(),
         }

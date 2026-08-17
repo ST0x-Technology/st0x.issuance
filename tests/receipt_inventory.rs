@@ -106,7 +106,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
 
     // Step 1: Mint a receipt BEFORE the service starts (simulates historic receipt)
     let historic_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-    let historic_receipt_id =
+    let (historic_receipt_id, _historic_shares) =
         evm.mint_directly(historic_amount, bot_wallet).await?;
 
     // Setup mocks
@@ -139,7 +139,8 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
 
     // Step 3: Mint another receipt while service is running (monitor should detect)
     let live_amount = U256::from(50) * U256::from(10).pow(U256::from(18));
-    let live_receipt_id = evm.mint_directly(live_amount, bot_wallet).await?;
+    let (live_receipt_id, _live_shares) =
+        evm.mint_directly(live_amount, bot_wallet).await?;
 
     // Give monitor time to detect the new receipt
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -242,7 +243,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     // Mint directly on TSLA vault BEFORE service starts
     // This simulates a receipt that exists on-chain but the service doesn't know about
     let mint_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-    let receipt_id =
+    let (receipt_id, _shares) =
         evm.mint_directly_on_vault(tsla_vault, mint_amount, bot_wallet).await?;
 
     // Create a temp file database so we can preseed assets before rocket starts

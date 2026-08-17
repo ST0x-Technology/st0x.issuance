@@ -40,7 +40,7 @@ async fn test_multichain_receipt_backfill_uses_chain_provider()
     let mock_alpaca = MockServer::start();
     let _mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let redeem_mock =
+    let (redeem_mock, _poll_mock) =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let user_private_key = b256!(

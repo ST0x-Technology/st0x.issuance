@@ -39,10 +39,11 @@ async fn test_multichain_redemption_routes_by_network()
     let redemption_states: Arc<
         Mutex<Vec<harness::alpaca_mocks::RedemptionState>>,
     > = Arc::new(Mutex::new(Vec::new()));
-    let redeem_mock = harness::alpaca_mocks::setup_redemption_mocks_with_states(
-        &mock_alpaca,
-        Arc::clone(&redemption_states),
-    );
+    let (redeem_mock, _poll_mock) =
+        harness::alpaca_mocks::setup_redemption_mocks_with_states(
+            &mock_alpaca,
+            Arc::clone(&redemption_states),
+        );
 
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("multichain_redemption.db");
