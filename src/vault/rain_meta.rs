@@ -23,7 +23,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
@@ -368,8 +368,10 @@ impl OaSchemaCache {
         // drops on every exit path, including timeout and error, so a failed
         // attempt never blocks the retry.
         let vault_lock = {
+            // Recover the guard on poisoning: the map only holds per vault
+            // lock handles, so there is no invariant a panic could corrupt.
             let mut locks =
-                self.locks.lock().expect("schema lock map poisoned");
+                self.locks.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(locks.entry(vault).or_default())
         };
         let _scan_guard = vault_lock.lock().await;
