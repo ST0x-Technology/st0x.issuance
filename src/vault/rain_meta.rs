@@ -299,13 +299,20 @@ pub(crate) const OA_SCHEMA_HASH: &str =
 
 /// Block window per `eth_getLogs` request when scanning for the schema event.
 /// The scan walks backwards from the chain tip one window at a time rather
-/// than issuing a single genesis-to-tip query: a bounded range is accepted by
-/// every provider (many cap `eth_getLogs` spans), and the newest emission is
-/// found in the first non-empty window. Sized for an indexed endpoint
-/// (Alchemy-class, which prod uses) where an address-filtered range is a cheap
-/// index lookup regardless of width; a capped public RPC still works, just in
-/// more round trips.
+/// than issuing a single query spanning genesis to tip: a bounded range is
+/// accepted by every provider (many cap `eth_getLogs` spans), and the newest
+/// emission is found in the first window that has one. Sized for an indexed
+/// endpoint like Alchemy, which prod uses, where a range filtered by address
+/// is a cheap index lookup at any width; a capped public RPC still works, just
+/// in more round trips.
 const SCHEMA_LOG_SCAN_WINDOW: u64 = 1_000_000;
+
+/// Ceiling on how long one vault's schema resolution may run. The walk runs on
+/// mint and burn preparation request paths, so a degraded provider must fall
+/// back to omitting OA_SCHEMA rather than stall the request for the whole scan.
+/// A timeout counts as a transient failure: not cached, retried next call.
+const SCHEMA_FETCH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(20);
 
 impl OaSchemaCache {
     pub(crate) fn new(provider: DynProvider) -> Self {
@@ -332,8 +339,11 @@ impl OaSchemaCache {
     /// vault, then caches the result. Returns `None` (and logs a warning) if
     /// the log query fails or the vault has no registered schema.
     ///
-    /// Only successful responses are cached. Transient failures (RPC errors)
-    /// are NOT cached so subsequent calls will retry.
+    /// Both a resolved hash and a definitive absent schema (the scan reached
+    /// genesis) are cached, so the history walk runs at most once per vault per
+    /// process. Transient failures, meaning RPC errors and a
+    /// [`SCHEMA_FETCH_DEADLINE`] timeout, are NOT cached, so subsequent calls
+    /// retry.
     pub(crate) async fn get(&self, vault: Address) -> Option<String> {
         match &self.mode {
             OaSchemaCacheMode::Fixed(schema) => return Some(schema.clone()),
@@ -348,7 +358,24 @@ impl OaSchemaCache {
             }
         }
 
-        let result = self.fetch_schema_hash(vault).await;
+        let result = match tokio::time::timeout(
+            SCHEMA_FETCH_DEADLINE,
+            self.fetch_schema_hash(vault),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(
+                    target: "vault",
+                    %vault,
+                    deadline_secs = SCHEMA_FETCH_DEADLINE.as_secs(),
+                    "OA schema read from the chain exceeded its deadline; \
+                     receipt metadata will omit OA_SCHEMA"
+                );
+                return None;
+            }
+        };
 
         match result {
             Ok(Some(schema_hash)) => {
@@ -360,10 +387,14 @@ impl OaSchemaCache {
             }
 
             Ok(None) => {
-                // Not cached: the scan reached genesis without finding a
-                // `ReceiptVaultInformation`, so the vault has no registered
-                // schema yet. Warn — a mint here omits OA_SCHEMA — and retry
-                // on the next call in case the event lands later.
+                // Definitive absent schema: the scan reached genesis with no
+                // `ReceiptVaultInformation`, so this vault has none on chain.
+                // Cache it. The answer cannot change until the vault emits the
+                // event, which happens at deployment before any mint, so a
+                // process restart resolves it again. Without caching, every
+                // mint against a vault that has no schema would rescan the
+                // whole history. A mint here omits OA_SCHEMA.
+                self.cache.write().await.insert(vault, None);
                 warn!(
                     target: "vault",
                     %vault,
@@ -374,7 +405,7 @@ impl OaSchemaCache {
             }
 
             Err(error) => {
-                // Don't cache transient failures — allow retry on next call
+                // Don't cache transient failures, allow retry on next call
                 warn!(
                     target: "vault",
                     %vault,
@@ -391,12 +422,12 @@ impl OaSchemaCache {
     /// the schema IPFS CID from its `vaultInformation` payload.
     ///
     /// Walks the log history backwards from the chain tip in
-    /// [`SCHEMA_LOG_SCAN_WINDOW`]-block windows, returning the newest emission
+    /// [`SCHEMA_LOG_SCAN_WINDOW`] block windows, returning the newest emission
     /// (the authoritative schema, which is stable per vault). Every request is
     /// a bounded range so a provider that caps `eth_getLogs` spans still
-    /// answers; the walk stops at the first non-empty window. Genesis is the
-    /// floor — a `CloneFactory` vault cannot predate it — so the scan never
-    /// misses an event no matter how the receipt-backfill start block is set.
+    /// answers; the walk stops at the first window that has one. Genesis is the
+    /// floor (a `CloneFactory` vault cannot predate it) so the scan never
+    /// misses an event no matter how the receipt backfill start block is set.
     ///
     /// The payload is a Rain meta v1 document containing a CBOR sequence. We
     /// look for an item with `OA_HASH_LIST` magic and extract key 0 (the IPFS
@@ -897,6 +928,53 @@ mod tests {
 
         let decoded = decode_receipt_meta(&encoded).unwrap();
         assert_eq!(decoded, json);
+    }
+
+    /// A definitive "no schema on chain" (the scan reaches genesis without a
+    /// `ReceiptVaultInformation`) is cached, so the history walk runs at most
+    /// once per vault. The mock is primed with a miss walk followed by a
+    /// resolving walk; the second `get` must return `None` from the cache
+    /// rather than consume the resolving responses.
+    #[tokio::test]
+    async fn definitive_missing_schema_is_cached_and_not_rewalked() {
+        let vault: Address =
+            "0x9b117137aa839b53fd1aaf2f92fc4d78087326a7".parse().unwrap();
+
+        let info_hex = "ff0a89c674ee7874a40058d3789c858eb14ec33010865fc53a3aa6a462a9e407600321d10d315ce34b73ad639bf37788a2be7beda620c482179f3ffffefccfe038278fd32b8e04167694d5bc77038d689ea0817c1bc1ceb0fa1e61504db66d8f3986f5021fa31c5a27d8eb7ab36d17f6505e2babbf59e389c20b293a54ac7c4a15c7fd913a2d67748e956340ff263191285306dba3cfd480d0d799851cd80f08b56569358dfbe8e1b381f42b3f2fd765bffbb30a8743c93bca9d70aa5f14fc7cf6ded4a889bdd1818cd67a70f9f1fe6bd8717722314bfc8fa5ac2bb25f75f0011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465a200783b6261666b7265696365636e783267766e746d3666626372766e63333336717a6536737435753771713734353769676567616d6433627a6b78377269011bff9fae3cc645f463";
+        let event = OffchainAssetReceiptVault::ReceiptVaultInformation {
+            sender: vault,
+            vaultInformation: Bytes::from(hex::decode(info_hex).unwrap()),
+        };
+        let resolving_log = Log {
+            inner: alloy::primitives::Log {
+                address: vault,
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let asserter = Asserter::new();
+        // Walk 1: tip 100, one empty [0, 100] window -> definitive miss.
+        asserter.push_success(&alloy::primitives::U64::from(100u64));
+        asserter.push_success(&Vec::<Log>::new());
+        // A resolving walk the cache must never consume on the second call.
+        asserter.push_success(&alloy::primitives::U64::from(100u64));
+        asserter.push_success(&vec![resolving_log]);
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(asserter).erased();
+
+        let cache = OaSchemaCache::new(provider);
+
+        assert_eq!(cache.get(vault).await, None);
+        // Cached absent result: returns None without walking again into the
+        // resolving responses (which would otherwise yield a hash).
+        assert_eq!(cache.get(vault).await, None);
     }
 
     #[test]
