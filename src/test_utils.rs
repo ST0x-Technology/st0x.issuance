@@ -160,6 +160,13 @@ pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 /// ```ignore
 /// let config = Config { vault_mode_config, ..test_config() };
 /// ```
+///
+/// # Panics
+///
+/// Panics if the hardcoded test URLs or auth config fail to parse, which
+/// would mean this function itself is malformed rather than anything about
+/// the calling test.
+#[must_use]
 pub fn test_config() -> Config {
     Config {
         database_url: "sqlite::memory:".to_string(),
