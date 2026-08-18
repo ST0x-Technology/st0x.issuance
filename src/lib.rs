@@ -535,26 +535,32 @@ struct RocketState {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
-fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
-    // BEHIND_PROXY=true is the nginx-TLS deployment shape (nix/ingress.nix):
-    // Rocket binds loopback so only the proxy can reach it, and the client IP
-    // the whitelists check comes from X-Real-IP, which nginx overwrites from
-    // the TCP source on every proxied request, so clients cannot spoof it.
-    // Without the proxy, header-based IP detection stays disabled and the TCP
-    // source address is the client IP; Rocket has no PROXY-protocol support,
-    // so a proxy that only preserves IPs at the network layer is not an
-    // option here.
-    let figment = if state.config.behind_proxy {
-        rocket::Config::figment()
+/// Server address and client-IP source, which move together.
+///
+/// Behind the proxy (`nix/ingress.nix`, `st0x.ingress.behindProxy`) Rocket
+/// binds loopback so nginx is the only way in, and the client IP the auth
+/// whitelists check comes from `X-Real-IP`, which nginx overwrites from the
+/// TCP source on every proxied request. Binding a public address while
+/// trusting that header would let any direct caller forge its own source, so
+/// the two settings are chosen here as one pair rather than configured apart.
+///
+/// Without the proxy, header-based detection stays off and the TCP source is
+/// the client IP. Rocket has no PROXY-protocol support, so a proxy that
+/// preserves the source only at the network layer is not an option.
+fn server_figment(behind_proxy: bool) -> rocket::figment::Figment {
+    let figment = rocket::Config::figment().merge(("port", 8000));
+
+    if behind_proxy {
+        figment
             .merge(("address", "127.0.0.1"))
-            .merge(("port", 8000))
             .merge(("ip_header", "X-Real-IP"))
     } else {
-        rocket::Config::figment()
-            .merge(("address", "0.0.0.0"))
-            .merge(("port", 8000))
-            .merge(("ip_header", false))
-    };
+        figment.merge(("address", "0.0.0.0")).merge(("ip_header", false))
+    }
+}
+
+fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
+    let figment = server_figment(state.config.behind_proxy);
 
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;
@@ -1883,10 +1889,54 @@ mod tests {
         ReconciliationFailures, VaultAddress, VaultBackfillConfig,
         cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
         run_burn_recovery_reconciler, run_startup_reconciliation_for_vaults,
+        server_figment,
     };
     use crate::chain::{ChainRegistry, ChainRegistryError};
     use crate::receipt_inventory::ReceiptInventory;
     use crate::test_utils::{log_count_at, logs_contain_at};
+
+    /// Without the proxy the TCP source must stay the client IP: a bound
+    /// public address plus a trusted `X-Real-IP` would let any direct caller
+    /// present itself as loopback and pass the internal whitelist.
+    #[test]
+    fn direct_server_reads_the_client_ip_from_the_connection() {
+        let figment = server_figment(false);
+
+        assert_eq!(
+            figment.extract_inner::<String>("address").unwrap(),
+            "0.0.0.0"
+        );
+        assert!(!figment.extract_inner::<bool>("ip_header").unwrap());
+    }
+
+    /// Behind the proxy the header nginx overwrites is the client IP, and the
+    /// listener must be loopback so nothing can reach Rocket without passing
+    /// through nginx and having that header rewritten.
+    #[test]
+    fn proxied_server_binds_loopback_and_reads_the_forwarded_ip() {
+        let figment = server_figment(true);
+
+        assert_eq!(
+            figment.extract_inner::<String>("address").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            figment.extract_inner::<String>("ip_header").unwrap(),
+            "X-Real-IP"
+        );
+    }
+
+    #[test]
+    fn both_server_shapes_listen_on_the_same_port() {
+        assert_eq!(
+            server_figment(false).extract_inner::<u16>("port").unwrap(),
+            8000
+        );
+        assert_eq!(
+            server_figment(true).extract_inner::<u16>("port").unwrap(),
+            8000
+        );
+    }
 
     #[tokio::test]
     async fn burn_recovery_reconciler_repeats_after_each_interval() {

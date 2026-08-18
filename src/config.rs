@@ -282,6 +282,24 @@ impl Config {
     }
 }
 
+/// Parses a boolean deployment flag, accepting the spellings an operator or a
+/// templating step is likely to produce.
+///
+/// clap's stock boolean parser takes only `true`/`false`, so `1` or an empty
+/// value from an unset template variable aborts startup. These flags are read
+/// on a unit with `Restart=always`, which turns that into a crash loop during
+/// the very cutover the flag exists for, so a wider vocabulary is worth more
+/// than strictness. An empty value means "not set", i.e. the default.
+fn parse_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "expected a boolean (true/false, 1/0, yes/no, on/off), got '{other}'"
+        )),
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
@@ -337,11 +355,13 @@ struct Env {
         env = "BEHIND_PROXY",
         default_value_t = false,
         action = clap::ArgAction::Set,
+        value_parser = parse_flag,
         help = "Run behind the host-local nginx TLS proxy: bind Rocket to \
                 loopback and take the client IP from the X-Real-IP header \
-                the proxy sets. Never enable while Rocket is reachable on a \
-                non-loopback address, or clients could spoof X-Real-IP past \
-                the IP whitelists"
+                the proxy sets. Set from the st0x.ingress.behindProxy Nix \
+                option, which opens the matching nginx routes; never enable \
+                it while Rocket is reachable on a non-loopback address, or \
+                clients could spoof X-Real-IP past the IP whitelists"
     )]
     behind_proxy: bool,
 
@@ -1126,6 +1146,26 @@ mod tests {
 
     use super::*;
     use crate::auth::IpWhitelist;
+
+    #[test]
+    fn parse_flag_accepts_the_common_boolean_spellings() {
+        for raw in ["true", "TRUE", " true ", "1", "yes", "on"] {
+            assert_eq!(parse_flag(raw), Ok(true), "expected {raw} to be true");
+        }
+
+        for raw in ["false", "0", "no", "off", ""] {
+            assert_eq!(
+                parse_flag(raw),
+                Ok(false),
+                "expected {raw} to be false"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_flag_rejects_a_value_that_is_not_a_boolean() {
+        assert!(parse_flag("maybe").is_err());
+    }
 
     fn minimal_args() -> Vec<&'static str> {
         vec![

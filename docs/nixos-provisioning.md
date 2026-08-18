@@ -140,6 +140,23 @@ nix run .#stagingDeployAll -- -i "$SSH_IDENTITY"
 nix run .#prodDeployAll -- -i "$SSH_IDENTITY"
 ```
 
+**Two prerequisites, both outside the deploy scripts.** nginx requests a
+Let's Encrypt certificate during system activation, so a first deploy fails
+and rolls back unless each is in place. Neither is checked for you:
+
+1. **DNS.** An A record for the environment's FQDN, pointing at its reserved
+   IP, at the s01issuer.com registrar (GoDaddy). The names are in
+   `nix/ingress.nix`: `issuance.s01issuer.com` for prod,
+   `issuance-staging.s01issuer.com` for staging.
+2. **Firewall.** `tfApply` for that environment, opening TCP 80 and 443 on the
+   DigitalOcean firewall. `nix run .#tfPlan`/`.#tfApply` above; the deploy
+   scripts never run Terraform, and CI's deploy workflow does not either.
+
+The http-01 challenge is what needs port 80. If it cannot be reached, the
+`acme-<fqdn>.service` unit fails, `switch-to-configuration` exits non-zero, and
+deploy-rs rolls the generation back. Re-run the deploy once the record and the
+firewall rule exist.
+
 ---
 
 ## Database (one-time, per environment)

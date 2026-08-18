@@ -151,25 +151,35 @@ pub fn receipt_inventory_aggregate_id(chain_id: u64, vault: Address) -> String {
 /// Chain ID for the Ethereum test runtime in multichain integration tests.
 pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 
-fn test_config() -> Result<Config, anyhow::Error> {
-    Ok(Config {
+/// The default [`Config`] for tests.
+///
+/// The single definition every test builds on, so a new field is added in one
+/// place and cannot acquire a different default per module. Override what a
+/// test cares about with struct-update syntax:
+///
+/// ```ignore
+/// let config = Config { vault_mode_config, ..test_config() };
+/// ```
+pub fn test_config() -> Config {
+    Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
-        rpc_url: Url::parse("wss://localhost:8545")?,
+        rpc_url: Url::parse("wss://localhost:8545").expect("valid test URL"),
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-        auth: test_auth_config()?,
+        auth: test_auth_config().expect("valid test auth config"),
         behind_proxy: false,
         log_level: LogLevel::Debug,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
-        subgraph_url: Url::parse("http://localhost:0/subgraph")?,
+        subgraph_url: Url::parse("http://localhost:0/subgraph")
+            .expect("valid test URL"),
         chains: Vec::new(),
         vault_mode_config: crate::config::VaultModeConfig::default(),
-    })
+    }
 }
 
 /// Sets up a test Rocket instance with in-memory database and mock services.
@@ -241,7 +251,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Build rocket
     Ok(rocket::build()
-        .manage(test_config()?)
+        .manage(test_config())
         .manage(account_store)
         .manage(tokenized_asset_store)
         .manage(mint_store)

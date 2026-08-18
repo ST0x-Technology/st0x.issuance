@@ -3011,12 +3011,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
-    use url::Url;
 
-    use crate::alpaca::service::AlpacaConfig;
-    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel};
-    use crate::wallet::SignerConfig;
+    use crate::auth::FailedAuthRateLimiter;
+    use crate::config::Config;
 
     use super::{
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
@@ -4197,24 +4194,7 @@ mod tests {
         Arc<Store<Redemption>>,
         sqlx::Pool<sqlx::Sqlite>,
     ) {
-        let config = Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            auth: test_auth_config().unwrap(),
-            behind_proxy: false,
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
-            chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
-        };
+        let config = test_config();
 
         let pool = setup_pool().await;
         let store = setup_store(&pool);
@@ -4499,24 +4479,7 @@ mod tests {
         vault_service: Arc<dyn VaultService>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
-        let config = Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            auth: test_auth_config().unwrap(),
-            behind_proxy: false,
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
-            chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
-        };
+        let config = test_config();
 
         rocket::build()
             .manage(config)
@@ -5678,24 +5641,7 @@ mod tests {
         pool: sqlx::Pool<sqlx::Sqlite>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
-        let config = Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            auth: test_auth_config().unwrap(),
-            behind_proxy: false,
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            chains: Vec::new(),
-            vault_mode_config: VaultModeConfig::default(),
-        };
+        let config = test_config();
 
         rocket::build()
             .manage(config)
@@ -6770,29 +6716,8 @@ mod tests {
         assert_eq!(summary.tx_id, Some(TxId::Hash(sendable_tx.hash)));
     }
 
-    fn admin_test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            auth: test_auth_config().unwrap(),
-            behind_proxy: false,
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
-            chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
-        }
-    }
-
     fn health_config(vault_mode_config: VaultModeConfig) -> Config {
-        Config { vault_mode_config, ..admin_test_config() }
+        Config { vault_mode_config, ..test_config() }
     }
 
     async fn seed_enabled_asset(
@@ -7301,7 +7226,7 @@ mod tests {
                 pool.clone(), ()
             ))));
         rocket::build()
-            .manage(admin_test_config())
+            .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool.clone())
             .manage(mint_store)

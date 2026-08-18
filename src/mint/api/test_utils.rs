@@ -1,24 +1,19 @@
-use alloy::primitives::{Address, B256, address};
+use alloy::primitives::{Address, address};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use event_sorcery::{Store, StoreBuilder};
 use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
-use crate::alpaca::service::AlpacaConfig;
-use crate::auth::test_auth_config;
-use crate::config::{Config, Environment, LogLevel};
 use crate::mint::{Mint, Network, TokenSymbol, UnderlyingSymbol};
 use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
 use crate::vault::{NetworkVaultServices, VaultService};
-use crate::wallet::SignerConfig;
 
 /// Wraps a single-network mock vault the way production Rocket state does.
 pub(crate) fn network_vault_services(
@@ -31,27 +26,7 @@ pub(crate) fn network_vault_services(
     )
 }
 
-pub(crate) fn test_config() -> Config {
-    Config {
-        database_url: "sqlite::memory:".to_string(),
-        database_max_connections: 5,
-        rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
-        chain_id: ANVIL_CHAIN_ID,
-        signer: SignerConfig::Local(B256::ZERO),
-        backfill_start_block: 0,
-        receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-        auth: test_auth_config().unwrap(),
-        behind_proxy: false,
-        log_level: LogLevel::Debug,
-        environment: Environment::Development,
-        hyperdx: None,
-        alpaca: AlpacaConfig::test_default(),
-        subgraph_url: Url::parse("http://localhost:0/subgraph")
-            .expect("valid test URL"),
-        chains: Vec::new(),
-        vault_mode_config: crate::config::VaultModeConfig::default(),
-    }
-}
+pub(crate) use crate::test_utils::test_config;
 
 pub(crate) struct TestHarness {
     pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
