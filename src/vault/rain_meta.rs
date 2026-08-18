@@ -280,8 +280,9 @@ pub(crate) struct OaSchemaCache {
 
 enum OaSchemaCacheMode {
     /// Reads the schema hash from the vault's on chain `ReceiptVaultInformation`
-    /// event on cache miss. `from_block` bounds the log scan.
-    OnChain { provider: DynProvider, from_block: u64 },
+    /// event on cache miss, walking the log history backwards from the chain
+    /// tip (see [`OaSchemaCache::fetch_schema_hash`]).
+    OnChain { provider: DynProvider },
 
     /// Returns a fixed schema hash for any vault. Used when the on chain read
     /// is unavailable (admin burn-excess recovery) and in tests to exercise the
@@ -296,10 +297,20 @@ enum OaSchemaCacheMode {
 pub(crate) const OA_SCHEMA_HASH: &str =
     "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
 
+/// Block window per `eth_getLogs` request when scanning for the schema event.
+/// The scan walks backwards from the chain tip one window at a time rather
+/// than issuing a single genesis-to-tip query: a bounded range is accepted by
+/// every provider (many cap `eth_getLogs` spans), and the newest emission is
+/// found in the first non-empty window. Sized for an indexed endpoint
+/// (Alchemy-class, which prod uses) where an address-filtered range is a cheap
+/// index lookup regardless of width; a capped public RPC still works, just in
+/// more round trips.
+const SCHEMA_LOG_SCAN_WINDOW: u64 = 1_000_000;
+
 impl OaSchemaCache {
-    pub(crate) fn new(provider: DynProvider, from_block: u64) -> Self {
+    pub(crate) fn new(provider: DynProvider) -> Self {
         Self {
-            mode: OaSchemaCacheMode::OnChain { provider, from_block },
+            mode: OaSchemaCacheMode::OnChain { provider },
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -349,8 +360,16 @@ impl OaSchemaCache {
             }
 
             Ok(None) => {
-                // Don't cache negative results — the vault may not have emitted
-                // its schema event yet. Retry on next call.
+                // Not cached: the scan reached genesis without finding a
+                // `ReceiptVaultInformation`, so the vault has no registered
+                // schema yet. Warn — a mint here omits OA_SCHEMA — and retry
+                // on the next call in case the event lands later.
+                warn!(
+                    target: "vault",
+                    %vault,
+                    "no ReceiptVaultInformation event found on chain for vault; \
+                     receipt metadata will omit OA_SCHEMA"
+                );
                 None
             }
 
@@ -371,6 +390,14 @@ impl OaSchemaCache {
     /// Reads the vault's latest `ReceiptVaultInformation` event and extracts
     /// the schema IPFS CID from its `vaultInformation` payload.
     ///
+    /// Walks the log history backwards from the chain tip in
+    /// [`SCHEMA_LOG_SCAN_WINDOW`]-block windows, returning the newest emission
+    /// (the authoritative schema, which is stable per vault). Every request is
+    /// a bounded range so a provider that caps `eth_getLogs` spans still
+    /// answers; the walk stops at the first non-empty window. Genesis is the
+    /// floor — a `CloneFactory` vault cannot predate it — so the scan never
+    /// misses an event no matter how the receipt-backfill start block is set.
+    ///
     /// The payload is a Rain meta v1 document containing a CBOR sequence. We
     /// look for an item with `OA_HASH_LIST` magic and extract key 0 (the IPFS
     /// CID string).
@@ -378,10 +405,8 @@ impl OaSchemaCache {
         &self,
         vault: Address,
     ) -> Result<Option<String>, OaSchemaFetchError> {
-        let (provider, from_block) = match &self.mode {
-            OaSchemaCacheMode::OnChain { provider, from_block } => {
-                (provider, *from_block)
-            }
+        let provider = match &self.mode {
+            OaSchemaCacheMode::OnChain { provider } => provider,
 
             OaSchemaCacheMode::Fixed(_) => {
                 // Fixed mode is handled in get() before reaching here
@@ -389,26 +414,35 @@ impl OaSchemaCache {
             }
         };
 
-        let filter = Filter::new()
-            .address(vault)
-            .event_signature(
-                OffchainAssetReceiptVault::ReceiptVaultInformation::SIGNATURE_HASH,
-            )
-            .from_block(from_block);
+        let mut hi = provider.get_block_number().await?;
+        loop {
+            let lo = hi.saturating_sub(SCHEMA_LOG_SCAN_WINDOW - 1);
 
-        let logs = provider.get_logs(&filter).await?;
+            let filter = Filter::new()
+                .address(vault)
+                .event_signature(
+                    OffchainAssetReceiptVault::ReceiptVaultInformation::SIGNATURE_HASH,
+                )
+                .from_block(lo)
+                .to_block(hi);
 
-        // The schema hash is stable per vault, so the newest emission (last in
-        // ascending log order) is authoritative.
-        let Some(log) = logs.last() else {
-            return Ok(None);
-        };
+            let logs = provider.get_logs(&filter).await?;
 
-        let decoded = log
-            .log_decode::<OffchainAssetReceiptVault::ReceiptVaultInformation>(
-            )?;
+            // Newest emission is authoritative; within a window it is the last
+            // in ascending log order.
+            if let Some(log) = logs.last() {
+                let decoded = log
+                    .log_decode::<OffchainAssetReceiptVault::ReceiptVaultInformation>()?;
+                return Ok(parse_schema_hash_from_bytes(
+                    &decoded.inner.data.vaultInformation,
+                ));
+            }
 
-        Ok(parse_schema_hash_from_bytes(&decoded.inner.data.vaultInformation))
+            if lo == 0 {
+                return Ok(None);
+            }
+            hi = lo - 1;
+        }
     }
 }
 
@@ -828,12 +862,15 @@ mod tests {
             removed: false,
         };
 
+        // The walk queries the chain tip first, then one bounded getLogs
+        // window; the log sits at block 100 so the [0, 100] window finds it.
         let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::U64::from(100u64));
         asserter.push_success(&vec![log]);
         let provider =
             ProviderBuilder::new().connect_mocked_client(asserter).erased();
 
-        let cache = OaSchemaCache::new(provider, 0);
+        let cache = OaSchemaCache::new(provider);
 
         let schema_hash = cache
             .get(vault)
