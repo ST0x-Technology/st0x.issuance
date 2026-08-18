@@ -312,43 +312,20 @@ pub(crate) async fn unwhitelist_wallet(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, address};
+    use alloy::primitives::address;
     use event_sorcery::StoreBuilder;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlx::sqlite::SqlitePoolOptions;
     use tracing::Level;
     use tracing_test::traced_test;
-    use url::Url;
 
     use super::*;
     use crate::account::Account;
-    use crate::alpaca::service::AlpacaConfig;
-    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel};
+    use crate::auth::FailedAuthRateLimiter;
     use crate::test_utils::logs_contain_at;
-    use crate::wallet::SignerConfig;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            auth: test_auth_config().unwrap(),
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph")
-                .expect("valid test URL"),
-            chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
-        }
-    }
+    use crate::test_utils::test_config;
 
     async fn register_account(
         store: &Arc<Store<Account>>,

@@ -63,13 +63,31 @@ resource "digitalocean_firewall" "st0x_issuance" {
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
-  # Public issuance API for Alpaca callbacks. Keep port 8000 to preserve the
-  # pre-NixOS Docker endpoint and avoid requiring an Alpaca configuration change.
-  # App-level auth still enforces X-API-KEY and ALPACA_IP_RANGES.
+  # Legacy plaintext issuance API (RAI-236). Kept while Alpaca and the old
+  # liquidity droplet still call http://<ip>:8000 directly; tighten
+  # api_source_addresses to those callers' ranges, then drop this rule once
+  # both are on the HTTPS endpoint. App-level auth still enforces X-API-KEY
+  # and the IP whitelists.
   inbound_rule {
     protocol         = "tcp"
     port_range       = "8000"
+    source_addresses = var.api_source_addresses
+  }
+
+  # ACME http-01 challenge + redirect-to-HTTPS (nginx, nix/ingress.nix).
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "80"
     source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # HTTPS issuance API (nginx, nix/ingress.nix): TLS in front of an explicit
+  # route allowlist. Tighten to Alpaca CIDRs + liquidity egress IPs once
+  # Alpaca provides theirs.
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "443"
+    source_addresses = var.https_source_addresses
   }
 
   # All outbound

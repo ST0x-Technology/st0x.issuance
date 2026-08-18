@@ -319,15 +319,10 @@ pub enum TestAuthConfigError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::B256;
     use rocket::http::Header;
     use rocket::local::asynchronous::Client;
-    use url::Url;
 
     use super::*;
-    use crate::alpaca::service::AlpacaConfig;
-    use crate::config::{Environment, LogLevel};
-    use crate::wallet::SignerConfig;
 
     #[rocket::get("/issuer-test")]
     fn issuer_endpoint(_auth: IssuerAuth) -> &'static str {
@@ -339,26 +334,7 @@ mod tests {
         "internal authenticated"
     }
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            database_max_connections: 5,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-            signer: SignerConfig::Local(B256::ZERO),
-            backfill_start_block: 0,
-            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-            auth: test_auth_config().unwrap(),
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig::test_default(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph")
-                .expect("valid test URL"),
-            chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
-        }
-    }
+    use crate::test_utils::test_config;
 
     #[tokio::test]
     async fn test_missing_api_key_header_returns_401() {
