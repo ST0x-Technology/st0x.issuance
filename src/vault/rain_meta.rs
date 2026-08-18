@@ -447,12 +447,16 @@ impl OaSchemaCache {
     /// the schema IPFS CID from its `vaultInformation` payload.
     ///
     /// Walks the log history backwards from the chain tip in
-    /// [`SCHEMA_LOG_SCAN_WINDOW`] block windows, returning the newest emission
-    /// (the authoritative schema, which is stable per vault). Every request is
-    /// a bounded range so a provider that caps `eth_getLogs` spans still
-    /// answers; the walk stops at the first window that has one. Genesis is the
-    /// floor (a `CloneFactory` vault cannot predate it) so the scan never
-    /// misses an event no matter how the receipt backfill start block is set.
+    /// [`SCHEMA_LOG_SCAN_WINDOW`] block windows, returning the newest
+    /// `ReceiptVaultInformation` emission in range. `receiptVaultInformation`
+    /// is permissionless, so emissions are caller supplied and may repeat: we
+    /// take the newest, and `get` caches it for the process lifetime, so an
+    /// emission after the first resolution is not reflected until restart.
+    /// Every request is a bounded range so a provider that caps `eth_getLogs`
+    /// spans still answers; the walk stops at the first window that has one.
+    /// Genesis is the floor (a `CloneFactory` vault cannot predate it) so the
+    /// scan never misses an event no matter how the receipt backfill start
+    /// block is set.
     ///
     /// The payload is a Rain meta v1 document containing a CBOR sequence. We
     /// look for an item with `OA_HASH_LIST` magic and extract key 0 (the IPFS
@@ -484,8 +488,9 @@ impl OaSchemaCache {
 
             let logs = provider.get_logs(&filter).await?;
 
-            // Newest emission is authoritative; within a window it is the last
-            // in ascending log order.
+            // Newest emission in this window, which is the last in ascending
+            // log order; walking from the tip, the first non-empty window
+            // holds the newest emission on chain.
             if let Some(log) = logs.last() {
                 let decoded = log
                     .log_decode::<OffchainAssetReceiptVault::ReceiptVaultInformation>()?;
@@ -514,7 +519,7 @@ enum OaSchemaFetchError {
     LogDecode(#[from] alloy::sol_types::Error),
 
     #[error("failed to decode ReceiptVaultInformation payload: {0}")]
-    CborDecode(#[from] ciborium::de::Error<std::io::Error>),
+    CborDeserialize(#[from] ciborium::de::Error<std::io::Error>),
 }
 
 /// Parses the schema IPFS CID from a hex-encoded `receiptVaultInformation`
