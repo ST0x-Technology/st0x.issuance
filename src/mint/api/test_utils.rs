@@ -41,6 +41,7 @@ pub(crate) fn test_config() -> Config {
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         auth: test_auth_config().unwrap(),
+        behind_proxy: false,
         log_level: LogLevel::Debug,
         environment: Environment::Development,
         hyperdx: None,
