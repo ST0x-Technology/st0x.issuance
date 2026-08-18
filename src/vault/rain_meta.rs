@@ -11,6 +11,7 @@
 /// The OffchainAsset magic numbers are used by the gildlab/SFT and h20.market
 /// tokenization frontends for encoding receipt information in
 /// `OffchainAssetReceiptVault` deposits and withdrawals.
+#[cfg(test)]
 use alloy::hex;
 use alloy::primitives::Address;
 use alloy::providers::{DynProvider, Provider};
@@ -487,24 +488,17 @@ enum OaSchemaFetchError {
 
     #[error("failed to decode ReceiptVaultInformation log: {0}")]
     LogDecode(#[from] alloy::sol_types::Error),
-
-    #[error("failed to decode information hex: {0}")]
-    Hex(#[from] hex::FromHexError),
-
-    #[error("CBOR deserialization error: {0}")]
-    CborDeserialize(#[from] ciborium::de::Error<std::io::Error>),
 }
 
 /// Parses the schema IPFS CID from a hex-encoded `receiptVaultInformation`
 /// document. Test only convenience over [`parse_schema_hash_from_bytes`] for
 /// the hex fixtures captured from real receipts.
 #[cfg(test)]
-fn parse_schema_hash_from_information(
-    info_hex: &str,
-) -> Result<Option<String>, OaSchemaFetchError> {
+fn parse_schema_hash_from_information(info_hex: &str) -> Option<String> {
     let hex_str = info_hex.strip_prefix("0x").unwrap_or(info_hex);
-    let raw_bytes = hex::decode(hex_str)?;
-    Ok(parse_schema_hash_from_bytes(&raw_bytes))
+    let raw_bytes =
+        hex::decode(hex_str).expect("test fixture must be valid hex");
+    parse_schema_hash_from_bytes(&raw_bytes)
 }
 
 /// Parses the schema IPFS CID from a decoded `vaultInformation` byte payload.
@@ -748,7 +742,7 @@ mod tests {
         // Contains two CBOR items: OA_SCHEMA definition + OA_HASH_LIST with CID.
         let info_hex = "0xff0a89c674ee7874a40058d3789c858eb14ec33010865fc53a3aa6a462a9e407600321d10d315ce34b73ad639bf37788a2be7beda620c482179f3ffffefccfe038278fd32b8e04167694d5bc77038d689ea0817c1bc1ceb0fa1e61504db66d8f3986f5021fa31c5a27d8eb7ab36d17f6505e2babbf59e389c20b293a54ac7c4a15c7fd913a2d67748e956340ff263191285306dba3cfd480d0d799851cd80f08b56569358dfbe8e1b381f42b3f2fd765bffbb30a8743c93bca9d70aa5f14fc7cf6ded4a889bdd1818cd67a70f9f1fe6bd8717722314bfc8fa5ac2bb25f75f0011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465a200783b6261666b7265696365636e783267766e746d3666626372766e63333336717a6536737435753771713734353769676567616d6433627a6b78377269011bff9fae3cc645f463";
 
-        let result = parse_schema_hash_from_information(info_hex).unwrap();
+        let result = parse_schema_hash_from_information(info_hex);
 
         assert_eq!(
             result.as_deref(),
@@ -759,13 +753,13 @@ mod tests {
 
     #[test]
     fn parse_schema_hash_returns_none_for_non_rain_meta() {
-        let result = parse_schema_hash_from_information("0xdeadbeef").unwrap();
+        let result = parse_schema_hash_from_information("0xdeadbeef");
         assert!(result.is_none());
     }
 
     #[test]
     fn parse_schema_hash_returns_none_for_empty_hex() {
-        let result = parse_schema_hash_from_information("0x").unwrap();
+        let result = parse_schema_hash_from_information("0x");
         assert!(result.is_none());
     }
 
