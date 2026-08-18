@@ -491,7 +491,7 @@ impl OaSchemaCache {
                     .log_decode::<OffchainAssetReceiptVault::ReceiptVaultInformation>()?;
                 return Ok(parse_schema_hash_from_bytes(
                     &decoded.inner.data.vaultInformation,
-                ));
+                )?);
             }
 
             if lo == 0 {
@@ -512,6 +512,9 @@ enum OaSchemaFetchError {
 
     #[error("failed to decode ReceiptVaultInformation log: {0}")]
     LogDecode(#[from] alloy::sol_types::Error),
+
+    #[error("failed to decode ReceiptVaultInformation payload: {0}")]
+    CborDecode(#[from] ciborium::de::Error<std::io::Error>),
 }
 
 /// Parses the schema IPFS CID from a hex-encoded `receiptVaultInformation`
@@ -522,7 +525,7 @@ fn parse_schema_hash_from_information(info_hex: &str) -> Option<String> {
     let hex_str = info_hex.strip_prefix("0x").unwrap_or(info_hex);
     let raw_bytes =
         hex::decode(hex_str).expect("test fixture must be valid hex");
-    parse_schema_hash_from_bytes(&raw_bytes)
+    parse_schema_hash_from_bytes(&raw_bytes).expect("test fixture must decode")
 }
 
 /// Parses the schema IPFS CID from a decoded `vaultInformation` byte payload.
@@ -530,9 +533,11 @@ fn parse_schema_hash_from_information(info_hex: &str) -> Option<String> {
 /// The payload is a Rain meta v1 CBOR sequence. We iterate the items looking
 /// for one whose magic (key 1) equals `OA_HASH_LIST`, then extract key 0 as
 /// the schema hash string.
-fn parse_schema_hash_from_bytes(raw_bytes: &[u8]) -> Option<String> {
+fn parse_schema_hash_from_bytes(
+    raw_bytes: &[u8],
+) -> Result<Option<String>, ciborium::de::Error<std::io::Error>> {
     if raw_bytes.len() <= 8 || raw_bytes[..8] != RAIN_META_DOCUMENT_V1 {
-        return None;
+        return Ok(None);
     }
 
     let cbor_data = &raw_bytes[8..];
@@ -543,10 +548,7 @@ fn parse_schema_hash_from_bytes(raw_bytes: &[u8]) -> Option<String> {
     while usize::try_from(cursor.position()).unwrap_or(usize::MAX)
         < cbor_data.len()
     {
-        let item: Value = match ciborium::from_reader(&mut cursor) {
-            Ok(value) => value,
-            Err(_) => break,
-        };
+        let item: Value = ciborium::from_reader(&mut cursor)?;
 
         let Value::Map(map) = &item else {
             continue;
@@ -564,12 +566,12 @@ fn parse_schema_hash_from_bytes(raw_bytes: &[u8]) -> Option<String> {
                 && !hash.is_empty()
                 && !hash.contains(',')
             {
-                return Some(hash);
+                return Ok(Some(hash));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -993,6 +995,75 @@ mod tests {
         // Cached absent result: returns None without walking again into the
         // resolving responses (which would otherwise yield a hash).
         assert_eq!(cache.get(vault).await, None);
+    }
+
+    /// A CBOR decode failure on the latest event is a read failure, not a
+    /// definitive absent schema: it is not cached, so a later call rescans and
+    /// resolves a subsequently emitted valid event.
+    #[tokio::test]
+    async fn cbor_decode_failure_is_not_cached_and_rescans() {
+        let vault: Address =
+            "0x9b117137aa839b53fd1aaf2f92fc4d78087326a7".parse().unwrap();
+
+        // Valid Rain meta prefix followed by malformed CBOR: an array header
+        // promising one item with no item, which ciborium rejects.
+        let mut corrupt = RAIN_META_DOCUMENT_V1.to_vec();
+        corrupt.push(0x81);
+        let corrupt_event =
+            OffchainAssetReceiptVault::ReceiptVaultInformation {
+                sender: vault,
+                vaultInformation: Bytes::from(corrupt),
+            };
+        let corrupt_log = Log {
+            inner: alloy::primitives::Log {
+                address: vault,
+                data: corrupt_event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let info_hex = "ff0a89c674ee7874a40058d3789c858eb14ec33010865fc53a3aa6a462a9e407600321d10d315ce34b73ad639bf37788a2be7beda620c482179f3ffffefccfe038278fd32b8e04167694d5bc77038d689ea0817c1bc1ceb0fa1e61504db66d8f3986f5021fa31c5a27d8eb7ab36d17f6505e2babbf59e389c20b293a54ac7c4a15c7fd913a2d67748e956340ff263191285306dba3cfd480d0d799851cd80f08b56569358dfbe8e1b381f42b3f2fd765bffbb30a8743c93bca9d70aa5f14fc7cf6ded4a889bdd1818cd67a70f9f1fe6bd8717722314bfc8fa5ac2bb25f75f0011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465a200783b6261666b7265696365636e783267766e746d3666626372766e63333336717a6536737435753771713734353769676567616d6433627a6b78377269011bff9fae3cc645f463";
+        let valid_event = OffchainAssetReceiptVault::ReceiptVaultInformation {
+            sender: vault,
+            vaultInformation: Bytes::from(hex::decode(info_hex).unwrap()),
+        };
+        let valid_log = Log {
+            inner: alloy::primitives::Log {
+                address: vault,
+                data: valid_event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let asserter = Asserter::new();
+        // Walk 1: the corrupt event fails to decode, so nothing is cached.
+        asserter.push_success(&alloy::primitives::U64::from(100u64));
+        asserter.push_success(&vec![corrupt_log]);
+        // Walk 2: a later valid event resolves on the rescan.
+        asserter.push_success(&alloy::primitives::U64::from(100u64));
+        asserter.push_success(&vec![valid_log]);
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(asserter).erased();
+
+        let cache = OaSchemaCache::new(provider);
+
+        assert_eq!(cache.get(vault).await, None);
+        assert_eq!(
+            cache.get(vault).await.as_deref(),
+            Some("bafkreicecnx2gvntm6fbcrvnc336qze6st5u7qq7457igegamd3bzkx7ri"),
+        );
     }
 
     #[test]
