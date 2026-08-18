@@ -124,6 +124,31 @@ pub(crate) enum RedemptionCommand {
         tx_id: TxId,
         dust_shares: U256,
     },
+
+    /// Records a confirmed VaultDirect burn from the result of the vault
+    /// call the caller already performed. Pure: no I/O, emits `TokensBurned`.
+    RecordBurnConfirmed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_id: TxId,
+        tx_hash: B256,
+        burns: Vec<super::BurnRecord>,
+        dust_returned: U256,
+        gas_used: u64,
+        block_number: u64,
+    },
+
+    /// Orchestrator mode counterpart of [`RecordBurnConfirmed`]. Pure: emits
+    /// `OrchestratorTokensBurned` after validating the burned shares against
+    /// the redemption's own persisted `alpaca_quantity`.
+    RecordOrchestratorBurnConfirmed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_id: TxId,
+        tx_hash: B256,
+        shares_burned: U256,
+        burn_range: BurnRange,
+        gas_used: u64,
+        block_number: u64,
+    },
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,

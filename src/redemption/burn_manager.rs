@@ -2528,46 +2528,115 @@ impl BurnManager {
         execution: &BurnExecutionPlan,
         tx_id: TxId,
     ) -> Result<(), BurnManagerError> {
-        let result = self
-            .store
-            .send(
+        // Performs the confirmation I/O here, then records the outcome through
+        // a pure command, so this step can later move to a durable job. A vault
+        // error is the definitive failure or uncertain case; a command error is
+        // a domain validation failure that propagates unchanged.
+        let vault_service = self.vault_for(execution.network)?;
+        let record_command = if execution.is_orchestrator() {
+            match vault_service.confirm_orchestrator_burn(&tx_id).await {
+                Ok(result) => {
+                    RedemptionCommand::RecordOrchestratorBurnConfirmed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tx_id: tx_id.clone(),
+                        tx_hash: result.tx_hash,
+                        shares_burned: result.shares_burned,
+                        burn_range: result.burn_range,
+                        gas_used: result.gas_used,
+                        block_number: result.block_number,
+                    }
+                }
+                Err(err) => {
+                    return self
+                        .handle_confirm_vault_error(
+                            issuer_request_id,
+                            execution,
+                            &tx_id,
+                            err,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            match vault_service
+                .confirm_burn(&tx_id, execution.dust_shares)
+                .await
+            {
+                Ok(result) => {
+                    let burns = result
+                        .burns
+                        .into_iter()
+                        .map(|burn| super::BurnRecord {
+                            receipt_id: burn.receipt_id,
+                            shares_burned: burn.shares_burned,
+                        })
+                        .collect();
+                    RedemptionCommand::RecordBurnConfirmed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tx_id: tx_id.clone(),
+                        tx_hash: result.tx_hash,
+                        burns,
+                        dust_returned: result.dust_returned,
+                        gas_used: result.gas_used,
+                        block_number: result.block_number,
+                    }
+                }
+                Err(err) => {
+                    return self
+                        .handle_confirm_vault_error(
+                            issuer_request_id,
+                            execution,
+                            &tx_id,
+                            err,
+                        )
+                        .await;
+                }
+            }
+        };
+
+        // Records the confirmed burn through a pure command. Domain validation
+        // errors, such as an orchestrator share mismatch, propagate unchanged.
+        self.store.send(issuer_request_id, record_command).await?;
+
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            "Burn confirmed successfully"
+        );
+
+        // The burn landed on chain: consume the reservation so the mirror
+        // balance drops to match.
+        let chain_id = self.chain_id_for(execution.network)?;
+        if !execution.is_orchestrator() {
+            self.settle_reserved_burn(
+                chain_id,
+                execution.vault,
                 issuer_request_id,
-                RedemptionCommand::ConfirmBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tx_id: tx_id.clone(),
-                    dust_shares: execution.dust_shares,
-                },
             )
             .await;
+        }
 
-        match result {
-            Ok(()) => {
-                info!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "Burn confirmed successfully"
-                );
+        Ok(())
+    }
 
-                // The burn landed on-chain: consume the reservation so the
-                // mirror balance drops to match.
-                let chain_id = self.chain_id_for(execution.network)?;
-                if !execution.is_orchestrator() {
-                    self.settle_reserved_burn(
-                        chain_id,
-                        execution.vault,
-                        issuer_request_id,
-                    )
-                    .await;
-                }
-
-                Ok(())
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::Vault {
-                    message,
-                    release_reservation,
-                    classification,
-                    ..
-                },
-            ))) => {
+    /// Handles a vault error from the inline confirm I/O, mirroring the old
+    /// `ConfirmBurn` `Apply(RedemptionError::Vault { .. })` arm: a failure
+    /// eligible for release terminalizes via
+    /// `record_definitive_confirm_failure`, an uncertain one is left for
+    /// periodic recovery, and either way the mapped error propagates with
+    /// `tx_id: None`. A `BurnConfirmationPending` mapping propagates directly.
+    async fn handle_confirm_vault_error(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        execution: &BurnExecutionPlan,
+        tx_id: &TxId,
+        error: VaultError,
+    ) -> Result<(), BurnManagerError> {
+        match super::map_confirm_burn_error(error, tx_id) {
+            RedemptionError::Vault {
+                message,
+                release_reservation,
+                classification,
+                ..
+            } => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %message,
                     classification = ?classification,
@@ -2582,7 +2651,7 @@ impl BurnManager {
                             is_orchestrator: execution.is_orchestrator(),
                             classification: &classification,
                             error: &message,
-                            tx_id: &tx_id,
+                            tx_id,
                             planned_burns: &execution.planned_burns,
                         },
                     )
@@ -2602,7 +2671,7 @@ impl BurnManager {
                     classification,
                 }))
             }
-            Err(error) => Err(error.into()),
+            other => Err(BurnManagerError::Redemption(other)),
         }
     }
 
