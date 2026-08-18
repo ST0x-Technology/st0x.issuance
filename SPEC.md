@@ -4526,26 +4526,25 @@ effects on that chain:
 
 - HTTP JSON-RPC provider (Alloy)
 - `VaultService` (Turnkey or local signer, bound to that chain's `chain_id`)
-- `backfill_start_block` for receipt backfill
-- Subgraph URL for receipt indexing
+- `backfill_start_block` for receipt backfill (the OA schema hash is read from
+  the vault's on chain `ReceiptVaultInformation` event, no indexer required)
 
 Constructed once at startup from config; immutable for the process lifetime.
 Alpaca calls a single issuer URL; payload `network` selects the runtime.
 
 **ChainRegistry:** Each configured network uses one complete environment group:
-`CHAIN_<NETWORK>_RPC_URL`, `CHAIN_<NETWORK>_CHAIN_ID`,
-`CHAIN_<NETWORK>_SUBGRAPH_URL`, and `CHAIN_<NETWORK>_BACKFILL_START_BLOCK`.
-Supplying any field requires all four, so partial chain configuration fails at
-startup. An absent additional-network group keeps that chain disabled.
-`CHAIN_<NETWORK>_CHAIN_ID` must be the network's canonical id (Base `8453`,
-Ethereum `1`, HyperEVM `999`); a mismatch fails at startup, because the receipt
-inventory is keyed by chain id and a mislabeled network orphans every existing
-aggregate. The legacy flat `CHAIN_ID` is exempt so local development can point
-Base at Anvil. `CHAIN_BASE_*` overrides the legacy flat Base values; when it is
-absent, `RPC_URL`, `SUBGRAPH_URL`, `CHAIN_ID`, and `BACKFILL_START_BLOCK`
-continue to produce the single Base entry unchanged. This lets one deployed
-artifact start Base-only and later activate another chain through a config
-update and restart.
+`CHAIN_<NETWORK>_RPC_URL`, `CHAIN_<NETWORK>_CHAIN_ID`, and
+`CHAIN_<NETWORK>_BACKFILL_START_BLOCK`. Supplying any field requires all three,
+so partial chain configuration fails at startup. An absent additional-network
+group keeps that chain disabled. `CHAIN_<NETWORK>_CHAIN_ID` must be the
+network's canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`); a mismatch
+fails at startup, because the receipt inventory is keyed by chain id and a
+mislabeled network orphans every existing aggregate. The legacy flat `CHAIN_ID`
+is exempt so local development can point Base at Anvil. `CHAIN_BASE_*` overrides
+the legacy flat Base values; when it is absent, `RPC_URL`, `CHAIN_ID`, and
+`BACKFILL_START_BLOCK` continue to produce the single Base entry unchanged. This
+lets one deployed artifact start Base-only and later activate another chain
+through a config update and restart.
 
 Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
