@@ -536,14 +536,25 @@ struct RocketState {
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
-    let figment = rocket::Config::figment()
-        .merge(("address", "0.0.0.0"))
-        .merge(("port", 8000))
-        // Disable header-based IP detection (X-Real-IP/X-Forwarded-For) to prevent
-        // IP spoofing. The app relies solely on TCP source address for client IP.
-        // If deployed behind a reverse proxy, the proxy must preserve the original
-        // client IP at the network layer (e.g., PROXY protocol) rather than headers.
-        .merge(("ip_header", false));
+    // BEHIND_PROXY=true is the nginx-TLS deployment shape (nix/ingress.nix):
+    // Rocket binds loopback so only the proxy can reach it, and the client IP
+    // the whitelists check comes from X-Real-IP, which nginx overwrites from
+    // the TCP source on every proxied request, so clients cannot spoof it.
+    // Without the proxy, header-based IP detection stays disabled and the TCP
+    // source address is the client IP; Rocket has no PROXY-protocol support,
+    // so a proxy that only preserves IPs at the network layer is not an
+    // option here.
+    let figment = if state.config.behind_proxy {
+        rocket::Config::figment()
+            .merge(("address", "127.0.0.1"))
+            .merge(("port", 8000))
+            .merge(("ip_header", "X-Real-IP"))
+    } else {
+        rocket::Config::figment()
+            .merge(("address", "0.0.0.0"))
+            .merge(("port", 8000))
+            .merge(("ip_header", false))
+    };
 
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;

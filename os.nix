@@ -34,6 +34,7 @@ in
     (modulesPath + "/profiles/qemu-guest.nix")
     ./disko.nix
     ./nix/cloud-init.nix
+    ./nix/ingress.nix
     ./nix/upgradeable-services.nix
   ];
 

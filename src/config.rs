@@ -216,6 +216,10 @@ pub struct Config {
     /// have to wait a full production interval for a reconciliation pass.
     pub receipt_poll_interval: Duration,
     pub auth: AuthConfig,
+    /// True when the host-local nginx TLS proxy fronts this server. Rebinds
+    /// Rocket to loopback and trusts the proxy-set `X-Real-IP` header for the
+    /// client IP the whitelists check.
+    pub behind_proxy: bool,
     pub log_level: LogLevel,
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
@@ -327,6 +331,19 @@ struct Env {
 
     #[clap(flatten)]
     auth: AuthConfig,
+
+    #[arg(
+        long,
+        env = "BEHIND_PROXY",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        help = "Run behind the host-local nginx TLS proxy: bind Rocket to \
+                loopback and take the client IP from the X-Real-IP header \
+                the proxy sets. Never enable while Rocket is reachable on a \
+                non-loopback address, or clients could spoof X-Real-IP past \
+                the IP whitelists"
+    )]
+    behind_proxy: bool,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -522,6 +539,7 @@ impl Env {
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: self.auth,
+            behind_proxy: self.behind_proxy,
             log_level: self.log_level,
             environment: self.environment,
             hyperdx,

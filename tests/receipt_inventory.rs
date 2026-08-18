@@ -308,6 +308,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
                 .parse()
                 .expect("Valid IP ranges"),
         },
+        behind_proxy: false,
         log_level: LogLevel::Debug,
         environment: Environment::Development,
         hyperdx: None,

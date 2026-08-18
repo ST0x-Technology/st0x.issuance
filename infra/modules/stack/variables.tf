@@ -64,3 +64,15 @@ variable "volume_description" {
   type        = string
   default     = null
 }
+
+variable "api_source_addresses" {
+  description = "Source ranges allowed to reach the legacy plaintext API on port 8000. Tighten to Alpaca ranges + the old liquidity droplet, then remove the rule after the HTTPS cutover (RAI-236)."
+  type        = list(string)
+  default     = ["0.0.0.0/0", "::/0"]
+}
+
+variable "https_source_addresses" {
+  description = "Source ranges allowed to reach the HTTPS API on port 443. World until Alpaca provides egress CIDRs."
+  type        = list(string)
+  default     = ["0.0.0.0/0", "::/0"]
+}
