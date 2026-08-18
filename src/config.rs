@@ -2045,8 +2045,6 @@ mod tests {
             "wss://localhost:8546",
             "--chain-ethereum-chain-id",
             "1",
-            "--chain-ethereum-subgraph-url",
-            "http://localhost:0/eth-subgraph",
             "--chain-ethereum-backfill-start-block",
             "1",
         ]);
