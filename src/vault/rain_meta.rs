@@ -24,7 +24,7 @@ use flate2::write::ZlibEncoder;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::bindings::OffchainAssetReceiptVault;
@@ -274,9 +274,13 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>, RainMetaError> {
 /// Transient failures are NOT cached, allowing retries on subsequent calls.
 pub(crate) struct OaSchemaCache {
     mode: OaSchemaCacheMode,
-    /// Only positive results (`Some(hash)`) are cached. Absent key means not
-    /// yet fetched, last fetch failed, or vault had no schema (all retried).
+    /// A resolved hash and a definitive absent schema are both cached; only
+    /// transient failures leave the key absent for retry.
     cache: Arc<RwLock<HashMap<Address, Option<String>>>>,
+    /// Per vault singleflight locks (see [`Self::get`]): concurrent first
+    /// callers for one vault share a single scan. Different vaults never block
+    /// each other.
+    locks: Arc<std::sync::Mutex<HashMap<Address, Arc<Mutex<()>>>>>,
 }
 
 enum OaSchemaCacheMode {
@@ -318,6 +322,7 @@ impl OaSchemaCache {
         Self {
             mode: OaSchemaCacheMode::OnChain { provider },
             cache: Arc::new(RwLock::new(HashMap::new())),
+            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -329,6 +334,7 @@ impl OaSchemaCache {
         Self {
             mode: OaSchemaCacheMode::Fixed(schema_hash.to_string()),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -351,7 +357,26 @@ impl OaSchemaCache {
 
         {
             let cache = self.cache.read().await;
+            if let Some(cached) = cache.get(&vault) {
+                return cached.clone();
+            }
+        }
 
+        // Singleflight per vault: the history walk is expensive and runs on the
+        // mint and burn request paths, so concurrent first callers for one
+        // vault share one scan instead of each launching their own. The guard
+        // drops on every exit path, including timeout and error, so a failed
+        // attempt never blocks the retry.
+        let vault_lock = {
+            let mut locks =
+                self.locks.lock().expect("schema lock map poisoned");
+            Arc::clone(locks.entry(vault).or_default())
+        };
+        let _scan_guard = vault_lock.lock().await;
+
+        // Another caller may have resolved this vault while we waited.
+        {
+            let cache = self.cache.read().await;
             if let Some(cached) = cache.get(&vault) {
                 return cached.clone();
             }
