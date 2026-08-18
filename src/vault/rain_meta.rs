@@ -300,12 +300,10 @@ pub(crate) const OA_SCHEMA_HASH: &str =
 
 /// Block window per `eth_getLogs` request when scanning for the schema event.
 /// The scan walks backwards from the chain tip one window at a time rather
-/// than issuing a single query spanning genesis to tip: a bounded range is
-/// accepted by every provider (many cap `eth_getLogs` spans), and the newest
-/// emission is found in the first window that has one. Sized for an indexed
-/// endpoint like Alchemy, which prod uses, where a range filtered by address
-/// is a cheap index lookup at any width; a capped public RPC still works, just
-/// in more round trips.
+/// than issuing a single query spanning genesis to tip, so every request is a
+/// bounded range (many providers cap `eth_getLogs` spans). A provider that
+/// serves wide address filtered ranges cheaply resolves the scan in few
+/// requests; one that caps ranges takes more round trips.
 const SCHEMA_LOG_SCAN_WINDOW: u64 = 1_000_000;
 
 /// Ceiling on how long one vault's schema resolution may run. The walk runs on
@@ -389,12 +387,11 @@ impl OaSchemaCache {
 
             Ok(None) => {
                 // Definitive absent schema: the scan reached genesis with no
-                // `ReceiptVaultInformation`, so this vault has none on chain.
-                // Cache it. The answer cannot change until the vault emits the
-                // event, which happens at deployment before any mint, so a
-                // process restart resolves it again. Without caching, every
-                // mint against a vault that has no schema would rescan the
-                // whole history. A mint here omits OA_SCHEMA.
+                // `ReceiptVaultInformation`, so this vault has none on chain
+                // right now. Cache it so a schemaless vault is not rescanned on
+                // every mint. If the vault emits the event later, the cached
+                // answer is not refreshed until the process restarts. A mint
+                // here omits OA_SCHEMA.
                 self.cache.write().await.insert(vault, None);
                 warn!(
                     target: "vault",
