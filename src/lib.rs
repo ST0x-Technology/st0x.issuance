@@ -55,6 +55,9 @@ use crate::receipt_inventory::{
     burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
+use crate::redemption::job::{
+    ConfirmBurnContext, ConfirmBurnJob, SubmitBurnContext, SubmitBurnJob,
+};
 use crate::redemption::{
     Redemption, RedemptionServices,
     burn_manager::BurnManager,
@@ -330,6 +333,7 @@ pub async fn initialize_rocket(
         &pool,
         bot_wallet,
         lifecycle_notifier.clone(),
+        &apalis_pool,
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
@@ -435,6 +439,7 @@ pub async fn initialize_rocket(
             shutdown_rx.clone(),
         ),
     );
+
 
     for (network, runtime) in chain_registry.runtimes() {
         background_task_handles.push(spawn_periodic_receipt_backfills(
@@ -1012,6 +1017,7 @@ fn setup_redemption_managers(
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
     lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+    apalis_pool: &ApalisSqlitePool,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
@@ -1035,6 +1041,7 @@ fn setup_redemption_managers(
         redemption_store.clone(),
         receipt_service,
         bot_wallet,
+        apalis_pool.clone(),
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -2109,8 +2116,14 @@ fn spawn_mint_background_tasks(
             workers.apalis_pool.clone(),
             shutdown.clone(),
         ),
-        spawn_burn_recovery_reconciler(burn, shutdown.clone()),
+        spawn_burn_recovery_reconciler(burn.clone(), shutdown.clone()),
     ];
+    handles.extend(spawn_burn_job_workers(
+        burn,
+        workers.pool.clone(),
+        workers.apalis_pool.clone(),
+        shutdown.clone(),
+    ));
     handles.extend(spawn_mint_job_workers(workers, shutdown));
     handles
 }
@@ -2172,6 +2185,39 @@ fn spawn_mint_job_workers(
             shutdown,
             "mint-callback-worker",
             target: "mint",
+        ),
+    ]
+}
+
+/// Spawns the two drainer workers for the burn side-effect job chain. Each
+/// gets an `Arc<BurnManager>` so it can perform its external call and record
+/// the outcome, and the submit worker gets the queue for the confirm handoff.
+fn spawn_burn_job_workers(
+    burn_manager: Arc<BurnManager>,
+    pool: Pool<Sqlite>,
+    apalis_pool: ApalisSqlitePool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    vec![
+        spawn_drainer_worker!(
+            ::<SubmitBurnContext, SubmitBurnJob>,
+            apalis_pool.clone(),
+            Arc::new(SubmitBurnContext {
+                burn_manager: burn_manager.clone(),
+                confirm_queue: JobQueue::new(&apalis_pool),
+                pool,
+            }),
+            shutdown.clone(),
+            "burn-submit-worker",
+            target: "redemption",
+        ),
+        spawn_drainer_worker!(
+            ::<ConfirmBurnContext, ConfirmBurnJob>,
+            apalis_pool,
+            Arc::new(ConfirmBurnContext { burn_manager }),
+            shutdown,
+            "burn-confirm-worker",
+            target: "redemption",
         ),
     ]
 }
