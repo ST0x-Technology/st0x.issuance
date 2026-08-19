@@ -301,7 +301,6 @@ pub async fn initialize_rocket(
         target: "startup",
         network = %base.network,
         chain_id = base.chain_id,
-        subgraph_url = %base.subgraph_url,
         "Chain runtime configured"
     );
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
