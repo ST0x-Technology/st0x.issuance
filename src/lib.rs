@@ -53,6 +53,9 @@ use crate::receipt_inventory::{
     burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
+use crate::redemption::job::{
+    ConfirmBurnContext, ConfirmBurnJob, SubmitBurnContext, SubmitBurnJob,
+};
 use crate::redemption::{
     Redemption, RedemptionServices,
     burn_manager::BurnManager,
@@ -319,6 +322,7 @@ pub async fn initialize_rocket(
         &receipt_inventory_store,
         &pool,
         bot_wallet,
+        &apalis_pool,
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
@@ -402,6 +406,12 @@ pub async fn initialize_rocket(
         )),
         bot: bot_wallet,
     });
+
+    spawn_burn_job_workers(
+        managers.burn.clone(),
+        pool.clone(),
+        apalis_pool.clone(),
+    );
 
     // Periodically re-enqueue recoverable mints that lost their recovery job
     // (e.g. an enqueue that failed during a transient SQLite outage at confirm
@@ -777,6 +787,7 @@ fn setup_redemption_managers(
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
+    apalis_pool: &ApalisSqlitePool,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
@@ -799,6 +810,7 @@ fn setup_redemption_managers(
         redemption_store.clone(),
         receipt_service,
         bot_wallet,
+        apalis_pool.clone(),
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -1826,6 +1838,35 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
         Arc::new(SendCallbackContext { mint_store, alpaca }),
         "mint-callback-worker",
         target: "mint",
+    );
+}
+
+/// Spawns the two drainer workers for the burn side-effect job chain. Each
+/// gets an `Arc<BurnManager>` so it can perform its external call and record
+/// the outcome, and the submit worker gets the queue for the confirm handoff.
+fn spawn_burn_job_workers(
+    burn_manager: Arc<BurnManager>,
+    pool: Pool<Sqlite>,
+    apalis_pool: ApalisSqlitePool,
+) {
+    spawn_drainer_worker!(
+        ::<SubmitBurnContext, SubmitBurnJob>,
+        apalis_pool.clone(),
+        Arc::new(SubmitBurnContext {
+            burn_manager: burn_manager.clone(),
+            confirm_queue: JobQueue::new(&apalis_pool),
+            pool,
+        }),
+        "burn-submit-worker",
+        target: "redemption",
+    );
+
+    spawn_drainer_worker!(
+        ::<ConfirmBurnContext, ConfirmBurnJob>,
+        apalis_pool,
+        Arc::new(ConfirmBurnContext { burn_manager }),
+        "burn-confirm-worker",
+        target: "redemption",
     );
 }
 

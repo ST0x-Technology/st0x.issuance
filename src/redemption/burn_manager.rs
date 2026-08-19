@@ -1,4 +1,5 @@
 use alloy::primitives::{Address, B256, U256};
+use apalis_sqlite::SqlitePool;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use super::job::SubmitBurnJob;
 use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
@@ -20,7 +22,9 @@ use super::{
 use crate::Quantity;
 use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::config::VaultMode;
+use crate::jobs::{JobQueue, QueuePushError, job_type};
 use crate::mint::QuantityConversionError;
+use crate::mint::recovery::release_terminal_job;
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
     Shares,
@@ -143,6 +147,7 @@ pub(crate) struct BurnManager {
     receipt_service: Arc<dyn ReceiptService>,
     bot_wallet: Address,
     automatic_recovery_lock: Arc<Mutex<()>>,
+    apalis_pool: SqlitePool,
 }
 
 impl BurnManager {
@@ -162,6 +167,7 @@ impl BurnManager {
         store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
+        apalis_pool: SqlitePool,
     ) -> Self {
         Self {
             vaults,
@@ -169,6 +175,7 @@ impl BurnManager {
             store,
             receipt_service,
             bot_wallet,
+            apalis_pool,
             automatic_recovery_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -230,6 +237,7 @@ impl BurnManager {
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
         receipt_chain_id: u64,
+        apalis_pool: SqlitePool,
     ) -> Self {
         Self {
             vaults: NetworkVaultServices::with_single_vault(
@@ -241,6 +249,7 @@ impl BurnManager {
             store,
             receipt_service,
             bot_wallet,
+            apalis_pool,
             automatic_recovery_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -2242,12 +2251,37 @@ impl BurnManager {
 
         self.reserve_execution(issuer_request_id, &execution).await?;
         self.persist_burn_intention(issuer_request_id, &execution).await?;
-        let tx_id =
-            self.submit_intended_burn(issuer_request_id, &execution).await;
         drop(wallet_guard);
-        let tx_id = tx_id?;
 
-        self.confirm_submitted_burn(issuer_request_id, &execution, tx_id).await
+        // Broadcast and confirm run in the durable SubmitBurnJob then
+        // ConfirmBurnJob chain, so a crash between a vault call and its event
+        // commit resumes from the persisted job.
+        self.enqueue_submit_burn(issuer_request_id, execution).await
+    }
+
+    /// Enqueues the durable `SubmitBurnJob` under the redemption's idempotency
+    /// key, freeing any terminal prior row so the push is not silently dropped.
+    pub(crate) async fn enqueue_submit_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        execution: BurnExecutionPlan,
+    ) -> Result<(), BurnManagerError> {
+        release_terminal_job(
+            &self.view_pool,
+            job_type::<SubmitBurnJob>(),
+            &issuer_request_id.to_string(),
+        )
+        .await?;
+        JobQueue::<SubmitBurnJob>::new(&self.apalis_pool)
+            .push_with_idempotency_key(
+                SubmitBurnJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    execution,
+                },
+                issuer_request_id.to_string(),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn is_burn_execution_current(
@@ -3159,6 +3193,8 @@ pub(crate) enum BurnManagerError {
          {issuer_request_id}; deferred to recovery"
     )]
     WalletIntentWaitExhausted { issuer_request_id: IssuerRedemptionRequestId },
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
 }
 
 #[cfg(test)]
