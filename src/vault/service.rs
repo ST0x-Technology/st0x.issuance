@@ -652,7 +652,7 @@ impl VaultService for RealBlockchainService {
                 } else {
                     burn.receipt_info
                         .as_ref()
-                        .map(|info| info.encode())
+                        .map(super::ReceiptInformation::encode)
                         .transpose()?
                         .unwrap_or_default()
                 };
