@@ -1353,8 +1353,6 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ];
 
         let result = Env::try_parse_from(args);

@@ -113,7 +113,6 @@ async fn test_multichain_receipt_backfill_uses_chain_provider()
         &mock_alpaca,
         &base_evm,
         &eth_evm,
-        eth_vault_address,
     )?;
     // The periodic receipt backfill must never fire within this test's
     // lifetime: it could discover the pre-start receipt and rescue a broken

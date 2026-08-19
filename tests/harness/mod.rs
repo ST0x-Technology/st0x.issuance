@@ -580,15 +580,12 @@ pub fn create_config_with_db(
 }
 
 /// Builds a [`Config`] wired to two Anvil chains: Base and Ethereum, both
-/// entries in `Config::chains`. `eth_evm` carries the Ethereum runtime; the
-/// separate vault address is retained in the signature for callers that deploy
-/// a distinct Ethereum vault.
+/// entries in `Config::chains`.
 pub fn create_multichain_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     base_evm: &LocalEvm,
     eth_evm: &LocalEvm,
-    _eth_vault_address: Address,
 ) -> Result<Config, Box<dyn std::error::Error>> {
     let mut base_config =
         create_config_with_db(db_path, mock_alpaca, base_evm)?;

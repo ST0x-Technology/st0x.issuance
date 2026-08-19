@@ -74,7 +74,6 @@ async fn test_multichain_redemption_routes_by_network()
         &mock_alpaca,
         &base_evm,
         &eth_evm,
-        eth_vault_address,
     )?;
 
     let rocket = initialize_rocket(config).await?;
