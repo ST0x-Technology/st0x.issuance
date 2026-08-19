@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use super::{
     BurnExternalTxId, BurnParams, BurnRecoveryAction, ExistingBurnProof,
     IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionEvent, next_burn_retry_external_tx_id_from_history,
+    vault_error_to_redemption,
 };
 use crate::Quantity;
 use crate::burn_excess::has_unresolved_excess_burn_intent;
@@ -33,7 +35,8 @@ use crate::redemption::{
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
-    BurnTxStatus, BurnVerification, MultiBurnEntry, NetworkVaultServices,
+    BurnRequestOrigin, BurnTxStatus, BurnVerification, MultiBurnEntry,
+    MultiBurnParams, NetworkVaultServices, OrchestratorBurnParams,
     OrchestratorBurnReadiness, SendableTxWithHash, TxId,
     UnconfiguredNetworkError, VaultError, VaultService,
 };
@@ -2409,99 +2412,183 @@ impl BurnManager {
         }
     }
 
-    async fn submit_intended_burn(
+    pub(crate) async fn submit_intended_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         execution: &BurnExecutionPlan,
     ) -> Result<TxId, BurnManagerError> {
+        // Performs the broadcast I/O and records the outcome through a pure
+        // command, so no external vault call runs inside an aggregate
+        // transition.
         let aggregate =
             self.store.load(issuer_request_id).await?.ok_or_else(|| {
                 BurnManagerError::InvalidAggregateState {
                     current_state: "Uninitialized".to_string(),
                 }
             })?;
-        let Redemption::BurnIntended { .. } = &aggregate else {
-            return Err(BurnManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(&aggregate).to_string(),
-            });
+        let (metadata, sendable_tx) = match &aggregate {
+            Redemption::BurnIntended { metadata, sendable_tx, .. } => {
+                (metadata.clone(), sendable_tx.clone())
+            }
+            // Already broadcast: a rerun returns the persisted id without
+            // resending the transaction.
+            Redemption::BurnSubmitted { tx_id, .. } => {
+                return Ok(tx_id.clone());
+            }
+            other => {
+                return Err(BurnManagerError::InvalidAggregateState {
+                    current_state: aggregate_state_name(other).to_string(),
+                });
+            }
         };
-        let result = self
-            .store
+
+        let vault_service = self.vault_for(execution.network)?;
+        let submit_result = match &execution.params {
+            BurnParams::VaultDirect { vault, burns, dust_shares, owner } => {
+                let params = MultiBurnParams {
+                    vault: *vault,
+                    burns: burns.clone(),
+                    dust_shares: *dust_shares,
+                    owner: *owner,
+                    user: metadata.wallet,
+                    origin: BurnRequestOrigin::Redemption(
+                        issuer_request_id.clone(),
+                    ),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: execution.external_tx_id.clone(),
+                };
+                vault_service.submit_burn(params, sendable_tx).await.map(
+                    |submitted| RedemptionCommand::RecordBurnTxSubmitted {
+                        issuer_request_id: issuer_request_id.clone(),
+                        external_tx_id: BurnExternalTxId::from_string(
+                            submitted.external_tx_id,
+                        ),
+                        tx_id: submitted.tx_id,
+                        planned_burns: execution.planned_burns.clone(),
+                    },
+                )
+            }
+            BurnParams::Orchestrator { token, amount, owner } => {
+                let VaultMode::Orchestrator { address: orchestrator } =
+                    metadata.burn_mode
+                else {
+                    return Err(BurnManagerError::InvalidAggregateState {
+                        current_state: "vault-direct burn_mode for an \
+                                        orchestrator execution"
+                            .to_string(),
+                    });
+                };
+                let params = OrchestratorBurnParams {
+                    orchestrator,
+                    token: *token,
+                    amount: *amount,
+                    owner: *owner,
+                    issuer_request_id: issuer_request_id.clone(),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: execution.external_tx_id.clone(),
+                };
+                vault_service
+                    .submit_orchestrator_burn(&params, &sendable_tx)
+                    .await
+                    .map(|submitted| {
+                        RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                            issuer_request_id: issuer_request_id.clone(),
+                            external_tx_id: BurnExternalTxId::from_string(
+                                submitted.external_tx_id,
+                            ),
+                            tx_id: submitted.tx_id,
+                        }
+                    })
+            }
+        };
+
+        let record_command = match submit_result {
+            Ok(command) => command,
+            Err(error) => {
+                return self
+                    .handle_broadcast_vault_error(
+                        issuer_request_id,
+                        execution,
+                        error,
+                    )
+                    .await;
+            }
+        };
+
+        self.store.send(issuer_request_id, record_command).await?;
+
+        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+            "Burn submitted, confirming..."
+        );
+        self.load_submitted_tx_id(issuer_request_id).await
+    }
+
+    /// Handles a vault error from the broadcast: a failure eligible for release
+    /// releases the reservation and records `RecordBurnFailure`; an ambiguous
+    /// broadcast keeps the persisted transaction for recovery and propagates
+    /// without recording.
+    async fn handle_broadcast_vault_error(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        execution: &BurnExecutionPlan,
+        error: VaultError,
+    ) -> Result<TxId, BurnManagerError> {
+        let RedemptionError::Vault {
+            message,
+            release_reservation,
+            tx_id,
+            classification,
+        } = vault_error_to_redemption(&error)
+        else {
+            unreachable!("vault_error_to_redemption always returns Vault");
+        };
+
+        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+            error = %message,
+            tx_id = ?tx_id,
+            "Burn submission failed"
+        );
+
+        if release_reservation && !execution.is_orchestrator() {
+            self.release_before_terminal_failure(
+                execution.network,
+                execution.vault,
+                issuer_request_id,
+            )
+            .await?;
+        }
+
+        if !release_reservation {
+            warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                "Burn broadcast outcome is ambiguous; keeping persisted transaction for recovery"
+            );
+            return Err(BurnManagerError::Redemption(RedemptionError::Vault {
+                message,
+                release_reservation: false,
+                tx_id,
+                classification,
+            }));
+        }
+
+        self.store
             .send(
                 issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordBurnFailure {
+                    classification: classification.clone(),
                     issuer_request_id: issuer_request_id.clone(),
-                    params: execution.params.clone(),
-                    external_tx_id: execution.external_tx_id.clone(),
+                    error: message.clone(),
+                    tx_id: tx_id.clone(),
+                    planned_burns: execution.planned_burns.clone(),
                 },
             )
-            .await;
-
-        match result {
-            Ok(()) => {
-                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "BurnTokens submitted, confirming..."
-                );
-                self.load_submitted_tx_id(issuer_request_id).await
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::Vault {
-                    message,
-                    release_reservation,
-                    tx_id,
-                    classification,
-                },
-            ))) => {
-                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    error = %message,
-                    tx_id = ?tx_id,
-                    "Burn submission failed"
-                );
-                if release_reservation && !execution.is_orchestrator() {
-                    self.release_before_terminal_failure(
-                        execution.network,
-                        execution.vault,
-                        issuer_request_id,
-                    )
-                    .await?;
-                }
-
-                if !release_reservation {
-                    warn!(target: "redemption",
-                        issuer_request_id = %issuer_request_id,
-                        "Burn broadcast outcome is ambiguous; keeping persisted transaction for recovery"
-                    );
-                    return Err(BurnManagerError::Redemption(
-                        RedemptionError::Vault {
-                            message,
-                            release_reservation: false,
-                            tx_id,
-                            classification,
-                        },
-                    ));
-                }
-
-                self.store
-                    .send(
-                        issuer_request_id,
-                        RedemptionCommand::RecordBurnFailure {
-                            classification: classification.clone(),
-                            issuer_request_id: issuer_request_id.clone(),
-                            error: message.clone(),
-                            tx_id: tx_id.clone(),
-                            planned_burns: execution.planned_burns.clone(),
-                        },
-                    )
-                    .await?;
-                Err(BurnManagerError::Redemption(RedemptionError::Vault {
-                    message,
-                    release_reservation,
-                    tx_id,
-                    classification,
-                }))
-            }
-            Err(error) => Err(error.into()),
-        }
+            .await?;
+        Err(BurnManagerError::Redemption(RedemptionError::Vault {
+            message,
+            release_reservation,
+            tx_id,
+            classification,
+        }))
     }
 
     async fn load_submitted_tx_id(
@@ -2522,7 +2609,7 @@ impl BurnManager {
         Ok(tx_id)
     }
 
-    async fn confirm_submitted_burn(
+    pub(crate) async fn confirm_submitted_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         execution: &BurnExecutionPlan,
@@ -2888,13 +2975,14 @@ impl BurnManager {
     }
 }
 
-struct BurnExecutionPlan {
-    network: Network,
-    vault: Address,
-    params: BurnParams,
-    planned_burns: Vec<BurnRecord>,
-    dust_shares: U256,
-    external_tx_id: Option<BurnExternalTxId>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BurnExecutionPlan {
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) params: BurnParams,
+    pub(crate) planned_burns: Vec<BurnRecord>,
+    pub(crate) dust_shares: U256,
+    pub(crate) external_tx_id: Option<BurnExternalTxId>,
 }
 
 impl BurnExecutionPlan {
@@ -2963,7 +3051,7 @@ impl BurnExecutionPlan {
 
     /// Whether this execution runs through the orchestrator, in which case
     /// the receipt-inventory reserve/settle/release lifecycle does not apply.
-    const fn is_orchestrator(&self) -> bool {
+    pub(crate) const fn is_orchestrator(&self) -> bool {
         matches!(self.params, BurnParams::Orchestrator { .. })
     }
 }
