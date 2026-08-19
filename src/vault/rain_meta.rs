@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn encode_produces_rain_meta_prefix() {
         let json = br#"{"test": "value"}"#;
-        let encoded = encode_receipt_meta(json, None).unwrap();
+        let encoded = encode_receipt_meta(json).unwrap();
 
         assert!(is_rain_meta(&encoded));
         assert_eq!(&encoded[..8], &RAIN_META_DOCUMENT_V1);
@@ -254,7 +254,7 @@ mod tests {
     fn encode_then_decode_roundtrips() {
         let json = TEST_RECEIPT_JSON.as_bytes();
 
-        let encoded = encode_receipt_meta(json, None).unwrap();
+        let encoded = encode_receipt_meta(json).unwrap();
         let decoded = decode_receipt_meta(&encoded).unwrap();
 
         assert_eq!(decoded, json);
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn decode_extracts_deflated_payload() {
         let json = br#"{"hello":"world"}"#;
-        let encoded = encode_receipt_meta(json, None).unwrap();
+        let encoded = encode_receipt_meta(json).unwrap();
         let decoded = decode_receipt_meta(&encoded).unwrap();
 
         let parsed: serde_json::Value =

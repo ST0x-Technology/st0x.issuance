@@ -193,14 +193,13 @@ async fn orchestrator_operations_route_to_each_networks_own_orchestrator()
     .await?;
     pool.close().await;
 
-    let (mut config, _mock_subgraph) =
-        harness::create_multichain_config_with_db(
-            &db_url,
-            &mock_alpaca,
-            &base_evm,
-            &eth_evm,
-            eth_vault_address,
-        )?;
+    let mut config = harness::create_multichain_config_with_db(
+        &db_url,
+        &mock_alpaca,
+        &base_evm,
+        &eth_evm,
+        eth_vault_address,
+    )?;
     config.vault_mode_config = VaultModeConfig::new(
         HashMap::from([
             ("AAPL".to_string(), VaultModeKind::Orchestrator),

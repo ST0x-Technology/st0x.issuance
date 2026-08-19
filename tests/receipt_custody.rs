@@ -542,7 +542,7 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
     setup_custody_roles(&evm, user_wallet, outgoing_wallet, incoming_wallet)
         .await?;
 
-    let (outgoing_config, _outgoing_subgraph) = harness::create_config_with_db(
+    let outgoing_config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,
@@ -629,12 +629,11 @@ async fn test_receipt_custody_migration_redeems_historical_receipt_after_restart
         "the new wallet must receive the historical receipt before startup"
     );
 
-    let (mut incoming_config, _incoming_subgraph) =
-        harness::create_config_with_db(
-            &databases.incoming_url,
-            &mock_alpaca,
-            &evm,
-        )?;
+    let mut incoming_config = harness::create_config_with_db(
+        &databases.incoming_url,
+        &mock_alpaca,
+        &evm,
+    )?;
     incoming_config.signer = SignerConfig::Local(incoming_private_key);
     let incoming_client = start_service(incoming_config).await?;
     assert_additional_chains_disabled(&incoming_client).await;
@@ -747,7 +746,7 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
 
     // Run the service only long enough to discover the receipt into inventory,
     // which the migration cross-checks against the chain.
-    let (config, _subgraph) = harness::create_config_with_db(
+    let config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,
@@ -933,7 +932,7 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
     setup_custody_roles(&evm, user_wallet, outgoing_wallet, incoming_wallet)
         .await?;
 
-    let (outgoing_config, _outgoing_subgraph) = harness::create_config_with_db(
+    let outgoing_config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,
@@ -975,12 +974,11 @@ async fn test_single_asset_rehearsal_operates_reverses_and_resumes()
     )
     .await?;
 
-    let (mut incoming_config, _incoming_subgraph) =
-        harness::create_config_with_db(
-            &databases.incoming_url,
-            &mock_alpaca,
-            &evm,
-        )?;
+    let mut incoming_config = harness::create_config_with_db(
+        &databases.incoming_url,
+        &mock_alpaca,
+        &evm,
+    )?;
     incoming_config.signer = SignerConfig::Local(incoming_private_key);
     let incoming_client = start_service(incoming_config).await?;
 
@@ -1061,7 +1059,7 @@ async fn resume_on_outgoing_wallet_and_redeem_canary(
     redeem_mock: &Mock<'_>,
     poll_mock: &Mock<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (resumed_config, _resumed_subgraph) =
+    let resumed_config =
         harness::create_config_with_db(database_url, mock_alpaca, evm)?;
     let resumed_client = start_service(resumed_config).await?;
 
@@ -1156,7 +1154,7 @@ async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_sh
     .await?;
     setup_custody_roles(&evm, user_wallet, outgoing_wallet, incoming_wallet)
         .await?;
-    let (outgoing_config, _outgoing_subgraph) = harness::create_config_with_db(
+    let outgoing_config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,
@@ -1204,12 +1202,11 @@ async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_sh
 
     // Bring up the replacement service against the un-migrated state, exactly
     // as an operator who skipped the custody step would.
-    let (mut incoming_config, _incoming_subgraph) =
-        harness::create_config_with_db(
-            &databases.incoming_url,
-            &mock_alpaca,
-            &evm,
-        )?;
+    let mut incoming_config = harness::create_config_with_db(
+        &databases.incoming_url,
+        &mock_alpaca,
+        &evm,
+    )?;
     incoming_config.signer =
         SignerConfig::Local(B256::from(incoming_signer.to_bytes()));
     let incoming_client = start_service(incoming_config).await?;
@@ -1316,7 +1313,7 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
     // Run the service only long enough to discover the receipt into
     // inventory, then restart so production startup reconciliation records
     // the outgoing holder — the engine refuses unobserved custody.
-    let (config, _subgraph) = harness::create_config_with_db(
+    let config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,
@@ -1791,7 +1788,7 @@ async fn test_receipt_custody_chunked_migration_resumes_into_the_orchestrator()
     evm.grant_certify_role(bot_wallet).await?;
     evm.certify_vault(U256::MAX).await?;
 
-    let (config, _subgraph) = harness::create_config_with_db(
+    let config = harness::create_config_with_db(
         &databases.outgoing_url,
         &mock_alpaca,
         &evm,

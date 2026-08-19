@@ -1029,8 +1029,6 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ]
     }
 
@@ -1050,7 +1048,6 @@ mod tests {
         assert_eq!(chain.network, Network::Base);
         assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(chain.rpc_url, config.rpc_url);
-        assert_eq!(chain.subgraph_url, config.subgraph_url);
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
     }
 
@@ -1059,14 +1056,11 @@ mod tests {
     {
         let mut args = minimal_args();
         remove_argument(&mut args, "--rpc-url");
-        remove_argument(&mut args, "--subgraph-url");
         args.extend_from_slice(&[
             "--chain-base-rpc-url",
             "wss://base.example",
             "--chain-base-chain-id",
             "8453",
-            "--chain-base-subgraph-url",
-            "https://base-subgraph.example",
             "--chain-base-backfill-start-block",
             "42000000",
         ]);
@@ -1079,10 +1073,6 @@ mod tests {
         assert_eq!(base.network, Network::Base);
         assert_eq!(base.chain_id, 8453);
         assert_eq!(base.rpc_url, Url::parse("wss://base.example").unwrap());
-        assert_eq!(
-            base.subgraph_url,
-            Url::parse("https://base-subgraph.example").unwrap()
-        );
         assert_eq!(base.backfill_start_block, 42_000_000);
     }
 
@@ -1098,8 +1088,6 @@ mod tests {
             "wss://base-grouped.example",
             "--chain-base-chain-id",
             "8453",
-            "--chain-base-subgraph-url",
-            "https://base-grouped-subgraph.example",
             "--chain-base-backfill-start-block",
             "42000000",
         ]);
@@ -1113,11 +1101,6 @@ mod tests {
             base.rpc_url,
             Url::parse("wss://base-grouped.example").unwrap(),
             "the grouped RPC endpoint must win over the legacy RPC_URL"
-        );
-        assert_eq!(
-            base.subgraph_url,
-            Url::parse("https://base-grouped-subgraph.example").unwrap(),
-            "the grouped subgraph must win over the legacy SUBGRAPH_URL"
         );
         assert_eq!(base.chain_id, 8453);
     }
@@ -1137,9 +1120,6 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
                 chain_id: Some(8453),
-                subgraph_url: Some(
-                    &Url::parse("https://ethereum-subgraph.example").unwrap(),
-                ),
                 backfill_start_block: Some(22_000_000),
             },
         );
@@ -1166,8 +1146,6 @@ mod tests {
             "wss://ethereum.example",
             "--chain-ethereum-chain-id",
             "1",
-            "--chain-ethereum-subgraph-url",
-            "https://ethereum-subgraph.example",
             "--chain-ethereum-backfill-start-block",
             "22000000",
         ]);
@@ -1183,10 +1161,6 @@ mod tests {
             ethereum.rpc_url,
             Url::parse("wss://ethereum.example").unwrap()
         );
-        assert_eq!(
-            ethereum.subgraph_url,
-            Url::parse("https://ethereum-subgraph.example").unwrap()
-        );
         assert_eq!(ethereum.backfill_start_block, 22_000_000);
     }
 
@@ -1198,8 +1172,6 @@ mod tests {
             "wss://hyperevm.example",
             "--chain-hyperevm-chain-id",
             "999",
-            "--chain-hyperevm-subgraph-url",
-            "https://hyperevm-subgraph.example",
             "--chain-hyperevm-backfill-start-block",
             "9000000",
         ]);
@@ -1215,10 +1187,6 @@ mod tests {
             hyperevm.rpc_url,
             Url::parse("wss://hyperevm.example").unwrap()
         );
-        assert_eq!(
-            hyperevm.subgraph_url,
-            Url::parse("https://hyperevm-subgraph.example").unwrap()
-        );
         assert_eq!(hyperevm.backfill_start_block, 9_000_000);
     }
 
@@ -1231,9 +1199,6 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
                 chain_id: Some(998),
-                subgraph_url: Some(
-                    &Url::parse("https://hyperevm-subgraph.example").unwrap(),
-                ),
                 backfill_start_block: Some(9_000_000),
             },
         );
@@ -1395,38 +1360,6 @@ mod tests {
         let result = Env::try_parse_from(args);
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_wss_subgraph_url_rejected() {
-        let args = vec![
-            "test-binary",
-            "--rpc-url",
-            "wss://localhost:8545",
-            "--evm-private-key",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--backfill-start-block",
-            "12345678",
-            "--issuer-api-key",
-            "test-key-that-is-at-least-32-chars-long",
-            "--alpaca-account-id",
-            "test-alpaca-account-id",
-            "--alpaca-api-key",
-            "alpaca-test-key",
-            "--alpaca-api-secret",
-            "alpaca-test-secret",
-            "--subgraph-url",
-            "wss://api.goldsky.com/api/public/project_xxx/subgraphs/test/1.0.0/gn",
-        ];
-
-        let env = Env::try_parse_from(args).unwrap();
-        let result = env.into_config();
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidSubgraphScheme { variable, .. })
-                if variable == "SUBGRAPH_URL"
-        ));
     }
 
     #[test]
@@ -2113,8 +2046,6 @@ mod tests {
             "wss://localhost:8546",
             "--chain-ethereum-chain-id",
             "1",
-            "--chain-ethereum-subgraph-url",
-            "http://localhost:0/eth-subgraph",
             "--chain-ethereum-backfill-start-block",
             "1",
         ]);

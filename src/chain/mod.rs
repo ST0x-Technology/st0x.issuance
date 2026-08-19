@@ -307,7 +307,6 @@ mod tests {
             network: Network::Base,
             chain_id,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 1,
         }
     }
@@ -321,8 +320,6 @@ mod tests {
                 network: Network::Ethereum,
                 chain_id: 8453,
                 rpc_url: Url::parse("wss://localhost:8546").unwrap(),
-                subgraph_url: Url::parse("http://localhost:0/subgraph")
-                    .unwrap(),
                 backfill_start_block: 1,
             },
         ];
@@ -491,7 +488,6 @@ mod tests {
             vault_service: Arc::new(MockVaultService::new_success())
                 as Arc<dyn VaultService>,
             http_provider: (),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 1,
         };
         let registry = ChainRegistry {
