@@ -4,6 +4,7 @@ rec {
     juan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHNeV3nfiJS0QE2JoW3d0dRw1j6OVKl7rXor24XHvsd";
     # purpose: op sec auditing and manual cli while fixing gaps in automation
     alastair = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJArH3PA+bFIon0JkCVQGs9aWr45lnVjiiTLLO9BPItn";
+    jakub = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM8D2RLBbEfB0GZKhT7tlT43pkKbrMnOR7cZfXoG9NbH";
 
     # purpose: deployments from github actions
     ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOkrujoBNXILB8Ypv90puKKhmKq161gitlvUFM5n0c+d";
@@ -32,6 +33,7 @@ rec {
       ssh = [
         juan
         alastair
+        jakub
         st0x-op
         ci
       ];
@@ -39,6 +41,7 @@ rec {
         st0x-op
         juan
         alastair
+        jakub
         host-prod
       ];
     };
@@ -47,6 +50,7 @@ rec {
       ssh = [
         juan
         alastair
+        jakub
         st0x-op
         ci
       ];
@@ -54,6 +58,7 @@ rec {
         st0x-op
         juan
         alastair
+        jakub
         host-staging
       ];
     };
