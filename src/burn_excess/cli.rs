@@ -8,7 +8,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 use std::io;
 use std::str::FromStr;
-use std::sync::Arc;
 use url::Url;
 
 use super::engine::{BurnExcessRequest, run_burn_excess};
@@ -20,7 +19,6 @@ use crate::config::{
 };
 use crate::mint::IssuerMintRequestId;
 use crate::tokenized_asset::Network;
-use crate::vault::rain_meta::{OA_SCHEMA_HASH, OaSchemaCache};
 use crate::vault::service::RealBlockchainService;
 use crate::wallet::local::resolve_local_signer;
 use crate::wallet::turnkey::resolve_turnkey_signer;
@@ -182,12 +180,7 @@ pub(crate) async fn run_burn_excess_cli(
         .wallet(resolved.wallet)
         .connect_http(http_url.clone());
 
-    // receipt_info_bytes always present from deposit; fixed cache avoids
-    // subgraph dependency for burn-excess admin recovery.
-    let vault_service = RealBlockchainService::new(
-        signing_provider,
-        Arc::new(OaSchemaCache::fixed(OA_SCHEMA_HASH)),
-    );
+    let vault_service = RealBlockchainService::new(signing_provider);
 
     let read_provider = ProviderBuilder::new().connect_http(http_url);
 

@@ -921,14 +921,11 @@ impl ReceiptInformation {
 
     /// Encodes the receipt information as a Rain metadata v1 document.
     ///
-    /// Format: rain meta prefix + CBOR map with deflated JSON payload,
-    /// `OA_STRUCTURE` magic number, and optional `OA_SCHEMA` IPFS CID.
-    pub(crate) fn encode(
-        &self,
-        oa_schema: Option<&str>,
-    ) -> Result<Bytes, ReceiptEncodeError> {
+    /// Format: rain meta prefix + CBOR map with the deflated JSON payload and
+    /// the `OA_STRUCTURE` magic number.
+    pub(crate) fn encode(&self) -> Result<Bytes, ReceiptEncodeError> {
         let json_bytes = serde_json::to_vec(self)?;
-        let rain_meta = rain_meta::encode_receipt_meta(&json_bytes, oa_schema)?;
+        let rain_meta = rain_meta::encode_receipt_meta(&json_bytes)?;
         Ok(Bytes::from(rain_meta))
     }
 }

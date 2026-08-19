@@ -20,7 +20,6 @@ use crate::tokenized_asset::Network;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
-use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     NetworkVault, NetworkVaultServices, VaultService,
     service::RealBlockchainService,
@@ -262,8 +261,6 @@ async fn build_chain_runtime(
         });
     }
 
-    let oa_schema_cache = Arc::new(OaSchemaCache::new(subgraph_url.clone())?);
-
     let resolved = match signer {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
         SignerConfig::Turnkey(env) => resolve_turnkey_signer(env, chain_id)?,
@@ -285,7 +282,7 @@ async fn build_chain_runtime(
         .connect_http(wss_to_http(&rpc_url)?);
 
     let vault_service: Arc<dyn VaultService> =
-        Arc::new(RealBlockchainService::new(signing_provider, oa_schema_cache));
+        Arc::new(RealBlockchainService::new(signing_provider));
 
     Ok(ChainRuntime {
         network,

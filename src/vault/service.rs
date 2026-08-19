@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
-use super::rain_meta::OaSchemaCache;
 use super::{
     BurnRange, BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
     MintTxStatus, MintedLogQuery, MintedLogScan, MultiBurnResult,
@@ -94,7 +93,6 @@ const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 ///   replacement transaction to double-burn.
 pub(crate) struct RealBlockchainService {
     provider: RealBlockchainServiceProvider,
-    oa_schema_cache: Arc<OaSchemaCache>,
     wallet_nonce_lock: Arc<Mutex<()>>,
 }
 
@@ -104,16 +102,8 @@ impl RealBlockchainService {
     /// # Arguments
     ///
     /// * `provider` - Alloy provider for blockchain communication
-    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
-    pub(crate) fn new(
-        provider: RealBlockchainServiceProvider,
-        oa_schema_cache: Arc<OaSchemaCache>,
-    ) -> Self {
-        Self {
-            provider,
-            oa_schema_cache,
-            wallet_nonce_lock: Arc::new(Mutex::new(())),
-        }
+    pub(crate) fn new(provider: RealBlockchainServiceProvider) -> Self {
+        Self { provider, wallet_nonce_lock: Arc::new(Mutex::new(())) }
     }
 
     /// Decodes the typed revert reason of a mined-but-reverted orchestrator
@@ -239,8 +229,7 @@ impl VaultService for RealBlockchainService {
         let external_tx_id = external_tx_id.unwrap_or_else(|| {
             format!("mint-{}", receipt_info.issuer_request_id)
         });
-        let oa_schema = self.oa_schema_cache.get(vault).await;
-        let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
+        let receipt_info_bytes = receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
@@ -653,16 +642,6 @@ impl VaultService for RealBlockchainService {
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
 
-        let needs_encoding = params.burns.iter().any(|burn| {
-            burn.receipt_info_bytes.is_none() && burn.receipt_info.is_some()
-        });
-
-        let oa_schema = if needs_encoding {
-            self.oa_schema_cache.get(params.vault).await
-        } else {
-            None
-        };
-
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
@@ -673,7 +652,7 @@ impl VaultService for RealBlockchainService {
                 } else {
                     burn.receipt_info
                         .as_ref()
-                        .map(|info| info.encode(oa_schema.as_deref()))
+                        .map(|info| info.encode())
                         .transpose()?
                         .unwrap_or_default()
                 };
@@ -1099,9 +1078,7 @@ impl VaultService for RealBlockchainService {
             params.external_tx_id.clone().unwrap_or_else(|| {
                 format!("mint-{}", params.receipt_info.issuer_request_id)
             });
-        let oa_schema = self.oa_schema_cache.get(params.token).await;
-        let receipt_info_bytes =
-            params.receipt_info.encode(oa_schema.as_deref())?;
+        let receipt_info_bytes = params.receipt_info.encode()?;
 
         let orchestrator_contract =
             IST0xOrchestratorV1::new(params.orchestrator, &self.provider);
