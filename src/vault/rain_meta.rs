@@ -5,8 +5,7 @@
 ///
 /// Format: 8-byte magic prefix followed by an RFC 8742 CBOR sequence of maps.
 /// Each CBOR map uses integer keys: 0=payload, 1=magic, 2=content-type,
-/// 3=content-encoding. The OA_SCHEMA key (a magic number, not a small integer)
-/// optionally references the IPFS CID of the JSON schema for the payload.
+/// 3=content-encoding.
 ///
 /// The OffchainAsset magic numbers are used by the gildlab/SFT and h20.market
 /// tokenization frontends for encoding receipt information in
