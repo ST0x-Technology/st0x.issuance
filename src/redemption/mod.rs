@@ -4,6 +4,7 @@ pub(crate) mod view;
 
 pub(crate) mod burn_manager;
 pub(crate) mod force_complete;
+pub(crate) mod job;
 pub(crate) mod journal_manager;
 pub(crate) mod poller;
 pub(crate) mod redeem_call_manager;
@@ -380,7 +381,7 @@ struct BurnInput {
 /// computing the reservation-release flag, recoverable tx id, and typed
 /// classification at the aggregate boundary where the typed error is last
 /// visible.
-fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
+pub(crate) fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
     RedemptionError::Vault {
         release_reservation: should_release_reserved_burn(error),
         tx_id: extract_tx_hash(error).map(Into::into),
@@ -926,6 +927,83 @@ impl Redemption {
             block_number,
             burned_at: Utc::now(),
         }])
+    }
+
+    /// Records a VaultDirect burn broadcast reported by the durable
+    /// `SubmitBurnJob`. Pure: emits `BurnTxSubmitted` from the payload.
+    /// Valid from `BurnIntended`; idempotent no-op once the redemption has
+    /// advanced to `BurnSubmitted` or a terminal state, so an at least once
+    /// job rerun is safe.
+    fn handle_record_burn_tx_submitted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: BurnExternalTxId,
+        tx_id: TxId,
+        planned_burns: Vec<BurnRecord>,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match self {
+            Self::BurnIntended { metadata, .. } => {
+                if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: VaultModeKind::Orchestrator,
+                        found: VaultModeKind::VaultDirect,
+                    });
+                }
+
+                Ok(vec![RedemptionEvent::BurnTxSubmitted {
+                    issuer_request_id,
+                    external_tx_id,
+                    tx_id,
+                    planned_burns,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::BurnSubmitted { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Closed { .. } => Ok(vec![]),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Orchestrator mode counterpart of
+    /// [`Self::handle_record_burn_tx_submitted`]. Pure: emits
+    /// `OrchestratorBurnSubmitted` from the payload. Same state validity and
+    /// idempotency.
+    fn handle_record_orchestrator_burn_submitted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: BurnExternalTxId,
+        tx_id: TxId,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match self {
+            Self::BurnIntended { metadata, .. } => {
+                let VaultMode::Orchestrator { .. } = metadata.burn_mode else {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: VaultModeKind::VaultDirect,
+                        found: VaultModeKind::Orchestrator,
+                    });
+                };
+
+                Ok(vec![RedemptionEvent::OrchestratorBurnSubmitted {
+                    issuer_request_id,
+                    external_tx_id,
+                    tx_id,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::BurnSubmitted { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Closed { .. } => Ok(vec![]),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
     }
 
     fn handle_record_burn_failure(
@@ -2039,6 +2117,13 @@ impl EventSourced for Redemption {
                     found: "Uninitialized".to_string(),
                 })
             }
+            RedemptionCommand::RecordBurnTxSubmitted { .. }
+            | RedemptionCommand::RecordOrchestratorBurnSubmitted { .. } => {
+                Err(RedemptionError::InvalidState {
+                    expected: "BurnIntended".to_string(),
+                    found: "Uninitialized".to_string(),
+                })
+            }
             RedemptionCommand::RecordBurnFailure { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "Burning, BurnIntended, or BurnSubmitted"
@@ -2154,6 +2239,26 @@ impl EventSourced for Redemption {
                 burn_range,
                 gas_used,
                 block_number,
+            ),
+            RedemptionCommand::RecordBurnTxSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+                planned_burns,
+            } => self.handle_record_burn_tx_submitted(
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+                planned_burns,
+            ),
+            RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+            } => self.handle_record_orchestrator_burn_submitted(
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
             ),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
