@@ -7,7 +7,8 @@ on-chain result together.
 
 Use this runbook for:
 
-- Alpaca sandbox validation on staging ([RAI-1210](https://linear.app/makeitrain/issue/RAI-1210));
+- Alpaca sandbox validation on staging
+  ([RAI-1210](https://linear.app/makeitrain/issue/RAI-1210));
 - the bounded production Ethereum activation after the Turnkey Base soak
   ([RAI-1508](https://linear.app/makeitrain/issue/RAI-1508)).
 
@@ -20,16 +21,15 @@ or Raindex orders.
 Do not configure or register the Ethereum asset until every applicable gate is
 green.
 
-| Gate | Required evidence |
-| --- | --- |
-| [RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) / [RAI-1096](https://linear.app/makeitrain/issue/RAI-1096) | Ethereum vault deployed; issuer roles verified |
-| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100) | Ethereum RPC endpoint ready |
-| [RAI-1102](https://linear.app/makeitrain/issue/RAI-1102) | Turnkey policy and Ethereum DEPOSIT / WITHDRAW / CERTIFY grants verified for the active signer |
-| [RAI-1103](https://linear.app/makeitrain/issue/RAI-1103) | Active signer funded with Ethereum gas |
-| [RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) | Ethereum receipt subgraph/indexer ready |
-| [RAI-1099](https://linear.app/makeitrain/issue/RAI-1099) | Alpaca environment accepts `network=ethereum` |
-| [PR #284](https://app.graphite.com/github/pr/ST0x-Technology/st0x.issuance/284) | Issuer parses complete `CHAIN_ETHEREUM_*` groups |
-| [PR #1110](https://app.graphite.com/github/pr/ST0x-Technology/st0x.liquidity/1110) | Operator CLI sends Ethereum mint/redeem requests and observes the Ethereum wallet |
+| Gate                                                                                                                | Required evidence                                                                              |
+| ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| [RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) / [RAI-1096](https://linear.app/makeitrain/issue/RAI-1096) | Ethereum vault deployed; issuer roles verified                                                 |
+| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100)                                                            | Ethereum RPC endpoint ready                                                                    |
+| [RAI-1102](https://linear.app/makeitrain/issue/RAI-1102)                                                            | Turnkey policy and Ethereum DEPOSIT / WITHDRAW / CERTIFY grants verified for the active signer |
+| [RAI-1103](https://linear.app/makeitrain/issue/RAI-1103)                                                            | Active signer funded with Ethereum gas                                                         |
+| [RAI-1099](https://linear.app/makeitrain/issue/RAI-1099)                                                            | Alpaca environment accepts `network=ethereum`                                                  |
+| [PR #284](https://app.graphite.com/github/pr/ST0x-Technology/st0x.issuance/284)                                     | Issuer parses complete `CHAIN_ETHEREUM_*` groups                                               |
+| [PR #1110](https://app.graphite.com/github/pr/ST0x-Technology/st0x.liquidity/1110)                                  | Operator CLI sends Ethereum mint/redeem requests and observes the Ethereum wallet              |
 
 For production, the Base-only Turnkey validation and soak must also be complete
 before RAI-1508 starts. Stop if the pinned revisions, active signer address,
@@ -60,11 +60,10 @@ underlying-scoped and has no network query parameter.
 ## 1. Configure and validate the Ethereum runtime
 
 A second runtime is supported by the merged environment parser. Configure all
-four fields as one complete group:
+three fields as one complete group:
 
 - `CHAIN_ETHEREUM_RPC_URL`
 - `CHAIN_ETHEREUM_CHAIN_ID=1`
-- `CHAIN_ETHEREUM_SUBGRAPH_URL`
 - `CHAIN_ETHEREUM_BACKFILL_START_BLOCK`
 
 Supplying only part of the group fails startup. The grouped Base form
@@ -89,8 +88,8 @@ Restart exactly one issuer instance. Runtime construction queries each RPC and
 rejects a chain ID that differs from the configured Base `8453` or Ethereum `1`;
 a failed start is a hard stop. Independently record the configured and
 RPC-reported IDs because the startup `Chain runtime configured` INFO line
-currently identifies Base only. A signer, role, RPC, or subgraph mismatch is
-also a hard stop.
+currently identifies Base only. A signer, role, or RPC mismatch is also a hard
+stop.
 
 ## 2. Issuance HTTP preflight
 
@@ -119,8 +118,8 @@ stop.
 
 ## 3. Base parity canary
 
-Before registering Ethereum, run the already-approved bounded Base canary on
-the pinned artifact. Confirm:
+Before registering Ethereum, run the already-approved bounded Base canary on the
+pinned artifact. Confirm:
 
 1. exactly one Base mint transaction and callback;
 2. expected Base balance delta;
@@ -157,10 +156,10 @@ From an Alpaca-authorized source IP, also run:
 The token-list row must include `ethereum` in `networks[]`.
 
 Restart exactly one issuer instance after registration. The transfer poller and
-periodic receipt backfill already re-read runtime-added assets, but this explicit
-restart forces the new vault through startup receipt backfill, reconciliation,
-and live-network validation before a canary can write to it. Confirm startup
-logs contain `Spawning dynamic transfer poller for network` with
+periodic receipt backfill already re-read runtime-added assets, but this
+explicit restart forces the new vault through startup receipt backfill,
+reconciliation, and live-network validation before a canary can write to it.
+Confirm startup logs contain `Spawning dynamic transfer poller for network` with
 `network=ethereum`, and confirm the Ethereum vault's receipt-backfill checkpoint
 has initialized or advanced before any redemption test.
 
@@ -251,21 +250,20 @@ Attach the following to the issue that was actually executed:
 - active signer, Ethereum vault/token, and verified role-grant references;
 - pre/post Base and Ethereum balances, checkpoints, and `/admin/stuck` output;
 - mint and redemption request IDs, transaction hashes, and callback outcomes;
-- confirmation that each side effect occurred exactly once and only on
-  Ethereum;
+- confirmation that each side effect occurred exactly once and only on Ethereum;
 - operator sign-off.
 
 Close staging [RAI-1210](https://linear.app/makeitrain/issue/RAI-1210) only
 after the sandbox mint and redemption were actually executed. Close production
 [RAI-1508](https://linear.app/makeitrain/issue/RAI-1508) only after activation,
-Base-isolation checks, receipt backfill, mint, and redemption are complete.
-Do not mark either issue done merely because this runbook or a supporting PR
+Base-isolation checks, receipt backfill, mint, and redemption are complete. Do
+not mark either issue done merely because this runbook or a supporting PR
 merged.
 
 ## References
 
-- [RAI-1098](https://linear.app/makeitrain/issue/RAI-1098) — issuance
-  multichain umbrella
+- [RAI-1098](https://linear.app/makeitrain/issue/RAI-1098) — issuance multichain
+  umbrella
 - [RAI-1213](https://linear.app/makeitrain/issue/RAI-1213) — broader CLI
   inventory tooling; wrapping remains separate from these mint/redeem canaries
 - [`docs/ops-recovery-guide.md`](../ops-recovery-guide.md) — stuck transaction

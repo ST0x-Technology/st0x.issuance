@@ -215,7 +215,7 @@ async fn orchestrator_burn_walks_multiple_receipts()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -329,7 +329,7 @@ async fn orchestrator_shortfall_is_classified_without_submission()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -528,7 +528,7 @@ async fn orchestrator_recovery_confirms_landed_burn_without_resubmitting()
     }
     pool.close().await;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -728,7 +728,7 @@ async fn orchestrator_crash_recovery_confirms_in_flight_burn_failed()
     }
     pool.close().await;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -849,7 +849,7 @@ async fn mixed_mode_assets_each_take_their_own_burn_path()
     harness::preseed_tokenized_asset(&db_url, vault2_address, "AAPL", "tAAPL")
         .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,

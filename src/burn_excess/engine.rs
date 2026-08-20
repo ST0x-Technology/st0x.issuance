@@ -1614,15 +1614,12 @@ mod tests {
     };
     use crate::vault::ReceiptInformation;
     use crate::vault::mock::MockVaultService;
-    use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::service::RealBlockchainService;
     use crate::vault::{
         BurnTxStatus, MultiBurnResult, MultiBurnResultEntry, SendableTxWithHash,
     };
     use crate::{Quantity, VaultMode};
 
-    const TEST_OA_SCHEMA: &str =
-        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
     const SHARES_RAW: u64 = 750_000_000_000_000_000;
 
     async fn pool() -> Pool<Sqlite> {
@@ -1740,10 +1737,7 @@ mod tests {
             .connect(&evm.endpoint)
             .await
             .unwrap();
-        let service = RealBlockchainService::new(
-            provider.clone(),
-            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
-        );
+        let service = RealBlockchainService::new(provider.clone());
         (evm, service, provider, signer)
     }
 
@@ -1753,7 +1747,7 @@ mod tests {
         issuer_request_id: &IssuerMintRequestId,
     ) -> (U256, U256, Bytes, B256) {
         let info = sample_receipt_info(issuer_request_id.clone());
-        let encoded = info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = info.encode().unwrap();
         let (receipt_id, shares, bytes) = evm
             .mint_directly_with_info(excess_shares(), to, encoded)
             .await
@@ -2181,7 +2175,7 @@ mod tests {
             .unwrap();
 
         let info = sample_receipt_info(issuer_request_id.clone());
-        let encoded = info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = info.encode().unwrap();
         let vault_issuer =
             OffchainAssetReceiptVault::new(evm.vault_address, &issuer_provider);
         let ratio = U256::from(10).pow(U256::from(18));

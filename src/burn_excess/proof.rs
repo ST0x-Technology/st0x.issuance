@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn strict_receipt_information_decoder_round_trip() {
         let info = sample_receipt_info(issuer_request());
-        let encoded = info.encode(None).unwrap();
+        let encoded = info.encode().unwrap();
         let decoded = decode_receipt_information_strict(&encoded).unwrap();
         assert_eq!(decoded.issuer_request_id, info.issuer_request_id);
     }
@@ -661,7 +661,7 @@ mod tests {
         let receipt_id = U256::from(7u64);
         let shares = U256::from(750_000_000_000_000_000u64);
         let info = sample_receipt_info(issuer.clone());
-        let encoded = info.encode(None).unwrap();
+        let encoded = info.encode().unwrap();
 
         let ok = DepositProof {
             receipt_id,

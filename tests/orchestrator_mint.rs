@@ -323,7 +323,7 @@ async fn orchestrator_mint_end_to_end() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -461,7 +461,7 @@ async fn wrong_signer_authorization_is_rejected_and_nothing_mints()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -578,7 +578,7 @@ async fn authorization_after_journal_confirmation_still_completes()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -737,7 +737,7 @@ async fn recovery_of_landed_orchestrator_mint_is_a_noop()
     let bot_nonce_before =
         reader.get_transaction_count(evm.wallet_address).await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -866,7 +866,7 @@ async fn nonce_collision_fails_for_manual_reconciliation()
     ));
     seed_mint_events(&db_url, &issuer_request_id, &events).await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -994,7 +994,7 @@ async fn unresolved_replay_parks_then_reconciles_after_restart()
     // Phase 1: recovery re-drives the seeded mint; the guard finds the
     // nonce consumed with no log inside the buffered window and parks the
     // mint unresolved.
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -1028,7 +1028,7 @@ async fn unresolved_replay_parks_then_reconciles_after_restart()
     // Phase 2: the restarted service's recovery reconciles with the widened
     // window, full-matches the landing, and drives the mint to its
     // callback.
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -1111,7 +1111,7 @@ async fn mixed_mode_assets_each_take_their_own_mint_path()
     harness::preseed_tokenized_asset(&db_url, vault2_address, "AAPL", "tAAPL")
         .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,

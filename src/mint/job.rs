@@ -3488,7 +3488,7 @@ mod tests {
                 shares: Shares::new(U256::from(100)),
                 block_number: 1_234,
                 tx_hash: B256::ZERO,
-                receipt_info_bytes: receipt_info.encode(None).unwrap(),
+                receipt_info_bytes: receipt_info.encode().unwrap(),
                 receipt_info,
             })
             .await
@@ -3790,7 +3790,7 @@ mod tests {
                 shares: Shares::new(U256::from(100u64)),
                 block_number: 1_234,
                 tx_hash: expected_hash,
-                receipt_info_bytes: receipt_info.encode(None).unwrap(),
+                receipt_info_bytes: receipt_info.encode().unwrap(),
                 receipt_info,
             })
             .await
@@ -4527,7 +4527,7 @@ mod tests {
                 shares: Shares::new(U256::from(100u64)),
                 block_number: 2_222,
                 tx_hash: prepared.hash,
-                receipt_info_bytes: receipt_info.encode(None).unwrap(),
+                receipt_info_bytes: receipt_info.encode().unwrap(),
                 receipt_info,
             })
             .await

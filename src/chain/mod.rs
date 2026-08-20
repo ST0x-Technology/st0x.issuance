@@ -20,7 +20,6 @@ use crate::tokenized_asset::Network;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
-use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     NetworkVault, NetworkVaultServices, VaultService,
     service::RealBlockchainService,
@@ -32,13 +31,12 @@ use crate::wallet::{
 
 const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
 
-/// Per-chain RPC, vault, and subgraph settings for [`ChainRegistry`].
+/// Per-chain RPC and vault settings for [`ChainRegistry`].
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
     pub network: Network,
     pub chain_id: u64,
     pub rpc_url: Url,
-    pub subgraph_url: Url,
     pub backfill_start_block: u64,
 }
 
@@ -47,7 +45,6 @@ pub(crate) struct ChainRuntime<P> {
     pub(crate) chain_id: u64,
     pub(crate) vault_service: Arc<dyn VaultService>,
     pub(crate) http_provider: P,
-    pub(crate) subgraph_url: Url,
     pub(crate) backfill_start_block: u64,
 }
 
@@ -243,13 +240,8 @@ async fn build_chain_runtime(
     config: ChainConfig,
     signer: &SignerConfig,
 ) -> Result<ChainRuntime<impl Provider + Clone + use<>>, ChainRegistryError> {
-    let ChainConfig {
-        network,
-        chain_id,
-        rpc_url,
-        subgraph_url,
-        backfill_start_block,
-    } = config;
+    let ChainConfig { network, chain_id, rpc_url, backfill_start_block } =
+        config;
 
     let http_url = wss_to_http(&rpc_url)?;
     let http_provider = ProviderBuilder::new().connect_http(http_url);
@@ -261,8 +253,6 @@ async fn build_chain_runtime(
             from_rpc: rpc_chain_id,
         });
     }
-
-    let oa_schema_cache = Arc::new(OaSchemaCache::new(subgraph_url.clone())?);
 
     let resolved = match signer {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
@@ -285,14 +275,13 @@ async fn build_chain_runtime(
         .connect_http(wss_to_http(&rpc_url)?);
 
     let vault_service: Arc<dyn VaultService> =
-        Arc::new(RealBlockchainService::new(signing_provider, oa_schema_cache));
+        Arc::new(RealBlockchainService::new(signing_provider));
 
     Ok(ChainRuntime {
         network,
         chain_id,
         vault_service,
         http_provider,
-        subgraph_url,
         backfill_start_block,
     })
 }
@@ -318,7 +307,6 @@ mod tests {
             network: Network::Base,
             chain_id,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 1,
         }
     }
@@ -332,8 +320,6 @@ mod tests {
                 network: Network::Ethereum,
                 chain_id: 8453,
                 rpc_url: Url::parse("wss://localhost:8546").unwrap(),
-                subgraph_url: Url::parse("http://localhost:0/subgraph")
-                    .unwrap(),
                 backfill_start_block: 1,
             },
         ];
@@ -502,7 +488,6 @@ mod tests {
             vault_service: Arc::new(MockVaultService::new_success())
                 as Arc<dyn VaultService>,
             http_provider: (),
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 1,
         };
         let registry = ChainRegistry {

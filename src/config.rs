@@ -220,7 +220,6 @@ pub struct Config {
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
-    pub subgraph_url: Url,
     /// All chain runtimes the registry is built from, Base first. Legacy flat
     /// env vars preserve the Base-only path; complete `CHAIN_<NETWORK>_*`
     /// groups override Base or append additional networks.
@@ -348,18 +347,9 @@ struct Env {
 
     #[arg(
         long,
-        env = "SUBGRAPH_URL",
-        required_unless_present = "chain_base_rpc_url",
-        help = "Goldsky subgraph URL for querying OA schema hashes"
-    )]
-    subgraph_url: Option<Url>,
-
-    #[arg(
-        long,
         env = "CHAIN_BASE_RPC_URL",
         requires_all = [
             "chain_base_chain_id",
-            "chain_base_subgraph_url",
             "chain_base_backfill_start_block"
         ],
         help = "Base RPC endpoint; setting it requires the full CHAIN_BASE_* \
@@ -377,14 +367,6 @@ struct Env {
 
     #[arg(
         long,
-        env = "CHAIN_BASE_SUBGRAPH_URL",
-        requires = "chain_base_rpc_url",
-        help = "Goldsky subgraph URL for the Base group (http or https)"
-    )]
-    chain_base_subgraph_url: Option<Url>,
-
-    #[arg(
-        long,
         env = "CHAIN_BASE_BACKFILL_START_BLOCK",
         requires = "chain_base_rpc_url",
         help = "Receipt-backfill start block for the Base group"
@@ -396,7 +378,6 @@ struct Env {
         env = "CHAIN_ETHEREUM_RPC_URL",
         requires_all = [
             "chain_ethereum_chain_id",
-            "chain_ethereum_subgraph_url",
             "chain_ethereum_backfill_start_block"
         ],
         help = "Ethereum RPC endpoint; setting it requires the full \
@@ -414,14 +395,6 @@ struct Env {
 
     #[arg(
         long,
-        env = "CHAIN_ETHEREUM_SUBGRAPH_URL",
-        requires = "chain_ethereum_rpc_url",
-        help = "Goldsky subgraph URL for the Ethereum group (http or https)"
-    )]
-    chain_ethereum_subgraph_url: Option<Url>,
-
-    #[arg(
-        long,
         env = "CHAIN_ETHEREUM_BACKFILL_START_BLOCK",
         requires = "chain_ethereum_rpc_url",
         help = "Receipt-backfill start block for the Ethereum group"
@@ -433,7 +406,6 @@ struct Env {
         env = "CHAIN_HYPEREVM_RPC_URL",
         requires_all = [
             "chain_hyperevm_chain_id",
-            "chain_hyperevm_subgraph_url",
             "chain_hyperevm_backfill_start_block"
         ],
         help = "HyperEVM RPC endpoint; setting it requires the full \
@@ -449,14 +421,6 @@ struct Env {
                 canonical 999"
     )]
     chain_hyperevm_chain_id: Option<u64>,
-
-    #[arg(
-        long,
-        env = "CHAIN_HYPEREVM_SUBGRAPH_URL",
-        requires = "chain_hyperevm_rpc_url",
-        help = "Goldsky subgraph URL for the HyperEVM group (http or https)"
-    )]
-    chain_hyperevm_subgraph_url: Option<Url>,
 
     #[arg(
         long,
@@ -482,7 +446,6 @@ impl Env {
         let (base, chains) = self.chain_configs()?;
         let rpc_url = base.rpc_url.clone();
         let chain_id = base.chain_id;
-        let subgraph_url = base.subgraph_url.clone();
         let backfill_start_block = base.backfill_start_block;
         let signer = self.signer.into_config()?;
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
@@ -526,7 +489,6 @@ impl Env {
             environment: self.environment,
             hyperdx,
             alpaca: self.alpaca,
-            subgraph_url,
             chains,
             vault_mode_config,
         })
@@ -547,7 +509,6 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_base_rpc_url.as_ref(),
                 chain_id: self.chain_base_chain_id,
-                subgraph_url: self.chain_base_subgraph_url.as_ref(),
                 backfill_start_block: self.chain_base_backfill_start_block,
             },
         )? {
@@ -555,15 +516,14 @@ impl Env {
             // stay in the environment for operator tooling — but the service
             // itself must not silently split-brain between them, so the
             // precedence is stated once, loudly.
-            if self.rpc_url.is_some() || self.subgraph_url.is_some() {
+            if self.rpc_url.is_some() {
                 warn!(
                     target: "config",
                     rpc_url = %base.rpc_url,
-                    subgraph_url = %base.subgraph_url,
                     chain_id = base.chain_id,
-                    "Both legacy (RPC_URL/SUBGRAPH_URL) and grouped \
-                     (CHAIN_BASE_*) Base configuration are set; the grouped \
-                     form takes precedence for the service"
+                    "Both legacy (RPC_URL) and grouped (CHAIN_BASE_*) Base \
+                     configuration are set; the grouped form takes precedence \
+                     for the service"
                 );
             }
             base
@@ -576,17 +536,10 @@ impl Env {
                 .rpc_url
                 .clone()
                 .ok_or(ConfigError::MissingBaseChainConfiguration)?;
-            let subgraph_url = self
-                .subgraph_url
-                .clone()
-                .ok_or(ConfigError::MissingBaseChainConfiguration)?;
-            validate_subgraph_scheme("SUBGRAPH_URL", &subgraph_url)?;
-
             ChainConfig {
                 network: Network::Base,
                 chain_id: self.chain_id,
                 rpc_url,
-                subgraph_url,
                 backfill_start_block: self.backfill_start_block,
             }
         };
@@ -595,7 +548,6 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_ethereum_rpc_url.as_ref(),
                 chain_id: self.chain_ethereum_chain_id,
-                subgraph_url: self.chain_ethereum_subgraph_url.as_ref(),
                 backfill_start_block: self.chain_ethereum_backfill_start_block,
             },
         )?;
@@ -604,7 +556,6 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_hyperevm_rpc_url.as_ref(),
                 chain_id: self.chain_hyperevm_chain_id,
-                subgraph_url: self.chain_hyperevm_subgraph_url.as_ref(),
                 backfill_start_block: self.chain_hyperevm_backfill_start_block,
             },
         )?;
@@ -619,26 +570,11 @@ impl Env {
         network: Network,
         group: &ChainGroupEnv<'_>,
     ) -> Result<Option<ChainConfig>, ConfigError> {
-        let &ChainGroupEnv {
-            rpc_url,
-            chain_id,
-            subgraph_url,
-            backfill_start_block,
-        } = group;
+        let &ChainGroupEnv { rpc_url, chain_id, backfill_start_block } = group;
 
-        match (rpc_url, chain_id, subgraph_url, backfill_start_block) {
-            (None, None, None, None) => Ok(None),
-            (
-                Some(rpc_url),
-                Some(chain_id),
-                Some(subgraph_url),
-                Some(backfill_start_block),
-            ) => {
-                validate_subgraph_scheme(
-                    subgraph_variable(network),
-                    subgraph_url,
-                )?;
-
+        match (rpc_url, chain_id, backfill_start_block) {
+            (None, None, None) => Ok(None),
+            (Some(rpc_url), Some(chain_id), Some(backfill_start_block)) => {
                 // A network label bound to a chain it does not name is not a
                 // recoverable misconfiguration: the receipt inventory is keyed
                 // `{chain_id}:{vault}`, so starting `Network::Base` on a
@@ -663,7 +599,6 @@ impl Env {
                     network,
                     chain_id,
                     rpc_url: rpc_url.clone(),
-                    subgraph_url: subgraph_url.clone(),
                     backfill_start_block,
                 }))
             }
@@ -676,42 +611,13 @@ impl Env {
 
 /// One network's `CHAIN_<NETWORK>_*` group, as read from the environment.
 ///
-/// Named fields rather than positional arguments because `rpc_url` and
-/// `subgraph_url` are both `Option<&Url>` and `chain_id` and
-/// `backfill_start_block` are both `Option<u64>`: transposing either pair would
-/// compile silently and produce a runtime pointed at the wrong endpoint.
+/// Named fields rather than positional arguments because `chain_id` and
+/// `backfill_start_block` are both `Option<u64>`: transposing them would
+/// compile silently and produce a runtime with the wrong start block.
 struct ChainGroupEnv<'env> {
     rpc_url: Option<&'env Url>,
     chain_id: Option<u64>,
-    subgraph_url: Option<&'env Url>,
     backfill_start_block: Option<u64>,
-}
-
-/// Validates a subgraph URL's scheme, naming the variable it came from.
-///
-/// With several chains configured, an error that only ever names `SUBGRAPH_URL`
-/// sends an operator to the wrong variable; `variable` is what makes the
-/// message actionable.
-fn validate_subgraph_scheme(
-    variable: &'static str,
-    subgraph_url: &Url,
-) -> Result<(), ConfigError> {
-    match subgraph_url.scheme() {
-        "http" | "https" => Ok(()),
-        scheme => Err(ConfigError::InvalidSubgraphScheme {
-            variable,
-            scheme: scheme.to_string(),
-        }),
-    }
-}
-
-/// The subgraph environment variable backing a network's chain group.
-const fn subgraph_variable(network: Network) -> &'static str {
-    match network {
-        Network::Base => "CHAIN_BASE_SUBGRAPH_URL",
-        Network::Ethereum => "CHAIN_ETHEREUM_SUBGRAPH_URL",
-        Network::HyperEvm => "CHAIN_HYPEREVM_SUBGRAPH_URL",
-    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone)]
@@ -793,9 +699,6 @@ pub enum ConfigError {
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
-    #[error("{variable} must use http or https scheme, got: {scheme}")]
-    InvalidSubgraphScheme { variable: &'static str, scheme: String },
-
     #[error("Base chain configuration is required")]
     MissingBaseChainConfiguration,
     #[error(
@@ -1126,8 +1029,6 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ]
     }
 
@@ -1147,7 +1048,6 @@ mod tests {
         assert_eq!(chain.network, Network::Base);
         assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(chain.rpc_url, config.rpc_url);
-        assert_eq!(chain.subgraph_url, config.subgraph_url);
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
     }
 
@@ -1156,14 +1056,11 @@ mod tests {
     {
         let mut args = minimal_args();
         remove_argument(&mut args, "--rpc-url");
-        remove_argument(&mut args, "--subgraph-url");
         args.extend_from_slice(&[
             "--chain-base-rpc-url",
             "wss://base.example",
             "--chain-base-chain-id",
             "8453",
-            "--chain-base-subgraph-url",
-            "https://base-subgraph.example",
             "--chain-base-backfill-start-block",
             "42000000",
         ]);
@@ -1176,10 +1073,6 @@ mod tests {
         assert_eq!(base.network, Network::Base);
         assert_eq!(base.chain_id, 8453);
         assert_eq!(base.rpc_url, Url::parse("wss://base.example").unwrap());
-        assert_eq!(
-            base.subgraph_url,
-            Url::parse("https://base-subgraph.example").unwrap()
-        );
         assert_eq!(base.backfill_start_block, 42_000_000);
     }
 
@@ -1195,8 +1088,6 @@ mod tests {
             "wss://base-grouped.example",
             "--chain-base-chain-id",
             "8453",
-            "--chain-base-subgraph-url",
-            "https://base-grouped-subgraph.example",
             "--chain-base-backfill-start-block",
             "42000000",
         ]);
@@ -1210,11 +1101,6 @@ mod tests {
             base.rpc_url,
             Url::parse("wss://base-grouped.example").unwrap(),
             "the grouped RPC endpoint must win over the legacy RPC_URL"
-        );
-        assert_eq!(
-            base.subgraph_url,
-            Url::parse("https://base-grouped-subgraph.example").unwrap(),
-            "the grouped subgraph must win over the legacy SUBGRAPH_URL"
         );
         assert_eq!(base.chain_id, 8453);
     }
@@ -1234,9 +1120,6 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
                 chain_id: Some(8453),
-                subgraph_url: Some(
-                    &Url::parse("https://ethereum-subgraph.example").unwrap(),
-                ),
                 backfill_start_block: Some(22_000_000),
             },
         );
@@ -1263,8 +1146,6 @@ mod tests {
             "wss://ethereum.example",
             "--chain-ethereum-chain-id",
             "1",
-            "--chain-ethereum-subgraph-url",
-            "https://ethereum-subgraph.example",
             "--chain-ethereum-backfill-start-block",
             "22000000",
         ]);
@@ -1280,10 +1161,6 @@ mod tests {
             ethereum.rpc_url,
             Url::parse("wss://ethereum.example").unwrap()
         );
-        assert_eq!(
-            ethereum.subgraph_url,
-            Url::parse("https://ethereum-subgraph.example").unwrap()
-        );
         assert_eq!(ethereum.backfill_start_block, 22_000_000);
     }
 
@@ -1295,8 +1172,6 @@ mod tests {
             "wss://hyperevm.example",
             "--chain-hyperevm-chain-id",
             "999",
-            "--chain-hyperevm-subgraph-url",
-            "https://hyperevm-subgraph.example",
             "--chain-hyperevm-backfill-start-block",
             "9000000",
         ]);
@@ -1312,10 +1187,6 @@ mod tests {
             hyperevm.rpc_url,
             Url::parse("wss://hyperevm.example").unwrap()
         );
-        assert_eq!(
-            hyperevm.subgraph_url,
-            Url::parse("https://hyperevm-subgraph.example").unwrap()
-        );
         assert_eq!(hyperevm.backfill_start_block, 9_000_000);
     }
 
@@ -1328,9 +1199,6 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
                 chain_id: Some(998),
-                subgraph_url: Some(
-                    &Url::parse("https://hyperevm-subgraph.example").unwrap(),
-                ),
                 backfill_start_block: Some(9_000_000),
             },
         );
@@ -1485,45 +1353,11 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ];
 
         let result = Env::try_parse_from(args);
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_wss_subgraph_url_rejected() {
-        let args = vec![
-            "test-binary",
-            "--rpc-url",
-            "wss://localhost:8545",
-            "--evm-private-key",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--backfill-start-block",
-            "12345678",
-            "--issuer-api-key",
-            "test-key-that-is-at-least-32-chars-long",
-            "--alpaca-account-id",
-            "test-alpaca-account-id",
-            "--alpaca-api-key",
-            "alpaca-test-key",
-            "--alpaca-api-secret",
-            "alpaca-test-secret",
-            "--subgraph-url",
-            "wss://api.goldsky.com/api/public/project_xxx/subgraphs/test/1.0.0/gn",
-        ];
-
-        let env = Env::try_parse_from(args).unwrap();
-        let result = env.into_config();
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidSubgraphScheme { variable, .. })
-                if variable == "SUBGRAPH_URL"
-        ));
     }
 
     #[test]
@@ -2210,8 +2044,6 @@ mod tests {
             "wss://localhost:8546",
             "--chain-ethereum-chain-id",
             "1",
-            "--chain-ethereum-subgraph-url",
-            "http://localhost:0/eth-subgraph",
             "--chain-ethereum-backfill-start-block",
             "1",
         ]);

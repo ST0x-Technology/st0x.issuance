@@ -1551,9 +1551,6 @@ mod tests {
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
 
-    const TEST_OA_SCHEMA: &str =
-        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
-
     /// The wallet balance readings are taken against in these tests.
     const OBSERVER: Address =
         address!("00000000000000000000000000000000000000ab");
@@ -2281,7 +2278,7 @@ mod tests {
             Some("cbor test".to_string()),
         );
 
-        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = receipt_info.encode().unwrap();
         assert!(
             rain_meta::is_rain_meta(&encoded),
             "encoded receipt should be rain meta format"
@@ -3632,7 +3629,7 @@ mod tests {
         fn encode_then_determine_source_preserves_issuer_request_id(
             receipt_info in arb_mint_receipt_information()
         ) {
-            let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+            let encoded = receipt_info.encode().unwrap();
             let (source, parsed_info) = determine_source(&encoded);
 
             prop_assert!(
@@ -3666,7 +3663,7 @@ mod tests {
             Some("Anvil integration test".to_string()),
         );
 
-        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = receipt_info.encode().unwrap();
         let amount = U256::from(100) * U256::from(10).pow(U256::from(18));
 
         let (_receipt_id, _shares, returned_info) = evm
@@ -3932,7 +3929,7 @@ mod tests {
 
         let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = make_receipt_info(&issuer_request_id);
-        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = receipt_info.encode().unwrap();
 
         service
             .register_minted_receipt(MintedReceiptParams {
@@ -3973,7 +3970,7 @@ mod tests {
         );
         let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = make_receipt_info(&issuer_request_id);
-        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = receipt_info.encode().unwrap();
 
         service
             .register_minted_receipt(MintedReceiptParams {
@@ -4018,7 +4015,7 @@ mod tests {
         for _ in 0..2 {
             let issuer_request_id = IssuerMintRequestId::random();
             let receipt_info = make_receipt_info(&issuer_request_id);
-            let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+            let encoded = receipt_info.encode().unwrap();
 
             service
                 .register_minted_receipt(MintedReceiptParams {
@@ -4056,7 +4053,7 @@ mod tests {
         );
         let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = make_receipt_info(&issuer_request_id);
-        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let encoded = receipt_info.encode().unwrap();
 
         service
             .register_minted_receipt(MintedReceiptParams {
