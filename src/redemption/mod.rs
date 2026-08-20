@@ -4,6 +4,7 @@ pub(crate) mod view;
 
 pub(crate) mod burn_manager;
 pub(crate) mod force_complete;
+pub(crate) mod job;
 pub(crate) mod journal_manager;
 pub(crate) mod poller;
 pub(crate) mod redeem_call_manager;
@@ -192,9 +193,10 @@ impl std::fmt::Display for BurnExternalTxId {
 }
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{
-    BurnRequestOrigin, BurnTxStatus, MultiBurnParams, NetworkVaultServices,
-    OrchestratorBurnParams, OrchestratorRevertReason, SendableTxWithHash, TxId,
-    UnconfiguredNetworkError, VaultError, VaultService,
+    BurnRange, BurnRequestOrigin, BurnTxStatus, MultiBurnParams,
+    NetworkVaultServices, OrchestratorBurnParams, OrchestratorRevertReason,
+    SendableTxWithHash, TxId, UnconfiguredNetworkError, VaultError,
+    VaultService,
 };
 
 pub(super) const fn default_redemption_network() -> Network {
@@ -379,13 +381,32 @@ struct BurnInput {
 /// computing the reservation-release flag, recoverable tx id, and typed
 /// classification at the aggregate boundary where the typed error is last
 /// visible.
-fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
+pub(crate) fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
     RedemptionError::Vault {
         release_reservation: should_release_reserved_burn(error),
         tx_id: extract_tx_hash(error).map(Into::into),
         classification: burn_failure_classification(error),
         message: error.to_string(),
     }
+}
+
+/// Maps the `VaultError` from a burn *confirmation* call into a
+/// `RedemptionError`, distinguishing the still pending case (retryable, keeps
+/// the reservation) from a definitive vault error. Shared by the aggregate's
+/// `ConfirmBurn` handler and `BurnManager`'s inline confirm path so both
+/// classify an identical vault error identically.
+pub(crate) fn map_confirm_burn_error(
+    error: VaultError,
+    tx_id: &TxId,
+) -> RedemptionError {
+    if is_pending_burn_confirmation(&error) {
+        return RedemptionError::BurnConfirmationPending {
+            tx_id: tx_id.clone(),
+            message: error.to_string(),
+        };
+    }
+
+    vault_error_to_redemption(&error)
 }
 
 /// Maps a typed `VaultError` to the burn-failure classification persisted on
@@ -719,16 +740,8 @@ impl Redemption {
             });
         }
 
-        let map_confirm_error = |error: VaultError| {
-            if is_pending_burn_confirmation(&error) {
-                return RedemptionError::BurnConfirmationPending {
-                    tx_id: tx_id.clone(),
-                    message: error.to_string(),
-                };
-            }
-
-            vault_error_to_redemption(&error)
-        };
+        let map_confirm_error =
+            |error: VaultError| map_confirm_burn_error(error, &tx_id);
 
         if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
             // `dust_shares` is vault-direct-shaped and always 0 here; dust
@@ -798,6 +811,199 @@ impl Redemption {
             block_number: result.block_number,
             burned_at: Utc::now(),
         })])
+    }
+
+    /// Records a confirmed VaultDirect burn from a result the caller already
+    /// obtained from the vault. The vault I/O half of the old `ConfirmBurn`
+    /// handler now lives in `BurnManager::confirm_submitted_burn`; this is the
+    /// pure event emitting half so the confirm step can move to a durable job.
+    fn handle_record_burn_confirmed(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_id: TxId,
+        tx_hash: B256,
+        burns: Vec<BurnRecord>,
+        dust_returned: U256,
+        gas_used: u64,
+        block_number: u64,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let stored_tx_id = match self {
+            Self::BurnSubmitted { tx_id, .. } => tx_id.clone(),
+            Self::BurnIntended { sendable_tx, .. } => sendable_tx.hash.into(),
+            _ => {
+                return Err(RedemptionError::InvalidState {
+                    expected: "BurnSubmitted or BurnIntended".to_string(),
+                    found: self.state_name().to_string(),
+                });
+            }
+        };
+
+        if stored_tx_id != tx_id {
+            return Err(RedemptionError::TxIdMismatch {
+                expected: stored_tx_id,
+                provided: tx_id,
+            });
+        }
+
+        Ok(vec![RedemptionEvent::TokensBurned(TokensBurnedData {
+            issuer_request_id,
+            tx_hash,
+            burns,
+            dust_returned,
+            gas_used,
+            block_number,
+            burned_at: Utc::now(),
+        })])
+    }
+
+    /// Orchestrator mode counterpart of [`Self::handle_record_burn_confirmed`].
+    /// Validates the burned shares against this redemption's own persisted
+    /// `alpaca_quantity` (1:1 accounting) before emitting, and records dust
+    /// retained from the persisted `dust_quantity` (SPEC Decision 6).
+    fn handle_record_orchestrator_burn_confirmed(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_id: TxId,
+        tx_hash: B256,
+        shares_burned: U256,
+        burn_range: BurnRange,
+        gas_used: u64,
+        block_number: u64,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let (stored_tx_id, alpaca_quantity, dust_quantity) = match self {
+            Self::BurnSubmitted {
+                tx_id,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            } => (tx_id.clone(), alpaca_quantity, dust_quantity),
+            Self::BurnIntended {
+                sendable_tx,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            } => (sendable_tx.hash.into(), alpaca_quantity, dust_quantity),
+            _ => {
+                return Err(RedemptionError::InvalidState {
+                    expected: "BurnSubmitted or BurnIntended".to_string(),
+                    found: self.state_name().to_string(),
+                });
+            }
+        };
+
+        if stored_tx_id != tx_id {
+            return Err(RedemptionError::TxIdMismatch {
+                expected: stored_tx_id,
+                provided: tx_id,
+            });
+        }
+
+        let expected_shares = alpaca_quantity
+            .to_u256_with_18_decimals()
+            .map_err(|error| RedemptionError::QuantityConversion {
+                message: error.to_string(),
+            })?;
+        if shares_burned != expected_shares {
+            return Err(RedemptionError::OrchestratorAmountMismatch {
+                expected: expected_shares,
+                actual: shares_burned,
+            });
+        }
+
+        let dust_retained =
+            dust_quantity.to_u256_with_18_decimals().map_err(|error| {
+                RedemptionError::QuantityConversion {
+                    message: error.to_string(),
+                }
+            })?;
+
+        Ok(vec![RedemptionEvent::OrchestratorTokensBurned {
+            issuer_request_id,
+            tx_hash,
+            shares_burned,
+            burn_range,
+            dust_retained,
+            gas_used,
+            block_number,
+            burned_at: Utc::now(),
+        }])
+    }
+
+    /// Records a VaultDirect burn broadcast reported by the durable
+    /// `SubmitBurnJob`. Pure: emits `BurnTxSubmitted` from the payload.
+    /// Valid from `BurnIntended`; idempotent no-op once the redemption has
+    /// advanced to `BurnSubmitted` or a terminal state, so an at least once
+    /// job rerun is safe.
+    fn handle_record_burn_tx_submitted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: BurnExternalTxId,
+        tx_id: TxId,
+        planned_burns: Vec<BurnRecord>,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match self {
+            Self::BurnIntended { metadata, .. } => {
+                if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: VaultModeKind::Orchestrator,
+                        found: VaultModeKind::VaultDirect,
+                    });
+                }
+
+                Ok(vec![RedemptionEvent::BurnTxSubmitted {
+                    issuer_request_id,
+                    external_tx_id,
+                    tx_id,
+                    planned_burns,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::BurnSubmitted { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Closed { .. } => Ok(vec![]),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Orchestrator mode counterpart of
+    /// [`Self::handle_record_burn_tx_submitted`]. Pure: emits
+    /// `OrchestratorBurnSubmitted` from the payload. Same state validity and
+    /// idempotency.
+    fn handle_record_orchestrator_burn_submitted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: BurnExternalTxId,
+        tx_id: TxId,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match self {
+            Self::BurnIntended { metadata, .. } => {
+                let VaultMode::Orchestrator { .. } = metadata.burn_mode else {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: VaultModeKind::VaultDirect,
+                        found: VaultModeKind::Orchestrator,
+                    });
+                };
+
+                Ok(vec![RedemptionEvent::OrchestratorBurnSubmitted {
+                    issuer_request_id,
+                    external_tx_id,
+                    tx_id,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::BurnSubmitted { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Closed { .. } => Ok(vec![]),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
     }
 
     fn handle_record_burn_failure(
@@ -1904,6 +2110,20 @@ impl EventSourced for Redemption {
                     found: "Uninitialized".to_string(),
                 })
             }
+            RedemptionCommand::RecordBurnConfirmed { .. }
+            | RedemptionCommand::RecordOrchestratorBurnConfirmed { .. } => {
+                Err(RedemptionError::InvalidState {
+                    expected: "BurnSubmitted or BurnIntended".to_string(),
+                    found: "Uninitialized".to_string(),
+                })
+            }
+            RedemptionCommand::RecordBurnTxSubmitted { .. }
+            | RedemptionCommand::RecordOrchestratorBurnSubmitted { .. } => {
+                Err(RedemptionError::InvalidState {
+                    expected: "BurnIntended".to_string(),
+                    found: "Uninitialized".to_string(),
+                })
+            }
             RedemptionCommand::RecordBurnFailure { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "Burning, BurnIntended, or BurnSubmitted"
@@ -1986,6 +2206,60 @@ impl EventSourced for Redemption {
                 )
                 .await
             }
+            RedemptionCommand::RecordBurnConfirmed {
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                burns,
+                dust_returned,
+                gas_used,
+                block_number,
+            } => self.handle_record_burn_confirmed(
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                burns,
+                dust_returned,
+                gas_used,
+                block_number,
+            ),
+            RedemptionCommand::RecordOrchestratorBurnConfirmed {
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                shares_burned,
+                burn_range,
+                gas_used,
+                block_number,
+            } => self.handle_record_orchestrator_burn_confirmed(
+                issuer_request_id,
+                tx_id,
+                tx_hash,
+                shares_burned,
+                burn_range,
+                gas_used,
+                block_number,
+            ),
+            RedemptionCommand::RecordBurnTxSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+                planned_burns,
+            } => self.handle_record_burn_tx_submitted(
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+                planned_burns,
+            ),
+            RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+            } => self.handle_record_orchestrator_burn_submitted(
+                issuer_request_id,
+                external_tx_id,
+                tx_id,
+            ),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error,
