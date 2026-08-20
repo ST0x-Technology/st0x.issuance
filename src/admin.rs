@@ -954,11 +954,11 @@ fn report_recovery_outcome(
             );
             "Recovered from Failed and executed burn immediately"
         }
-        RecoveryOutcome::ExistingBurnRecorded => {
+        RecoveryOutcome::EnqueuedBurnJob => {
             info!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
-                "Recovered redemption by recording a previously submitted on-chain burn"
+                "Recovered redemption and enqueued a durable burn job"
             );
-            "Recovered from Failed and recorded a previously submitted on-chain burn"
+            "Recovered from Failed and enqueued a durable burn job"
         }
         RecoveryOutcome::SkippedManualIntervention => {
             warn!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,

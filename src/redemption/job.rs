@@ -13,7 +13,6 @@
 //! left to the burn recovery reconciler; an infrastructure failure surfaces as
 //! a job error that apalis redrives.
 
-use apalis_sqlite::SqlitePool;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;

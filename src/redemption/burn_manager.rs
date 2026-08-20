@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::job::SubmitBurnJob;
+use super::job::{ConfirmBurnJob, SubmitBurnJob};
 use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
@@ -114,8 +114,9 @@ struct PersistedBurnRecovery<'state> {
 pub(crate) enum RecoveryOutcome {
     /// A fresh burn was submitted on-chain for a `Burning` redemption.
     Executed,
-    /// A previously submitted tx burn was confirmed and recorded.
-    ExistingBurnRecorded,
+    /// Recovery enqueued a durable burn job (`SubmitBurnJob` or
+    /// `ConfirmBurnJob`) that broadcasts or confirms the burn.
+    EnqueuedBurnJob,
     /// Burn skipped: the bot's on-chain balance is insufficient, so the burn
     /// likely already landed but was never recorded. Needs manual review.
     SkippedManualIntervention,
@@ -1117,112 +1118,26 @@ impl BurnManager {
         if has_submitted {
             info!(target: "redemption", issuer_request_id = %issuer_request_id,
                 tx_id = %tx_id,
-                "Recovering BurnSubmitted redemption - confirming existing transaction"
+                "Recovering BurnSubmitted redemption - enqueuing confirm job"
             );
         } else {
             info!(target: "redemption", issuer_request_id = %issuer_request_id,
                 tx_id = %tx_id,
-                "Recovering BurnIntended redemption - checking existing transaction"
+                "Recovering BurnIntended redemption - enqueuing confirm job"
             );
         }
 
-        let confirm_result = self
-            .store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::ConfirmBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tx_id: tx_id.clone(),
-                    dust_shares,
-                },
-            )
-            .await;
+        let execution = self.recovery_confirm_execution(
+            metadata.network,
+            vault,
+            metadata.burn_mode,
+            dust_shares,
+            planned_burns,
+        );
+        self.enqueue_confirm_burn(issuer_request_id, execution, tx_id.clone())
+            .await?;
 
-        let is_orchestrator =
-            matches!(metadata.burn_mode, VaultMode::Orchestrator { .. });
-
-        match confirm_result {
-            Ok(()) => {
-                info!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "Burn confirmed successfully during recovery"
-                );
-
-                let chain_id = self.chain_id_for(metadata.network)?;
-                if !is_orchestrator {
-                    self.settle_reserved_burn(
-                        chain_id,
-                        vault,
-                        issuer_request_id,
-                    )
-                    .await;
-                }
-
-                Ok(RecoveryOutcome::ExistingBurnRecorded)
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::Vault {
-                    message: err,
-                    release_reservation,
-                    classification,
-                    ..
-                },
-            ))) => {
-                if has_submitted {
-                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                        error = %err,
-                        classification = ?classification,
-                        "Burn confirmation failed during recovery"
-                    );
-                } else {
-                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                        error = %err,
-                        classification = ?classification,
-                        "BurnIntended confirmation failed during recovery"
-                    );
-                }
-
-                if release_reservation {
-                    self.record_definitive_confirm_failure(
-                        metadata.network,
-                        issuer_request_id,
-                        DefinitiveConfirmFailure {
-                            vault,
-                            is_orchestrator,
-                            classification: &classification,
-                            error: &err,
-                            tx_id,
-                            planned_burns,
-                        },
-                    )
-                    .await?;
-                } else {
-                    warn!(target: "redemption",
-                        issuer_request_id = %issuer_request_id,
-                        tx_id = %tx_id,
-                        "Burn confirmation remains uncertain; keeping persisted transaction recoverable"
-                    );
-                }
-
-                Err(BurnManagerError::Redemption(RedemptionError::Vault {
-                    message: err,
-                    release_reservation,
-                    tx_id: None,
-                    classification,
-                }))
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                RedemptionError::NetworkNotConfigured { network },
-            ))) => self
-                .record_burn_failure_for_unconfigured_network(
-                    issuer_request_id,
-                    network,
-                    Some(tx_id.clone()),
-                    planned_burns.to_vec(),
-                )
-                .await
-                .map(|()| RecoveryOutcome::Executed),
-            Err(err) => Err(err.into()),
-        }
+        Ok(RecoveryOutcome::EnqueuedBurnJob)
     }
 
     /// Builds the mode-correct `BurnParams` for a recovery-driven command
@@ -1347,29 +1262,40 @@ impl BurnManager {
             return Ok(RecoveryOutcome::SkippedManualIntervention);
         }
 
-        let command = match status {
-            BurnTxStatus::StillMineable => RedemptionCommand::BurnTokens {
-                issuer_request_id: issuer_request_id.clone(),
-                params: self.recovery_burn_params(
+        match status {
+            BurnTxStatus::StillMineable => {
+                let params = self.recovery_burn_params(
                     metadata.burn_mode,
                     vault,
                     planned_burns,
                     sendable_tx.dust_shares,
                     alpaca_quantity,
-                )?,
-                external_tx_id,
-            },
-            BurnTxStatus::ProvablyDead => RedemptionCommand::ReplaceDeadBurn {
-                issuer_request_id: issuer_request_id.clone(),
-                owner: self.bot_wallet,
-            },
+                )?;
+                let execution = BurnExecutionPlan::from_recovery(
+                    metadata.network,
+                    params,
+                    planned_burns.to_vec(),
+                    external_tx_id,
+                );
+                self.enqueue_submit_burn(issuer_request_id, execution).await?;
+            }
+            BurnTxStatus::ProvablyDead => {
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::ReplaceDeadBurn {
+                            issuer_request_id: issuer_request_id.clone(),
+                            owner: self.bot_wallet,
+                        },
+                    )
+                    .await?;
+            }
             BurnTxStatus::Mined | BurnTxStatus::Reverted => {
                 return Err(BurnManagerError::InvalidAggregateState {
                     current_state: "terminal burn classification".to_string(),
                 });
             }
-        };
-        self.store.send(issuer_request_id, command).await?;
+        }
 
         if status == BurnTxStatus::ProvablyDead {
             self.submit_replacement_after_dead_burn(
@@ -1388,7 +1314,7 @@ impl BurnManager {
             action = ?action,
             "Automatic burn recovery action accepted"
         );
-        Ok(RecoveryOutcome::Executed)
+        Ok(RecoveryOutcome::EnqueuedBurnJob)
     }
 
     /// Broadcasts the replacement transaction `ReplaceDeadBurn` just
@@ -1406,6 +1332,7 @@ impl BurnManager {
             planned_burns,
             sendable_tx,
             external_tx_id,
+            metadata,
             ..
         }) = self.store.load(issuer_request_id).await?
         else {
@@ -1414,22 +1341,20 @@ impl BurnManager {
             });
         };
 
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::BurnTokens {
-                    issuer_request_id: issuer_request_id.clone(),
-                    params: self.recovery_burn_params(
-                        burn_mode,
-                        vault,
-                        &planned_burns,
-                        sendable_tx.dust_shares,
-                        alpaca_quantity,
-                    )?,
-                    external_tx_id,
-                },
-            )
-            .await?;
+        let params = self.recovery_burn_params(
+            burn_mode,
+            vault,
+            &planned_burns,
+            sendable_tx.dust_shares,
+            alpaca_quantity,
+        )?;
+        let execution = BurnExecutionPlan::from_recovery(
+            metadata.network,
+            params,
+            planned_burns,
+            external_tx_id,
+        );
+        self.enqueue_submit_burn(issuer_request_id, execution).await?;
 
         Ok(())
     }
@@ -1626,7 +1551,7 @@ impl BurnManager {
                 self.handle_burning_started(issuer_request_id, &aggregate)
                     .await?;
 
-                Ok(RecoveryOutcome::Executed)
+                Ok(RecoveryOutcome::EnqueuedBurnJob)
             }
 
             _ => {
@@ -2282,6 +2207,67 @@ impl BurnManager {
             )
             .await?;
         Ok(())
+    }
+
+    /// Enqueues the durable `ConfirmBurnJob` under the redemption's idempotency
+    /// key, freeing any terminal prior row so the push is not silently dropped.
+    pub(crate) async fn enqueue_confirm_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        execution: BurnExecutionPlan,
+        tx_id: TxId,
+    ) -> Result<(), BurnManagerError> {
+        release_terminal_job(
+            &self.view_pool,
+            job_type::<ConfirmBurnJob>(),
+            &issuer_request_id.to_string(),
+        )
+        .await?;
+        JobQueue::<ConfirmBurnJob>::new(&self.apalis_pool)
+            .push_with_idempotency_key(
+                ConfirmBurnJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    execution,
+                    tx_id,
+                },
+                issuer_request_id.to_string(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Builds the plan a recovery-driven `ConfirmBurnJob` needs: confirm reads
+    /// only `network`, the params variant, `vault`, and `dust_shares`, so the
+    /// submit-only fields carry no receipt payload.
+    fn recovery_confirm_execution(
+        &self,
+        network: Network,
+        vault: Address,
+        burn_mode: VaultMode,
+        dust_shares: U256,
+        planned_burns: &[BurnRecord],
+    ) -> BurnExecutionPlan {
+        let params = match burn_mode {
+            VaultMode::VaultDirect => BurnParams::VaultDirect {
+                vault,
+                burns: vec![],
+                dust_shares,
+                owner: self.bot_wallet,
+            },
+            VaultMode::Orchestrator { .. } => BurnParams::Orchestrator {
+                token: vault,
+                amount: U256::ZERO,
+                owner: self.bot_wallet,
+            },
+        };
+        BurnExecutionPlan {
+            network,
+            vault,
+            params,
+            planned_burns: planned_burns.to_vec(),
+            dust_shares,
+            external_tx_id: None,
+        }
     }
 
     async fn is_burn_execution_current(
@@ -3083,6 +3069,34 @@ impl BurnExecutionPlan {
         }
     }
 
+    /// Builds a plan for a recovery-driven re-broadcast from the mode-correct
+    /// `BurnParams` the reconciler reconstructed. `vault` and `dust_shares` are
+    /// taken from the params so a later confirm reads the same anchor the hot
+    /// path records.
+    fn from_recovery(
+        network: Network,
+        params: BurnParams,
+        planned_burns: Vec<BurnRecord>,
+        external_tx_id: Option<BurnExternalTxId>,
+    ) -> Self {
+        let (vault, dust_shares, planned_burns) = match &params {
+            BurnParams::VaultDirect { vault, dust_shares, .. } => {
+                (*vault, *dust_shares, planned_burns)
+            }
+            BurnParams::Orchestrator { token, .. } => {
+                (*token, U256::ZERO, vec![])
+            }
+        };
+        Self {
+            network,
+            vault,
+            params,
+            planned_burns,
+            dust_shares,
+            external_tx_id,
+        }
+    }
+
     /// Whether this execution runs through the orchestrator, in which case
     /// the receipt-inventory reserve/settle/release lifecycle does not apply.
     pub(crate) const fn is_orchestrator(&self) -> bool {
@@ -3207,6 +3221,7 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -3331,6 +3346,7 @@ mod tests {
         receipt_inventory_store: Arc<Store<ReceiptInventory>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
         asset_store: Arc<Store<TokenizedAsset>>,
+        apalis_pool: apalis_sqlite::SqlitePool,
     }
 
     struct SettleFailingReceiptService {
@@ -3434,18 +3450,39 @@ mod tests {
         }
 
         async fn with_vault_mock(vault_mock: Arc<MockVaultService>) -> Self {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(5)
-                .connect(":memory:")
-                .await
-                .expect("Failed to create in-memory database");
+            let database_path = std::env::temp_dir()
+                .join(format!("st0x-burn-test-{}.db", uuid::Uuid::new_v4()));
+            let database_url = format!("sqlite:{}", database_path.display());
 
-            Self::with_pool(vault_mock, pool).await
+            let options =
+                sqlx::sqlite::SqliteConnectOptions::from_str(&database_url)
+                    .expect("valid sqlite url")
+                    .create_if_missing(true)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(5));
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .expect("Failed to create test database");
+
+            let apalis_options =
+                apalis_sqlite::SqliteConnectOptions::from_str(&database_url)
+                    .expect("valid sqlite url")
+                    .pragma("journal_mode", "WAL")
+                    .busy_timeout(Duration::from_secs(5));
+            let apalis_pool =
+                apalis_sqlite::SqlitePool::connect_with(apalis_options)
+                    .await
+                    .expect("Failed to create apalis test pool");
+
+            Self::with_pool(vault_mock, pool, apalis_pool).await
         }
 
         async fn with_pool(
             vault_mock: Arc<MockVaultService>,
             pool: SqlitePool,
+            apalis_pool: apalis_sqlite::SqlitePool,
         ) -> Self {
             sqlx::migrate!("./migrations")
                 .run(&pool)
@@ -3487,6 +3524,7 @@ mod tests {
                 receipt_inventory_store,
                 pool,
                 asset_store,
+                apalis_pool,
             }
         }
 
