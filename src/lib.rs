@@ -398,6 +398,16 @@ pub async fn initialize_rocket(
         shutdown_rx.clone(),
     ));
 
+    // After recovery so a drain pass cannot race the startup sweep over the
+    // same aggregates. Resumes redemptions held during a dividend freeze once
+    // their asset unfreezes.
+    background_task_handles.push(
+        redemption::redeem_call_manager::spawn_held_redemption_reconciler(
+            managers.redeem_call.clone(),
+            shutdown_rx.clone(),
+        ),
+    );
+
     for (network, runtime) in chain_registry.runtimes() {
         background_task_handles.push(spawn_periodic_receipt_backfills(
             PeriodicBackfillSpawn {
