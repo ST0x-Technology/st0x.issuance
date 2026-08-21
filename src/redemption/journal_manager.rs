@@ -590,7 +590,6 @@ impl From<AggregateError<LifecycleError<Redemption>>> for JournalManagerError {
 mod tests {
     use alloy::primitives::{Address, TxHash, address, b256};
     use async_trait::async_trait;
-    use chrono::NaiveDate;
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -604,8 +603,7 @@ mod tests {
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
     use crate::alpaca::{
-        AlpacaError, AlpacaService, DividendAnnouncement, RedeemRequestStatus,
-        TokenizationRequest,
+        AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
     };
     use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
@@ -821,14 +819,6 @@ mod tests {
                     })
                 }
             }
-        }
-
-        async fn list_dividend_announcements(
-            &self,
-            _since: NaiveDate,
-            _until: NaiveDate,
-        ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-            unreachable!("not used in journal manager tests")
         }
     }
 
@@ -1389,14 +1379,6 @@ mod tests {
                     updated_at: Some(chrono::Utc::now()),
                 })
             }
-
-            async fn list_dividend_announcements(
-                &self,
-                _since: NaiveDate,
-                _until: NaiveDate,
-            ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-                unreachable!("not used in journal manager tests")
-            }
         }
 
         let mock = Arc::new(QuantityMismatchMock {
@@ -1489,14 +1471,6 @@ mod tests {
                     updated_at: Some(chrono::Utc::now()),
                 })
             }
-
-            async fn list_dividend_announcements(
-                &self,
-                _since: NaiveDate,
-                _until: NaiveDate,
-            ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-                unreachable!("not used in journal manager tests")
-            }
         }
 
         let mock = Arc::new(NetworkMismatchMock {
@@ -1575,14 +1549,6 @@ mod tests {
                 _tokenization_request_id: &TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
                 Ok(TokenizationRequest::Mint {})
-            }
-
-            async fn list_dividend_announcements(
-                &self,
-                _since: NaiveDate,
-                _until: NaiveDate,
-            ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
-                unreachable!("not used in journal manager tests")
             }
         }
 

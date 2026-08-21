@@ -23,7 +23,7 @@ use apalis_core::backend::poll_strategy::{
 };
 use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{
-    CompactType, Config, SqlitePool, SqliteStorage, SqlxError,
+    CompactType, Config, SqlitePool, SqliteStorage, SqlxError, TaskBuilderExt,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -59,6 +59,7 @@ pub(crate) struct ScheduledTask<Task> {
     pub(crate) task: Task,
     pub(crate) idempotency_key: String,
     pub(crate) run_after: Duration,
+    pub(crate) max_attempts: Option<u32>,
 }
 
 /// Error returned by [`JobQueue::push_with_idempotency_key`]. Wrapping
@@ -115,11 +116,20 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static>
         tasks: [ScheduledTask<Task>; N],
     ) -> Result<(), QueuePushError> {
         let mut tasks = futures::stream::iter(tasks.map(
-            |ScheduledTask { task, idempotency_key, run_after }| {
-                TaskBuilder::new(task)
+            |ScheduledTask {
+                 task,
+                 idempotency_key,
+                 run_after,
+                 max_attempts,
+             }| {
+                let task = TaskBuilder::new(task)
                     .with_idempotency_key(idempotency_key)
-                    .run_after(run_after)
-                    .build()
+                    .run_after(run_after);
+                match max_attempts {
+                    Some(max_attempts) => task.max_attempts(max_attempts),
+                    None => task,
+                }
+                .build()
             },
         ));
         Ok(TaskSink::push_all(&mut self.0, &mut tasks).await?)

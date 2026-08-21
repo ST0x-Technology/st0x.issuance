@@ -55,6 +55,22 @@ pub type TestProviderBuilder = ProviderBuilder<
     >,
 >;
 
+pub fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
+    const PATH: &str = "/v1beta1/events/corporate-actions";
+    const EVENT_TYPES: &str = "cash_dividend_corporateaction_event,stock_dividend_corporateaction_event";
+
+    mock_alpaca.mock(|when, then| {
+        when.method(GET).path(PATH);
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(
+                "id: 01J9RPMV5TKB8WX3M4F1KZ7QH2\nevent: insert\ndata: {\"event_type\":\"cash_dividend_corporateaction_event\",\"region\":\"us\",\"ca\":{\"id\":\"development-baseline\",\"symbol\":\"UNLISTED\",\"ex_date\":\"2026-08-21\"}}\n\n",
+            );
+    });
+
+    format!("{}{PATH}?type={EVENT_TYPES}&region=us", mock_alpaca.base_url())
+}
+
 pub async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
     wallet: Address,
@@ -330,14 +346,14 @@ pub async fn seed_tokenized_asset_with(
 /// This allows `initialize_rocket` to discover the asset during startup,
 /// so that receipt backfill and redemption monitoring are wired for this vault.
 ///
-/// Seeds the `events` table with a `TokenizedAsset::Added` event before the
-/// Rocket service starts.
+/// Seeds a `TokenizedAsset::Added` event before Rocket starts.
 ///
 /// Per AGENTS.md "Setup phase exception", direct event store seeding is
 /// permitted in e2e test setup phases. The tokenized asset view is rebuilt
 /// from events by `initialize_rocket` during startup (via the
 /// `TokenizedAsset` projection's catch-up in `StoreBuilder::build`), so only
-/// the event needs to be seeded.
+/// the event needs to be seeded for the aggregate. The credential-free
+/// development feed establishes its own cursor through the running service.
 pub async fn preseed_tokenized_asset(
     db_url: &str,
     vault: Address,
@@ -568,6 +584,10 @@ pub fn create_config_with_db(
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: setup_corporate_actions_stream_mock(
+                mock_alpaca,
+            ),
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),
