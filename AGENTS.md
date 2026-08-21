@@ -151,7 +151,7 @@ ES + CQRS are this bot's architectural foundation.
 
 - **Aggregates**: Business entities encapsulating state and logic (`Mint`,
   `Redemption`, `Account`, `TokenizedAsset`)
-- **Commands**: Requests representing user/system intent (`InitiateMint`,
+- **Commands**: Requests representing user/system intent (`Initiate`,
   `ConfirmJournal`)
 - **Events**: Immutable past-tense facts (`MintInitiated`, `JournalConfirmed`)
 - **Event Store**: Single source of truth - append-only log of domain events in
@@ -346,16 +346,15 @@ across a deploy.
 **Mint Flow:**
 
 1. AP requests mint -> Alpaca calls `/inkind/issuance`
-2. We validate and respond with `issuer_request_id` (Command: `InitiateMint`,
-   Event: `MintInitiated`)
+2. Validate and respond with `issuer_request_id`: `Initiate` -> `Initiated`
 3. Alpaca journals shares from AP to our custodian account
-4. Alpaca confirms journal -> `/inkind/issuance/confirm` (Command:
-   `ConfirmJournal`, Events: `JournalConfirmed`, `MintingStarted`)
-5. We prepare and persist the exact signed mint multicall (Command:
-   `PrepareMint`, Event: `MintTxIntended`)
-6. We broadcast and confirm it (Commands: `SubmitMint`, `ConfirmMint`; Events:
-   `MintTxSubmitted`, `TokensMinted`)
-7. We call Alpaca's callback (Command: `SendCallback`, Event: `MintCompleted`)
+4. Alpaca confirms: `ConfirmJournal`, `Deposit` -> `JournalConfirmed`,
+   `MintingStarted`
+5. `SubmitMintJob` prepares/persists the signed tx: `RecordTxIntended` ->
+   `MintTxIntended`
+6. Jobs broadcast/confirm: `RecordTxSubmitted`, `RecordTokensMinted` ->
+   `MintTxSubmitted`, `TokensMinted`
+7. `SendCallbackJob` calls Alpaca: `RecordCallbackSent` -> `MintCompleted`
 
 **Redemption Flow:**
 
@@ -738,7 +737,7 @@ fn test_fields() {
 
 // Good: Tests our validation logic
 fn test_validates_quantity() {
-    let result = Mint::default().handle(InitiateMint { qty: (-10).into(), .. });
+    let result = Mint::default().handle(Initiate { qty: (-10).into(), .. });
     assert!(matches!(result, Err(MintError::InvalidQuantity)));
 }
 ```
