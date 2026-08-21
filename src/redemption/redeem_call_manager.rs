@@ -10,13 +10,14 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionView,
-    RedemptionViewError, find_detected, find_held,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionState,
+    RedemptionView, RedemptionViewError, find_detected, find_held,
 };
 use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
+use crate::notifications::{LifecycleNotification, LifecycleNotifier};
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
@@ -71,6 +72,7 @@ pub(crate) struct RedeemCallManager {
     alpaca_service: Arc<dyn AlpacaService>,
     store: Arc<Store<Redemption>>,
     pool: Pool<Sqlite>,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
     #[cfg(test)]
     before_claim_test_hook:
         Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
@@ -81,11 +83,13 @@ impl RedeemCallManager {
         alpaca_service: Arc<dyn AlpacaService>,
         store: Arc<Store<Redemption>>,
         pool: Pool<Sqlite>,
+        lifecycle_notifier: Arc<dyn LifecycleNotifier>,
     ) -> Self {
         Self {
             alpaca_service,
             store,
             pool,
+            lifecycle_notifier,
             #[cfg(test)]
             before_claim_test_hook: None,
         }
@@ -340,7 +344,7 @@ impl RedeemCallManager {
             }
         }
 
-        let (client_id, alpaca_account) =
+        let (client_id, _) =
             self.lookup_account_for_recovery(&metadata.wallet).await?;
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -348,7 +352,6 @@ impl RedeemCallManager {
         );
 
         self.handle_redemption_detected_with_outcome(
-            &alpaca_account,
             issuer_request_id,
             &aggregate,
             client_id,
@@ -371,6 +374,12 @@ impl RedeemCallManager {
             return Ok(());
         }
 
+        let Redemption::Detected { metadata } = aggregate else {
+            return Err(RedeemCallManagerError::InvalidAggregateState {
+                current_state: aggregate.state(),
+            });
+        };
+
         self.store
             .send(
                 issuer_request_id,
@@ -379,6 +388,13 @@ impl RedeemCallManager {
                 },
             )
             .await?;
+
+        self.lifecycle_notifier
+            .notify(&LifecycleNotification::RedemptionHeld {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: metadata.underlying.clone(),
+            })
+            .await;
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Held redemption before the Alpaca call: the underlying is frozen; \
@@ -424,29 +440,47 @@ impl RedeemCallManager {
         }
     }
 
-    #[tracing::instrument(skip(self, aggregate), fields(
+    #[tracing::instrument(skip(self, aggregate, _alpaca_account), fields(
         issuer_request_id = %issuer_request_id,
         client_id = %client_id
     ))]
     pub(crate) async fn handle_redemption_detected(
         &self,
-        alpaca_account: &AlpacaAccountNumber,
+        _alpaca_account: &AlpacaAccountNumber,
         issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
     ) -> Result<DetectedRecoveryOutcome, RedeemCallManagerError> {
-        self.handle_redemption_detected_with_outcome(
-            alpaca_account,
-            issuer_request_id,
-            aggregate,
-            client_id,
-        )
-        .await
+        let resuming_underlying = match aggregate {
+            Redemption::Held { metadata, .. } => {
+                Some(metadata.underlying.clone())
+            }
+            _ => None,
+        };
+        let result = self
+            .handle_redemption_detected_with_outcome(
+                issuer_request_id,
+                aggregate,
+                client_id,
+            )
+            .await;
+
+        if result.is_err()
+            && let Some(underlying) = resuming_underlying
+        {
+            self.lifecycle_notifier
+                .notify(&LifecycleNotification::RedemptionResumeFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                })
+                .await;
+        }
+
+        result
     }
 
     async fn handle_redemption_detected_with_outcome(
         &self,
-        _alpaca_account: &AlpacaAccountNumber,
         issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
@@ -456,7 +490,7 @@ impl RedeemCallManager {
         | Redemption::AlpacaCallClaimed { metadata, .. }) = aggregate
         else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
-                current_state: aggregate.state_name().to_string(),
+                current_state: aggregate.state(),
             });
         };
 
@@ -507,7 +541,7 @@ impl RedeemCallManager {
                 ) {
                     return Err(
                         RedeemCallManagerError::InvalidAggregateState {
-                            current_state: current.state_name().to_string(),
+                            current_state: current.state(),
                         },
                     );
                 }
@@ -555,7 +589,6 @@ impl RedeemCallManager {
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             underlying = %metadata.underlying,
-            wallet = %metadata.wallet,
             "Calling Alpaca redeem endpoint"
         );
 
@@ -584,7 +617,12 @@ impl RedeemCallManager {
                     network = %response.network,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
-                    fees = ?response.fees.as_ref().map(|f| f.0),
+                    fees = ?response.fees.as_ref().map(|fees| fees.0),
+                    quantity_matches_request = response.quantity == alpaca_quantity,
+                    wallet_matches_request = response.wallet == metadata.wallet,
+                    fees_nonzero = response.fees.as_ref().is_some_and(|fees| {
+                        !fees.0.is_zero()
+                    }),
                     "Alpaca redeem API call succeeded"
                 );
 
@@ -600,6 +638,15 @@ impl RedeemCallManager {
                         },
                     )
                     .await?;
+
+                if matches!(aggregate, Redemption::Held { .. }) {
+                    self.lifecycle_notifier
+                        .notify(&LifecycleNotification::RedemptionResumed {
+                            issuer_request_id: issuer_request_id.clone(),
+                            underlying: metadata.underlying.clone(),
+                        })
+                        .await;
+                }
 
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "RecordAlpacaCall command executed successfully"
@@ -640,7 +687,7 @@ pub(crate) enum RedeemCallManagerError {
     #[error("CQRS error: {0}")]
     Cqrs(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Invalid aggregate state: {current_state}")]
-    InvalidAggregateState { current_state: String },
+    InvalidAggregateState { current_state: RedemptionState },
     #[error("Redemption aggregate not found: {issuer_request_id}")]
     RedemptionNotFound { issuer_request_id: IssuerRedemptionRequestId },
     #[error("View error: {0}")]
@@ -715,7 +762,7 @@ mod tests {
 
     use super::{
         DetectedRecoveryOutcome, RedeemCallManager, RedeemCallManagerError,
-        spawn_held_redemption_reconciler,
+        RedemptionState, spawn_held_redemption_reconciler,
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
@@ -730,6 +777,10 @@ mod tests {
     };
     use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::notifications::{
+        CapturingLifecycleNotifier, LifecycleNotification, LifecycleNotifier,
+        NoopLifecycleNotifier,
+    };
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
@@ -927,10 +978,22 @@ mod tests {
             &self,
             alpaca_service: Arc<dyn crate::alpaca::AlpacaService>,
         ) -> RedeemCallManager {
+            self.create_manager_with_notifier(
+                alpaca_service,
+                Arc::new(NoopLifecycleNotifier),
+            )
+        }
+
+        fn create_manager_with_notifier(
+            &self,
+            alpaca_service: Arc<dyn crate::alpaca::AlpacaService>,
+            lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+        ) -> RedeemCallManager {
             RedeemCallManager::new(
                 alpaca_service,
                 self.redemption_store.clone(),
                 self.pool.clone(),
+                lifecycle_notifier,
             )
         }
 
@@ -1090,8 +1153,12 @@ mod tests {
             captured_network: Mutex::new(None),
         });
         let alpaca_service = capture.clone() as Arc<dyn AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+        let manager = RedeemCallManager::new(
+            alpaca_service,
+            store.clone(),
+            pool,
+            Arc::new(NoopLifecycleNotifier),
+        );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("TSLA").unwrap();
@@ -1580,7 +1647,9 @@ mod tests {
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = harness.create_manager(alpaca_service);
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let manager = harness
+            .create_manager_with_notifier(alpaca_service, notifier.clone());
 
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -1621,6 +1690,14 @@ mod tests {
             .unwrap();
         process_redemption(detected).await;
 
+        assert_eq!(
+            notifier.notifications(),
+            vec![LifecycleNotification::RedemptionHeld {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: underlying.clone(),
+            }]
+        );
+
         // Second pass while still frozen: stays Held, no Alpaca call, no error.
         let held = harness
             .redemption_store
@@ -1631,6 +1708,7 @@ mod tests {
         assert!(matches!(held, Redemption::Held { .. }));
         process_redemption(held).await;
         assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        assert_eq!(notifier.notifications().len(), 1);
 
         harness.unfreeze_underlying(&underlying).await;
 
@@ -1658,6 +1736,92 @@ mod tests {
             matches!(resumed, Redemption::AlpacaCalled { .. }),
             "Expected AlpacaCalled after unfreeze, got {resumed:?}"
         );
+        assert_eq!(
+            notifier.notifications(),
+            vec![
+                LifecycleNotification::RedemptionHeld {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: underlying.clone(),
+                },
+                LifecycleNotification::RedemptionResumed {
+                    issuer_request_id,
+                    underlying,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn held_redemption_resume_failure_is_notified() {
+        let harness = TestHarness::new().await;
+        let alpaca_service = Arc::new(MockAlpacaService::new_failure(
+            "redeem endpoint unavailable",
+        ))
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let manager = harness
+            .create_manager_with_notifier(alpaca_service, notifier.clone());
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &detected,
+                ClientId::new(),
+            )
+            .await
+            .unwrap();
+        harness.unfreeze_underlying(&underlying).await;
+        let held = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &held,
+                ClientId::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RedeemCallManagerError::Alpaca(_)));
+        assert_eq!(
+            notifier.notifications(),
+            vec![
+                LifecycleNotification::RedemptionHeld {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: underlying.clone(),
+                },
+                LifecycleNotification::RedemptionResumeFailed {
+                    issuer_request_id,
+                    underlying,
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1665,7 +1829,12 @@ mod tests {
         let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, store, pool);
+        let manager = RedeemCallManager::new(
+            alpaca_service,
+            store,
+            pool,
+            Arc::new(NoopLifecycleNotifier),
+        );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         // A non-Detected aggregate exercises the InvalidAggregateState guard.
@@ -1691,7 +1860,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(RedeemCallManagerError::InvalidAggregateState { .. })
+                Err(RedeemCallManagerError::InvalidAggregateState {
+                    current_state: RedemptionState::Completed,
+                })
             ),
             "Expected InvalidAggregateState error, got {result:?}"
         );
@@ -1730,7 +1901,12 @@ mod tests {
         let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, store, pool);
+        let manager = RedeemCallManager::new(
+            alpaca_service,
+            store,
+            pool,
+            Arc::new(NoopLifecycleNotifier),
+        );
 
         let wallet = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
@@ -1768,7 +1944,12 @@ mod tests {
         let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, store, pool);
+        let manager = RedeemCallManager::new(
+            alpaca_service,
+            store,
+            pool,
+            Arc::new(NoopLifecycleNotifier),
+        );
 
         let underlying = UnderlyingSymbol::new("UNKNOWN").unwrap();
 
@@ -1818,7 +1999,12 @@ mod tests {
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, store, pool);
+        let manager = RedeemCallManager::new(
+            alpaca_service,
+            store,
+            pool,
+            Arc::new(NoopLifecycleNotifier),
+        );
 
         manager.recover_detected_redemptions().await;
 

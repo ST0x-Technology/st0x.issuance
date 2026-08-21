@@ -11,8 +11,8 @@ use serde_json::json;
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use harness::create_provider;
+use harness::initialize_rocket;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::LocalEvm;
 

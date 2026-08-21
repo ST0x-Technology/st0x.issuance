@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network, initialize_rocket};
+use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network};
+
+use crate::harness::initialize_rocket;
 
 /// Verifies receipt startup backfill discovers receipts through each asset's
 /// own chain provider.

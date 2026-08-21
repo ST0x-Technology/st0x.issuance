@@ -20,7 +20,7 @@ use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
-use st0x_issuance::initialize_rocket;
+use harness::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
 const UNDERLYING: &str = "AAPL";

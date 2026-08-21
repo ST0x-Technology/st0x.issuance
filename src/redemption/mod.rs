@@ -261,6 +261,43 @@ pub(crate) struct RedemptionMetadata {
     pub(crate) burn_mode: VaultMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedemptionState {
+    Detected,
+    Held,
+    AlpacaCallClaimed,
+    AlpacaCalled,
+    Burning,
+    BurnSubmitted,
+    Completed,
+    Failed,
+    Closed,
+    BurnIntended,
+}
+
+impl RedemptionState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Detected => "Detected",
+            Self::Held => "Held",
+            Self::AlpacaCallClaimed => "AlpacaCallClaimed",
+            Self::AlpacaCalled => "AlpacaCalled",
+            Self::Burning => "Burning",
+            Self::BurnSubmitted => "BurnSubmitted",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Closed => "Closed",
+            Self::BurnIntended => "BurnIntended",
+        }
+    }
+}
+
+impl std::fmt::Display for RedemptionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Redemption {
     Detected {
@@ -510,19 +547,25 @@ impl Redemption {
         }
     }
 
-    pub(crate) const fn state_name(&self) -> &'static str {
+    pub(crate) const fn state(&self) -> RedemptionState {
         match self {
-            Self::Detected { .. } => "Detected",
-            Self::Held { .. } => "Held",
-            Self::AlpacaCallClaimed { .. } => "AlpacaCallClaimed",
-            Self::AlpacaCalled { .. } => "AlpacaCalled",
-            Self::Burning { .. } => "Burning",
-            Self::BurnSubmitted { .. } => "BurnSubmitted",
-            Self::Completed { .. } => "Completed",
-            Self::Failed { .. } => "Failed",
-            Self::Closed { .. } => "Closed",
-            Self::BurnIntended { .. } => "BurnIntended",
+            Self::Detected { .. } => RedemptionState::Detected,
+            Self::Held { .. } => RedemptionState::Held,
+            Self::AlpacaCallClaimed { .. } => {
+                RedemptionState::AlpacaCallClaimed
+            }
+            Self::AlpacaCalled { .. } => RedemptionState::AlpacaCalled,
+            Self::Burning { .. } => RedemptionState::Burning,
+            Self::BurnSubmitted { .. } => RedemptionState::BurnSubmitted,
+            Self::Completed { .. } => RedemptionState::Completed,
+            Self::Failed { .. } => RedemptionState::Failed,
+            Self::Closed { .. } => RedemptionState::Closed,
+            Self::BurnIntended { .. } => RedemptionState::BurnIntended,
         }
+    }
+
+    pub(crate) const fn state_name(&self) -> &'static str {
+        self.state().as_str()
     }
 
     fn handle_claim_alpaca_call(

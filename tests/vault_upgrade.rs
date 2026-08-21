@@ -5,8 +5,9 @@ mod harness;
 use alloy::primitives::address;
 use httpmock::prelude::*;
 
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+use crate::harness::initialize_rocket;
 
 #[tokio::test]
 async fn test_vault_upgrade_via_add_endpoint()

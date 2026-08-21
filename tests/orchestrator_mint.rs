@@ -19,17 +19,17 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use st0x_issuance::Network;
 use st0x_issuance::bindings::IST0xOrchestratorV1;
 use st0x_issuance::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Instance;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
 
 use crate::harness::{
     MintFlowRequest, TEST_API_KEY, authenticated_get_json, bot_provider,
     confirm_mint_journal, create_provider, fetch_stuck_entries,
-    initiate_mint_request, orchestrator_vault_modes, tokens,
+    initialize_rocket, initiate_mint_request, orchestrator_vault_modes, tokens,
 };
 
 const USER_PRIVATE_KEY: B256 =
