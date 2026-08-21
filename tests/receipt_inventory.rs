@@ -309,6 +309,8 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
+        lifecycle_notifications:
+            st0x_issuance::LifecycleNotificationsConfig::disabled(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,

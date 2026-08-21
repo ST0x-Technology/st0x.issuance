@@ -73,6 +73,7 @@ pub(crate) async fn has_unresolved_signer_intent(
 /// 4 bytes formatted as `"red-{hex}"`; keep parsing/serializing them so
 /// historical aggregates remain operable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub(crate) enum IssuerRedemptionRequestId {
     Full(TxHash),
     Legacy(FixedBytes<4>),
@@ -117,6 +118,7 @@ impl std::str::FromStr for IssuerRedemptionRequestId {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub(crate) enum IssuerRedemptionRequestIdParseError {
     #[error("invalid hex: {0}")]
     Hex(#[from] hex::FromHexError),

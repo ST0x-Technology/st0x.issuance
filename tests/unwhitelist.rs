@@ -68,6 +68,8 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
+        lifecycle_notifications:
+            st0x_issuance::LifecycleNotificationsConfig::disabled(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,

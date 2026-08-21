@@ -4219,6 +4219,8 @@ mod tests {
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
+            lifecycle_notifications:
+                crate::LifecycleNotificationsConfig::disabled(),
             chains: Vec::new(),
             vault_mode_config: crate::config::VaultModeConfig::default(),
         };
@@ -4519,6 +4521,8 @@ mod tests {
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
+            lifecycle_notifications:
+                crate::LifecycleNotificationsConfig::disabled(),
             chains: Vec::new(),
             vault_mode_config: crate::config::VaultModeConfig::default(),
         };
@@ -5695,6 +5699,8 @@ mod tests {
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
+            lifecycle_notifications:
+                crate::LifecycleNotificationsConfig::disabled(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             chains: Vec::new(),
             vault_mode_config: VaultModeConfig::default(),
@@ -6787,6 +6793,8 @@ mod tests {
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
+            lifecycle_notifications:
+                crate::LifecycleNotificationsConfig::disabled(),
             chains: Vec::new(),
             vault_mode_config: crate::config::VaultModeConfig::default(),
         }
