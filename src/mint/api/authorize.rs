@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use super::ErrorResponse;
 use crate::auth::InternalAuth;
 use crate::config::VaultMode;
-use crate::mint::recovery::enqueue_scheduled_mint_recovery;
+use crate::mint::recovery::enqueue_authorized_mint_recovery;
 use crate::mint::view::find_issuer_id_by_tokenization_request_id;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, MintError, TokenizationRequestId,
@@ -379,7 +379,7 @@ async fn wake_mint_recovery(
     apalis_pool: &ApalisSqlitePool,
     issuer_request_id: &IssuerMintRequestId,
 ) {
-    if let Err(error) = enqueue_scheduled_mint_recovery(
+    if let Err(error) = enqueue_authorized_mint_recovery(
         pool,
         apalis_pool,
         issuer_request_id.clone(),
@@ -661,7 +661,7 @@ mod tests {
             ",
         )
         .bind(type_name::<MintRecoveryJob>())
-        .bind(issuer_request_id.to_string())
+        .bind(format!("{issuer_request_id}:authorization"))
         .fetch_one(&harness.pool)
         .await
         .unwrap();

@@ -242,23 +242,58 @@ pub(crate) async fn enqueue_scheduled_mint_recovery(
     push_mint_recovery_job(apalis_pool, issuer_request_id).await
 }
 
+/// Enqueues the recovery pass triggered by a newly recorded authorization.
+/// Its distinct idempotency key prevents a recovery job that is concurrently
+/// retiring its pre-authorization snapshot from swallowing the wake-up.
+pub(crate) async fn enqueue_authorized_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &SqlitePool,
+    issuer_request_id: IssuerMintRequestId,
+) -> Result<(), anyhow::Error> {
+    let idempotency_key = format!("{issuer_request_id}:authorization");
+    release_terminal_job(pool, mint_recovery_job_type(), &idempotency_key)
+        .await?;
+    push_recovery_job(
+        apalis_pool,
+        MintRecoveryJob {
+            issuer_request_id: issuer_request_id.clone(),
+            manual: false,
+        },
+        idempotency_key.clone(),
+    )
+    .await?;
+    debug!(target: "mint", %issuer_request_id, %idempotency_key,
+        "Enqueued mint recovery after recording authorization"
+    );
+    Ok(())
+}
+
 /// Admin-reprocess variant of [`enqueue_scheduled_mint_recovery`]: the pushed
 /// job carries the `manual` flag, permitting exactly one re-drive of a
-/// classified failure the automatic loop refuses. A concurrent ACTIVE
-/// automatic job for the same mint dedups this push (idempotency key), but a
-/// classified mint's automatic job has already concluded and been released
-/// here, so the admin path is not raced in practice.
+/// classified failure the automatic loop refuses. Its distinct idempotency key
+/// prevents an active automatic recovery from swallowing the operator's
+/// explicitly authorized re-drive.
 pub(crate) async fn enqueue_manual_mint_recovery(
     pool: &Pool<Sqlite>,
     apalis_pool: &SqlitePool,
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
-    release_terminal_recovery_job(pool, &issuer_request_id).await?;
+    let idempotency_key = format!("{issuer_request_id}:manual");
+    release_terminal_job(pool, mint_recovery_job_type(), &idempotency_key)
+        .await?;
     push_recovery_job(
         apalis_pool,
-        MintRecoveryJob { issuer_request_id, manual: true },
+        MintRecoveryJob {
+            issuer_request_id: issuer_request_id.clone(),
+            manual: true,
+        },
+        idempotency_key.clone(),
     )
-    .await
+    .await?;
+    debug!(target: "mint", %issuer_request_id, %idempotency_key,
+        "Enqueued operator-authorized mint recovery"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,9 +445,11 @@ pub(crate) async fn push_mint_recovery_job(
     apalis_pool: &SqlitePool,
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
+    let idempotency_key = issuer_request_id.to_string();
     push_recovery_job(
         apalis_pool,
         MintRecoveryJob { issuer_request_id, manual: false },
+        idempotency_key,
     )
     .await
 }
@@ -420,6 +457,7 @@ pub(crate) async fn push_mint_recovery_job(
 async fn push_recovery_job(
     apalis_pool: &SqlitePool,
     job: MintRecoveryJob,
+    idempotency_key: String,
 ) -> Result<(), anyhow::Error> {
     let mut attempt = 0;
     // The queue handle is reusable across attempts
@@ -432,17 +470,14 @@ async fn push_recovery_job(
         attempt += 1;
 
         match queue
-            .push_with_idempotency_key(
-                job.clone(),
-                issuer_request_id.to_string(),
-            )
+            .push_with_idempotency_key(job.clone(), idempotency_key.clone())
             .await
         {
             Ok(()) => return Ok(()),
             Err(error) if attempt < ENQUEUE_ATTEMPTS => {
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    attempt, error = %error,
-                    "Failed to enqueue scheduled mint recovery; retrying after backoff"
+                    %idempotency_key, attempt, error = %error,
+                    "Failed to enqueue mint recovery; retrying after backoff"
                 );
                 tokio::time::sleep(ENQUEUE_BACKOFF).await;
             }
@@ -2286,6 +2321,122 @@ mod tests {
             queued, 1,
             "re-enqueue for the same mint must collapse to one job row"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_recovery_is_not_deduplicated_by_an_active_automatic_job() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+        enqueue_manual_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        let idempotency_keys: Vec<String> = sqlx::query_scalar(
+            "
+            SELECT idempotency_key
+            FROM Jobs
+            WHERE job_type = ?
+            ORDER BY idempotency_key
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            idempotency_keys,
+            vec![
+                issuer_request_id.to_string(),
+                format!("{issuer_request_id}:manual"),
+            ],
+            "an active automatic recovery must not suppress the operator's \
+             manual re-drive"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "manual_recovery_is_not_deduplicated_by_an_active_automatic_job",
+                "Enqueued operator-authorized mint recovery",
+                "idempotency_key",
+                ":manual"
+            ]
+        ));
+    }
+
+    /// An authorization wake uses a distinct automatic key, so an already
+    /// scheduled pass cannot swallow the signal that unblocks a waiting mint.
+    #[traced_test]
+    #[tokio::test]
+    async fn authorization_recovery_is_distinct_and_remains_automatic() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+        enqueue_authorized_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        let queued_jobs: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "
+            SELECT idempotency_key, job
+            FROM Jobs
+            WHERE job_type = ?
+            ORDER BY idempotency_key
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            queued_jobs
+                .iter()
+                .map(|(idempotency_key, _)| idempotency_key)
+                .collect::<Vec<_>>(),
+            vec![
+                &issuer_request_id.to_string(),
+                &format!("{issuer_request_id}:authorization"),
+            ]
+        );
+
+        let authorization_job: MintRecoveryJob =
+            serde_json::from_slice(&queued_jobs[1].1).unwrap();
+        assert!(
+            !authorization_job.manual,
+            "an authorization wake must remain an automatic recovery"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "authorization_recovery_is_distinct_and_remains_automatic",
+                "Enqueued mint recovery after recording authorization",
+                &format!("{issuer_request_id}:authorization")
+            ]
+        ));
     }
 
     /// The periodic reconciler pushes WITHOUT releasing terminal jobs, so a mint
