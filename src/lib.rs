@@ -63,7 +63,7 @@ use crate::redemption::{
 };
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
-    validate_no_cross_network_vault_collisions, view::list_enabled_assets,
+    validate_one_underlying_per_network_vault, view::list_enabled_assets,
 };
 use crate::underlying::Underlying;
 use crate::vault::NetworkVaultServices;
@@ -1056,7 +1056,7 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
         return Ok(vec![]);
     }
 
-    validate_no_cross_network_vault_collisions(&assets)?;
+    validate_one_underlying_per_network_vault(&assets)?;
 
     info!(
         target: "receipt",

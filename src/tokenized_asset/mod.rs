@@ -27,37 +27,44 @@ pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
-/// Two enabled assets on different networks share one vault address.
+/// Two enabled underlyings share one vault address on the same network.
 ///
-/// Receipt inventory is keyed by `(chain_id, vault)`, so the streams no longer
-/// merge, but a shared address across networks is still a misconfiguration:
-/// transfer matching, admin tooling, and operator mental models assume a vault
-/// address identifies one deployment. Reject at boot and at add time.
+/// Token deploys are deterministic (CREATE2), so one underlying legitimately
+/// has the same vault address on every network it is deployed to. Receipt
+/// inventory, vault lookup, and redemption transfer matching are all keyed by
+/// `(network, vault)`, so those streams stay separate. Two underlyings behind
+/// one `(network, vault)` is the real misconfiguration: a share transfer to
+/// that vault cannot be attributed to one asset. Reject at boot and at add
+/// time.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "vault address {vault} is configured on both {first} and {second}; \
-     one address cannot serve two networks"
+    "vault address {vault} on {network} is configured for both {first} and \
+     {second}; one vault cannot serve two underlyings on one network"
 )]
-pub(crate) struct CrossNetworkVaultCollision {
+pub(crate) struct VaultUnderlyingCollision {
     pub(crate) vault: Address,
-    pub(crate) first: Network,
-    pub(crate) second: Network,
+    pub(crate) network: Network,
+    pub(crate) first: UnderlyingSymbol,
+    pub(crate) second: UnderlyingSymbol,
 }
 
-/// Rejects enabled-asset sets where the same vault address appears on more
-/// than one network.
-pub(crate) fn validate_no_cross_network_vault_collisions(
+/// Rejects enabled-asset sets where one `(network, vault)` pair serves more
+/// than one underlying. The same vault address on different networks is
+/// allowed: deterministic deploys reuse the address across chains.
+pub(crate) fn validate_one_underlying_per_network_vault(
     assets: &[TokenizedAssetView],
-) -> Result<(), CrossNetworkVaultCollision> {
-    let mut vault_networks: HashMap<Address, Network> = HashMap::new();
+) -> Result<(), VaultUnderlyingCollision> {
+    let mut owners: HashMap<(Network, Address), &UnderlyingSymbol> =
+        HashMap::new();
 
     assets.iter().try_for_each(|asset| {
-        match vault_networks.insert(asset.vault, asset.network) {
-            Some(first) if first != asset.network => {
-                Err(CrossNetworkVaultCollision {
+        match owners.insert((asset.network, asset.vault), &asset.underlying) {
+            Some(first) if first != &asset.underlying => {
+                Err(VaultUnderlyingCollision {
                     vault: asset.vault,
-                    first,
-                    second: asset.network,
+                    network: asset.network,
+                    first: first.clone(),
+                    second: asset.underlying.clone(),
                 })
             }
             _ => Ok(()),
@@ -217,7 +224,7 @@ mod tests {
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent, TokenizedAssetView, UnderlyingSymbol,
-        validate_no_cross_network_vault_collisions,
+        validate_one_underlying_per_network_vault,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -236,21 +243,41 @@ mod tests {
         }
     }
 
+    /// Deterministic (CREATE2) deploys give one underlying the same vault
+    /// address on every network, so a shared address across networks must
+    /// pass validation.
     #[test]
-    fn cross_network_vault_address_collision_is_rejected() {
+    fn shared_vault_address_across_networks_passes_validation() {
+        let shared = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let assets = vec![
+            enabled_asset("RKLB", Network::Ethereum, shared),
+            enabled_asset("RKLB", Network::HyperEvm, shared),
+        ];
+
+        assert!(validate_one_underlying_per_network_vault(&assets).is_ok());
+    }
+
+    /// Two underlyings behind one `(network, vault)` cannot be told apart by
+    /// redemption transfer matching; that stays rejected.
+    #[test]
+    fn same_network_vault_serving_two_underlyings_is_rejected() {
         let shared = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let assets = vec![
             enabled_asset("AAPL", Network::Base, shared),
-            enabled_asset("MSFT", Network::Ethereum, shared),
+            enabled_asset("MSFT", Network::Base, shared),
         ];
 
         let error =
-            validate_no_cross_network_vault_collisions(&assets).unwrap_err();
+            validate_one_underlying_per_network_vault(&assets).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("base"), "missing first network: {message}");
+        assert!(message.contains("base"), "missing network: {message}");
         assert!(
-            message.contains("ethereum"),
-            "missing second network: {message}"
+            message.contains("AAPL"),
+            "missing first underlying: {message}"
+        );
+        assert!(
+            message.contains("MSFT"),
+            "missing second underlying: {message}"
         );
     }
 
@@ -269,7 +296,7 @@ mod tests {
             ),
         ];
 
-        assert!(validate_no_cross_network_vault_collisions(&assets).is_ok());
+        assert!(validate_one_underlying_per_network_vault(&assets).is_ok());
     }
 
     #[traced_test]
