@@ -14,7 +14,7 @@ use tracing::{error, warn};
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    UnderlyingSymbol, view::TokenizedAssetView,
+    UnderlyingSymbol, VAULT_CLAIM_CONFLICT_MESSAGE, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
@@ -313,10 +313,7 @@ pub(crate) async fn add_tokenized_asset(
             _ => Err(err),
         })
         .map_err(|err| {
-            if err
-                .to_string()
-                .contains("serves another underlying on this network")
-            {
+            if err.to_string().contains(VAULT_CLAIM_CONFLICT_MESSAGE) {
                 warn!(
                     target: "asset",
                     vault = %request.vault,
@@ -1119,9 +1116,7 @@ mod tests {
              conflict: {error:?}"
         );
         assert!(
-            error
-                .to_string()
-                .contains("serves another underlying on this network"),
+            error.to_string().contains(VAULT_CLAIM_CONFLICT_MESSAGE),
             "store must reject the second owner via the (network, vault) claim, \
              got: {error:?}"
         );
@@ -1137,13 +1132,25 @@ mod tests {
     }
 
     /// Two concurrent registrations for different underlyings on one
-    /// (network, vault) must not both commit. The projection they pre-check
-    /// against lags the event store, so the DB-level claim is the real arbiter:
-    /// exactly one wins with 201, the loser is rejected with 422 (not 500), and
-    /// only one aggregate is persisted.
+    /// (network, vault) must not both commit. The projection they read lags the
+    /// event store, so the database claim is the real arbiter: exactly one wins
+    /// with 201, the other is rejected with 422 (not 500), and only one
+    /// aggregate persists.
+    #[traced_test]
     #[tokio::test]
     async fn test_add_asset_concurrent_shared_vault_admits_one() {
-        let pool = migrated_in_memory_pool().await;
+        // Multiple connections so both handlers can read the projection before
+        // either commits, letting the database claim be the arbiter instead of
+        // serializing on one connection.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
         let store = setup_tokenized_asset_store(&pool).await;
 
         let rocket = rocket::build()
@@ -1200,6 +1207,16 @@ mod tests {
             "exactly one concurrent add wins, the other is rejected: \
              {first:?}, {second:?}"
         );
+
+        // The loser WARNs a rejection through one of two guards depending on the
+        // race: the projection read, or the database claim when both reads
+        // passed. Both carry these fields, so this holds either way; the
+        // database claim path is covered on its own by
+        // tokenized_asset_vault_claim_rejects_second_owner_at_store.
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Rejected tokenized-asset registration", "another underlying"]
+        ));
 
         let aapl = store
             .load(&AssetKey::new(

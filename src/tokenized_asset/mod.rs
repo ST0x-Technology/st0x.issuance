@@ -27,6 +27,12 @@ pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
+/// Substring the vault ownership trigger's `RAISE(ABORT, ...)` messages carry
+/// and `add_tokenized_asset` matches to return 422 on a concurrent claim
+/// rejection. Keep this and the two RAISE sites in the migration in lockstep.
+pub(crate) const VAULT_CLAIM_CONFLICT_MESSAGE: &str =
+    "serves another underlying on this network";
+
 /// Two enabled underlyings share one vault address on the same network.
 ///
 /// Token deploys are deterministic (CREATE2), so one underlying legitimately
