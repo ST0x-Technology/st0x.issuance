@@ -89,11 +89,12 @@ WHEN NEW.aggregate_type = 'TokenizedAsset'
  AND json_extract(NEW.payload, '$.Added.network') IS NOT NULL
  AND json_extract(NEW.payload, '$.Added.vault') IS NOT NULL
 BEGIN
-    -- This message must contain the Rust constant VAULT_CLAIM_CONFLICT_MESSAGE
-    -- (src/tokenized_asset/mod.rs); the add handler matches it to return 422.
+    -- The VAULT_CLAIM_CONFLICT: prefix is the machine token the add handler
+    -- matches (Rust constant VAULT_CLAIM_CONFLICT_TOKEN, src/tokenized_asset/mod.rs)
+    -- to return 422; the sentence after it is for the operator.
     SELECT RAISE(
         ABORT,
-        'tokenized asset vault already serves another underlying on this network'
+        'VAULT_CLAIM_CONFLICT: tokenized asset vault already serves another underlying on this network'
     )
     WHERE EXISTS (
         SELECT 1
@@ -121,11 +122,12 @@ WHEN NEW.aggregate_type = 'TokenizedAsset'
  AND NEW.event_type = 'TokenizedAssetEvent::VaultAddressUpdated'
  AND json_extract(NEW.payload, '$.VaultAddressUpdated.vault') IS NOT NULL
 BEGIN
-    -- This message must contain the Rust constant VAULT_CLAIM_CONFLICT_MESSAGE
-    -- (src/tokenized_asset/mod.rs); the add handler matches it to return 422.
+    -- The VAULT_CLAIM_CONFLICT: prefix is the machine token the add handler
+    -- matches (Rust constant VAULT_CLAIM_CONFLICT_TOKEN, src/tokenized_asset/mod.rs)
+    -- to return 422; the sentence after it is for the operator.
     SELECT RAISE(
         ABORT,
-        'tokenized asset vault already serves another underlying on this network'
+        'VAULT_CLAIM_CONFLICT: tokenized asset vault already serves another underlying on this network'
     )
     WHERE EXISTS (
         SELECT 1

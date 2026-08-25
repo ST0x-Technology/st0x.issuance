@@ -14,7 +14,7 @@ use tracing::{error, warn};
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    UnderlyingSymbol, VAULT_CLAIM_CONFLICT_MESSAGE, view::TokenizedAssetView,
+    UnderlyingSymbol, VAULT_CLAIM_CONFLICT_TOKEN, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
@@ -313,7 +313,7 @@ pub(crate) async fn add_tokenized_asset(
             _ => Err(err),
         })
         .map_err(|err| {
-            if err.to_string().contains(VAULT_CLAIM_CONFLICT_MESSAGE) {
+            if err.to_string().contains(VAULT_CLAIM_CONFLICT_TOKEN) {
                 warn!(
                     target: "asset",
                     vault = %request.vault,
@@ -1119,7 +1119,7 @@ mod tests {
              conflict: {error:?}"
         );
         assert!(
-            error.to_string().contains(VAULT_CLAIM_CONFLICT_MESSAGE),
+            error.to_string().contains(VAULT_CLAIM_CONFLICT_TOKEN),
             "store must reject the second owner via the (network, vault) claim, \
              got: {error:?}"
         );
