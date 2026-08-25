@@ -36,9 +36,11 @@ async fn tokenized_asset_status_via_client()
     )
     .await?;
 
+    let (frozen_vault, _) = evm.deploy_additional_vault().await?;
+
     harness::preseed_frozen_tokenized_asset(
         &db_url,
-        evm.vault_address,
+        frozen_vault,
         FROZEN_UNDERLYING,
         FROZEN_TOKEN,
     )
