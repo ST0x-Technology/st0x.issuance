@@ -220,6 +220,7 @@ pub struct Config {
     pub receipt_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
+    /// Console log output format; see [`LogFormat`].
     pub log_format: LogFormat,
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
@@ -1059,6 +1060,8 @@ pub(crate) fn default_log_filter(level: Level) -> String {
     parts.join(",")
 }
 
+/// Installs the global console tracing subscriber at `log_level`, emitting
+/// text or one JSON object per line according to `log_format`.
 pub fn setup_tracing(log_level: &LogLevel, log_format: LogFormat) {
     let level: Level = log_level.into();
     let default_filter = default_log_filter(level);
