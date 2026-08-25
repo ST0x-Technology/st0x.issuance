@@ -12,29 +12,36 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network, initialize_rocket};
 
-/// Verifies receipt startup backfill discovers receipts through each asset's
-/// own chain provider.
+/// Verifies the full service boots and operates with the SAME vault address
+/// registered on two networks -- the RAI-2108 scenario, where deterministic
+/// CREATE2 deploys put a token's vault at an identical address on every chain.
 ///
-/// The receipt is minted BEFORE the service starts, on a vault deployed as an
-/// additional instance on the Ethereum chain -- its address differs from
-/// `base_evm.vault_address` and the contract exists ONLY on the Ethereum
-/// chain, so a lookup through the wrong (Base) provider could never find it.
-/// Because the mint pre-dates the service, live receipt monitoring never sees
-/// the deposit; only the startup backfill, querying the Ethereum RPC, can put
-/// the receipt into inventory. Burn planning draws exclusively on inventoried
-/// receipts, so the redemption burn completing proves the backfill discovered
-/// the receipt via the Ethereum provider.
+/// This drives `initialize_rocket` end to end: the boot-time guard must accept
+/// one address serving the same underlying on Base and Ethereum, and startup
+/// receipt backfill must query each listing through its OWN chain provider. The
+/// receipt is minted BEFORE the service starts, on the Ethereum vault only, so
+/// live monitoring never sees the deposit; only the startup backfill, querying
+/// the Ethereum RPC, can put it into inventory. Because the two vaults share an
+/// address, a lookup through the wrong (Base) provider cannot be disambiguated
+/// by address at all -- only per-network RPC selection finds the receipt. Burn
+/// planning draws exclusively on inventoried receipts, so the redemption burn
+/// completing proves the backfill discovered the receipt via the Ethereum
+/// provider, keyed by (chain_id, vault).
 #[tokio::test]
 async fn test_multichain_receipt_backfill_uses_chain_provider()
 -> Result<(), Box<dyn std::error::Error>> {
     let base_evm = LocalEvm::new().await?;
     let eth_evm = LocalEvm::with_chain_id(ETHEREUM_TEST_CHAIN_ID).await?;
-    let (eth_vault_address, eth_authorizer_address) =
-        eth_evm.deploy_additional_vault().await?;
-    assert_ne!(
+    // Deterministic deploys collide the vault address across chains: both
+    // Anvils deploy from the same key, so the Ethereum vault lands at the same
+    // address as the Base vault. This is the address the service must now
+    // accept on two networks, not refuse.
+    let eth_vault_address = eth_evm.vault_address;
+    let eth_authorizer_address = eth_evm.authorizer_address;
+    assert_eq!(
         eth_vault_address, base_evm.vault_address,
-        "test precondition: the Ethereum vault address must not collide with \
-         the Base vault"
+        "test premise: deterministic deploys collide the vault address across \
+         chains"
     );
 
     let mock_alpaca = MockServer::start();
@@ -94,15 +101,15 @@ async fn test_multichain_receipt_backfill_uses_chain_provider()
     harness::preseed_tokenized_asset_into_pool(
         &pool,
         base_evm.vault_address,
-        "AAPL",
-        "tAAPL",
+        "RKLB",
+        "tRKLB",
     )
     .await?;
     harness::preseed_tokenized_asset_into_pool_with_network(
         &pool,
         eth_vault_address,
-        "TSLA",
-        "tTSLA",
+        "RKLB",
+        "tRKLB",
         Network::Ethereum,
     )
     .await?;

@@ -27,37 +27,51 @@ pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
-/// Two enabled assets on different networks share one vault address.
+/// Machine token the vault ownership trigger's `RAISE(ABORT, ...)` messages
+/// carry and `add_tokenized_asset` matches to return 422 on a concurrent claim
+/// rejection. A token, not the prose, so an unrelated error whose text happens
+/// to mention the sentence cannot be misrouted to 422. Keep this and the two
+/// RAISE sites in the migration in lockstep.
+pub(crate) const VAULT_CLAIM_CONFLICT_TOKEN: &str = "VAULT_CLAIM_CONFLICT";
+
+/// Two enabled underlyings share one vault address on the same network.
 ///
-/// Receipt inventory is keyed by `(chain_id, vault)`, so the streams no longer
-/// merge, but a shared address across networks is still a misconfiguration:
-/// transfer matching, admin tooling, and operator mental models assume a vault
-/// address identifies one deployment. Reject at boot and at add time.
+/// Token deploys are deterministic (CREATE2), so one underlying legitimately
+/// has the same vault address on every network it is deployed to. Receipt
+/// inventory, vault lookup, and redemption transfer matching are all keyed by
+/// `(network, vault)`, so those streams stay separate. Two underlyings behind
+/// one `(network, vault)` is the real misconfiguration: a share transfer to
+/// that vault cannot be attributed to one asset. Reject at boot and at add
+/// time.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "vault address {vault} is configured on both {first} and {second}; \
-     one address cannot serve two networks"
+    "vault address {vault} on {network} is configured for both {first} and \
+     {second}; one vault cannot serve two underlyings on one network"
 )]
-pub(crate) struct CrossNetworkVaultCollision {
+pub(crate) struct VaultUnderlyingCollision {
     pub(crate) vault: Address,
-    pub(crate) first: Network,
-    pub(crate) second: Network,
+    pub(crate) network: Network,
+    pub(crate) first: UnderlyingSymbol,
+    pub(crate) second: UnderlyingSymbol,
 }
 
-/// Rejects enabled-asset sets where the same vault address appears on more
-/// than one network.
-pub(crate) fn validate_no_cross_network_vault_collisions(
+/// Rejects enabled-asset sets where one `(network, vault)` pair serves more
+/// than one underlying. The same vault address on different networks is
+/// allowed: deterministic deploys reuse the address across chains.
+pub(crate) fn validate_one_underlying_per_network_vault(
     assets: &[TokenizedAssetView],
-) -> Result<(), CrossNetworkVaultCollision> {
-    let mut vault_networks: HashMap<Address, Network> = HashMap::new();
+) -> Result<(), VaultUnderlyingCollision> {
+    let mut owners: HashMap<(Network, Address), &UnderlyingSymbol> =
+        HashMap::new();
 
     assets.iter().try_for_each(|asset| {
-        match vault_networks.insert(asset.vault, asset.network) {
-            Some(first) if first != asset.network => {
-                Err(CrossNetworkVaultCollision {
+        match owners.insert((asset.network, asset.vault), &asset.underlying) {
+            Some(first) if first != &asset.underlying => {
+                Err(VaultUnderlyingCollision {
                     vault: asset.vault,
-                    first,
-                    second: asset.network,
+                    network: asset.network,
+                    first: first.clone(),
+                    second: asset.underlying.clone(),
                 })
             }
             _ => Ok(()),
@@ -162,6 +176,7 @@ impl EventSourced for TokenizedAsset {
                 vault,
             } => {
                 tracing::info!(target: "asset", underlying = %underlying,
+                    network = %network,
                     vault = %vault,
                     "Adding new tokenized asset"
                 );
@@ -217,7 +232,7 @@ mod tests {
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent, TokenizedAssetView, UnderlyingSymbol,
-        validate_no_cross_network_vault_collisions,
+        validate_one_underlying_per_network_vault,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -236,21 +251,41 @@ mod tests {
         }
     }
 
+    /// Deterministic (CREATE2) deploys give one underlying the same vault
+    /// address on every network, so a shared address across networks must
+    /// pass validation.
     #[test]
-    fn cross_network_vault_address_collision_is_rejected() {
+    fn shared_vault_address_across_networks_passes_validation() {
+        let shared = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let assets = vec![
+            enabled_asset("RKLB", Network::Ethereum, shared),
+            enabled_asset("RKLB", Network::HyperEvm, shared),
+        ];
+
+        assert!(validate_one_underlying_per_network_vault(&assets).is_ok());
+    }
+
+    /// Two underlyings behind one `(network, vault)` cannot be told apart by
+    /// redemption transfer matching; that stays rejected.
+    #[test]
+    fn same_network_vault_serving_two_underlyings_is_rejected() {
         let shared = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let assets = vec![
             enabled_asset("AAPL", Network::Base, shared),
-            enabled_asset("MSFT", Network::Ethereum, shared),
+            enabled_asset("MSFT", Network::Base, shared),
         ];
 
         let error =
-            validate_no_cross_network_vault_collisions(&assets).unwrap_err();
+            validate_one_underlying_per_network_vault(&assets).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("base"), "missing first network: {message}");
+        assert!(message.contains("base"), "missing network: {message}");
         assert!(
-            message.contains("ethereum"),
-            "missing second network: {message}"
+            message.contains("AAPL"),
+            "missing first underlying: {message}"
+        );
+        assert!(
+            message.contains("MSFT"),
+            "missing second underlying: {message}"
         );
     }
 
@@ -269,7 +304,249 @@ mod tests {
             ),
         ];
 
-        assert!(validate_no_cross_network_vault_collisions(&assets).is_ok());
+        assert!(validate_one_underlying_per_network_vault(&assets).is_ok());
+    }
+
+    /// A live database predating this migration may hold two underlyings on one
+    /// `(network, vault)` (the previous guard allowed it on one network). The
+    /// ownership backfill must fail closed with an actionable message, not a
+    /// bare `UNIQUE constraint failed` naming nothing.
+    #[tokio::test]
+    async fn vault_ownership_backfill_reports_ambiguous_listings() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_version TEXT NOT NULL,
+                payload JSON NOT NULL,
+                metadata JSON NOT NULL
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for underlying in ["FOO", "BAR"] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"{underlying}","token":"t{underlying}","network":"base","vault":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES (
+                    'TokenizedAsset', ?, 1,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(format!("{underlying}:base"))
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let migration = include_str!(
+            "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
+        );
+        let error = sqlx::raw_sql(migration).execute(&pool).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("serves two underlyings"),
+            "abort must name the conflict class, got: {error}"
+        );
+    }
+
+    /// A `VaultAddressUpdated` for an asset with no ownership row (its `Added`
+    /// carried no network/vault, so the on-added trigger skipped it) must abort,
+    /// not silently match no rows and leave the vault change unrecorded.
+    #[tokio::test]
+    async fn vault_ownership_update_without_row_aborts() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // Added with no network/vault: the on-added trigger skips it, so no
+        // ownership row is created for this aggregate.
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type, aggregate_id, sequence,
+                event_type, event_version, payload, metadata
+            )
+            VALUES (
+                'TokenizedAsset', 'FOO:base', 1,
+                'TokenizedAssetEvent::Added', '1.0', '{}', '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repoint = r#"{"VaultAddressUpdated":{"vault":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","previous_vault":"0x0000000000000000000000000000000000000000","updated_at":"2026-01-01T00:00:00Z"}}"#;
+        let error = sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type, aggregate_id, sequence,
+                event_type, event_version, payload, metadata
+            )
+            VALUES (
+                'TokenizedAsset', 'FOO:base', 2,
+                'TokenizedAssetEvent::VaultAddressUpdated', '1.0', ?, '{}'
+            )
+            ",
+        )
+        .bind(repoint)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("no recorded ownership row"),
+            "abort must name the missing ownership row, got: {error}"
+        );
+    }
+
+    /// Repeated `Added` events for one aggregate must not violate
+    /// `UNIQUE (aggregate_id)` and abort the backfill; the latest vault wins.
+    #[tokio::test]
+    async fn vault_ownership_backfill_deduplicates_repeated_added() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_version TEXT NOT NULL,
+                payload JSON NOT NULL,
+                metadata JSON NOT NULL
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (sequence, vault) in [
+            (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (2, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"FOO","token":"tFOO","network":"base","vault":"{vault}","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type, aggregate_id, sequence,
+                    event_type, event_version, payload, metadata
+                )
+                VALUES (
+                    'TokenizedAsset', 'FOO:base', ?,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(sequence)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let migration = include_str!(
+            "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
+        );
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        let vault: String = sqlx::query_scalar(
+            "SELECT vault FROM tokenized_asset_vault_owners WHERE aggregate_id = 'FOO:base'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "the latest Added vault must win"
+        );
+    }
+
+    /// A second `Added` for one aggregate with a new vault re-points its claim
+    /// through the on-added upsert, instead of the event committing while the
+    /// stale ownership row survives.
+    #[tokio::test]
+    async fn vault_ownership_second_added_repoints_claim() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        for (sequence, vault) in [
+            (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (2, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"FOO","token":"tFOO","network":"base","vault":"{vault}","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type, aggregate_id, sequence,
+                    event_type, event_version, payload, metadata
+                )
+                VALUES (
+                    'TokenizedAsset', 'FOO:base', ?,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(sequence)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let vault: String = sqlx::query_scalar(
+            "SELECT vault FROM tokenized_asset_vault_owners WHERE aggregate_id = 'FOO:base'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "the second Added must re-point the claim to the new vault"
+        );
     }
 
     #[traced_test]
@@ -312,7 +589,7 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Adding new tokenized asset", "AAPL"]
+            &["Adding new tokenized asset", "AAPL", "base"]
         ));
     }
 
