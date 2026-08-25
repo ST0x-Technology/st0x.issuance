@@ -19,10 +19,38 @@ CREATE TABLE tokenized_asset_vault_owners (
 -- Backfill the current owner of every (network, vault) from the event log so a
 -- new registration against a vault an existing asset already uses is rejected.
 -- The current vault of an asset is the vault on its latest VaultAddressUpdated
--- event, or its Added vault if it was never re-pointed. Existing ambiguous state
--- (two underlyings on one (network, vault)) violates the PRIMARY KEY and fails
--- this migration closed, matching the boot guard. Added events without network /
--- vault metadata are ignored: they cannot name a listing to claim.
+-- event, or its Added vault if it was never re-pointed. Added events without
+-- network or vault metadata are ignored: they cannot name a listing to claim.
+-- A live database may already hold two underlyings on one (network, vault): the
+-- previous guard only rejected the same vault across different networks, so a
+-- same network pair passed it. The backfill below would then hit the PRIMARY
+-- KEY with a bare "UNIQUE constraint failed" naming nothing, taking the service
+-- down at boot (the migration runs inside initialize_rocket). This temporary
+-- trigger turns that into an actionable error. RAISE is trigger only and cannot
+-- interpolate values, so find the offending listings with:
+--   SELECT json_extract(payload, '$.Added.network') AS network,
+--          json_extract(payload, '$.Added.vault') AS vault,
+--          GROUP_CONCAT(aggregate_id)
+--   FROM events
+--   WHERE aggregate_type = 'TokenizedAsset'
+--     AND event_type = 'TokenizedAssetEvent::Added'
+--   GROUP BY network, vault HAVING COUNT(DISTINCT aggregate_id) > 1;
+CREATE TEMP TRIGGER reject_ambiguous_vault_backfill
+BEFORE INSERT ON tokenized_asset_vault_owners
+WHEN EXISTS (
+    SELECT 1
+    FROM tokenized_asset_vault_owners
+    WHERE network = NEW.network
+      AND vault = NEW.vault
+      AND aggregate_id != NEW.aggregate_id
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'tokenized asset vault ownership backfill: a (network, vault) serves two underlyings; resolve the duplicate listing before upgrading'
+    );
+END;
+
 INSERT INTO tokenized_asset_vault_owners (network, vault, aggregate_id)
 SELECT
     json_extract(added.payload, '$.Added.network'),
@@ -44,6 +72,8 @@ WHERE added.aggregate_type = 'TokenizedAsset'
   AND added.event_type = 'TokenizedAssetEvent::Added'
   AND json_extract(added.payload, '$.Added.network') IS NOT NULL
   AND json_extract(added.payload, '$.Added.vault') IS NOT NULL;
+
+DROP TRIGGER reject_ambiguous_vault_backfill;
 
 -- Claim the (network, vault) when an asset is first added. The explicit RAISE is
 -- load-bearing: the event store appends with INSERT OR IGNORE, and that IGNORE

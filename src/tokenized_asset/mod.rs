@@ -306,6 +306,77 @@ mod tests {
         assert!(validate_one_underlying_per_network_vault(&assets).is_ok());
     }
 
+    /// A live database predating this migration may hold two underlyings on one
+    /// `(network, vault)` (the previous guard allowed it on one network). The
+    /// ownership backfill must fail closed with an actionable message, not a
+    /// bare `UNIQUE constraint failed` naming nothing.
+    #[tokio::test]
+    async fn vault_ownership_backfill_reports_ambiguous_listings() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("create in-memory database");
+
+        sqlx::query(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_version TEXT NOT NULL,
+                payload JSON NOT NULL,
+                metadata JSON NOT NULL
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .expect("create events table");
+
+        for underlying in ["FOO", "BAR"] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"{underlying}","token":"t{underlying}","network":"base","vault":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES (
+                    'TokenizedAsset', ?, 1,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(format!("{underlying}:base"))
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .expect("seed conflicting Added event");
+        }
+
+        let migration = include_str!(
+            "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
+        );
+        let error = sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect_err("backfill must abort on two underlyings per vault");
+
+        assert!(
+            error.to_string().contains("serves two underlyings"),
+            "abort must name the conflict class, got: {error}"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_add_asset_creates_new_asset() {
