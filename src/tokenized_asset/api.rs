@@ -989,6 +989,10 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Created);
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "RKLB"]
+        ));
 
         let key = AssetKey::new(
             UnderlyingSymbol::new("RKLB").unwrap(),
