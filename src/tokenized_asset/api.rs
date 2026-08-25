@@ -1070,6 +1070,7 @@ mod tests {
     /// The (network, vault) claim is enforced at the event-append boundary, not
     /// only by the read-model pre-check: a second `Added` for a different
     /// underlying on one (network, vault) is rejected by the store itself.
+    #[traced_test]
     #[tokio::test]
     async fn tokenized_asset_vault_claim_rejects_second_owner_at_store() {
         let pool = migrated_in_memory_pool().await;
@@ -1120,6 +1121,15 @@ mod tests {
             "store must reject the second owner via the (network, vault) claim, \
              got: {error:?}"
         );
+
+        // This path runs the aggregate handler, which logs the add attempt
+        // before the append is rejected. The rejection WARN is the HTTP
+        // handler's job (asserted in the handler tests); the store boundary
+        // emits only this attempt log.
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "MSFT"]
+        ));
 
         let msft = store
             .load(&AssetKey::new(
