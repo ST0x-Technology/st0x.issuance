@@ -317,7 +317,7 @@ mod tests {
             .max_connections(1)
             .connect(":memory:")
             .await
-            .expect("create in-memory database");
+            .unwrap();
 
         sqlx::query(
             "
@@ -334,7 +334,7 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .expect("create events table");
+        .unwrap();
 
         for underlying in ["FOO", "BAR"] {
             let payload = format!(
@@ -361,16 +361,13 @@ mod tests {
             .bind(payload)
             .execute(&pool)
             .await
-            .expect("seed conflicting Added event");
+            .unwrap();
         }
 
         let migration = include_str!(
             "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
         );
-        let error = sqlx::raw_sql(migration)
-            .execute(&pool)
-            .await
-            .expect_err("backfill must abort on two underlyings per vault");
+        let error = sqlx::raw_sql(migration).execute(&pool).await.unwrap_err();
 
         assert!(
             error.to_string().contains("serves two underlyings"),
@@ -387,11 +384,8 @@ mod tests {
             .max_connections(1)
             .connect(":memory:")
             .await
-            .expect("create in-memory database");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("run migrations");
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         // Added with no network/vault: the on-added trigger skips it, so no
         // ownership row is created for this aggregate.
@@ -409,7 +403,7 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .expect("seed metadata-less Added");
+        .unwrap();
 
         let repoint = r#"{"VaultAddressUpdated":{"vault":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","previous_vault":"0x0000000000000000000000000000000000000000","updated_at":"2026-01-01T00:00:00Z"}}"#;
         let error = sqlx::query(
@@ -427,7 +421,7 @@ mod tests {
         .bind(repoint)
         .execute(&pool)
         .await
-        .expect_err("update without an ownership row must abort");
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("no recorded ownership row"),
@@ -443,7 +437,7 @@ mod tests {
             .max_connections(1)
             .connect(":memory:")
             .await
-            .expect("create in-memory database");
+            .unwrap();
 
         sqlx::query(
             "
@@ -460,7 +454,7 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .expect("create events table");
+        .unwrap();
 
         for (sequence, vault) in [
             (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -485,23 +479,20 @@ mod tests {
             .bind(payload)
             .execute(&pool)
             .await
-            .expect("seed repeated Added");
+            .unwrap();
         }
 
         let migration = include_str!(
             "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
         );
-        sqlx::raw_sql(migration)
-            .execute(&pool)
-            .await
-            .expect("backfill must dedup repeated Added, not abort");
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
         let vault: String = sqlx::query_scalar(
             "SELECT vault FROM tokenized_asset_vault_owners WHERE aggregate_id = 'FOO:base'",
         )
         .fetch_one(&pool)
         .await
-        .expect("one ownership row for the aggregate");
+        .unwrap();
         assert_eq!(
             vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "the latest Added vault must win"
@@ -517,11 +508,8 @@ mod tests {
             .max_connections(1)
             .connect(":memory:")
             .await
-            .expect("create in-memory database");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("run migrations");
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         for (sequence, vault) in [
             (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -546,7 +534,7 @@ mod tests {
             .bind(payload)
             .execute(&pool)
             .await
-            .expect("append Added");
+            .unwrap();
         }
 
         let vault: String = sqlx::query_scalar(
@@ -554,7 +542,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .expect("one ownership row for the aggregate");
+        .unwrap();
         assert_eq!(
             vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "the second Added must re-point the claim to the new vault"
@@ -601,7 +589,7 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Adding new tokenized asset", "AAPL"]
+            &["Adding new tokenized asset", "AAPL", "base"]
         ));
     }
 
