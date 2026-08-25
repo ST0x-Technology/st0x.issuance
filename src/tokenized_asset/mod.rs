@@ -378,6 +378,63 @@ mod tests {
         );
     }
 
+    /// A `VaultAddressUpdated` for an asset with no ownership row (its `Added`
+    /// carried no network/vault, so the on-added trigger skipped it) must abort,
+    /// not silently match no rows and leave the vault change unrecorded.
+    #[tokio::test]
+    async fn vault_ownership_update_without_row_aborts() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("create in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        // Added with no network/vault: the on-added trigger skips it, so no
+        // ownership row is created for this aggregate.
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type, aggregate_id, sequence,
+                event_type, event_version, payload, metadata
+            )
+            VALUES (
+                'TokenizedAsset', 'FOO:base', 1,
+                'TokenizedAssetEvent::Added', '1.0', '{}', '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed metadata-less Added");
+
+        let repoint = r#"{"VaultAddressUpdated":{"vault":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","previous_vault":"0x0000000000000000000000000000000000000000","updated_at":"2026-01-01T00:00:00Z"}}"#;
+        let error = sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type, aggregate_id, sequence,
+                event_type, event_version, payload, metadata
+            )
+            VALUES (
+                'TokenizedAsset', 'FOO:base', 2,
+                'TokenizedAssetEvent::VaultAddressUpdated', '1.0', ?, '{}'
+            )
+            ",
+        )
+        .bind(repoint)
+        .execute(&pool)
+        .await
+        .expect_err("update without an ownership row must abort");
+
+        assert!(
+            error.to_string().contains("no recorded ownership row"),
+            "abort must name the missing ownership row, got: {error}"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_add_asset_creates_new_asset() {

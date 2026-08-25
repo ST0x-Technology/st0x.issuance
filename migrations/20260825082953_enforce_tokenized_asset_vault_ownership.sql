@@ -122,6 +122,20 @@ WHEN NEW.aggregate_type = 'TokenizedAsset'
  AND NEW.event_type = 'TokenizedAssetEvent::VaultAddressUpdated'
  AND json_extract(NEW.payload, '$.VaultAddressUpdated.vault') IS NOT NULL
 BEGIN
+    -- Fail closed when this asset has no ownership row: the network would be
+    -- unknown, the conflict check below vacuous, and the UPDATE would match no
+    -- rows, leaving the vault change unrecorded and the vault claimable by
+    -- another underlying.
+    SELECT RAISE(
+        ABORT,
+        'tokenized asset vault change has no recorded ownership row for this asset'
+    )
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM tokenized_asset_vault_owners
+        WHERE aggregate_id = NEW.aggregate_id
+    );
+
     -- The VAULT_CLAIM_CONFLICT: prefix is the machine token the add handler
     -- matches (Rust constant VAULT_CLAIM_CONFLICT_TOKEN, src/tokenized_asset/mod.rs)
     -- to return 422; the sentence after it is for the operator.
