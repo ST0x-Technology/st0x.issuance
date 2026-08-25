@@ -383,6 +383,7 @@ fn find_matching_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address, b256};
+    use chrono::Utc;
     use event_sorcery::{Store, StoreBuilder, test_store};
     use sqlx::SqlitePool;
     use std::sync::Arc;
@@ -400,8 +401,7 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{
-        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol,
+        Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
     };
     use crate::underlying::{Underlying, UnderlyingCommand};
     use crate::vault::mock::MockVaultService;
@@ -1032,25 +1032,26 @@ mod tests {
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
         let store = setup_test_store(&pool);
 
-        let (asset_store, _projection) =
-            StoreBuilder::<TokenizedAsset>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
-        let tsla = UnderlyingSymbol::new("TSLA").unwrap();
-        let key = AssetKey::new(tsla.clone(), Network::Base);
-        asset_store
-            .send(
-                &key,
-                TokenizedAssetCommand::Add {
-                    underlying: tsla,
-                    token: TokenSymbol::new("tTSLA"),
-                    network: Network::Base,
-                    vault,
-                },
-            )
-            .await
-            .unwrap();
+        // The write-path guard now forbids two assets sharing a (network,
+        // vault), so seed the second listing's projection row directly to
+        // reproduce the ambiguous read model this runtime guard defends.
+        let tsla_view = TokenizedAssetView {
+            underlying: UnderlyingSymbol::new("TSLA").unwrap(),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::Base,
+            vault,
+            added_at: Utc::now(),
+        };
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('TSLA:base', 1, ?)
+            ",
+        )
+        .bind(serde_json::json!({ "Live": tsla_view }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
         let log = create_transfer_log(
