@@ -986,9 +986,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Created);
+        // Scope to the Ethereum add so it cannot pass on the RKLB Base setup
+        // log above, which shares the underlying and vault.
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Adding new tokenized asset", "RKLB"]
+            &["Adding new tokenized asset", "RKLB", "ethereum"]
         ));
 
         let key = AssetKey::new(
@@ -1149,14 +1151,20 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_add_asset_concurrent_shared_vault_admits_one() {
-        // Multiple connections so both handlers can read the projection before
+        // Five connections so both handlers can read the projection before
         // either commits, letting the database claim be the arbiter instead of
-        // serializing on one connection.
+        // serializing on one connection. The database is file backed, not
+        // :memory:, because a multi connection :memory: pool gives each
+        // connection its own empty database; the connections must share one
+        // schema and rows.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = temp_dir.path().join("concurrent.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(":memory:")
+            .connect(&db_url)
             .await
-            .expect("Failed to create in-memory database");
+            .expect("Failed to create database");
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await

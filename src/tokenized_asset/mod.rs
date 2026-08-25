@@ -175,6 +175,7 @@ impl EventSourced for TokenizedAsset {
                 vault,
             } => {
                 tracing::info!(target: "asset", underlying = %underlying,
+                    network = %network,
                     vault = %vault,
                     "Adding new tokenized asset"
                 );
