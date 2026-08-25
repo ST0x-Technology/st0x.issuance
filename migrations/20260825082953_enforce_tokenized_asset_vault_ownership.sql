@@ -71,7 +71,17 @@ FROM events AS added
 WHERE added.aggregate_type = 'TokenizedAsset'
   AND added.event_type = 'TokenizedAssetEvent::Added'
   AND json_extract(added.payload, '$.Added.network') IS NOT NULL
-  AND json_extract(added.payload, '$.Added.vault') IS NOT NULL;
+  AND json_extract(added.payload, '$.Added.vault') IS NOT NULL
+  -- Deduplicate repeated Added events for one aggregate: take only the latest,
+  -- so two Added rows cannot violate UNIQUE (aggregate_id) and abort the
+  -- migration with a bare constraint error.
+  AND added.sequence = (
+      SELECT MAX(dup.sequence)
+      FROM events AS dup
+      WHERE dup.aggregate_type = 'TokenizedAsset'
+        AND dup.aggregate_id = added.aggregate_id
+        AND dup.event_type = 'TokenizedAssetEvent::Added'
+  );
 
 DROP TRIGGER reject_ambiguous_vault_backfill;
 
@@ -104,12 +114,19 @@ BEGIN
           AND aggregate_id != NEW.aggregate_id
     );
 
+    -- Upsert on aggregate_id: a second Added for the same asset with a new vault
+    -- re-points its claim. A plain INSERT would violate UNIQUE (aggregate_id),
+    -- and the event store's outer INSERT OR IGNORE would swallow it, committing
+    -- the event while the stale row survived.
     INSERT INTO tokenized_asset_vault_owners (network, vault, aggregate_id)
     VALUES (
         json_extract(NEW.payload, '$.Added.network'),
         json_extract(NEW.payload, '$.Added.vault'),
         NEW.aggregate_id
-    );
+    )
+    ON CONFLICT (aggregate_id) DO UPDATE SET
+        network = excluded.network,
+        vault = excluded.vault;
 END;
 
 -- Move the claim when an asset is re-pointed at a new vault. Re-pointing onto a

@@ -435,6 +435,132 @@ mod tests {
         );
     }
 
+    /// Repeated `Added` events for one aggregate must not violate
+    /// `UNIQUE (aggregate_id)` and abort the backfill; the latest vault wins.
+    #[tokio::test]
+    async fn vault_ownership_backfill_deduplicates_repeated_added() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("create in-memory database");
+
+        sqlx::query(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_version TEXT NOT NULL,
+                payload JSON NOT NULL,
+                metadata JSON NOT NULL
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .expect("create events table");
+
+        for (sequence, vault) in [
+            (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (2, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"FOO","token":"tFOO","network":"base","vault":"{vault}","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type, aggregate_id, sequence,
+                    event_type, event_version, payload, metadata
+                )
+                VALUES (
+                    'TokenizedAsset', 'FOO:base', ?,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(sequence)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .expect("seed repeated Added");
+        }
+
+        let migration = include_str!(
+            "../../migrations/20260825082953_enforce_tokenized_asset_vault_ownership.sql"
+        );
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("backfill must dedup repeated Added, not abort");
+
+        let vault: String = sqlx::query_scalar(
+            "SELECT vault FROM tokenized_asset_vault_owners WHERE aggregate_id = 'FOO:base'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("one ownership row for the aggregate");
+        assert_eq!(
+            vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "the latest Added vault must win"
+        );
+    }
+
+    /// A second `Added` for one aggregate with a new vault re-points its claim
+    /// through the on-added upsert, instead of the event committing while the
+    /// stale ownership row survives.
+    #[tokio::test]
+    async fn vault_ownership_second_added_repoints_claim() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("create in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        for (sequence, vault) in [
+            (1, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (2, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            let payload = format!(
+                r#"{{"Added":{{"underlying":"FOO","token":"tFOO","network":"base","vault":"{vault}","added_at":"2026-01-01T00:00:00Z"}}}}"#
+            );
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type, aggregate_id, sequence,
+                    event_type, event_version, payload, metadata
+                )
+                VALUES (
+                    'TokenizedAsset', 'FOO:base', ?,
+                    'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+                )
+                ",
+            )
+            .bind(sequence)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .expect("append Added");
+        }
+
+        let vault: String = sqlx::query_scalar(
+            "SELECT vault FROM tokenized_asset_vault_owners WHERE aggregate_id = 'FOO:base'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("one ownership row for the aggregate");
+        assert_eq!(
+            vault, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "the second Added must re-point the claim to the new vault"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_add_asset_creates_new_asset() {
