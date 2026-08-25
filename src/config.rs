@@ -716,6 +716,10 @@ pub enum LogFormat {
     Json,
 }
 
+/// Placeholder in a log query url template replaced with the id being
+/// linked.
+pub(crate) const LOG_QUERY_ID_PLACEHOLDER: &str = "{id}";
+
 /// Deployment environment. Gates developer-facing surfaces that must not be
 /// exposed in production. Defaults to `Production` so an unset `ENVIRONMENT`
 /// fails closed (docs hidden) rather than open.

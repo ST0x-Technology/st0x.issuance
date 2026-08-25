@@ -23,9 +23,9 @@ use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
-    LogLevel, VaultModeConfig, VaultModeKind, load_vault_mode_config,
-    setup_tracing,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
+    LOG_QUERY_ID_PLACEHOLDER, LogFormat, LogLevel, VaultModeConfig,
+    VaultModeKind, load_vault_mode_config, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -195,6 +195,15 @@ struct ForceCompleteRedemptionArgs {
     /// unresolved signed transaction different from `--burn-tx-hash`.
     #[arg(long)]
     acknowledged_unresolved_burn_tx_hash: Option<B256>,
+
+    /// Log query link printed after the command, with the id placeholder
+    /// replaced by the issuer request id. Unset prints nothing.
+    #[arg(
+        long,
+        env = "LOG_QUERY_URL_TEMPLATE",
+        value_parser = parse_log_query_url_template
+    )]
+    log_query_url_template: Option<String>,
 
     #[arg(
         long = "database-url",
@@ -494,7 +503,17 @@ impl IssuerCli {
                 run_asset_command(AssetAction::Status, &args).await
             }
             IssuerCommand::ForceCompleteRedemption(args) => {
-                run_force_complete_redemption(*args, prompt_confirm).await
+                let id = args.issuer_request_id.to_string();
+                let template = args.log_query_url_template.clone();
+                let result =
+                    run_force_complete_redemption(*args, prompt_confirm).await;
+                let link = write_log_query_url(
+                    &mut io::stdout(),
+                    template.as_deref(),
+                    &id,
+                )
+                .map_err(anyhow::Error::from);
+                result.and(link)
             }
             IssuerCommand::BurnExcess(command) => {
                 run_burn_excess_cli(*command, prompt_confirm).await
@@ -526,6 +545,31 @@ impl IssuerCli {
             }
         }
     }
+}
+
+/// Refuses a log query url template that cannot carry the id it links.
+fn parse_log_query_url_template(value: &str) -> Result<String, String> {
+    if value.contains(LOG_QUERY_ID_PLACEHOLDER) {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "template must contain the {LOG_QUERY_ID_PLACEHOLDER} placeholder"
+        ))
+    }
+}
+
+/// Writes the log query link with the id placeholder substituted. `None`
+/// writes nothing.
+fn write_log_query_url<W: Write>(
+    stdout: &mut W,
+    template: Option<&str>,
+    id: &str,
+) -> io::Result<()> {
+    let Some(template) = template else {
+        return Ok(());
+    };
+    let url = template.replace(LOG_QUERY_ID_PLACEHOLDER, id);
+    writeln!(stdout, "Logs: {url}")
 }
 
 /// Verifies an operator-supplied transaction as a Failed redemption's landed
@@ -2156,6 +2200,39 @@ mod tests {
         };
 
         *args
+    }
+
+    /// A template without the id placeholder can never carry the id it
+    /// exists to link, so argument parsing refuses it.
+    #[test]
+    fn log_query_url_template_requires_the_id_placeholder() {
+        parse_log_query_url_template("https://logs.example/q?id=missing")
+            .unwrap_err();
+
+        let template =
+            parse_log_query_url_template("https://logs.example/q?id={id}")
+                .unwrap();
+        assert_eq!(template, "https://logs.example/q?id={id}");
+    }
+
+    /// The link is deployment config: no template writes nothing, a template
+    /// writes one line with the id substituted verbatim.
+    #[test]
+    fn write_log_query_url_substitutes_id_and_skips_when_unset() {
+        let mut out = Vec::new();
+        write_log_query_url(&mut out, None, "red-1").unwrap();
+        assert!(out.is_empty(), "no template must write nothing");
+
+        write_log_query_url(
+            &mut out,
+            Some("https://logs.example/q?id={id}"),
+            "red-1",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Logs: https://logs.example/q?id=red-1\n"
+        );
     }
 
     /// The two independent statements of where the command runs must agree
