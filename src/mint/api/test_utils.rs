@@ -12,7 +12,7 @@ use crate::account::{
 };
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
-use crate::config::{Config, Environment, LogLevel};
+use crate::config::{Config, Environment, LogFormat, LogLevel};
 use crate::mint::{Mint, Network, TokenSymbol, UnderlyingSymbol};
 use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
@@ -42,6 +42,7 @@ pub(crate) fn test_config() -> Config {
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         auth: test_auth_config().unwrap(),
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),

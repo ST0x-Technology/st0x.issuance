@@ -23,8 +23,9 @@ use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
-    VaultModeConfig, VaultModeKind, load_vault_mode_config, setup_tracing,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
+    LogLevel, VaultModeConfig, VaultModeKind, load_vault_mode_config,
+    setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -56,7 +57,7 @@ use crate::wallet::{SignerConfig, SignerEnv};
 /// asset is not supported, the operator aborts a mutation, or the command
 /// dispatch fails.
 pub async fn run_issuer_cli() -> anyhow::Result<()> {
-    setup_tracing(&LogLevel::Info);
+    setup_tracing(&LogLevel::Info, LogFormat::Text);
     IssuerCli::parse().dispatch().await
 }
 

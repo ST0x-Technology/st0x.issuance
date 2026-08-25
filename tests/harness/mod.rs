@@ -36,7 +36,7 @@ use st0x_issuance::test_utils::{
 };
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, ChainConfig, Config, Environment, IpWhitelist,
-    LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
+    LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
 };
 
 /// The internal API key every harness-built config and request header share:
@@ -607,6 +607,7 @@ pub fn create_config_with_db(
                 .expect("Valid IP ranges"),
         },
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {

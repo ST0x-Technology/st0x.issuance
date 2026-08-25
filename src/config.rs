@@ -220,6 +220,7 @@ pub struct Config {
     pub receipt_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
+    pub log_format: LogFormat,
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
@@ -334,6 +335,15 @@ struct Env {
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
+
+    #[arg(
+        long,
+        env = "LOG_FORMAT",
+        default_value = "text",
+        help = "Console log output format: text (human readable) or json \
+                (one JSON object per line, for log shippers reading journald)"
+    )]
+    log_format: LogFormat,
 
     #[arg(
         long,
@@ -463,7 +473,8 @@ impl Env {
         let chain_id = base.chain_id;
         let backfill_start_block = base.backfill_start_block;
         let signer = self.signer.into_config()?;
-        let hyperdx = self.hyperdx.into_config(log_level_tracing);
+        let hyperdx =
+            self.hyperdx.into_config(log_level_tracing, self.log_format);
         let vault_mode_config = if let Some(config_path) = self.config {
             load_vault_mode_config(&config_path)?
         } else {
@@ -501,6 +512,7 @@ impl Env {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
+            log_format: self.log_format,
             environment: self.environment,
             hyperdx,
             alpaca: self.alpaca,
@@ -693,6 +705,14 @@ impl From<&LogLevel> for Level {
     }
 }
 
+/// Console log output format. `Json` emits one JSON object per line, the
+/// shape a log shipper parses from journald.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
 /// Deployment environment. Gates developer-facing surfaces that must not be
 /// exposed in production. Defaults to `Production` so an unset `ENVIRONMENT`
 /// fails closed (docs hidden) rather than open.
@@ -724,11 +744,16 @@ struct HyperDxEnv {
 }
 
 impl HyperDxEnv {
-    fn into_config(self, log_level: Level) -> Option<HyperDxConfig> {
+    fn into_config(
+        self,
+        log_level: Level,
+        log_format: LogFormat,
+    ) -> Option<HyperDxConfig> {
         self.hyperdx_api_key.map(|api_key| HyperDxConfig {
             api_key: HyperDxApiKey::new(api_key),
             service_name: self.hyperdx_service_name,
             log_level,
+            log_format,
         })
     }
 }
@@ -1034,16 +1059,25 @@ pub(crate) fn default_log_filter(level: Level) -> String {
     parts.join(",")
 }
 
-pub fn setup_tracing(log_level: &LogLevel) {
+pub fn setup_tracing(log_level: &LogLevel, log_format: LogFormat) {
     let level: Level = log_level.into();
     let default_filter = default_log_filter(level);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .try_init();
+    match log_format {
+        LogFormat::Text => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .try_init();
+        }
+        LogFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .try_init();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1092,6 +1126,18 @@ mod tests {
         assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(chain.rpc_url, config.rpc_url);
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
+    }
+
+    #[test]
+    fn log_format_defaults_to_text_and_parses_json() {
+        let env = Env::try_parse_from(minimal_args()).unwrap();
+        assert_eq!(env.log_format, LogFormat::Text);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--log-format", "json"]);
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config().unwrap();
+        assert_eq!(config.log_format, LogFormat::Json);
     }
 
     #[test]

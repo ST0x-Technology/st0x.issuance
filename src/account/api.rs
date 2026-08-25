@@ -325,7 +325,7 @@ mod tests {
     use crate::account::Account;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel};
+    use crate::config::{Config, Environment, LogFormat, LogLevel};
     use crate::test_utils::logs_contain_at;
     use crate::wallet::SignerConfig;
 
@@ -340,6 +340,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            log_format: LogFormat::Text,
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),

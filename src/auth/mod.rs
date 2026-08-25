@@ -326,7 +326,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
-    use crate::config::{Environment, LogLevel};
+    use crate::config::{Environment, LogFormat, LogLevel};
     use crate::wallet::SignerConfig;
 
     #[rocket::get("/issuer-test")]
@@ -350,6 +350,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            log_format: LogFormat::Text,
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),

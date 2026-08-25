@@ -17,7 +17,7 @@ use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
+    IpWhitelist, LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig,
     receipt_inventory_aggregate_id,
 };
 
@@ -299,6 +299,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
                 .expect("Valid IP ranges"),
         },
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {

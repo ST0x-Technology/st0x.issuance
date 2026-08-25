@@ -37,7 +37,7 @@ use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt, ST0xOrchestrator,
 };
-use crate::config::{Config, Environment, LogLevel};
+use crate::config::{Config, Environment, LogFormat, LogLevel};
 use crate::mint::Mint;
 use crate::receipt_inventory::view::ReceiptInventoryViewReactor;
 use crate::tokenized_asset::{
@@ -162,6 +162,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),

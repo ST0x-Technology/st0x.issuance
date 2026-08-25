@@ -76,11 +76,14 @@ use tracing::Level;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
+use crate::config::LogFormat;
+
 #[derive(Clone, Debug)]
 pub struct HyperDxConfig {
     pub(crate) api_key: HyperDxApiKey,
     pub(crate) service_name: String,
     pub(crate) log_level: Level,
+    pub(crate) log_format: LogFormat,
 }
 
 /// HyperDX ingestion API key.
@@ -171,8 +174,15 @@ impl HyperDxConfig {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_filter.into());
 
-        let fmt_layer =
-            tracing_subscriber::fmt::layer().with_filter(fmt_filter);
+        let fmt_layer = match self.log_format {
+            LogFormat::Text => {
+                tracing_subscriber::fmt::layer().with_filter(fmt_filter).boxed()
+            }
+            LogFormat::Json => tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(fmt_filter)
+                .boxed(),
+        };
         let telemetry_layer = telemetry_layer.with_filter(telemetry_filter);
 
         let subscriber =
@@ -241,9 +251,13 @@ const TRACER_NAME: &str = "st0x-tracer";
 
 #[cfg(test)]
 mod tests {
-    use tracing::Level;
+    use std::io::Write;
 
-    use super::{HyperDxApiKey, HyperDxConfig};
+    use tracing::Level;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::{HyperDxApiKey, HyperDxConfig, LogFormat};
 
     #[test]
     fn hyperdx_config_debug_redacts_api_key() {
@@ -251,6 +265,7 @@ mod tests {
             api_key: HyperDxApiKey::new("super-secret-hyperdx-key".to_string()),
             service_name: "issuer".to_string(),
             log_level: Level::INFO,
+            log_format: LogFormat::Text,
         };
 
         let rendered = format!("{config:?}");
@@ -263,5 +278,61 @@ mod tests {
             rendered.contains("<redacted>"),
             "Debug output should redact the api_key: {rendered}"
         );
+    }
+
+    /// Captures everything written through a subscriber layer so tests can
+    /// assert on the emitted bytes.
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Pins the JSON console wire shape a log shipper parses: one JSON object
+    /// per line carrying `timestamp`, `level`, `target`, the event fields
+    /// under `fields`, and span fields under `span`. The same shape as the
+    /// liquidity bot emits, so the shipper has one parse contract for both
+    /// bots. A tracing subscriber upgrade that changes this shape must fail
+    /// here, not in the shipper.
+    #[test]
+    fn json_console_layer_emits_one_parseable_object_per_line() {
+        let writer = SharedWriter::default();
+        let layer =
+            tracing_subscriber::fmt::layer().json().with_writer(writer.clone());
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span =
+                tracing::info_span!("redeem", issuer_request_id = "abc-123");
+            let _entered = span.enter();
+            tracing::info!(target: "redemption", "json shape pin");
+        });
+
+        let bytes = writer.0.lock().clone();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        let line = output.lines().next().expect("one log line was emitted");
+
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(entry["timestamp"].is_string(), "missing timestamp: {entry}");
+        assert_eq!(entry["level"], "INFO");
+        assert_eq!(entry["target"], "redemption");
+        assert_eq!(entry["fields"]["message"], "json shape pin");
+        assert_eq!(entry["span"]["issuer_request_id"], "abc-123");
     }
 }

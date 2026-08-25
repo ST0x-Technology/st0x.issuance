@@ -101,8 +101,8 @@ pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use chain::ChainConfig;
 pub use config::{
-    Config, Environment, LogLevel, VaultMode, VaultModeConfig, VaultModeKind,
-    setup_tracing,
+    Config, Environment, LogFormat, LogLevel, VaultMode, VaultModeConfig,
+    VaultModeKind, setup_tracing,
 };
 pub use notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,

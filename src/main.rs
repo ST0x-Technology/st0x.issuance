@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
         match hyperdx.setup_telemetry() {
             Ok(guard) => Some(guard),
             Err(err) => {
-                setup_tracing(&config.log_level);
+                setup_tracing(&config.log_level, config.log_format);
                 tracing::error!(
                     target: "startup",
                     error = %err,
@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        setup_tracing(&config.log_level);
+        setup_tracing(&config.log_level, config.log_format);
         None
     };
 

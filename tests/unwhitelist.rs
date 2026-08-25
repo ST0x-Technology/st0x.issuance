@@ -13,7 +13,7 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
+    IpWhitelist, LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig,
 };
 
 use crate::harness::{create_provider, initialize_rocket};
@@ -72,6 +72,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
                 .expect("Valid IP ranges"),
         },
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {
