@@ -379,13 +379,33 @@ pub async fn initialize_rocket(
     run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
         .await;
 
-    let corporate_action_feed = prepare_corporate_action_feed(
-        &config,
-        pool.clone(),
-        &apalis_pool,
-        lifecycle_notifier.clone(),
-    )
-    .await?;
+    // FIXME: temporary production gate. Remove once the snapshot-repair
+    // baseline operation ships so production can establish a cursor and run
+    // the feed. See docs/runbooks/corporate-action-feed-boundary.md.
+    // The corporate-action feed fails the whole service closed on first
+    // production start: an authenticated stream with no committed cursor
+    // returns BaselineRequired, and production cannot establish a baseline
+    // until the snapshot-repair operation ships. Skip it in production until
+    // then; development auto-establishes its baseline and keeps running.
+    let corporate_action_feed = if config.environment == Environment::Production
+    {
+        tracing::info!(
+            target: "asset",
+            "Corporate-action feed disabled in production pending the \
+             snapshot-repair baseline operation"
+        );
+        None
+    } else {
+        Some(
+            prepare_corporate_action_feed(
+                &config,
+                pool.clone(),
+                &apalis_pool,
+                lifecycle_notifier.clone(),
+            )
+            .await?,
+        )
+    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut background_task_handles = Vec::new();
@@ -497,11 +517,13 @@ pub async fn initialize_rocket(
         pool.clone(),
     );
 
-    background_task_handles.push(spawn_corporate_action_feed(
-        corporate_action_feed,
-        shutdown_rx.clone(),
-        shutdown_tx.clone(),
-    ));
+    if let Some(corporate_action_feed) = corporate_action_feed {
+        background_task_handles.push(spawn_corporate_action_feed(
+            corporate_action_feed,
+            shutdown_rx.clone(),
+            shutdown_tx.clone(),
+        ));
+    }
 
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
