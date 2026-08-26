@@ -704,12 +704,18 @@ impl BackgroundTasks {
 fn log_background_task_failures(
     results: impl IntoIterator<Item = Result<(), tokio::task::JoinError>>,
 ) {
+    let mut failures: u64 = 0;
     for error in results
         .into_iter()
         .filter_map(Result::err)
         .filter(|error| !error.is_cancelled())
     {
-        warn!(%error, "Background task failed during shutdown");
+        failures += 1;
+        debug!(%error, "Background task failed during shutdown");
+    }
+
+    if failures > 0 {
+        warn!(failures, "Background tasks failed during shutdown");
     }
 }
 
@@ -1856,6 +1862,7 @@ fn spawn_mint_recovery_worker(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut restarts: u64 = 0;
         loop {
             let apalis_pool = apalis_pool.clone();
             let pool = pool.clone();
@@ -1892,10 +1899,12 @@ fn spawn_mint_recovery_worker(
                 break;
             }
 
+            restarts += 1;
             match result {
                 Ok(()) => {
-                    warn!(
+                    debug!(
                         target: "mint",
+                        restarts,
                         backoff_secs =
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                         "Recovery worker monitor exited cleanly; restarting"
@@ -1903,12 +1912,13 @@ fn spawn_mint_recovery_worker(
                 }
                 Err(error) => {
                     // Degraded but self-recovering (the loop restarts the
-                    // worker after a backoff), so WARN, not ERROR — an ERROR
-                    // here would raise a false unrecoverable alert during a
-                    // transient, self-retrying outage.
-                    warn!(
+                    // worker after a backoff): per-retry records stay at
+                    // DEBUG so a long outage does not flood the log, and the
+                    // post-loop summary reports the episode once at WARN.
+                    debug!(
                         target: "mint",
                         error = %error,
+                        restarts,
                         backoff_secs =
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                         "Mint recovery worker crashed; restarting after backoff"
@@ -1926,6 +1936,14 @@ fn spawn_mint_recovery_worker(
             ) {
                 break;
             }
+        }
+
+        if restarts > 0 {
+            warn!(
+                target: "mint",
+                restarts,
+                "Mint recovery worker restarted before shutdown"
+            );
         }
     })
 }
@@ -1955,6 +1973,7 @@ macro_rules! spawn_drainer_worker {
         let mut shutdown: tokio::sync::watch::Receiver<bool> = $shutdown;
         let worker_name: &'static str = $worker_name;
         tokio::spawn(async move {
+            let mut restarts: u64 = 0;
             loop {
                 let apalis_pool = apalis_pool.clone();
                 let ctx = ctx.clone();
@@ -1978,21 +1997,24 @@ macro_rules! spawn_drainer_worker {
                     break;
                 }
 
+                restarts += 1;
                 match result {
                     Ok(()) => {
-                        warn!(
+                        debug!(
                             target: $target,
                             worker = worker_name,
+                            restarts,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                             "Job worker monitor exited cleanly; restarting"
                         );
                     }
                     Err(error) => {
-                        warn!(
+                        debug!(
                             target: $target,
                             worker = worker_name,
                             error = %error,
+                            restarts,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                             "Job worker crashed; restarting after backoff"
@@ -2011,6 +2033,15 @@ macro_rules! spawn_drainer_worker {
                 {
                     break;
                 }
+            }
+
+            if restarts > 0 {
+                warn!(
+                    target: $target,
+                    worker = worker_name,
+                    restarts,
+                    "Job worker restarted before shutdown"
+                );
             }
         })
     }};

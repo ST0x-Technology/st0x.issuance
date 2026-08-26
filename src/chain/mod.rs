@@ -330,6 +330,7 @@ mod tests {
         ));
     }
 
+    #[traced_test]
     #[test]
     fn validate_rejects_duplicate_network() {
         let configs = vec![base_config(8453), base_config(8453)];

@@ -266,7 +266,6 @@ const TRACER_NAME: &str = "st0x-tracer";
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-
     use tracing::Level;
     use tracing_subscriber::Registry;
     use tracing_subscriber::layer::SubscriberExt;
