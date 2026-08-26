@@ -120,6 +120,24 @@ impl FreezeHoldId {
     }
 }
 
+impl std::fmt::Display for FreezeHoldId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            FreezeHoldSource::Operator => formatter.write_str("operator"),
+            FreezeHoldSource::CorporateAction(window) => write!(
+                formatter,
+                "corporate-action:{}:{}",
+                window
+                    .freeze_at()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                window
+                    .unfreeze_at()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ),
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -247,6 +265,10 @@ pub(crate) struct Underlying {
 impl Underlying {
     fn has_freeze_hold(&self, hold_id: &FreezeHoldId) -> bool {
         self.freeze_state.contains(hold_id)
+    }
+
+    pub(crate) const fn freeze_status(&self) -> AssetStatus {
+        self.freeze_state.status()
     }
 }
 
@@ -591,16 +613,97 @@ pub(crate) async fn load_freeze_status(
     Ok(view.freeze_state.status())
 }
 
+/// Replays an underlying's retained history and reports whether one exact
+/// persisted event changed its effective freeze status.
+pub(crate) async fn persisted_event_changed_freeze_status(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+    expected_event: &UnderlyingEvent,
+) -> Result<bool, PersistedUnderlyingOutcomeError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "
+        SELECT sequence, payload
+        FROM events
+        WHERE aggregate_type = ? AND aggregate_id = ?
+        ORDER BY sequence
+        ",
+    )
+    .bind(Underlying::AGGREGATE_TYPE)
+    .bind(underlying.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let (_, changed_state) = rows.into_iter().try_fold(
+        (None::<Underlying>, false),
+        |(state, changed_state), (sequence, payload)| {
+            let event: UnderlyingEvent =
+                serde_json::from_str(&payload).map_err(|source| {
+                    PersistedUnderlyingOutcomeError::Decode { sequence, source }
+                })?;
+            let before = state
+                .as_ref()
+                .map_or(AssetStatus::Enabled, Underlying::freeze_status);
+            let next = state.as_ref().map_or_else(
+                || {
+                    Underlying::originate(&event).ok_or(
+                        PersistedUnderlyingOutcomeError::CannotOriginate {
+                            sequence,
+                        },
+                    )
+                },
+                |current| match Underlying::evolve(current, &event) {
+                    Ok(Some(next)) => Ok(next),
+                    Ok(None) => {
+                        Err(PersistedUnderlyingOutcomeError::CannotEvolve {
+                            sequence,
+                        })
+                    }
+                    Err(never) => match never {},
+                },
+            )?;
+            let after = next.freeze_status();
+
+            Ok::<_, PersistedUnderlyingOutcomeError>((
+                Some(next),
+                changed_state || (&event == expected_event && before != after),
+            ))
+        },
+    )?;
+
+    Ok(changed_state)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PersistedUnderlyingOutcomeError {
+    #[error("failed to load the underlying event stream")]
+    Database(#[from] sqlx::Error),
+    #[error("failed to decode underlying event at sequence {sequence}")]
+    Decode {
+        sequence: i64,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "underlying event at sequence {sequence} cannot originate a stream"
+    )]
+    CannotOriginate { sequence: i64 },
+    #[error("underlying event at sequence {sequence} cannot evolve the stream")]
+    CannotEvolve { sequence: i64 },
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
+    use cqrs_es::DomainEvent;
     use event_sorcery::TestHarness;
+    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use tracing_test::traced_test;
 
     use super::{
-        AssetStatus, FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
+        AssetStatus, FreezeHoldId, FreezeWindow,
+        PersistedUnderlyingOutcomeError, Underlying, UnderlyingCommand,
         UnderlyingEvent, UnderlyingSymbol, UnderlyingViewError,
-        load_freeze_status,
+        load_freeze_status, persisted_event_changed_freeze_status,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -616,6 +719,157 @@ mod tests {
         FreezeHoldId::corporate_action(
             FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
         )
+    }
+
+    async fn event_pool() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_underlying_event(
+        pool: &Pool<Sqlite>,
+        sequence: i64,
+        event: &UnderlyingEvent,
+    ) {
+        insert_underlying_payload(
+            pool,
+            sequence,
+            &event.event_type(),
+            &serde_json::to_string(event).unwrap(),
+        )
+        .await;
+    }
+
+    async fn insert_underlying_payload(
+        pool: &Pool<Sqlite>,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Underlying', 'AAPL', ?, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_release_cannot_originate_underlying_stream() {
+        let pool = event_pool().await;
+        let event = UnderlyingEvent::FreezeHoldReleased {
+            hold_id: FreezeHoldId::operator(),
+            released_at: Utc::now(),
+        };
+        insert_underlying_event(&pool, 1, &event).await;
+
+        let error =
+            persisted_event_changed_freeze_status(&pool, &aapl(), &event)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistedUnderlyingOutcomeError::CannotOriginate { sequence: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_malformed_event_reports_its_sequence() {
+        let pool = event_pool().await;
+        insert_underlying_payload(
+            &pool,
+            1,
+            "UnderlyingEvent::FreezeHoldAcquired",
+            "{not valid json}",
+        )
+        .await;
+        let expected_event = UnderlyingEvent::FreezeHoldAcquired {
+            hold_id: FreezeHoldId::operator(),
+            acquired_at: Utc::now(),
+        };
+
+        let error = persisted_event_changed_freeze_status(
+            &pool,
+            &aapl(),
+            &expected_event,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistedUnderlyingOutcomeError::Decode { sequence: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_reacquire_changes_status_but_unmatched_release_does_not()
+    {
+        let pool = event_pool().await;
+        let now = Utc::now();
+        let active_hold = corporate_action_hold(
+            now + ChronoDuration::hours(1),
+            now + ChronoDuration::hours(2),
+        );
+        let absent_hold = corporate_action_hold(
+            now + ChronoDuration::hours(3),
+            now + ChronoDuration::hours(4),
+        );
+        let acquired = UnderlyingEvent::FreezeHoldAcquired {
+            hold_id: active_hold,
+            acquired_at: now,
+        };
+        let released = UnderlyingEvent::FreezeHoldReleased {
+            hold_id: active_hold,
+            released_at: now + ChronoDuration::minutes(1),
+        };
+        let reacquired = UnderlyingEvent::FreezeHoldAcquired {
+            hold_id: active_hold,
+            acquired_at: now + ChronoDuration::minutes(2),
+        };
+        let unmatched_release = UnderlyingEvent::FreezeHoldReleased {
+            hold_id: absent_hold,
+            released_at: now + ChronoDuration::minutes(3),
+        };
+        insert_underlying_event(&pool, 1, &acquired).await;
+        insert_underlying_event(&pool, 2, &released).await;
+        insert_underlying_event(&pool, 3, &reacquired).await;
+        insert_underlying_event(&pool, 4, &unmatched_release).await;
+
+        assert!(
+            persisted_event_changed_freeze_status(&pool, &aapl(), &reacquired,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !persisted_event_changed_freeze_status(
+                &pool,
+                &aapl(),
+                &unmatched_release,
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[traced_test]

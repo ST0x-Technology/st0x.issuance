@@ -27,6 +27,11 @@ use super::UnderlyingSymbol;
 use super::schedule::{FreezeScheduleError, FreezeScheduler};
 use super::view::{TokenizedAssetViewError, list_enabled_assets};
 use crate::alpaca::{AlpacaError, AlpacaService, DividendAnnouncement};
+use crate::jobs::{JobQueue, QueuePushError};
+use crate::notifications::{
+    LifecycleNotification, LifecycleNotifier, SendLifecycleNotification,
+    release_dead_lifecycle_notification_job,
+};
 
 /// How far ahead each sync pass looks for ex-dates. Alpaca documents both
 /// bounds as inclusive and caps the range at 90 days, so an 88-day offset
@@ -42,9 +47,11 @@ const CORPORATE_ACTIONS_SYNC_INTERVAL: Duration =
 
 /// Periodic sync arming freeze windows from Alpaca dividend announcements.
 pub(crate) struct CorporateActionsSync {
-    alpaca: Arc<dyn AlpacaService>,
-    scheduler: FreezeScheduler,
-    pool: Pool<Sqlite>,
+    pub(crate) alpaca: Arc<dyn AlpacaService>,
+    pub(crate) scheduler: FreezeScheduler,
+    pub(crate) notification_queue: JobQueue<SendLifecycleNotification>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) notifier: Arc<dyn LifecycleNotifier>,
 }
 
 /// What one sync pass did, for the caller to log or assert on.
@@ -58,6 +65,9 @@ pub(crate) struct SyncSummary {
     pub(crate) skipped_undated: usize,
     /// Announcements whose whole window already elapsed.
     pub(crate) skipped_elapsed: usize,
+    /// Freeze windows armed even though their operator notification could not
+    /// be queued during this pass.
+    pub(crate) notification_enqueue_failures: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,17 +85,13 @@ pub(crate) enum CorporateActionsSyncError {
     View(#[from] TokenizedAssetViewError),
     #[error(transparent)]
     Schedule(#[from] FreezeScheduleError),
+    #[error(transparent)]
+    QueuePush(#[from] QueuePushError),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
 }
 
 impl CorporateActionsSync {
-    pub(crate) fn new(
-        alpaca: Arc<dyn AlpacaService>,
-        scheduler: FreezeScheduler,
-        pool: Pool<Sqlite>,
-    ) -> Self {
-        Self { alpaca, scheduler, pool }
-    }
-
     /// Runs one sync pass: fetch upcoming dividend ex-dates and arm a freeze
     /// window for each supported asset.
     ///
@@ -169,6 +175,50 @@ impl CorporateActionsSync {
                 .await
             {
                 Ok(()) => {
+                    let notification_key = format!(
+                        "notify:corporate-action:{initiating_symbol}:{ex_date}:{}:{}",
+                        freeze_at.to_rfc3339_opts(
+                            chrono::SecondsFormat::Nanos,
+                            true,
+                        ),
+                        unfreeze_at.to_rfc3339_opts(
+                            chrono::SecondsFormat::Nanos,
+                            true,
+                        )
+                    );
+                    let notification_result = async {
+                        release_dead_lifecycle_notification_job(
+                            &self.pool,
+                            &notification_key,
+                        )
+                        .await?;
+                        self.notification_queue
+                            .push_with_idempotency_key(
+                                SendLifecycleNotification {
+                                    notification:
+                                        LifecycleNotification::CorporateActionScheduled {
+                                            underlying: initiating_symbol.clone(),
+                                            ex_date,
+                                            freeze_at,
+                                            unfreeze_at,
+                                        },
+                                },
+                                notification_key,
+                            )
+                            .await?;
+                        Ok::<(), CorporateActionsSyncError>(())
+                    }
+                    .await;
+                    if let Err(error) = notification_result {
+                        summary.notification_enqueue_failures += 1;
+                        debug!(target: "tokenized_asset",
+                            underlying = %initiating_symbol,
+                            %ex_date,
+                            error = %error,
+                            "Failed to queue corporate-action lifecycle \
+                             notification"
+                        );
+                    }
                     debug!(target: "tokenized_asset",
                         underlying = %initiating_symbol,
                         %ex_date,
@@ -200,9 +250,26 @@ impl CorporateActionsSync {
             skipped_unsupported = summary.skipped_unsupported,
             skipped_undated = summary.skipped_undated,
             skipped_elapsed = summary.skipped_elapsed,
+            notification_enqueue_failures =
+                summary.notification_enqueue_failures,
             "Corporate-actions freeze sync pass complete"
         );
         Ok(summary)
+    }
+
+    async fn sync_and_notify(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<SyncSummary, CorporateActionsSyncError> {
+        match self.sync_once(now).await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                self.notifier
+                    .notify(&LifecycleNotification::CorporateActionsSyncFailed)
+                    .await;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -221,7 +288,8 @@ pub(crate) fn spawn_corporate_actions_sync(
             tokio::select! {
                 _ = shutdown.changed() => break,
                 _ = ticker.tick() => {
-                    let _sync_result = sync.sync_once(Utc::now()).await;
+                    let _sync_result =
+                        sync.sync_and_notify(Utc::now()).await;
                 }
             }
         }
@@ -257,10 +325,17 @@ mod tests {
         CorporateActionsSync, ex_date_window, spawn_corporate_actions_sync,
     };
     use crate::alpaca::{DividendAnnouncement, mock::MockAlpacaService};
+    use crate::jobs::{JobQueue, job_type};
     use crate::mint::test_utils::TestHarness;
+    use crate::notifications::{
+        CapturingLifecycleNotifier, LifecycleNotification,
+        SendLifecycleNotification,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::UnderlyingSymbol;
-    use crate::tokenized_asset::schedule::FreezeScheduler;
+    use crate::tokenized_asset::schedule::{
+        ApplyFreezeTransition, FreezeScheduler,
+    };
 
     #[test]
     fn ex_date_window_brackets_the_utc_day() {
@@ -292,6 +367,7 @@ mod tests {
         let underlying = harness.setup_account_and_asset().await.underlying;
         let scheduler =
             FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
+        let pool = harness.pool.clone();
         let now = Utc::now();
         let upcoming_ex_date =
             now.date_naive().checked_add_days(Days::new(7)).unwrap();
@@ -319,8 +395,13 @@ mod tests {
             ]),
         );
 
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
 
         let summary = sync.sync_once(now).await.unwrap();
 
@@ -328,6 +409,13 @@ mod tests {
         assert_eq!(summary.skipped_unsupported, 1);
         assert_eq!(summary.skipped_undated, 1);
         assert_eq!(summary.skipped_elapsed, 1);
+        let notification_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(notification_jobs, 1);
         assert!(logs_contain_at!(
             Level::DEBUG,
             &["Armed dividend freeze window", "AAPL"]
@@ -340,6 +428,64 @@ mod tests {
         assert!(logs_contain_at!(Level::DEBUG, &["already elapsed", "AAPL"]));
     }
 
+    #[traced_test]
+    #[tokio::test]
+    async fn notification_queue_failure_does_not_abort_remaining_windows() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let scheduler =
+            FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
+        let queue_harness = TestHarness::new().await;
+        let notification_queue = JobQueue::new(&queue_harness.apalis_pool);
+        queue_harness.apalis_pool.close().await;
+        let now = Utc::now();
+        let first_ex_date =
+            now.date_naive().checked_add_days(Days::new(7)).unwrap();
+        let second_ex_date =
+            now.date_naive().checked_add_days(Days::new(8)).unwrap();
+        let alpaca = Arc::new(
+            MockAlpacaService::new_success().with_announcements(vec![
+                DividendAnnouncement {
+                    initiating_symbol: underlying.clone(),
+                    ex_date: Some(first_ex_date),
+                },
+                DividendAnnouncement {
+                    initiating_symbol: underlying.clone(),
+                    ex_date: Some(second_ex_date),
+                },
+            ]),
+        );
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue,
+            pool: harness.pool.clone(),
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
+
+        let summary = sync.sync_once(now).await.unwrap();
+
+        assert_eq!(
+            summary.armed,
+            vec![
+                (underlying.clone(), first_ex_date),
+                (underlying, second_ex_date)
+            ]
+        );
+        assert_eq!(summary.notification_enqueue_failures, 2);
+        let scheduled_transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<ApplyFreezeTransition>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(scheduled_transitions, 4);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Failed to queue corporate-action lifecycle notification"]
+        ));
+    }
+
     // Re-running the identical pass must not error: the scheduler's
     // idempotency keys collapse the duplicate window enqueues.
     #[traced_test]
@@ -349,6 +495,7 @@ mod tests {
         let underlying = harness.setup_account_and_asset().await.underlying;
         let scheduler =
             FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
+        let pool = harness.pool.clone();
         let now = Utc::now();
         let ex_date = now.date_naive().checked_add_days(Days::new(7)).unwrap();
 
@@ -360,8 +507,13 @@ mod tests {
                 }],
             ));
 
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
 
         let first = sync.sync_once(now).await.unwrap();
         let second = sync.sync_once(now).await.unwrap();
@@ -372,6 +524,73 @@ mod tests {
             &["Armed dividend freeze window", underlying.as_str()]
         ));
         assert_eq!(second.armed, vec![(underlying, ex_date)]);
+        let notification_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(notification_jobs, 1);
+
+        let first_job_id: String =
+            sqlx::query_scalar("SELECT id FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE Jobs SET status = 'Killed' WHERE job_type = ?")
+            .bind(job_type::<SendLifecycleNotification>())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sync.sync_once(now).await.unwrap();
+
+        let (replacement_job_id, replacement_status): (String, String) =
+            sqlx::query_as("SELECT id, status FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(replacement_job_id, first_job_id);
+        assert_eq!(replacement_status, "Pending");
+
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts \
+             WHERE job_type = ?",
+        )
+        .bind(job_type::<SendLifecycleNotification>())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sync.sync_once(now).await.unwrap();
+
+        let (retry_job_id, retry_status): (String, String) =
+            sqlx::query_as("SELECT id, status FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(retry_job_id, replacement_job_id);
+        assert_eq!(retry_status, "Pending");
+
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(job_type::<SendLifecycleNotification>())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sync.sync_once(now).await.unwrap();
+
+        let (completed_job_id, completed_status): (String, String) =
+            sqlx::query_as("SELECT id, status FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<SendLifecycleNotification>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(completed_job_id, retry_job_id);
+        assert_eq!(completed_status, "Done");
     }
 
     #[traced_test]
@@ -381,8 +600,13 @@ mod tests {
         let scheduler =
             FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
         let alpaca = Arc::new(MockAlpacaService::new_success());
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
         let now = NaiveDate::MAX.and_hms_opt(0, 0, 0).unwrap().and_utc();
 
         assert!(matches!(
@@ -416,8 +640,13 @@ mod tests {
                     ex_date: Some(NaiveDate::MAX),
                 }],
             ));
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
 
         assert!(matches!(
             sync.sync_once(Utc::now()).await.unwrap_err(),
@@ -439,7 +668,7 @@ mod tests {
     // loop logs it and retries next interval.
     #[traced_test]
     #[tokio::test]
-    async fn sync_once_propagates_fetch_failures() {
+    async fn sync_failure_is_propagated_and_notified() {
         let harness = TestHarness::new().await;
         harness.setup_account_and_asset().await;
         let scheduler =
@@ -447,20 +676,30 @@ mod tests {
 
         let alpaca = Arc::new(MockAlpacaService::new_failure("api down"));
 
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: notifier.clone(),
+        };
 
-        let error = sync.sync_once(Utc::now()).await.unwrap_err();
+        let error = sync.sync_and_notify(Utc::now()).await.unwrap_err();
 
         assert!(matches!(error, super::CorporateActionsSyncError::Alpaca(_)));
         assert!(logs_contain_at!(
             Level::DEBUG,
             &[
-                "sync_once_propagates_fetch_failures",
+                "sync_failure_is_propagated_and_notified",
                 "Corporate-actions freeze sync pass failed",
                 "api down"
             ]
         ));
+        assert_eq!(
+            notifier.notifications(),
+            vec![LifecycleNotification::CorporateActionsSyncFailed]
+        );
     }
 
     #[traced_test]
@@ -469,11 +708,13 @@ mod tests {
         let harness = TestHarness::new().await;
         let scheduler =
             FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
-        let sync = CorporateActionsSync::new(
-            Arc::new(MockAlpacaService::new_success()),
+        let sync = CorporateActionsSync {
+            alpaca: Arc::new(MockAlpacaService::new_success()),
             scheduler,
-            harness.pool,
-        );
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let sync_task = spawn_corporate_actions_sync(sync, shutdown_rx);
 
@@ -500,8 +741,13 @@ mod tests {
         let scheduler =
             FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone());
         let alpaca = Arc::new(MockAlpacaService::new_failure("api down"));
-        let mut sync =
-            CorporateActionsSync::new(alpaca, scheduler, harness.pool);
+        let mut sync = CorporateActionsSync {
+            alpaca,
+            scheduler,
+            notification_queue: JobQueue::new(&harness.apalis_pool),
+            pool: harness.pool,
+            notifier: Arc::new(CapturingLifecycleNotifier::default()),
+        };
 
         let result = sync.sync_once(Utc::now()).await;
 

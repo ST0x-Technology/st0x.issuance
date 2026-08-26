@@ -165,6 +165,8 @@ fn test_config() -> Result<Config, anyhow::Error> {
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
+        lifecycle_notifications: crate::LifecycleNotificationsConfig::disabled(
+        ),
         chains: Vec::new(),
         vault_mode_config: crate::config::VaultModeConfig::default(),
     })
@@ -1035,6 +1037,8 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
         "admin"
     } else if module.contains("::vault") {
         "vault"
+    } else if module.contains("::notifications") {
+        "notifications"
     } else {
         "startup"
     }
