@@ -1,15 +1,15 @@
 use alloy::primitives::{address, b256};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::{
-    AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, RedeemResponse, TokenizationRequest,
-    TokenizationRequestType,
+    AlpacaError, AlpacaService, DividendAnnouncement, Fees,
+    MintCallbackRequest, RedeemRequest, RedeemRequestStatus, RedeemResponse,
+    TokenizationRequest, TokenizationRequestType,
 };
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::IssuerRedemptionRequestId;
@@ -31,6 +31,8 @@ pub(crate) struct MockAlpacaService {
     #[cfg(test)]
     error_message: Option<String>,
     callback_delay_ms: u64,
+    #[cfg(test)]
+    announcements: Vec<DividendAnnouncement>,
     call_count: Arc<AtomicUsize>,
 }
 
@@ -44,6 +46,8 @@ impl MockAlpacaService {
             #[cfg(test)]
             error_message: None,
             callback_delay_ms: 0,
+            #[cfg(test)]
+            announcements: Vec::new(),
             call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -59,8 +63,19 @@ impl MockAlpacaService {
             should_succeed: false,
             error_message: Some(error_message.into()),
             callback_delay_ms: 0,
+            announcements: Vec::new(),
             call_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Sets the dividend announcements `list_dividend_announcements` returns.
+    #[cfg(test)]
+    pub(crate) fn with_announcements(
+        mut self,
+        announcements: Vec<DividendAnnouncement>,
+    ) -> Self {
+        self.announcements = announcements;
+        self
     }
 
     /// Returns the number of times `send_mint_callback()` was called.
@@ -222,6 +237,30 @@ impl AlpacaService for MockAlpacaService {
                 updated_at: Some(Utc::now()),
             });
         }
+    }
+
+    async fn list_dividend_announcements(
+        &self,
+        _since: NaiveDate,
+        _until: NaiveDate,
+    ) -> Result<Vec<DividendAnnouncement>, AlpacaError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(test)]
+        {
+            if self.should_succeed {
+                Ok(self.announcements.clone())
+            } else {
+                let body = self
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Mock error".to_string());
+                Err(AlpacaError::Api { status_code: 500, body })
+            }
+        }
+
+        #[cfg(not(test))]
+        Ok(Vec::new())
     }
 }
 
