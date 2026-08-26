@@ -352,7 +352,9 @@ mod tests {
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel, VaultModeConfig};
+    use crate::config::{
+        Config, Environment, LogFormat, LogLevel, VaultModeConfig,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -371,6 +373,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            log_format: LogFormat::Text,
             environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),

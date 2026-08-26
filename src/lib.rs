@@ -101,8 +101,8 @@ pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use chain::ChainConfig;
 pub use config::{
-    Config, Environment, LogLevel, VaultMode, VaultModeConfig, VaultModeKind,
-    setup_tracing,
+    Config, Environment, LogFormat, LogLevel, VaultMode, VaultModeConfig,
+    VaultModeKind, setup_tracing,
 };
 pub use notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
@@ -680,9 +680,10 @@ impl BackgroundTasks {
 
         let mut handles: FuturesUnordered<_> =
             self.handles.into_iter().collect();
+        let mut failures: u64 = 0;
         let graceful_drain = async {
             while let Some(result) = handles.next().await {
-                log_background_task_failures(std::iter::once(result));
+                failures += log_background_task_failure(result);
             }
         };
 
@@ -702,7 +703,7 @@ impl BackgroundTasks {
             );
             let aborted_drain = async {
                 while let Some(result) = handles.next().await {
-                    log_background_task_failures(std::iter::once(result));
+                    failures += log_background_task_failure(result);
                 }
             };
             if tokio::time::timeout(abort_drain_budget, aborted_drain)
@@ -720,18 +721,30 @@ impl BackgroundTasks {
                 );
             }
         }
+
+        if failures > 0 {
+            warn!(
+                target: "startup",
+                failures,
+                "Background tasks failed during shutdown"
+            );
+        }
     }
 }
 
-fn log_background_task_failures(
-    results: impl IntoIterator<Item = Result<(), tokio::task::JoinError>>,
-) {
-    for error in results
-        .into_iter()
-        .filter_map(Result::err)
-        .filter(|error| !error.is_cancelled())
-    {
-        warn!(%error, "Background task failed during shutdown");
+/// Logs one drained background task result at DEBUG and returns 1 for a
+/// non-cancelled failure, so the caller can accumulate a single shutdown
+/// summary across the drain loops.
+fn log_background_task_failure(
+    result: Result<(), tokio::task::JoinError>,
+) -> u64 {
+    match result {
+        Ok(()) => 0,
+        Err(error) if error.is_cancelled() => 0,
+        Err(error) => {
+            debug!(%error, "Background task failed during shutdown");
+            1
+        }
     }
 }
 
@@ -1878,6 +1891,7 @@ fn spawn_mint_recovery_worker(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut restarts: u64 = 0;
         loop {
             let apalis_pool = apalis_pool.clone();
             let pool = pool.clone();
@@ -1914,10 +1928,12 @@ fn spawn_mint_recovery_worker(
                 break;
             }
 
+            restarts += 1;
             match result {
                 Ok(()) => {
-                    warn!(
+                    debug!(
                         target: "mint",
+                        restarts,
                         backoff_secs =
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                         "Recovery worker monitor exited cleanly; restarting"
@@ -1925,12 +1941,13 @@ fn spawn_mint_recovery_worker(
                 }
                 Err(error) => {
                     // Degraded but self-recovering (the loop restarts the
-                    // worker after a backoff), so WARN, not ERROR — an ERROR
-                    // here would raise a false unrecoverable alert during a
-                    // transient, self-retrying outage.
-                    warn!(
+                    // worker after a backoff): per-retry records stay at
+                    // DEBUG so a long outage does not flood the log, and the
+                    // post-loop summary reports the episode once at WARN.
+                    debug!(
                         target: "mint",
                         error = %error,
+                        restarts,
                         backoff_secs =
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                         "Mint recovery worker crashed; restarting after backoff"
@@ -1948,6 +1965,14 @@ fn spawn_mint_recovery_worker(
             ) {
                 break;
             }
+        }
+
+        if restarts > 0 {
+            warn!(
+                target: "mint",
+                restarts,
+                "Mint recovery worker restarted before shutdown"
+            );
         }
     })
 }
@@ -1977,6 +2002,7 @@ macro_rules! spawn_drainer_worker {
         let mut shutdown: tokio::sync::watch::Receiver<bool> = $shutdown;
         let worker_name: &'static str = $worker_name;
         tokio::spawn(async move {
+            let mut restarts: u64 = 0;
             loop {
                 let apalis_pool = apalis_pool.clone();
                 let ctx = ctx.clone();
@@ -2000,21 +2026,24 @@ macro_rules! spawn_drainer_worker {
                     break;
                 }
 
+                restarts += 1;
                 match result {
                     Ok(()) => {
-                        warn!(
+                        debug!(
                             target: $target,
                             worker = worker_name,
+                            restarts,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                             "Job worker monitor exited cleanly; restarting"
                         );
                     }
                     Err(error) => {
-                        warn!(
+                        debug!(
                             target: $target,
                             worker = worker_name,
                             error = %error,
+                            restarts,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                             "Job worker crashed; restarting after backoff"
@@ -2033,6 +2062,15 @@ macro_rules! spawn_drainer_worker {
                 {
                     break;
                 }
+            }
+
+            if restarts > 0 {
+                warn!(
+                    target: $target,
+                    worker = worker_name,
+                    restarts,
+                    "Job worker restarted before shutdown"
+                );
             }
         })
     }};
@@ -2311,6 +2349,30 @@ mod tests {
             Level::WARN,
             &["Background task abort drain timed out", "unresolved_tasks=1"]
         ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn background_task_shutdown_summarizes_failures_once() {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let tasks = BackgroundTasks {
+            shutdown,
+            handles: vec![
+                tokio::spawn(async { panic!("first failure") }),
+                tokio::spawn(async { panic!("second failure") }),
+            ],
+        };
+
+        tasks.stop_with_grace(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &["Background tasks failed during shutdown", "failures=2"]
+            ),
+            1,
+            "both failed tasks must land in a single summary record"
+        );
     }
 
     #[tokio::test]

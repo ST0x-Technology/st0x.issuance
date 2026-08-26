@@ -1213,6 +1213,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
         let harness = TestHarness::new().await;
