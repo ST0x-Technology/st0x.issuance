@@ -239,7 +239,7 @@ pub(crate) use event::{
 };
 pub(crate) use view::{
     RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
-    find_stuck,
+    find_held, find_stuck,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

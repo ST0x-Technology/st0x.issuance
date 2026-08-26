@@ -1,13 +1,17 @@
 use alloy::primitives::Address;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
+use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-    RedemptionViewError, find_detected,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionView,
+    RedemptionViewError, find_detected, find_held,
 };
 use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
@@ -21,6 +25,47 @@ use crate::underlying::{
     PersistedUnderlyingOutcomeError, load_committed_freeze_status,
     with_freeze_admission,
 };
+
+/// Interval between held-redemption drain passes.
+///
+/// Unfreeze has no event signal this manager can react to (manual CLI today,
+/// scheduled automation in V1), so a periodic poll is the robust resume
+/// driver. The held state is event-sourced, so the reconciler also survives
+/// restarts. Freeze windows span hours-to-days, so 60s adds negligible
+/// latency while keeping the view query cheap.
+const HELD_DRAIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawns the periodic reconciler that resumes held redemptions once their
+/// asset unfreezes. Spawn AFTER startup recovery completes so a drain pass
+/// cannot race the recovery sweep over the same aggregates.
+pub(crate) fn spawn_held_redemption_reconciler(
+    manager: Arc<RedeemCallManager>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if *shutdown.borrow() {
+            debug!(target: "redemption",
+                "Held redemption reconciler stopped on shutdown"
+            );
+            return;
+        }
+        let mut ticker = tokio::time::interval(HELD_DRAIN_INTERVAL);
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        debug!(target: "redemption",
+                            "Held redemption reconciler stopped on shutdown"
+                        );
+                        return;
+                    }
+                }
+                _ = ticker.tick() => manager.drain_held_redemptions().await,
+            }
+        }
+    })
+}
 
 pub(crate) struct RedeemCallManager {
     alpaca_service: Arc<dyn AlpacaService>,
@@ -72,52 +117,33 @@ impl RedeemCallManager {
         let mut failed = 0u32;
 
         for (issuer_request_id, _view) in &stuck_redemptions {
-            match self.recover_single_detected(issuer_request_id).await {
-                Ok(DetectedRecoveryOutcome::Recovered) => {
+            match self.classify_detected_recovery(issuer_request_id).await {
+                DetectedRecoveryClassification::Recovered => {
                     recovered += 1;
                 }
-                Ok(DetectedRecoveryOutcome::AlreadyClaimed) => {
+                DetectedRecoveryClassification::AlreadyClaimed => {
                     already_claimed += 1;
                 }
-                Ok(DetectedRecoveryOutcome::Held) => held += 1,
-                Ok(DetectedRecoveryOutcome::Skipped) => skipped += 1,
-                Err(
-                    RedeemCallManagerError::AccountNotFound { .. }
-                    | RedeemCallManagerError::AccountNotLinked { .. },
-                ) => {
-                    let command = RedemptionCommand::MarkFailed {
-                        issuer_request_id: issuer_request_id.clone(),
-                        reason: "No linked account found for redemption wallet"
-                            .to_string(),
-                    };
-
-                    if let Err(err) =
-                        self.store.send(issuer_request_id, command).await
-                    {
-                        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                            error = %err,
-                            "Failed to mark unrecoverable Detected redemption as failed"
-                        );
-                        failed += 1;
-                    } else {
-                        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                            "Auto-failed Detected redemption with no linked account"
-                        );
-                        auto_failed += 1;
-                    }
+                DetectedRecoveryClassification::Held => held += 1,
+                DetectedRecoveryClassification::Skipped => skipped += 1,
+                DetectedRecoveryClassification::AutoFailedAccount => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        "Auto-failed Detected redemption with no linked account"
+                    );
+                    auto_failed += 1;
                 }
                 // The Alpaca call failed and `handle_redemption_detected`
                 // already recorded `RecordAlpacaFailure`, so the redemption is
                 // properly terminal-ized. Count it as auto-failed rather than a
                 // recovery failure that would be re-attempted every sweep.
-                Err(RedeemCallManagerError::Alpaca(err)) => {
+                DetectedRecoveryClassification::AutoFailedAlpaca(err) => {
                     debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
                         "Auto-failed Detected redemption via Alpaca rejection"
                     );
                     auto_failed += 1;
                 }
-                Err(err) => {
+                DetectedRecoveryClassification::Failed(err) => {
                     debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
                         "Failed to recover Detected redemption"
@@ -136,6 +162,144 @@ impl RedeemCallManager {
             failed,
             "Detected redemption recovery complete"
         );
+    }
+
+    /// Drains held redemptions in detection order. Each candidate re-runs the
+    /// detection handler, which re-checks the freeze status: a still-frozen
+    /// (or re-frozen mid-drain) asset re-holds safely; a now-enabled asset
+    /// resumes with the Alpaca call.
+    pub(crate) async fn drain_held_redemptions(&self) {
+        let held_redemptions = match find_held(&self.pool).await {
+            Ok(redemptions) => redemptions,
+            Err(err) => {
+                error!(target: "redemption", error = %err, "Failed to query for held redemptions");
+                return;
+            }
+        };
+
+        if held_redemptions.is_empty() {
+            debug!(target: "redemption", "No held redemptions to drain");
+            return;
+        }
+
+        // Detection order: the tokens reached the wallet in this order, so
+        // they resume in it — no held redemption can be starved by a later one.
+        let ordered = held_redemptions
+            .into_iter()
+            .filter_map(|(issuer_request_id, view)| match view {
+                RedemptionView::Held { detected_at, .. } => {
+                    Some((detected_at, issuer_request_id))
+                }
+                _ => None,
+            })
+            .sorted_by_key(|(detected_at, _)| *detected_at)
+            .collect::<Vec<_>>();
+
+        debug!(target: "redemption", count = ordered.len(),
+            "Draining held redemptions"
+        );
+
+        let mut resumed = 0u32;
+        let mut already_claimed = 0u32;
+        let mut still_held = 0u32;
+        let mut auto_failed = 0u32;
+        let mut failed = 0u32;
+
+        for (_, issuer_request_id) in &ordered {
+            match self.classify_detected_recovery(issuer_request_id).await {
+                DetectedRecoveryClassification::Recovered => resumed += 1,
+                DetectedRecoveryClassification::AlreadyClaimed => {
+                    already_claimed += 1;
+                }
+                DetectedRecoveryClassification::Held => still_held += 1,
+                DetectedRecoveryClassification::Skipped => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        "Held redemption disappeared during drain"
+                    );
+                    failed += 1;
+                }
+                DetectedRecoveryClassification::AutoFailedAccount => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        "Auto-failed Held redemption with no linked account"
+                    );
+                    auto_failed += 1;
+                }
+                DetectedRecoveryClassification::AutoFailedAlpaca(err) => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Auto-failed Held redemption via Alpaca rejection"
+                    );
+                    auto_failed += 1;
+                }
+                DetectedRecoveryClassification::Failed(err) => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Failed to drain held redemption"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        info!(target: "redemption", total = ordered.len(),
+            resumed,
+            already_claimed,
+            still_held,
+            auto_failed,
+            failed,
+            "Held redemption drain complete"
+        );
+    }
+
+    async fn classify_detected_recovery(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> DetectedRecoveryClassification {
+        match self.recover_single_detected(issuer_request_id).await {
+            Ok(DetectedRecoveryOutcome::Recovered) => {
+                DetectedRecoveryClassification::Recovered
+            }
+            Ok(DetectedRecoveryOutcome::AlreadyClaimed) => {
+                DetectedRecoveryClassification::AlreadyClaimed
+            }
+            Ok(DetectedRecoveryOutcome::Held) => {
+                DetectedRecoveryClassification::Held
+            }
+            Ok(DetectedRecoveryOutcome::Skipped) => {
+                DetectedRecoveryClassification::Skipped
+            }
+            Err(
+                RedeemCallManagerError::AccountNotFound { .. }
+                | RedeemCallManagerError::AccountNotLinked { .. },
+            ) => match self
+                .mark_unrecoverable_account_failed(issuer_request_id)
+                .await
+            {
+                Ok(()) => DetectedRecoveryClassification::AutoFailedAccount,
+                Err(error) => DetectedRecoveryClassification::Failed(error),
+            },
+            Err(RedeemCallManagerError::Alpaca(error)) => {
+                DetectedRecoveryClassification::AutoFailedAlpaca(error)
+            }
+            Err(error) => DetectedRecoveryClassification::Failed(error),
+        }
+    }
+
+    async fn mark_unrecoverable_account_failed(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<(), RedeemCallManagerError> {
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "No linked account found for redemption wallet"
+                        .to_string(),
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn recover_single_detected(
@@ -524,6 +688,17 @@ pub(crate) enum DetectedRecoveryOutcome {
     Skipped,
 }
 
+#[derive(Debug)]
+enum DetectedRecoveryClassification {
+    Recovered,
+    AlreadyClaimed,
+    Held,
+    Skipped,
+    AutoFailedAccount,
+    AutoFailedAlpaca(AlpacaError),
+    Failed(RedeemCallManagerError),
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
@@ -533,11 +708,14 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::Barrier;
+    use std::time::Duration;
+    use tokio::sync::{Barrier, watch};
+    use tokio::time::timeout;
     use tracing_test::traced_test;
 
     use super::{
         DetectedRecoveryOutcome, RedeemCallManager, RedeemCallManagerError,
+        spawn_held_redemption_reconciler,
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
@@ -1901,6 +2079,230 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Detected redemption recovery complete", "auto_failed=1"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn held_redemption_reconciler_stops_on_shutdown() {
+        let harness = TestHarness::new().await;
+        let alpaca = Arc::new(MockAlpacaService::new_success());
+        let manager = Arc::new(harness.create_manager(alpaca.clone()));
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        harness
+            .register_and_link_account(
+                client_id,
+                "shutdown@example.com",
+                &AlpacaAccountNumber("acc-shutdown".to_string()),
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &detected,
+                client_id,
+            )
+            .await
+            .unwrap();
+        harness.unfreeze_underlying(&underlying).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        shutdown_tx.send(true).unwrap();
+        let handle = spawn_held_redemption_reconciler(manager, shutdown_rx);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("reconciler must stop promptly on service shutdown")
+            .expect("reconciler task must not panic");
+        assert_eq!(
+            alpaca.get_call_count(),
+            0,
+            "shutdown must prevent the immediately-ready first drain"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Held redemption reconciler stopped on shutdown"]
+        ));
+    }
+
+    // The periodic drain: held redemptions stay parked while frozen and
+    // resume (in detection order) once the asset unfreezes.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_drain_held_redemptions_resumes_after_unfreeze() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &AlpacaAccountNumber("acc-drain".to_string()),
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &detected,
+                client_id,
+            )
+            .await
+            .unwrap();
+
+        // Still frozen: the drain re-holds, no Alpaca call.
+        manager.drain_held_redemptions().await;
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        let after_frozen_drain = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(after_frozen_drain, Redemption::Held { .. }));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption drain complete", "still_held=1"]
+        ));
+
+        harness.unfreeze_underlying(&underlying).await;
+
+        manager.drain_held_redemptions().await;
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            1,
+            "The drain must call Alpaca once the asset unfreezes"
+        );
+        let resumed = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(resumed, Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled after drain, got {resumed:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption drain complete", "resumed=1"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_drain_held_redemptions_noop_when_none_held() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        manager.drain_held_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["No held redemptions to drain"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn drain_terminalizes_held_redemption_with_unlinked_account() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &detected,
+                ClientId::new(),
+            )
+            .await
+            .unwrap();
+        harness.unfreeze_underlying(&underlying).await;
+
+        manager.drain_held_redemptions().await;
+
+        let terminal = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(terminal, Redemption::Failed { .. }));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption drain complete", "auto_failed=1", "failed=0"]
         ));
     }
 
