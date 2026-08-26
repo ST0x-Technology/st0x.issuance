@@ -23,9 +23,9 @@ use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
-    LOG_QUERY_ID_PLACEHOLDER, LogFormat, LogLevel, VaultModeConfig,
-    VaultModeKind, load_vault_mode_config, setup_tracing,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
+    LogLevel, VaultModeConfig, VaultModeKind, load_vault_mode_config,
+    setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -203,7 +203,7 @@ struct ForceCompleteRedemptionArgs {
         env = "LOG_QUERY_URL_TEMPLATE",
         value_parser = parse_log_query_url_template
     )]
-    log_query_url_template: Option<String>,
+    log_query_url_template: Option<LogQueryUrlTemplate>,
 
     #[arg(
         long = "database-url",
@@ -509,7 +509,7 @@ impl IssuerCli {
                     run_force_complete_redemption(*args, prompt_confirm).await;
                 let link = write_log_query_url(
                     &mut io::stdout(),
-                    template.as_deref(),
+                    template.as_ref(),
                     &id,
                 )
                 .map_err(anyhow::Error::from);
@@ -547,29 +547,55 @@ impl IssuerCli {
     }
 }
 
-/// Refuses a log query url template that cannot carry the id it links.
-fn parse_log_query_url_template(value: &str) -> Result<String, String> {
-    if value.contains(LOG_QUERY_ID_PLACEHOLDER) {
-        Ok(value.to_string())
-    } else {
-        Err(format!(
-            "template must contain the {LOG_QUERY_ID_PLACEHOLDER} placeholder"
-        ))
+/// Placeholder in a log query url template replaced with the id being
+/// linked.
+const LOG_QUERY_ID_PLACEHOLDER: &str = "{id}";
+
+/// Log query link template printed after id-bearing commands.
+///
+/// Construction proves the template contains the id placeholder and parses
+/// as a URL once the placeholder is substituted, so [`Self::substitute`]
+/// needs no re-validation of either half.
+#[derive(Clone, Debug)]
+struct LogQueryUrlTemplate(String);
+
+impl LogQueryUrlTemplate {
+    /// The template with the id placeholder replaced by `id`.
+    fn substitute(&self, id: &str) -> String {
+        self.0.replace(LOG_QUERY_ID_PLACEHOLDER, id)
     }
+}
+
+/// Refuses a log query url template that cannot carry the id it links or
+/// that is not a URL once the id is substituted.
+fn parse_log_query_url_template(
+    value: &str,
+) -> Result<LogQueryUrlTemplate, String> {
+    if !value.contains(LOG_QUERY_ID_PLACEHOLDER) {
+        return Err(format!(
+            "template must contain the {LOG_QUERY_ID_PLACEHOLDER} placeholder"
+        ));
+    }
+
+    let sample = value.replace(LOG_QUERY_ID_PLACEHOLDER, "sample-id");
+    if let Err(error) = Url::parse(&sample) {
+        return Err(format!("template is not a valid URL: {error}"));
+    }
+
+    Ok(LogQueryUrlTemplate(value.to_string()))
 }
 
 /// Writes the log query link with the id placeholder substituted. `None`
 /// writes nothing.
 fn write_log_query_url<W: Write>(
     stdout: &mut W,
-    template: Option<&str>,
+    template: Option<&LogQueryUrlTemplate>,
     id: &str,
 ) -> io::Result<()> {
     let Some(template) = template else {
         return Ok(());
     };
-    let url = template.replace(LOG_QUERY_ID_PLACEHOLDER, id);
-    writeln!(stdout, "Logs: {url}")
+    writeln!(stdout, "Logs: {}", template.substitute(id))
 }
 
 /// Verifies an operator-supplied transaction as a Failed redemption's landed
@@ -2212,7 +2238,18 @@ mod tests {
         let template =
             parse_log_query_url_template("https://logs.example/q?id={id}")
                 .unwrap();
-        assert_eq!(template, "https://logs.example/q?id={id}");
+        assert_eq!(
+            template.substitute("red-1"),
+            "https://logs.example/q?id=red-1"
+        );
+    }
+
+    /// A template that is not a URL would print a dead link after every
+    /// command, so argument parsing refuses it even with the placeholder
+    /// present.
+    #[test]
+    fn log_query_url_template_must_be_a_url() {
+        parse_log_query_url_template("not a url {id}").unwrap_err();
     }
 
     /// The link is deployment config: no template writes nothing, a template
@@ -2223,12 +2260,10 @@ mod tests {
         write_log_query_url(&mut out, None, "red-1").unwrap();
         assert!(out.is_empty(), "no template must write nothing");
 
-        write_log_query_url(
-            &mut out,
-            Some("https://logs.example/q?id={id}"),
-            "red-1",
-        )
-        .unwrap();
+        let template =
+            parse_log_query_url_template("https://logs.example/q?id={id}")
+                .unwrap();
+        write_log_query_url(&mut out, Some(&template), "red-1").unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "Logs: https://logs.example/q?id=red-1\n"
