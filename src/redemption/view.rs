@@ -41,6 +41,26 @@ pub(crate) enum RedemptionView {
         #[serde(default)]
         burn_mode: VaultMode,
     },
+    /// Parked before the Alpaca redeem call because the asset was frozen.
+    /// Deferred, not stuck: the resume driver re-runs detection handling once
+    /// the asset unfreezes. It becomes eligible for stale-redemption triage
+    /// only after that active freeze clears.
+    Held {
+        issuer_request_id: IssuerRedemptionRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        /// Mode anchor carried over from `Detected` so a resumed redemption
+        /// keeps deriving its burn path from detection time.
+        #[serde(default)]
+        burn_mode: VaultMode,
+        held_at: DateTime<Utc>,
+    },
     AlpacaCalled {
         issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -142,6 +162,7 @@ impl RedemptionView {
     pub(crate) const fn underlying(&self) -> Option<&UnderlyingSymbol> {
         match self {
             Self::Detected { underlying, .. }
+            | Self::Held { underlying, .. }
             | Self::AlpacaCalled { underlying, .. }
             | Self::Burning { underlying, .. }
             | Self::BurnFailed { underlying, .. } => Some(underlying),
@@ -160,7 +181,7 @@ impl RedemptionView {
         dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     ) -> Self {
-        let Self::Detected {
+        let (Self::Detected {
             underlying,
             token,
             network,
@@ -171,7 +192,19 @@ impl RedemptionView {
             detected_at,
             burn_mode,
             ..
-        } = self
+        }
+        | Self::Held {
+            underlying,
+            token,
+            network,
+            wallet,
+            quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            burn_mode,
+            ..
+        }) = self
         else {
             return self;
         };
@@ -191,6 +224,42 @@ impl RedemptionView {
             detected_at,
             called_at,
             burn_mode,
+        }
+    }
+
+    fn update_held(
+        self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        held_at: DateTime<Utc>,
+    ) -> Self {
+        let Self::Detected {
+            underlying,
+            token,
+            network,
+            wallet,
+            quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            burn_mode,
+            ..
+        } = self
+        else {
+            return self;
+        };
+
+        Self::Held {
+            issuer_request_id,
+            underlying,
+            token,
+            network,
+            wallet,
+            quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            burn_mode,
+            held_at,
         }
     }
 
@@ -361,6 +430,9 @@ impl RedemptionView {
                 dust_quantity.clone(),
                 *called_at,
             ),
+            RedemptionEvent::RedemptionHeld { issuer_request_id, held_at } => {
+                self.update_held(issuer_request_id.clone(), *held_at)
+            }
             RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id,
                 error,
@@ -774,10 +846,13 @@ pub(crate) async fn find_burn_failed(
 
 /// Finds all redemptions that are not in a terminal state.
 ///
-/// Returns every redemption whose view sits in `Detected`, `AlpacaCalled`,
-/// `Burning`, `Failed`, or `BurnFailed` — i.e. anything that hasn't reached
-/// `Completed` or `Closed`. Callers (`/admin/stuck`) apply the staleness gate
-/// and decide which entries the operator must act on.
+/// Returns every redemption whose view sits in `Detected`, `Held`,
+/// `AlpacaCalled`, `Burning`, `Failed`, or `BurnFailed` — i.e. anything that
+/// hasn't reached `Completed` or `Closed`. Callers (`/admin/stuck`) apply the
+/// staleness gate and decide which entries the operator must act on. A `Held`
+/// entry is deliberate during a freeze window — it appears here so operators
+/// can see funds parked in the redemption wallet, and a hold outliving its
+/// freeze window is a real stuck signal.
 pub(crate) async fn find_stuck(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
@@ -787,6 +862,7 @@ pub(crate) async fn find_stuck(
         SELECT view_id as "view_id!: String", payload as "payload!: String"
         FROM redemption_view
         WHERE json_extract(payload, '$.Detected')     IS NOT NULL
+           OR json_extract(payload, '$.Held')         IS NOT NULL
            OR json_extract(payload, '$.AlpacaCalled') IS NOT NULL
            OR json_extract(payload, '$.Burning')      IS NOT NULL
            OR json_extract(payload, '$.Failed')       IS NOT NULL

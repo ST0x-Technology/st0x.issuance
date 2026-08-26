@@ -46,6 +46,7 @@ use crate::redemption::{
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
 use crate::tokenized_asset::view::{find_vault, list_enabled_assets};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
+use crate::underlying::{UnderlyingViewError, load_freeze_status};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
@@ -2072,10 +2073,14 @@ pub(crate) async fn list_stuck(
         })?;
 
     for (issuer_redemption_request_id, view) in stuck_redemptions {
-        let Some((class, timestamp)) = redemption_stuck_info(&view) else {
-            continue;
-        };
-        if !is_stuck(class, timestamp, now) {
+        if !redemption_is_stuck(pool.inner(), &view, now).await.map_err(
+            |err| {
+                error!(target: "admin", error = %err,
+                    "Failed to resolve held redemption freeze status"
+                );
+                Status::InternalServerError
+            },
+        )? {
             continue;
         }
 
@@ -2353,6 +2358,20 @@ fn is_stuck(
     }
 }
 
+async fn redemption_is_stuck(
+    pool: &Pool<Sqlite>,
+    view: &RedemptionView,
+    now: DateTime<Utc>,
+) -> Result<bool, UnderlyingViewError> {
+    if let RedemptionView::Held { underlying, .. } = view
+        && load_freeze_status(pool, underlying).await?.is_frozen()
+    {
+        return Ok(false);
+    }
+    Ok(redemption_stuck_info(view)
+        .is_some_and(|(class, timestamp)| is_stuck(class, timestamp, now)))
+}
+
 /// Returns the stuck-classification and state-entered timestamp for a view
 /// the operator may need to act on, or `None` for terminal/Unavailable
 /// variants that never appear in `/admin/stuck`. Fusing the classification
@@ -2367,6 +2386,10 @@ const fn redemption_stuck_info(
         RedemptionView::Detected { detected_entered_at, .. } => {
             Some((InProgress, *detected_entered_at))
         }
+        // `redemption_is_stuck` suppresses this classification while the
+        // underlying remains frozen. Once the freeze clears, a stale Held
+        // redemption needs operator visibility if the resume driver stalls.
+        RedemptionView::Held { held_at, .. } => Some((InProgress, *held_at)),
         RedemptionView::AlpacaCalled { called_at, .. } => {
             Some((InProgress, *called_at))
         }
@@ -2411,6 +2434,24 @@ fn stuck_redemption_entry(
             "Detected".to_string(),
             "Waiting to call Alpaca".to_string(),
             detected_entered_at,
+            Some(underlying),
+            Some(quantity),
+            Some(network),
+            Some(tx_hash),
+            history.tx_id,
+        ),
+        RedemptionView::Held {
+            underlying,
+            quantity,
+            network,
+            tx_hash,
+            held_at,
+            ..
+        } => (
+            None,
+            "Held".to_string(),
+            "Held during asset freeze — resumes on unfreeze".to_string(),
+            held_at,
             Some(underlying),
             Some(quantity),
             Some(network),
@@ -3058,6 +3099,7 @@ mod tests {
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
+    use crate::underlying::{Underlying, UnderlyingCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnRange, BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
@@ -5918,6 +5960,62 @@ mod tests {
         // Older than threshold — stuck.
         let old = now - chrono::Duration::hours(13);
         assert!(super::is_stuck(super::StuckClass::InProgress, old, now));
+    }
+
+    #[tokio::test]
+    async fn active_freeze_hold_is_not_classified_as_stuck() {
+        let harness = TestHarness::new().await;
+        let metadata = test_metadata();
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(harness.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        underlying_store
+            .send(
+                &metadata.underlying,
+                UnderlyingCommand::Freeze {
+                    underlying: metadata.underlying.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let held = RedemptionView::Held {
+            issuer_request_id: metadata.issuer_request_id,
+            underlying: metadata.underlying,
+            token: metadata.token,
+            network: metadata.network,
+            wallet: metadata.wallet,
+            quantity: metadata.quantity,
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            burn_mode: metadata.burn_mode,
+            held_at: Utc::now() - super::STUCK_THRESHOLD,
+        };
+
+        assert!(
+            !super::redemption_is_stuck(&harness.pool, &held, Utc::now())
+                .await
+                .unwrap()
+        );
+
+        let RedemptionView::Held { underlying, .. } = &held else {
+            unreachable!("test constructs a Held redemption")
+        };
+        underlying_store
+            .send(
+                underlying,
+                UnderlyingCommand::Unfreeze { underlying: underlying.clone() },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            super::redemption_is_stuck(&harness.pool, &held, Utc::now())
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

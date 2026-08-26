@@ -644,8 +644,20 @@ on-chain transfer through calling Alpaca to burning tokens.
 **Commands:**
 
 - `Detect` - Transfer to redemption wallet detected
-- `RecordAlpacaCall` - Alpaca redeem API called successfully
-- `RecordAlpacaFailure` - Alpaca redeem API call failed
+- `Hold` - Park a detected redemption of a frozen asset before the Alpaca redeem
+  call. Valid from `Detected` (emits `RedemptionHeld`) and idempotent from
+  `Held` (no event), so concurrent guard paths cannot race each other. Holding
+  happens strictly **before** the Alpaca call: past that boundary Alpaca has
+  decremented its side, and holding the burn would leave on-chain supply above
+  the Alpaca count — the exact divergence the freeze prevents. A held redemption
+  is deferred, never dropped (its tokens are already committed on-chain); resume
+  reuses `RecordAlpacaCall`, giving the audit trail
+  `Detected -> RedemptionHeld -> AlpacaCalled` with no separate resume event.
+- `RecordAlpacaCall` - Alpaca redeem API called successfully. Valid from
+  `Detected` or `Held` (a held redemption resumes through this command once the
+  asset unfreezes)
+- `RecordAlpacaFailure` - Alpaca redeem API call failed (valid from `Detected`
+  or `Held`)
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
@@ -769,6 +781,10 @@ on-chain transfer through calling Alpaca to burning tokens.
   asset's resolved `VaultMode` at detection time, before any possible burn
   submission; this anchors mode-derivation for the redemption the same way
   `Initiated.mint_mode` anchors it for Mint
+- `RedemptionHeld` - Redemption of a frozen asset parked before the Alpaca
+  redeem call. Carries only `held_at`; detection metadata stays in the aggregate
+  from `RedemptionDetected`. The resume driver drains held redemptions in
+  detection order once the asset unfreezes.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
@@ -882,7 +898,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 | Command                                  | Events                             | Notes                                                                                                                                                                                                                                              |
 | ---------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                  |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                                                                                                                                                                                                                  |
+| `Hold`                                   | `RedemptionHeld`                   | Asset frozen; park pre-Alpaca (idempotent)                                                                                                                                                                                                         |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called (from Detected or Held)                                                                                                                                                                                                          |
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                                                                                                                                                                                   |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                                                                                                                                                                                   |
 | `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
@@ -4003,7 +4020,10 @@ struct BurnResult {
 stateDiagram-v2
     [*] --> Detected: Detect
     Detected --> AlpacaCalled: RecordAlpacaCall
-    Detected --> Failed: MarkFailed
+    Detected --> Held: Hold (asset frozen)
+    Detected --> Failed: RecordAlpacaFailure / MarkFailed
+    Held --> AlpacaCalled: RecordAlpacaCall (asset unfrozen)
+    Held --> Failed: RecordAlpacaFailure / MarkFailed
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn
@@ -4045,6 +4065,7 @@ struct StoredRedemption {
     quantity: Quantity,
     status: RedemptionStatus,
     detected_at: DateTime<Utc>,
+    held_at: Option<DateTime<Utc>>,
     alpaca_called_at: Option<DateTime<Utc>>,
     alpaca_completed_at: Option<DateTime<Utc>>,
     burned_at: Option<DateTime<Utc>>,
@@ -4052,6 +4073,7 @@ struct StoredRedemption {
 
 enum RedemptionStatus {
     Detected,
+    Held,
     AlpacaCalled,
     Burning,
     Completed,
