@@ -24,10 +24,10 @@ use st0x_issuance::receipt_inventory::migration::{
 };
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::tokenized_asset::UnderlyingSymbol;
-use st0x_issuance::{Config, Network, SignerConfig, initialize_rocket};
+use st0x_issuance::{Config, Network, SignerConfig};
 use std::path::{Path, PathBuf};
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 /// The single asset every migration scenario seeds and migrates. The migration
 /// identity must name the seeded listing: quiescence is scoped by underlying,

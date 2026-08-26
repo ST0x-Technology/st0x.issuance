@@ -12,10 +12,9 @@ use std::time::Duration;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 /// Helper: set up a second wallet from Anvil's test accounts (account index 1).
 fn second_wallet() -> (PrivateKeySigner, Address) {

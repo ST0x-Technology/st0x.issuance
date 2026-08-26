@@ -7,11 +7,11 @@ use alloy::primitives::{U256, b256};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
+use st0x_issuance::Network;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 /// Tests that redemptions are detected and completed on ALL vaults, not just one.
 ///
