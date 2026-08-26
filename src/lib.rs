@@ -658,9 +658,10 @@ impl BackgroundTasks {
 
         let mut handles: FuturesUnordered<_> =
             self.handles.into_iter().collect();
+        let mut failures: u64 = 0;
         let graceful_drain = async {
             while let Some(result) = handles.next().await {
-                log_background_task_failures(std::iter::once(result));
+                failures += log_background_task_failure(result);
             }
         };
 
@@ -680,7 +681,7 @@ impl BackgroundTasks {
             );
             let aborted_drain = async {
                 while let Some(result) = handles.next().await {
-                    log_background_task_failures(std::iter::once(result));
+                    failures += log_background_task_failure(result);
                 }
             };
             if tokio::time::timeout(abort_drain_budget, aborted_drain)
@@ -698,24 +699,30 @@ impl BackgroundTasks {
                 );
             }
         }
+
+        if failures > 0 {
+            warn!(
+                target: "startup",
+                failures,
+                "Background tasks failed during shutdown"
+            );
+        }
     }
 }
 
-fn log_background_task_failures(
-    results: impl IntoIterator<Item = Result<(), tokio::task::JoinError>>,
-) {
-    let mut failures: u64 = 0;
-    for error in results
-        .into_iter()
-        .filter_map(Result::err)
-        .filter(|error| !error.is_cancelled())
-    {
-        failures += 1;
-        debug!(%error, "Background task failed during shutdown");
-    }
-
-    if failures > 0 {
-        warn!(failures, "Background tasks failed during shutdown");
+/// Logs one drained background task result at DEBUG and returns 1 for a
+/// non-cancelled failure, so the caller can accumulate a single shutdown
+/// summary across the drain loops.
+fn log_background_task_failure(
+    result: Result<(), tokio::task::JoinError>,
+) -> u64 {
+    match result {
+        Ok(()) => 0,
+        Err(error) if error.is_cancelled() => 0,
+        Err(error) => {
+            debug!(%error, "Background task failed during shutdown");
+            1
+        }
     }
 }
 
@@ -2320,6 +2327,30 @@ mod tests {
             Level::WARN,
             &["Background task abort drain timed out", "unresolved_tasks=1"]
         ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn background_task_shutdown_summarizes_failures_once() {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let tasks = BackgroundTasks {
+            shutdown,
+            handles: vec![
+                tokio::spawn(async { panic!("first failure") }),
+                tokio::spawn(async { panic!("second failure") }),
+            ],
+        };
+
+        tasks.stop_with_grace(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &["Background tasks failed during shutdown", "failures=2"]
+            ),
+            1,
+            "both failed tasks must land in a single summary record"
+        );
     }
 
     #[tokio::test]
