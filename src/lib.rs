@@ -486,6 +486,7 @@ pub async fn initialize_rocket(
         );
     }
 
+    spawn_terminal_unfreeze_recovery(pool.clone(), shutdown_rx.clone());
     spawn_freeze_schedule_worker(apalis_pool.clone(), underlying_store);
 
     let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
@@ -908,6 +909,7 @@ async fn run_mint_recovery(
 /// Interval between periodic mint-recovery reconciliation passes.
 const MINT_RECOVERY_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const BURN_RECOVERY_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+const TERMINAL_UNFREEZE_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Periodically re-enqueues recoverable mints that lack a recovery job, closing
 /// the window where a mint whose enqueue failed (a transient SQLite outage at
@@ -1846,6 +1848,17 @@ fn spawn_freeze_schedule_worker(
         "freeze-schedule-worker",
         target: "asset",
     );
+}
+
+fn spawn_terminal_unfreeze_recovery(
+    pool: Pool<Sqlite>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(tokenized_asset::schedule::run_terminal_unfreeze_recovery(
+        pool,
+        TERMINAL_UNFREEZE_RECOVERY_INTERVAL,
+        shutdown,
+    ));
 }
 
 #[cfg(test)]
