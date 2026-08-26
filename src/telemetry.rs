@@ -78,6 +78,28 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use crate::config::LogFormat;
 
+/// Build the console fmt layer for `log_format`. The JSON arm is the single
+/// place the console JSON wire shape is defined, so every subscriber emits
+/// one JSON shape.
+pub(crate) fn console_fmt_layer<S>(
+    log_format: LogFormat,
+    env_filter: tracing_subscriber::EnvFilter,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber
+        + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    match log_format {
+        LogFormat::Text => {
+            tracing_subscriber::fmt::layer().with_filter(env_filter).boxed()
+        }
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_filter(env_filter)
+            .boxed(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HyperDxConfig {
     pub(crate) api_key: HyperDxApiKey,
@@ -174,15 +196,7 @@ impl HyperDxConfig {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_filter.into());
 
-        let fmt_layer = match self.log_format {
-            LogFormat::Text => {
-                tracing_subscriber::fmt::layer().with_filter(fmt_filter).boxed()
-            }
-            LogFormat::Json => tracing_subscriber::fmt::layer()
-                .json()
-                .with_filter(fmt_filter)
-                .boxed(),
-        };
+        let fmt_layer = console_fmt_layer(self.log_format, fmt_filter);
         let telemetry_layer = telemetry_layer.with_filter(telemetry_filter);
 
         let subscriber =

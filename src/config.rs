@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{Level, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
@@ -16,7 +18,7 @@ use crate::chain::{
 use crate::notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
 };
-use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
+use crate::telemetry::{HyperDxApiKey, HyperDxConfig, console_fmt_layer};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
 
@@ -1068,19 +1070,9 @@ pub fn setup_tracing(log_level: &LogLevel, log_format: LogFormat) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
 
-    match log_format {
-        LogFormat::Text => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .try_init();
-        }
-        LogFormat::Json => {
-            let _ = tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(env_filter)
-                .try_init();
-        }
-    }
+    let _ = tracing_subscriber::registry()
+        .with(console_fmt_layer(log_format, env_filter))
+        .try_init();
 }
 
 #[cfg(test)]
