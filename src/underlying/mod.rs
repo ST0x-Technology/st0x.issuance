@@ -13,11 +13,30 @@ use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::collections::BTreeSet;
+use std::future::Future;
 
 use st0x_issuance_dto::TokenizedAssetStatus;
 pub use st0x_issuance_dto::UnderlyingSymbol;
 
 use crate::tokenized_asset::CorporateActionId;
+
+/// Serializes every freeze acquisition with the durable admission point for
+/// an external redemption call. The issuer service has one writer process;
+/// callers must hold this guard through the event-store commit that establishes
+/// their side of the ordering.
+static FREEZE_ADMISSION: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn with_freeze_admission<Operation, OperationFuture, Output>(
+    operation: Operation,
+) -> Output
+where
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = Output>,
+{
+    let _admission = FREEZE_ADMISSION.lock().await;
+    operation().await
+}
 
 /// Whether an underlying accepts new mints, on any network.
 ///
@@ -643,6 +662,22 @@ pub(crate) async fn load_freeze_status(
     Ok(view.freeze_state.status())
 }
 
+/// Replays the retained event stream so admission decisions observe committed
+/// freeze state even when the asynchronous projection is stale.
+pub(crate) async fn load_committed_freeze_status(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<AssetStatus, PersistedUnderlyingOutcomeError> {
+    let state = load_underlying_events(pool, underlying)
+        .await?
+        .into_iter()
+        .try_fold(None::<Underlying>, |state, (sequence, event)| {
+            advance_underlying(state.as_ref(), sequence, &event).map(Some)
+        })?;
+
+    Ok(state.as_ref().map_or(AssetStatus::Enabled, Underlying::freeze_status))
+}
+
 /// Replays an underlying's retained history and reports whether one exact
 /// persisted event changed its effective freeze status.
 pub(crate) async fn persisted_event_changed_freeze_status(
@@ -650,6 +685,32 @@ pub(crate) async fn persisted_event_changed_freeze_status(
     underlying: &UnderlyingSymbol,
     expected_event: &UnderlyingEvent,
 ) -> Result<bool, PersistedUnderlyingOutcomeError> {
+    let (_, changed_state) =
+        load_underlying_events(pool, underlying).await?.into_iter().try_fold(
+            (None::<Underlying>, false),
+            |(state, changed_state), (sequence, event)| {
+                let before = state
+                    .as_ref()
+                    .map_or(AssetStatus::Enabled, Underlying::freeze_status);
+                let next =
+                    advance_underlying(state.as_ref(), sequence, &event)?;
+                let after = next.freeze_status();
+
+                Ok::<_, PersistedUnderlyingOutcomeError>((
+                    Some(next),
+                    changed_state
+                        || (&event == expected_event && before != after),
+                ))
+            },
+        )?;
+
+    Ok(changed_state)
+}
+
+async fn load_underlying_events(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<Vec<(i64, UnderlyingEvent)>, PersistedUnderlyingOutcomeError> {
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "
         SELECT sequence, payload
@@ -663,44 +724,37 @@ pub(crate) async fn persisted_event_changed_freeze_status(
     .fetch_all(pool)
     .await?;
 
-    let (_, changed_state) = rows.into_iter().try_fold(
-        (None::<Underlying>, false),
-        |(state, changed_state), (sequence, payload)| {
-            let event: UnderlyingEvent =
-                serde_json::from_str(&payload).map_err(|source| {
-                    PersistedUnderlyingOutcomeError::Decode { sequence, source }
-                })?;
-            let before = state
-                .as_ref()
-                .map_or(AssetStatus::Enabled, Underlying::freeze_status);
-            let next = state.as_ref().map_or_else(
-                || {
-                    Underlying::originate(&event).ok_or(
-                        PersistedUnderlyingOutcomeError::CannotOriginate {
-                            sequence,
-                        },
-                    )
-                },
-                |current| match Underlying::evolve(current, &event) {
-                    Ok(Some(next)) => Ok(next),
-                    Ok(None) => {
-                        Err(PersistedUnderlyingOutcomeError::CannotEvolve {
-                            sequence,
-                        })
-                    }
-                    Err(never) => match never {},
-                },
-            )?;
-            let after = next.freeze_status();
+    rows.into_iter()
+        .map(|(sequence, payload)| {
+            serde_json::from_str(&payload)
+                .map(|event| (sequence, event))
+                .map_err(|source| PersistedUnderlyingOutcomeError::Decode {
+                    sequence,
+                    source,
+                })
+        })
+        .collect()
+}
 
-            Ok::<_, PersistedUnderlyingOutcomeError>((
-                Some(next),
-                changed_state || (&event == expected_event && before != after),
-            ))
+fn advance_underlying(
+    state: Option<&Underlying>,
+    sequence: i64,
+    event: &UnderlyingEvent,
+) -> Result<Underlying, PersistedUnderlyingOutcomeError> {
+    state.map_or_else(
+        || {
+            Underlying::originate(event).ok_or(
+                PersistedUnderlyingOutcomeError::CannotOriginate { sequence },
+            )
         },
-    )?;
-
-    Ok(changed_state)
+        |current| match Underlying::evolve(current, event) {
+            Ok(Some(next)) => Ok(next),
+            Ok(None) => {
+                Err(PersistedUnderlyingOutcomeError::CannotEvolve { sequence })
+            }
+            Err(never) => match never {},
+        },
+    )
 }
 
 #[derive(Debug, thiserror::Error)]

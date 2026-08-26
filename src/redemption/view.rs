@@ -544,9 +544,10 @@ impl RedemptionView {
                 block_number: *block_number,
                 completed_at: *recovered_at,
             },
-            // View stays in Burning — BurnIntended and the submission events
-            // are internal details that don't change the query-facing state.
-            RedemptionEvent::BurnIntended { .. }
+            // Admission and burn-progress events are internal lifecycle details
+            // that do not change the query-facing state.
+            RedemptionEvent::AlpacaCallClaimed { .. }
+            | RedemptionEvent::BurnIntended { .. }
             | RedemptionEvent::BurnTxSubmitted { .. }
             | RedemptionEvent::OrchestratorBurnSubmitted { .. }
             | RedemptionEvent::BurnRecoveryAttempted { .. }

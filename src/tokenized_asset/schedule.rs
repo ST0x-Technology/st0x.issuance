@@ -40,7 +40,7 @@ use crate::notifications::{
 };
 use crate::underlying::{
     FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand, UnderlyingEvent,
-    persisted_event_changed_freeze_status,
+    persisted_event_changed_freeze_status, with_freeze_admission,
 };
 
 /// Which side of the freeze window a scheduled job applies.
@@ -496,19 +496,25 @@ impl Job<CorporateActionFreezeCtx> for AlignCorporateActionFreeze {
         .await?;
 
         if should_hold {
-            ctx.underlying_store
-                .send(
-                    &underlying_symbol,
-                    UnderlyingCommand::AcquireFreezeHold {
-                        underlying: underlying_symbol.clone(),
-                        hold_id: hold_id.clone(),
-                        acquired_at: now,
-                    },
-                )
-                .await
-                .map_err(|source| {
-                    CorporateActionFreezeError::Aggregate(Box::new(source))
-                })?;
+            // `perform` holds the revision guard before entering freeze
+            // admission. Every caller that needs both must keep that order;
+            // acquiring them in reverse would deadlock the issuer process.
+            with_freeze_admission(|| async {
+                ctx.underlying_store
+                    .send(
+                        &underlying_symbol,
+                        UnderlyingCommand::AcquireFreezeHold {
+                            underlying: underlying_symbol.clone(),
+                            hold_id: hold_id.clone(),
+                            acquired_at: now,
+                        },
+                    )
+                    .await
+                    .map_err(|source| {
+                        CorporateActionFreezeError::Aggregate(Box::new(source))
+                    })
+            })
+            .await?;
         }
 
         for observed_underlying in observed_underlyings {
@@ -586,9 +592,17 @@ impl Job<FreezeScheduleCtx> for ApplyFreezeTransition {
             proceed.wait().await;
         }
 
-        if let Err(source) =
+        let dispatch = || async {
             ctx.underlying_store.send(&self.underlying, command).await
-        {
+        };
+        let dispatch_result = match self.transition {
+            FreezeTransition::Freeze => with_freeze_admission(dispatch).await,
+            // Releases intentionally skip admission: widening the enabled
+            // interval cannot let a claim cross a freeze acquisition.
+            FreezeTransition::Unfreeze => dispatch().await,
+        };
+
+        if let Err(source) = dispatch_result {
             warn!(target: "asset", underlying = %self.underlying,
                 transition = ?self.transition,
                 scheduled_for = %self.scheduled_for,

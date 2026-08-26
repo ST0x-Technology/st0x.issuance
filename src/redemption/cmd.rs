@@ -69,6 +69,13 @@ pub(crate) enum RedemptionCommand {
         /// caller that forgot to resolve the mode.
         burn_mode: VaultMode,
     },
+    /// Durably claims ownership of the external Alpaca call after the freeze
+    /// admission check. A committed claim establishes that the call precedes
+    /// any later freeze and lets recovery resume after a crash without
+    /// re-entering the freeze gate.
+    ClaimAlpacaCall {
+        issuer_request_id: IssuerRedemptionRequestId,
+    },
     RecordAlpacaCall {
         issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,

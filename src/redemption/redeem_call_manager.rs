@@ -17,11 +17,18 @@ use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
+use crate::underlying::{
+    PersistedUnderlyingOutcomeError, load_committed_freeze_status,
+    with_freeze_admission,
+};
 
 pub(crate) struct RedeemCallManager {
     alpaca_service: Arc<dyn AlpacaService>,
     store: Arc<Store<Redemption>>,
     pool: Pool<Sqlite>,
+    #[cfg(test)]
+    before_claim_test_hook:
+        Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 impl RedeemCallManager {
@@ -30,7 +37,13 @@ impl RedeemCallManager {
         store: Arc<Store<Redemption>>,
         pool: Pool<Sqlite>,
     ) -> Self {
-        Self { alpaca_service, store, pool }
+        Self {
+            alpaca_service,
+            store,
+            pool,
+            #[cfg(test)]
+            before_claim_test_hook: None,
+        }
     }
 
     pub(crate) async fn recover_detected_redemptions(&self) {
@@ -52,14 +65,22 @@ impl RedeemCallManager {
         );
 
         let mut recovered = 0u32;
+        let mut already_claimed = 0u32;
+        let mut held = 0u32;
+        let mut skipped = 0u32;
         let mut auto_failed = 0u32;
         let mut failed = 0u32;
 
         for (issuer_request_id, _view) in &stuck_redemptions {
             match self.recover_single_detected(issuer_request_id).await {
-                Ok(()) => {
+                Ok(DetectedRecoveryOutcome::Recovered) => {
                     recovered += 1;
                 }
+                Ok(DetectedRecoveryOutcome::AlreadyClaimed) => {
+                    already_claimed += 1;
+                }
+                Ok(DetectedRecoveryOutcome::Held) => held += 1,
+                Ok(DetectedRecoveryOutcome::Skipped) => skipped += 1,
                 Err(
                     RedeemCallManagerError::AccountNotFound { .. }
                     | RedeemCallManagerError::AccountNotLinked { .. },
@@ -108,6 +129,9 @@ impl RedeemCallManager {
 
         info!(target: "redemption", total = stuck_redemptions.len(),
             recovered,
+            already_claimed,
+            held,
+            skipped,
             auto_failed,
             failed,
             "Detected redemption recovery complete"
@@ -117,23 +141,23 @@ impl RedeemCallManager {
     async fn recover_single_detected(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Result<(), RedeemCallManagerError> {
+    ) -> Result<DetectedRecoveryOutcome, RedeemCallManagerError> {
         let Some(aggregate) = self.store.load(issuer_request_id).await? else {
             debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "Redemption not found, skipping"
             );
-            return Ok(());
+            return Ok(DetectedRecoveryOutcome::Skipped);
         };
 
-        let Redemption::Detected { metadata } = &aggregate else {
+        let (Redemption::Detected { metadata }
+        | Redemption::Held { metadata, .. }
+        | Redemption::AlpacaCallClaimed { metadata, .. }) = &aggregate
+        else {
             debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                "Redemption no longer in Detected state, skipping"
+                "Redemption no longer recoverable before the Alpaca call, skipping"
             );
-            return Ok(());
+            return Ok(DetectedRecoveryOutcome::Skipped);
         };
-
-        let (client_id, alpaca_account) =
-            self.lookup_account_for_recovery(&metadata.wallet).await?;
 
         self.verify_asset_enabled(
             metadata.underlying.clone(),
@@ -141,17 +165,61 @@ impl RedeemCallManager {
         )
         .await?;
 
+        if !matches!(aggregate, Redemption::AlpacaCallClaimed { .. }) {
+            let status =
+                load_committed_freeze_status(&self.pool, &metadata.underlying)
+                    .await?;
+            if status.is_frozen() {
+                self.hold_frozen_redemption(issuer_request_id, &aggregate)
+                    .await?;
+                return Ok(DetectedRecoveryOutcome::Held);
+            }
+        }
+
+        let (client_id, alpaca_account) =
+            self.lookup_account_for_recovery(&metadata.wallet).await?;
+
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
         );
 
-        self.handle_redemption_detected(
+        self.handle_redemption_detected_with_outcome(
             &alpaca_account,
             issuer_request_id,
             &aggregate,
             client_id,
         )
-        .await?;
+        .await
+    }
+
+    /// Parks a redemption whose asset is frozen: dispatches `Hold` from
+    /// `Detected` (the command is idempotent from `Held`, so a redemption the
+    /// resume driver re-visits mid-freeze stays parked without erroring).
+    async fn hold_frozen_redemption(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        aggregate: &Redemption,
+    ) -> Result<(), RedeemCallManagerError> {
+        if matches!(aggregate, Redemption::Held { .. }) {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Redemption already held; asset still frozen"
+            );
+            return Ok(());
+        }
+
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Hold {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await?;
+
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            "Held redemption before the Alpaca call: the underlying is frozen; \
+             it will resume after unfreeze"
+        );
 
         Ok(())
     }
@@ -202,12 +270,120 @@ impl RedeemCallManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
-    ) -> Result<(), RedeemCallManagerError> {
-        let Redemption::Detected { metadata } = aggregate else {
+    ) -> Result<DetectedRecoveryOutcome, RedeemCallManagerError> {
+        self.handle_redemption_detected_with_outcome(
+            alpaca_account,
+            issuer_request_id,
+            aggregate,
+            client_id,
+        )
+        .await
+    }
+
+    async fn handle_redemption_detected_with_outcome(
+        &self,
+        _alpaca_account: &AlpacaAccountNumber,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        aggregate: &Redemption,
+        client_id: ClientId,
+    ) -> Result<DetectedRecoveryOutcome, RedeemCallManagerError> {
+        let (Redemption::Detected { metadata }
+        | Redemption::Held { metadata, .. }
+        | Redemption::AlpacaCallClaimed { metadata, .. }) = aggregate
+        else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
                 current_state: aggregate.state_name().to_string(),
             });
         };
+
+        // The freeze gate sits at the single point between detection and the
+        // Alpaca redeem call. Before that call neither side has moved (Alpaca
+        // has not decremented, nothing burned), so holding here keeps on-chain
+        // supply equal to Alpaca's snapshot — the freeze invariant. The
+        // corporate-action freeze is underlying-scoped, so one freeze holds
+        // redemptions of that underlying on every network. Replaying the
+        // committed Underlying stream avoids projection lag; any replay error
+        // propagates before Alpaca is called.
+        if !matches!(aggregate, Redemption::AlpacaCallClaimed { .. }) {
+            let status =
+                load_committed_freeze_status(&self.pool, &metadata.underlying)
+                    .await?;
+
+            if status.is_frozen() {
+                self.hold_frozen_redemption(issuer_request_id, aggregate)
+                    .await?;
+                return Ok(DetectedRecoveryOutcome::Held);
+            }
+
+            #[cfg(test)]
+            if let Some((reached, proceed)) = &self.before_claim_test_hook {
+                reached.wait().await;
+                proceed.wait().await;
+            }
+
+            let admission = with_freeze_admission(|| async {
+                let current = self
+                    .store
+                    .load(issuer_request_id)
+                    .await?
+                    .ok_or_else(|| {
+                        RedeemCallManagerError::RedemptionNotFound {
+                            issuer_request_id: issuer_request_id.clone(),
+                        }
+                    })?;
+                if matches!(current, Redemption::AlpacaCallClaimed { .. }) {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        "A concurrent task already claimed the Alpaca call"
+                    );
+                    return Ok(AlpacaCallAdmission::AlreadyClaimed);
+                }
+                if !matches!(
+                    current,
+                    Redemption::Detected { .. } | Redemption::Held { .. }
+                ) {
+                    return Err(
+                        RedeemCallManagerError::InvalidAggregateState {
+                            current_state: current.state_name().to_string(),
+                        },
+                    );
+                }
+
+                let status = load_committed_freeze_status(
+                    &self.pool,
+                    &metadata.underlying,
+                )
+                .await?;
+                if status.is_frozen() {
+                    self.hold_frozen_redemption(issuer_request_id, &current)
+                        .await?;
+                    return Ok(AlpacaCallAdmission::Held);
+                }
+
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::ClaimAlpacaCall {
+                            issuer_request_id: issuer_request_id.clone(),
+                        },
+                    )
+                    .await?;
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    underlying = %metadata.underlying,
+                    "Alpaca call durably claimed"
+                );
+                Ok(AlpacaCallAdmission::Claimed)
+            })
+            .await?;
+            match admission {
+                AlpacaCallAdmission::Claimed => {}
+                AlpacaCallAdmission::AlreadyClaimed => {
+                    return Ok(DetectedRecoveryOutcome::AlreadyClaimed);
+                }
+                AlpacaCallAdmission::Held => {
+                    return Ok(DetectedRecoveryOutcome::Held);
+                }
+            }
+        }
 
         // Truncate to 9 decimals for Alpaca - they don't support 18 decimal precision
         let (alpaca_quantity, dust_quantity) =
@@ -215,9 +391,6 @@ impl RedeemCallManager {
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             underlying = %metadata.underlying,
-            original_quantity = %metadata.quantity.0,
-            alpaca_quantity = %alpaca_quantity.0,
-            dust_quantity = %dust_quantity.0,
             wallet = %metadata.wallet,
             "Calling Alpaca redeem endpoint"
         );
@@ -268,7 +441,7 @@ impl RedeemCallManager {
                     "RecordAlpacaCall command executed successfully"
                 );
 
-                Ok(())
+                Ok(DetectedRecoveryOutcome::Recovered)
             }
             Err(err) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -304,6 +477,8 @@ pub(crate) enum RedeemCallManagerError {
     Cqrs(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
+    #[error("Redemption aggregate not found: {issuer_request_id}")]
+    RedemptionNotFound { issuer_request_id: IssuerRedemptionRequestId },
     #[error("View error: {0}")]
     View(#[from] RedemptionViewError),
     #[error("Account view error: {0}")]
@@ -314,6 +489,8 @@ pub(crate) enum RedeemCallManagerError {
     AccountNotLinked { wallet: Address },
     #[error("Asset view error: {0}")]
     AssetView(#[from] TokenizedAssetViewError),
+    #[error("Underlying event stream error: {0}")]
+    Underlying(#[from] PersistedUnderlyingOutcomeError),
     #[error(
         "Asset not found for underlying: {underlying} on network: {network}"
     )]
@@ -332,6 +509,21 @@ impl From<AggregateError<LifecycleError<Redemption>>>
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlpacaCallAdmission {
+    Claimed,
+    AlreadyClaimed,
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetectedRecoveryOutcome {
+    Recovered,
+    AlreadyClaimed,
+    Held,
+    Skipped,
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
@@ -341,9 +533,12 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::{Arc, Mutex};
+    use tokio::sync::Barrier;
     use tracing_test::traced_test;
 
-    use super::{RedeemCallManager, RedeemCallManagerError};
+    use super::{
+        DetectedRecoveryOutcome, RedeemCallManager, RedeemCallManagerError,
+    };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
@@ -366,6 +561,7 @@ mod tests {
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
+    use crate::underlying::{Underlying, UnderlyingCommand};
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
@@ -383,6 +579,7 @@ mod tests {
         redemption_store: Arc<Store<Redemption>>,
         account_store: Arc<Store<Account>>,
         asset_store: Arc<Store<TokenizedAsset>>,
+        underlying_store: Arc<Store<Underlying>>,
     }
 
     impl TestHarness {
@@ -422,7 +619,19 @@ mod tests {
                     .await
                     .expect("Failed to build tokenized asset store");
 
-            Self { pool, redemption_store, account_store, asset_store }
+            let (underlying_store, _underlying_projection) =
+                StoreBuilder::<Underlying>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build underlying store");
+
+            Self {
+                pool,
+                redemption_store,
+                account_store,
+                asset_store,
+                underlying_store,
+            }
         }
 
         async fn register_and_link_account(
@@ -479,6 +688,35 @@ mod tests {
                 .expect("Failed to add asset");
         }
 
+        /// Freezes the underlying for a corporate action. The freeze is
+        /// underlying-scoped, so it covers every network's listing.
+        async fn freeze_underlying(&self, underlying: &UnderlyingSymbol) {
+            crate::underlying::with_freeze_admission(|| async {
+                self.underlying_store
+                    .send(
+                        underlying,
+                        UnderlyingCommand::Freeze {
+                            underlying: underlying.clone(),
+                        },
+                    )
+                    .await
+                    .expect("Failed to freeze underlying");
+            })
+            .await;
+        }
+
+        async fn unfreeze_underlying(&self, underlying: &UnderlyingSymbol) {
+            self.underlying_store
+                .send(
+                    underlying,
+                    UnderlyingCommand::Unfreeze {
+                        underlying: underlying.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to unfreeze underlying");
+        }
+
         async fn detect_redemption(
             &self,
             issuer_request_id: &IssuerRedemptionRequestId,
@@ -517,6 +755,17 @@ mod tests {
                 self.pool.clone(),
             )
         }
+
+        fn create_manager_paused_before_claim(
+            &self,
+            alpaca_service: Arc<dyn crate::alpaca::AlpacaService>,
+            reached: Arc<Barrier>,
+            proceed: Arc<Barrier>,
+        ) -> RedeemCallManager {
+            let mut manager = self.create_manager(alpaca_service);
+            manager.before_claim_test_hook = Some((reached, proceed));
+            manager
+        }
     }
 
     async fn setup_test_store()
@@ -546,56 +795,34 @@ mod tests {
         (store, pool)
     }
 
-    async fn create_test_redemption_in_detected_state(
-        store: &Store<Redemption>,
-        issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Redemption {
-        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
-        let token = TokenSymbol::new("tAAPL");
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let quantity = Quantity::new(Decimal::from(100));
-        let tx_hash = b256!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-        let block_number = 12345;
-
-        store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::Detect {
-                    issuer_request_id: issuer_request_id.clone(),
-                    underlying,
-                    token,
-                    network: Network::Base,
-                    wallet,
-                    quantity,
-                    tx_hash,
-                    block_number,
-                    burn_mode: VaultMode::VaultDirect,
-                },
-            )
-            .await
-            .unwrap();
-
-        store.load(issuer_request_id).await.unwrap().unwrap()
-    }
-
     #[traced_test]
     #[tokio::test]
     async fn test_handle_redemption_detected_with_success() {
-        let (store, pool) = setup_test_store().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let aggregate = create_test_redemption_in_detected_state(
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let client_id = ClientId::new();
 
@@ -608,12 +835,16 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+        result.unwrap();
 
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
-        let updated_aggregate =
-            store.load(&issuer_request_id).await.unwrap().unwrap();
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
@@ -739,20 +970,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
-        let (store, pool) = setup_test_store().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock =
             Arc::new(MockAlpacaService::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool);
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let aggregate = create_test_redemption_in_detected_state(
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let client_id = ClientId::new();
 
@@ -772,8 +1015,12 @@ mod tests {
 
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
-        let updated_aggregate =
-            store.load(&issuer_request_id).await.unwrap().unwrap();
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -788,6 +1035,451 @@ mod tests {
             tracing::Level::WARN,
             &["Alpaca redeem API call failed"]
         ));
+    }
+
+    // The freeze gate: a detected redemption of a frozen asset is parked in
+    // Held before the Alpaca call — the one point where neither side has
+    // moved — and never dropped.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_handle_redemption_detected_holds_frozen_asset() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+                ClientId::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            0,
+            "Alpaca must not be called for a frozen asset"
+        );
+
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(updated_aggregate, Redemption::Held { .. }),
+            "Expected Held state, got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption before the Alpaca call", "frozen"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn committed_freeze_holds_when_projection_update_fails() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        sqlx::query(
+            "
+            CREATE TRIGGER fail_underlying_view_insert
+            BEFORE INSERT ON underlying_view
+            BEGIN
+                SELECT RAISE(FAIL, 'projection unavailable');
+            END
+            ",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        harness.freeze_underlying(&underlying).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager
+            .handle_redemption_detected(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+                ClientId::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        let updated = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(updated, Redemption::Held { .. }));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption before the Alpaca call", "frozen"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn recovery_holds_frozen_redemption_before_account_lookup() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+
+        manager.recover_detected_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        let recovered = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(recovered, Redemption::Held { .. }),
+            "frozen redemption must remain Held even without a linked account, got {recovered:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption before the Alpaca call", "frozen"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn freeze_wins_before_durable_alpaca_call_claim() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let reached = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        let manager = harness.create_manager_paused_before_claim(
+            alpaca_service_mock.clone()
+                as Arc<dyn crate::alpaca::AlpacaService>,
+            reached.clone(),
+            proceed.clone(),
+        );
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let network = Network::Base;
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        let alpaca_account = AlpacaAccountNumber("acc-race".to_string());
+        harness.add_asset(&underlying, &network).await;
+        harness
+            .register_and_link_account(
+                client_id,
+                "race@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &network,
+                wallet,
+            )
+            .await;
+
+        let recovery = manager.recover_single_detected(&issuer_request_id);
+        let freeze = async {
+            reached.wait().await;
+            harness.freeze_underlying(&underlying).await;
+            proceed.wait().await;
+        };
+        let (recovery_result, ()) = tokio::join!(recovery, freeze);
+        recovery_result.expect("freeze race must be handled");
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            0,
+            "Alpaca must not be called when freeze commits before the claim"
+        );
+        let updated = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(updated, Redemption::Held { .. }),
+            "freeze must win the serialization order, got {updated:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Held redemption before the Alpaca call", "frozen"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn recovery_resumes_a_durable_claim_ahead_of_a_later_freeze() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let network = Network::Base;
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        let alpaca_account = AlpacaAccountNumber("acc-claimed".to_string());
+        harness.add_asset(&underlying, &network).await;
+        harness
+            .register_and_link_account(
+                client_id,
+                "claimed@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &network,
+                wallet,
+            )
+            .await;
+        harness
+            .redemption_store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        harness.freeze_underlying(&underlying).await;
+
+        manager.recover_detected_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 1);
+        let recovered = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(recovered, Redemption::AlpacaCalled { .. }),
+            "a committed claim must resume without re-entering the freeze gate, got {recovered:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Calling Alpaca redeem endpoint", "AAPL"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn concurrent_claim_is_not_reported_as_recovered() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let network = Network::Base;
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        let alpaca_account = AlpacaAccountNumber("acc-concurrent".to_string());
+        harness.add_asset(&underlying, &network).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &network,
+                wallet,
+            )
+            .await;
+        let stale_detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .redemption_store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .handle_redemption_detected(
+                &alpaca_account,
+                &issuer_request_id,
+                &stale_detected,
+                client_id,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, DetectedRecoveryOutcome::AlreadyClaimed);
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["concurrent task", "already claimed the Alpaca call"]
+        ));
+    }
+
+    // Re-visiting a Held redemption while the asset is still frozen is a
+    // no-op (the Hold command is idempotent), and once the asset unfreezes
+    // the same chokepoint resumes it: Held -> AlpacaCallClaimed -> AlpacaCalled.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_held_redemption_stays_held_then_resumes_after_unfreeze() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+
+        let process_redemption = |aggregate: Redemption| {
+            let manager = &manager;
+            let issuer_request_id = &issuer_request_id;
+            async move {
+                manager
+                    .handle_redemption_detected(
+                        &test_alpaca_account(),
+                        issuer_request_id,
+                        &aggregate,
+                        ClientId::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let detected = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        process_redemption(detected).await;
+
+        // Second pass while still frozen: stays Held, no Alpaca call, no error.
+        let held = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(held, Redemption::Held { .. }));
+        process_redemption(held).await;
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+
+        harness.unfreeze_underlying(&underlying).await;
+
+        let held = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        process_redemption(held).await;
+
+        assert_eq!(
+            alpaca_service_mock.get_call_count(),
+            1,
+            "Alpaca must be called once the asset unfreezes"
+        );
+
+        let resumed = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(resumed, Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled after unfreeze, got {resumed:?}"
+        );
     }
 
     #[tokio::test]
@@ -1021,6 +1713,45 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn frozen_redemption_is_counted_as_held_not_recovered() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        harness.add_asset(&underlying, &Network::Base).await;
+        harness.freeze_underlying(&underlying).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                wallet,
+            )
+            .await;
+
+        manager.recover_detected_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        assert!(matches!(
+            harness
+                .redemption_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            Redemption::Held { .. }
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Detected redemption recovery complete", "recovered=0", "held=1"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn test_recover_detected_alpaca_failure_counts_auto_failed() {
         // A recovery whose Alpaca call fails records `RecordAlpacaFailure` — the
         // redemption is properly terminal-ized — so it must be counted as
@@ -1096,15 +1827,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_single_detected_missing_account() {
-        let (store, pool) = setup_test_store().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, store.clone(), pool.clone());
+        let manager = harness.create_manager(alpaca_service);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_detected_state(&store, &issuer_request_id)
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+            )
             .await;
 
         let result = manager.recover_single_detected(&issuer_request_id).await;
@@ -1129,6 +1867,7 @@ mod tests {
 
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, &Network::Base).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
