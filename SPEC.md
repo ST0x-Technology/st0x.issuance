@@ -1611,32 +1611,39 @@ sub-second window is rejected with 422 (apalis schedules at second granularity,
 so a sub-second window has no defined execution order); a fully elapsed window
 is rejected rather than flapping the asset; a `freeze_at` already in the past
 with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
-the schedule mechanism both the manual admin endpoint and the automated
-corporate-actions sourcing feed.
+the manual/operator schedule mechanism; the automated corporate-actions feed
+uses the same underlying freeze-hold commands through its own action-keyed
+alignment jobs.
 
-**Corporate-actions sourcing.** Issuance consumes Alpaca's corporate-actions SSE
-stream as an authenticated, durable mutation source. The accepted contract is
-exactly US-region `cash_dividend_corporateaction_event` and
-`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
-`delete`. Any other mutation kind or discriminator, another region, malformed
-identity, or invalid date is a typed poison boundary and cannot advance the
-cursor. A valid accepted event for an underlying that issuance does not list is
-instead an explicit no-op: the projection transaction records the event with a
-typed `no_op_unlisted_underlying` outcome and advances the cursor without
-creating an action projection, schedule, transition job, or hold, while
-retaining the canonical mutation payload. After an asset listing commits, a
-service-owned reactor selects the latest retained mutation per action for that
-underlying. It atomically creates pending revisions for the latest non-delete
-mutations and records their source event IDs without changing the stream cursor
-or rewriting the historical no-op outcomes. The ordinary alignment path then
-applies future windows and immediately acquires holds for windows already
-active; tests cover both cases. A latest retained delete creates no revision
-because no source hold was acquired. Listed events record a `schedule_revision`
-outcome with the resulting revision in that same transaction. Each listed
-action's stable Alpaca ID owns one source hold and one current schedule
-revision, so updates replace that action's prior window and deletes release only
-that action's hold. An operator hold or another action on the same underlying is
-never affected.
+**Corporate-actions sourcing.** Issuance consumes Alpaca's authenticated Market
+Data SSE stream (`GET /v1beta1/events/corporate-actions`) as a durable mutation
+source. Production and staging accept only HTTPS on
+`stream.data.alpaca.markets`; development may use plain HTTP only when the URL
+targets a loopback IP and the request carries no Alpaca credential headers. The
+credential-free development transport may establish its initial cursor from the
+first validated mock frame through the ordinary decoder and projection path;
+authenticated environments still require the fail-closed snapshot-repair
+baseline described below. The accepted contract is exactly US-region
+`cash_dividend_corporateaction_event` and `stock_dividend_corporateaction_event`
+frames with `insert`, `update`, or `delete`. Any other mutation kind or
+discriminator, another region, malformed identity, or invalid date is a typed
+poison boundary and cannot advance the cursor. A valid accepted event for an
+underlying that issuance does not list is instead an explicit no-op: the
+projection transaction records the event with a typed
+`no_op_unlisted_underlying` outcome and advances the cursor without creating an
+action projection, schedule, transition job, or hold, while retaining the
+canonical mutation payload. After an asset listing commits, a service-owned
+reactor selects the latest retained mutation per action for that underlying. It
+atomically creates pending revisions for the latest non-delete mutations and
+records their source event IDs without changing the stream cursor or rewriting
+the historical no-op outcomes. The ordinary alignment path then applies future
+windows and immediately acquires holds for windows already active; tests cover
+both cases. A latest retained delete creates no revision because no source hold
+was acquired. Listed events record a `schedule_revision` outcome with the
+resulting revision in that same transaction. Each listed action's stable Alpaca
+ID owns one source hold and one current schedule revision, so updates replace
+that action's prior window and deletes release only that action's hold. An
+operator hold or another action on the same underlying is never affected.
 
 Unlisted canonical state is bounded: one latest row is upserted per
 `(region, underlying, action_id)`, while a separate audit row keeps only the
@@ -1675,6 +1682,21 @@ alignment, then resets the same keyed job to pending with a fresh retry budget.
 Restart tests cover both killed and retry-exhausted rows and prove the marker
 stays null until the re-armed alignment succeeds.
 
+Each projected revision enqueues durable `AlignCorporateActionFreeze` jobs keyed
+by action ID and event ID. Projection commits and the alignment job's
+expected-event check plus action-owned hold effects share one process-wide
+revision guard; the single-writer issuer therefore cannot commit a newer
+revision between the check and those effects. Insert/update alignment acquires
+exactly that Alpaca-owned hold when the current revision is inside its active
+window and releases the same hold from any superseded underlying. A delete or
+elapsed window schedules release-only alignment. At startup, `Running`
+transition and alignment jobs reset to `Pending`; `Killed` or exhausted
+alignment jobs are re-armed because the projection remains pending, and each
+terminal alignment key enqueues one deduplicated sync-failure lifecycle
+notification. `Done` alignment jobs and terminal transition jobs are vacuumed
+after dead transitions are logged. A valid mutation for an unlisted underlying
+bypasses projection and alignment entirely.
+
 Event IDs are canonical uppercase ULIDs ordered by their encoded value. An exact
 replay is a duplicate. The projection transaction looks up its accepted-mutation
 row by `event_id`: matching canonical content leaves the mutation, schedule,
@@ -1690,18 +1712,20 @@ typed reason, and a fixed 32-byte SHA-256 fingerprint computed incrementally
 over the rejected frame. Oversized or malformed frames therefore persist a
 blocked boundary even when no event ID can be parsed, without retaining the
 frame beyond the decoder limit. Startup refuses to reconnect while that blocked
-boundary remains. Restart tests cover malformed and oversized frames without an
-event ID. The first install has no cursor and cannot establish a production
-baseline from the documented Alpaca contracts: neither an unbounded `since`
-replay nor the paginated GET endpoint proves a complete state at an SSE event
-ID. Minting and normal consumption remain gated until an operator restores a
-full issuance database backup with a cursor that inclusive replay still accepts.
-A controlled mock stream may establish a development fixture cursor only.
-Subsequent production connections use inclusive `since_id=<committed-event-id>`
-replay, and the first data frame must echo that cursor. `Last-Event-Id` is never
-sent, because Alpaca gives that header precedence over `since_id`. A rejected
-anchor or non-echoing first frame is a replay gap: no later or live event is
-accepted.
+boundary remains. Operators follow
+@docs/runbooks/corporate-action-feed-boundary.md to inspect the exact stored
+boundary and cursor, preserve incident evidence, and invoke no unsafe SQL
+override. Restart tests cover malformed and oversized frames without an event
+ID. The first install has no cursor and cannot establish a production baseline
+from the documented Alpaca contracts: neither an unbounded `since` replay nor
+the paginated GET endpoint proves a complete state at an SSE event ID. Minting
+and normal consumption remain gated until an operator restores a full issuance
+database backup with a cursor that inclusive replay still accepts. A controlled
+mock stream may establish a development fixture cursor only. Subsequent
+production connections use inclusive `since_id=<committed-event-id>` replay, and
+the first data frame must echo that cursor. `Last-Event-Id` is never sent,
+because Alpaca gives that header precedence over `since_id`. A rejected anchor
+or non-echoing first frame is a replay gap: no later or live event is accepted.
 
 A replay-retention gap is not repaired by resetting the cursor or combining an
 uncertified GET page set with a live buffer. Alpaca documents neither a REST
@@ -1731,10 +1755,20 @@ The Market Data GET endpoint is diagnostic only. Every diagnostic request uses
 whose declared region is missing or not US. GET rows and absences never mutate
 the action projection, release a hold, or advance the SSE cursor.
 
-This slice must not be deployed independently. PR #281 records the migration to
-Alpaca's current corporate-actions REST/SSE surface, and PR #282 replaces this
-poller with the authenticated mutation stream and durable insert/update/delete
-reconciliation.
+Only a full backup restore followed by echo-verified inclusive replay, or a
+future implementation of a documented provider snapshot/replay boundary, may
+clear a replay-gap boundary. Until one is available and validated, a blocked
+production feed remains stopped and the corporate-actions feature cannot be
+re-enabled by editing its cursor or projection tables.
+
+The reconnect signals answer two separate on-call questions. A structured WARN
+with `state=reconnect_threshold_exceeded`, `consecutive_failures`, and
+`backoff_secs` answers how long and how aggressively the client has been
+retrying. A single `CorporateActionsSyncFailed` lifecycle notification when the
+fifth consecutive connection ends without an accepted mutation answers whether
+an operator needs to investigate. Backoff is exponential with jitter, bounded
+between five and sixty seconds, and both the counter and backoff reset only
+after a connection accepts a mutation.
 
 Corporate-action scheduling and failure notifications follow the shared operator
 lifecycle notification contract below.
