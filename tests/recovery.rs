@@ -246,8 +246,8 @@ async fn test_mint_recovery_after_view_deletion()
     )
     .await?;
 
-    // "Crash" - drop the service
-    drop(client1);
+    // Stop the first service before mutating its persisted state and restarting.
+    client1.terminate().await;
 
     // Connect to the database to manipulate state
     let query_pool =
@@ -515,7 +515,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Now insert events directly to create a mint stuck in Minting state
     // WITHOUT any on-chain transaction
@@ -635,7 +635,7 @@ async fn test_mint_recovery_prevents_double_mint()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Insert events to create a mint stuck in Minting state with matching issuer_request_id
     let query_pool =
@@ -756,7 +756,7 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Restart service. The receipt monitor will spawn (asset exists).
     // Auto-recovery runs but finds NO stuck mints (we haven't inserted any yet).
@@ -878,7 +878,7 @@ async fn test_mint_recovery_from_minting_failed_state()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Insert events to create a mint in MintingFailed state
     let query_pool =
@@ -991,7 +991,7 @@ async fn test_startup_clears_and_rebuilds_views()
     harness::setup_account(&client1, user_wallet).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a Detected redemption for the LINKED wallet into events
     let query_pool =
@@ -1111,7 +1111,7 @@ async fn test_detected_redemption_auto_failed_when_no_account()
 
     let link_body = harness::setup_account(&client1, user_wallet).await;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a Detected redemption for an UNKNOWN wallet (no linked account)
     let orphan_wallet = Address::random();
@@ -1254,7 +1254,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 
     let _link_body = harness::setup_account(&client1, user_wallet).await;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a BurnFailed redemption directly in the event store
     let query_pool =
