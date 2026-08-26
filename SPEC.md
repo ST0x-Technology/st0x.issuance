@@ -1614,19 +1614,122 @@ with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
 the schedule mechanism both the manual admin endpoint and the automated
 corporate-actions sourcing feed.
 
-**Corporate-actions sourcing.** This transitional slice uses Alpaca's deprecated
-Broker API Corporate Actions Announcements endpoint, so `ALPACA_BASE_URL` must
-select the Broker API: `GET /v1/corporate_actions/announcements`, filtered to
-`ca_types=dividend` / `date_type=ex_date` over an 89-day inclusive range. A
-periodic sync every 6 hours arms one freeze window per supported asset per
-ex-date through the same scheduler. The window is the full UTC ex-date day —
-freeze at ex-date 00:00 UTC, unfreeze at 00:00 UTC the next day — which brackets
-the US/Eastern trading session on both sides. Announcements for symbols we do
-not tokenize, announcements whose ex-date is not yet set, and windows that
-already elapsed are skipped; a failed pass is retried at the next interval, and
-because re-arming the same window is an idempotent no-op the sync needs no state
-of its own. The issuer CLI owns an independent operator hold and cannot release
-a corporate-action window's hold.
+**Corporate-actions sourcing.** Issuance consumes Alpaca's corporate-actions SSE
+stream as an authenticated, durable mutation source. The accepted contract is
+exactly US-region `cash_dividend_corporateaction_event` and
+`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
+`delete`. Any other mutation kind or discriminator, another region, malformed
+identity, or invalid date is a typed poison boundary and cannot advance the
+cursor. A valid accepted event for an underlying that issuance does not list is
+instead an explicit no-op: the projection transaction records the event with a
+typed `no_op_unlisted_underlying` outcome and advances the cursor without
+creating an action projection, schedule, transition job, or hold, while
+retaining the canonical mutation payload. After an asset listing commits, a
+service-owned reactor selects the latest retained mutation per action for that
+underlying. It atomically creates pending revisions for the latest non-delete
+mutations and records their source event IDs without changing the stream cursor
+or rewriting the historical no-op outcomes. The ordinary alignment path then
+applies future windows and immediately acquires holds for windows already
+active; tests cover both cases. A latest retained delete creates no revision
+because no source hold was acquired. Listed events record a `schedule_revision`
+outcome with the resulting revision in that same transaction. Each listed
+action's stable Alpaca ID owns one source hold and one current schedule
+revision, so updates replace that action's prior window and deletes release only
+that action's hold. An operator hold or another action on the same underlying is
+never affected.
+
+Unlisted canonical state is bounded: one latest row is upserted per
+`(region, underlying, action_id)`, while a separate audit row keeps only the
+event ID, action ID, mutation kind, typed outcome, payload fingerprint, and
+acceptance time. Production requires positive audit-TTL and global
+unlisted-action-capacity settings. Expired audit rows may be removed; canonical
+rows may be removed only after listing promotion reconciles, or after a
+delete/elapsed window has no schedule or hold. Reaching capacity before any row
+is eligible blocks the feed rather than silently evicting promotion or release
+state. The projection transaction stores the current replay cursor together with
+a single durable cursor-echo record containing that event ID and the fixed
+32-byte fingerprint of its canonical accepted content. This bounded record is
+replaced only when the cursor advances and is never removed by audit compaction,
+so inclusive replay can still verify the committed anchor after its audit row
+expires.
+
+The streaming decoder bounds untrusted input before JSON decoding: one SSE frame
+is at most 64 KiB, with only the separator bytes buffered beyond that limit, and
+an Alpaca action ID is 1 through 128 bytes. An oversized frame is a typed poison
+boundary before JSON or action allocation and cannot advance the cursor. Empty
+or oversized action IDs are likewise typed poison boundaries.
+
+The window is the full UTC ex-date day — freeze at ex-date 00:00 UTC and
+unfreeze at 00:00 UTC the next day — which brackets the US/Eastern trading
+session on both sides. An immediate idempotent alignment job reconciles a new
+revision against the current time and underlying before its boundary jobs run.
+The projection transaction persists the mutation, action revision, pending
+alignment marker, and replay cursor together. Apalis jobs and aggregate hold
+events are recoverable second-phase effects; startup aligns every pending
+revision before reconnecting. A null reconciled marker plus a pending or running
+alignment row is `pending`; a null marker plus a killed or retry-exhausted row
+is `terminal_failed`; a marker equal to the current source event ID is
+`reconciled`. Exhausting retries never advances the marker. On startup, issuance
+first enqueues one deduplicated sync-failure notification per terminal
+alignment, then resets the same keyed job to pending with a fresh retry budget.
+Restart tests cover both killed and retry-exhausted rows and prove the marker
+stays null until the re-armed alignment succeeds.
+
+Event IDs are canonical uppercase ULIDs ordered by their encoded value. An exact
+replay is a duplicate. The projection transaction looks up its accepted-mutation
+row by `event_id`: matching canonical content leaves the mutation, schedule,
+revision, and cursor unchanged, while different content for the same ID persists
+a typed poison boundary. If compaction removed that row, the current cursor ID
+is verified against the durable cursor echo instead. A lower ID with neither a
+retained audit row nor the cursor echo cannot be proven to be the same
+historical event; it persists a typed replay-evidence-unavailable boundary and
+stops the feed rather than being accepted as a duplicate. An unseen lower ID is
+a cursor regression. Before a poison or regression stops the feed, issuance
+persists the last accepted cursor, an optional canonical provider event ID, the
+typed reason, and a fixed 32-byte SHA-256 fingerprint computed incrementally
+over the rejected frame. Oversized or malformed frames therefore persist a
+blocked boundary even when no event ID can be parsed, without retaining the
+frame beyond the decoder limit. Startup refuses to reconnect while that blocked
+boundary remains. Restart tests cover malformed and oversized frames without an
+event ID. The first install has no cursor and cannot establish a production
+baseline from the documented Alpaca contracts: neither an unbounded `since`
+replay nor the paginated GET endpoint proves a complete state at an SSE event
+ID. Minting and normal consumption remain gated until an operator restores a
+full issuance database backup with a cursor that inclusive replay still accepts.
+A controlled mock stream may establish a development fixture cursor only.
+Subsequent production connections use inclusive `since_id=<committed-event-id>`
+replay, and the first data frame must echo that cursor. `Last-Event-Id` is never
+sent, because Alpaca gives that header precedence over `since_id`. A rejected
+anchor or non-echoing first frame is a replay gap: no later or live event is
+accepted.
+
+A replay-retention gap is not repaired by resetting the cursor or combining an
+uncertified GET page set with a live buffer. Alpaca documents neither a REST
+snapshot watermark nor a consistency relationship between GET pagination and an
+SSE event ID, so an empty buffer, a first live frame, and `since_id` cannot
+prove a safe cutover. Issuance remains gated at the durable replay-gap boundary
+until an operator restores a full database backup whose cursor can be
+echo-verified by inclusive replay, or Alpaca adds a documented atomic
+snapshot/replay boundary. Without either input, recovery is intentionally
+unavailable.
+
+Every durable ingestion boundary that gates consumption — poison (including
+replay-evidence-unavailable), cursor regression, rejected anchor, or replay-
+retention gap — owns one active durable operator alert. Its deduplication
+identity is `(boundary_kind, stored_cursor_or_none, fingerprint)`, and its
+payload includes the typed stored reason, cursor, and fingerprint; reconnect
+attempts and notification retries reuse that identity instead of paging
+repeatedly. The alert remains active in health and operator status until the
+corresponding boundary is removed in the same recovery transaction that records
+a restored cursor and a successful inclusive replay verification. Clearing or
+acknowledging the alert alone never ungates issuance. Resolution queues one
+deduplicated recovery notification for that alert identity.
+
+The Market Data GET endpoint is diagnostic only. Every diagnostic request uses
+`region=us`, `data_quality=all`, and exactly
+`types=cash_dividend,stock_dividend`, exhausts pagination, and rejects a row
+whose declared region is missing or not US. GET rows and absences never mutate
+the action projection, release a hold, or advance the SSE cursor.
 
 This slice must not be deployed independently. PR #281 records the migration to
 Alpaca's current corporate-actions REST/SSE surface, and PR #282 replaces this
