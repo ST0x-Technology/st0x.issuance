@@ -12,19 +12,23 @@
 #          certificate. No route is forwarded, so the IP whitelists keep
 #          separating Alpaca from internal callers exactly as they do today.
 #
-#   true   Rocket listens on 127.0.0.1 and takes the client IP from X-Real-IP,
-#          which nginx overwrites from the TCP source on every proxied request.
-#          nginx forwards the allowlist below, port 8000 closes, and the
-#          whitelists see real client addresses again.
+#   true   Rocket listens on 127.0.0.1:8001 and takes the client IP from
+#          X-Real-IP, which nginx overwrites from the TCP source on every
+#          proxied request. nginx forwards the allowlist below over HTTPS,
+#          and (while st0x.ingress.legacyPlaintext is still on) over plaintext
+#          8000 as well, so callers can move to the HTTPS name one at a time
+#          instead of all at the flip. The whitelists see real client
+#          addresses on both.
 #
 # Forwarding while the app still reads the TCP source would hand every request
 # a source of 127.0.0.1, which is inside the default INTERNAL_IP_RANGES: the
 # internal routes would degrade to a bare check of a key Alpaca also holds.
 # Tying both halves to one option is what rules that state out.
 #
-# Flipping to true requires, in the same window: every caller of
-# http://<ip>:8000 moved to the HTTPS name, and the port-8000 firewall rule
-# dropped from infra/.
+# The flip does not require moving callers first: 8000 keeps working through
+# nginx afterwards. Retiring plaintext is a later, independent step: set
+# st0x.ingress.legacyPlaintext = false and drop the port-8000 rule from infra/
+# once nothing calls http://<ip>:8000.
 #
 # Deploy the flip with `nix run .#<env>DeployAll`, never `.#<env>DeployNixos`.
 # The system profile carries the nginx and firewall half; only the service
@@ -110,20 +114,67 @@ let
   parkedRoutes = {
     "/".return = "503";
   };
+
+  # Server level, so scanners walking unrouted paths are limited by the same
+  # budget as real callers rather than getting unlimited 403s. Rate is per
+  # client address and sized well above real Alpaca volume; a burst is served
+  # immediately rather than queued.
+  commonLimits = ''
+    limit_req zone=issuance_api burst=60 nodelay;
+    limit_req_status 429;
+    client_max_body_size 64k;
+  '';
 in
 {
-  options.st0x.ingress.behindProxy = lib.mkOption {
-    type = lib.types.bool;
-    default = false;
-    description = ''
-      Serve the API through the local nginx TLS proxy instead of exposing
-      Rocket directly on port 8000. Drives both the proxied routes here and
-      BEHIND_PROXY on the service unit; see the header of nix/ingress.nix for
-      what each state means and what else has to move in the same window.
-    '';
+  options.st0x.ingress = {
+    behindProxy = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Serve the API through the local nginx TLS proxy instead of exposing
+        Rocket directly on port 8000. Drives both the proxied routes here and
+        BEHIND_PROXY on the service unit; see the header of nix/ingress.nix
+        for what each state means and what else has to move in the same
+        window.
+      '';
+    };
+
+    legacyPlaintext = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Keep the plaintext API reachable on port 8000 for callers not yet
+        moved to the HTTPS name.
+
+        This is a separate switch from `behindProxy` on purpose. Alpaca
+        cannot be pointed at the HTTPS name until HTTPS actually serves,
+        which only happens once `behindProxy` is on; if the same switch also
+        closed 8000, every caller would break at the flip and stay broken
+        until Alpaca shipped their own URL change. With both, the flip brings
+        HTTPS up while 8000 keeps working, and dropping plaintext becomes an
+        independent later step.
+
+        With `behindProxy` on, nginx serves 8000 itself and forwards the same
+        allowlist to the app, so `/admin/*` comes off the public listener at
+        the flip rather than waiting for plaintext to go. Turn this off, then
+        drop the matching rule in `infra/`, once no caller uses
+        `http://<ip>:8000`.
+      '';
+    };
   };
 
   config = {
+    # behindProxy = false puts the app itself on 8000; closing the port would
+    # leave the environment with no reachable API at all.
+    assertions = [
+      {
+        assertion = cfg.behindProxy || cfg.legacyPlaintext;
+        message =
+          "st0x.ingress: legacyPlaintext can only be disabled once behindProxy "
+          + "is enabled, otherwise nothing serves the API.";
+      }
+    ];
+
     security.acme = {
       acceptTerms = true;
       defaults.email = "kais@rainlang.xyz";
@@ -138,33 +189,51 @@ in
         limit_req_zone $binary_remote_addr zone=issuance_api:10m rate=30r/s;
       '';
 
-      virtualHosts.${fqdn} = {
-        enableACME = true;
-        forceSSL = true;
-        # 308 keeps the method and body: the mutating routes are POST-only, and
-        # a 301 would have clients retry them as a bodiless GET that 404s.
-        redirectCode = 308;
+      virtualHosts = {
+        ${fqdn} = {
+          enableACME = true;
+          forceSSL = true;
+          # 308 keeps the method and body: the mutating routes are POST-only,
+          # and a 301 would have clients retry them as a bodiless GET that
+          # 404s.
+          redirectCode = 308;
 
-        # Server level, so scanners walking unrouted paths are limited by the
-        # same budget as real callers rather than getting unlimited 403s.
-        # Rate is per client address and sized well above real Alpaca volume;
-        # a burst is served immediately rather than queued.
-        extraConfig = ''
-          limit_req zone=issuance_api burst=60 nodelay;
-          limit_req_status 429;
-          client_max_body_size 64k;
-        '';
+          extraConfig = commonLimits;
 
-        locations = if cfg.behindProxy then proxiedRoutes else parkedRoutes;
+          locations = if cfg.behindProxy then proxiedRoutes else parkedRoutes;
+        };
+      }
+      # Transitional plaintext listener. Only exists once the app has moved to
+      # loopback: before that the app owns 8000 itself and nginx must not try
+      # to bind it. Same allowlist and same limits as the HTTPS vhost, and the
+      # same X-Real-IP rewrite, so plaintext callers face the IP whitelists
+      # exactly as HTTPS callers do.
+      // lib.optionalAttrs (cfg.behindProxy && cfg.legacyPlaintext) {
+        legacy-plaintext = {
+          # Alpaca and the old liquidity droplet address this by IP, so it
+          # must answer whatever Host header arrives.
+          default = true;
+          listen = [
+            {
+              addr = "0.0.0.0";
+              port = 8000;
+              ssl = false;
+            }
+          ];
+
+          extraConfig = commonLimits;
+          locations = proxiedRoutes;
+        };
       };
     };
 
-    # 80 is ACME http-01 plus the HTTPS redirect; 443 is the API. Port 8000 is
-    # only worth opening while Rocket still listens on a public address.
+    # 80 is ACME http-01 plus the HTTPS redirect; 443 is the API. 8000 is the
+    # plaintext path, served by the app before the flip and by nginx after it,
+    # until legacyPlaintext is turned off.
     networking.firewall.allowedTCPPorts = [
       80
       443
     ]
-    ++ lib.optional (!cfg.behindProxy) 8000;
+    ++ lib.optional cfg.legacyPlaintext 8000;
   };
 }

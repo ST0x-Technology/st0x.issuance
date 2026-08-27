@@ -774,9 +774,9 @@ pub(crate) const PROXIED_PORT: u16 = 8001;
 /// (`nix/upgradeable-services.nix`), so a system-profile activation writes a
 /// new value into the unit file without restarting the running process. On
 /// its own that lets nginx start proxying while the app still reads the TCP
-/// source, and every proxied request then arrives as `127.0.0.1` -- inside
-/// `INTERNAL_IP_RANGES`, which drops the two proxied `InternalAuth` routes to
-/// a bare check of a key Alpaca also holds.
+/// source, and every proxied request then arrives as `127.0.0.1`, which is
+/// inside `INTERNAL_IP_RANGES`. That drops the two proxied `InternalAuth`
+/// routes to a bare check of a key Alpaca also holds.
 ///
 /// Giving each mode its own port makes that state fail closed instead: nginx
 /// proxies to [`PROXIED_PORT`], so a process still running in direct mode is

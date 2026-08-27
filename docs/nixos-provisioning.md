@@ -169,6 +169,12 @@ flip shows up as nginx returning 502 rather than as requests reaching the app
 with a spoofable source address. Run `nix run .#<env>DeployAll` and let both
 profiles land.
 
+The flip does not strand plaintext callers. While `st0x.ingress.legacyPlaintext`
+is on (the default), nginx also serves the same route allowlist over plain HTTP
+on 8000, so Alpaca and the liquidity bots keep working on the old URL and can
+move to the HTTPS name one at a time. Retiring plaintext is a separate step:
+set `legacyPlaintext = false`, deploy, then drop the port-8000 rule in `infra/`.
+
 ---
 
 ## Database (one-time, per environment)
