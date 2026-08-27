@@ -104,6 +104,7 @@ pub(crate) enum AssetNetworkValidationError {
     ChainRegistry(#[from] ChainRegistryError),
 }
 
+/// Errors during chain registry construction and lookups.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainRegistryError {
     #[error("duplicate chain configuration for network {network}")]

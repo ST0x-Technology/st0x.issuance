@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::warn;
 
+/// IP address whitelist for request filtering, either allowing all IPs or a specific set of ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpWhitelist {
     AllowAll,
@@ -83,6 +84,7 @@ impl FromStr for IpWhitelist {
     }
 }
 
+/// Errors during IP whitelist parsing and validation.
 #[derive(Debug, thiserror::Error)]
 pub enum IpWhitelistParseError {
     #[error("Failed to parse IP range: {0}")]
@@ -99,6 +101,7 @@ pub enum IpWhitelistParseError {
 ///
 /// Internal endpoints must never admit every address, so an empty string,
 /// `0.0.0.0/0`, and `::/0` (the most common misconfigurations) are rejected at
+/// Validated internal IP whitelist that rejects configurations allowing all addresses at
 /// parse time. This prevents a misconfigured `INTERNAL_IP_RANGES_EXTRA` deploy
 /// secret from silently opening the admin API to all clients. Equivalent
 /// full-coverage expressed as split CIDRs (e.g. `0.0.0.0/1,128.0.0.0/1`) is

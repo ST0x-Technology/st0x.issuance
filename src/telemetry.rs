@@ -100,6 +100,7 @@ where
     }
 }
 
+/// Configuration for HyperDX telemetry integration.
 #[derive(Clone, Debug)]
 pub struct HyperDxConfig {
     pub(crate) api_key: HyperDxApiKey,
@@ -208,6 +209,7 @@ impl HyperDxConfig {
     }
 }
 
+/// Errors during telemetry initialization and setup.
 #[derive(Debug, Error)]
 pub enum TelemetryError {
     #[error("Failed to build OTLP exporter")]
@@ -223,6 +225,7 @@ pub enum TelemetryError {
     Subscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
 }
 
+/// Guard ensuring telemetry resources are properly flushed on shutdown.
 pub struct TelemetryGuard {
     tracer_provider: SdkTracerProvider,
 }

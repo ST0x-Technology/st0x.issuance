@@ -109,6 +109,7 @@ impl<'de> Deserialize<'de> for Email {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 
+/// Unique identifier for a registered account client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientId(Uuid);
 

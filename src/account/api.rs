@@ -73,6 +73,7 @@ pub(crate) struct RegisterAccountRequest {
     pub(crate) email: Email,
 }
 
+/// Response from account registration containing the newly assigned client ID.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RegisterAccountResponse {
     #[schema(value_type = String)]
@@ -169,6 +170,7 @@ pub(crate) struct AccountLinkRequest {
     pub(crate) account: AlpacaAccountNumber,
 }
 
+/// Response from account linking to Alpaca confirming the linked client ID.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AccountLinkResponse {
     pub client_id: ClientId,
@@ -215,6 +217,7 @@ pub(crate) struct WhitelistWalletRequest {
     pub(crate) wallet: Address,
 }
 
+/// Response from wallet whitelist/unwhitelist operations.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WhitelistWalletResponse {
     pub success: bool,

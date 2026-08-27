@@ -222,6 +222,7 @@ struct TracingTurnkeyClient {
     retry_config: RetryConfig,
 }
 
+/// Errors from Turnkey client operations with detailed tracing.
 #[derive(Debug, thiserror::Error)]
 pub enum TracingTurnkeyClientError {
     #[error(transparent)]

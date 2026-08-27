@@ -37,6 +37,7 @@ use crate::redemption::BurnExternalTxId;
 use crate::vault::orchestrator::BurnProofKind;
 use crate::vault::{OrchestratorMintResult, OrchestratorMintedLog};
 
+/// Alloy provider configured with transaction filling middleware for blockchain interactions.
 pub type RealBlockchainServiceProvider = FillProvider<
     JoinFill<
         JoinFill<
