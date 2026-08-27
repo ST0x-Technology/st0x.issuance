@@ -332,80 +332,23 @@ pub async fn initialize_rocket(
         lifecycle_notifier.clone(),
     )?;
 
-    // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Each replay clears its view table first to remove
-    // stale/corrupt data, then rebuilds from the event store.
-    debug!(target: "startup", "Rebuilding all views from events");
-    rebuild_receipt_inventory_view(&pool).await?;
-    rebuild_redemption_view(&pool).await?;
-    rebuild_receipt_burns_view(&pool).await?;
-
-    validate_configured_asset_networks(&pool, &chain_registry).await?;
-
-    // Receipt backfill must run before recovery so that recovery can check
-    // receipt inventory to detect already-minted receipts (prevents double-mints).
-    let vault_configs = run_all_receipt_backfills(
+    rebuild_views_and_recover(
         &pool,
+        &apalis_pool,
         &chain_registry,
         &receipt_inventory_store,
+        &managers,
         bot_wallet,
     )
     .await?;
 
-    if let Err(error) = run_startup_reconciliation_for_vaults(
-        &chain_registry,
-        &vault_configs,
-        &receipt_inventory_store,
-        bot_wallet,
+    let corporate_action_feed = prepare_corporate_action_feed_unless_gated(
+        &config,
+        pool.clone(),
+        &apalis_pool,
+        lifecycle_notifier.clone(),
     )
-    .await
-    {
-        error.log();
-    }
-
-    // The synchronous recovery pass runs with a timeout before the HTTP server
-    // starts. Mints that need deferred or pending follow-up are handed to
-    // detached background scheduled-recovery tasks that intentionally outlive
-    // this timeout and run concurrently with request handling; their safety
-    // rests on cqrs-es optimistic concurrency and externalTxId
-    // idempotency, not on completing before the server is up. If the
-    // synchronous pass hangs it is cancelled and any remaining stuck aggregates
-    // are left for manual admin intervention.
-    let receipt_vaults: Vec<(u64, Address)> = vault_configs
-        .iter()
-        .map(|config| (config.chain_id, config.vault))
-        .collect();
-
-    run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
-        .await;
-
-    // FIXME: temporary production gate. Remove once the snapshot-repair
-    // baseline operation ships so production can establish a cursor and run
-    // the feed. See docs/runbooks/corporate-action-feed-boundary.md.
-    // The corporate-action feed fails the whole service closed on first
-    // production start: an authenticated stream with no committed cursor
-    // returns BaselineRequired, and production cannot establish a baseline
-    // until the snapshot-repair operation ships. Skip it in production until
-    // then; development auto-establishes its baseline and keeps running.
-    let corporate_action_feed = if config.environment == Environment::Production
-    {
-        tracing::info!(
-            target: "asset",
-            "Corporate-action feed disabled in production pending the \
-             snapshot-repair baseline operation"
-        );
-        None
-    } else {
-        Some(
-            prepare_corporate_action_feed(
-                &config,
-                pool.clone(),
-                &apalis_pool,
-                lifecycle_notifier.clone(),
-            )
-            .await?,
-        )
-    };
+    .await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut background_task_handles = Vec::new();
@@ -546,6 +489,118 @@ pub async fn initialize_rocket(
             handles: background_task_handles,
         },
     }))
+}
+
+/// Rebuilds every view from the event store, backfills receipts, and runs the
+/// synchronous recovery pass, in that order.
+///
+/// The order is the point, which is why these steps live together rather than
+/// inline among the rest of startup. Reprojections must finish before recovery
+/// so recovery queries up-to-date views, and receipt backfill must finish
+/// before recovery so it can spot already-minted receipts and not double-mint.
+///
+/// # Errors
+///
+/// Returns an error if a view rebuild, the asset-network validation, or a
+/// receipt backfill fails. Startup reconciliation logs and swallows its own
+/// errors, and the recovery pass is bounded by its own timeout.
+async fn rebuild_views_and_recover<P: Provider + Clone>(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    chain_registry: &ChainRegistry<P>,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
+    managers: &RedemptionManagers,
+    bot_wallet: Address,
+) -> Result<(), anyhow::Error> {
+    // Reprojections must complete BEFORE recovery runs, so recovery queries
+    // up-to-date views. Each replay clears its view table first to remove
+    // stale/corrupt data, then rebuilds from the event store.
+    debug!(target: "startup", "Rebuilding all views from events");
+    rebuild_receipt_inventory_view(pool).await?;
+    rebuild_redemption_view(pool).await?;
+    rebuild_receipt_burns_view(pool).await?;
+
+    validate_configured_asset_networks(pool, chain_registry).await?;
+
+    // Receipt backfill must run before recovery so that recovery can check
+    // receipt inventory to detect already-minted receipts (prevents double-mints).
+    let vault_configs = run_all_receipt_backfills(
+        pool,
+        chain_registry,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await?;
+
+    if let Err(error) = run_startup_reconciliation_for_vaults(
+        chain_registry,
+        &vault_configs,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await
+    {
+        error.log();
+    }
+
+    // The synchronous recovery pass runs with a timeout before the HTTP server
+    // starts. Mints that need deferred or pending follow-up are handed to
+    // detached background scheduled-recovery tasks that intentionally outlive
+    // this timeout and run concurrently with request handling; their safety
+    // rests on cqrs-es optimistic concurrency and externalTxId
+    // idempotency, not on completing before the server is up. If the
+    // synchronous pass hangs it is cancelled and any remaining stuck aggregates
+    // are left for manual admin intervention.
+    let receipt_vaults: Vec<(u64, Address)> = vault_configs
+        .iter()
+        .map(|config| (config.chain_id, config.vault))
+        .collect();
+
+    run_recovery_with_timeout(pool, apalis_pool, managers, &receipt_vaults)
+        .await;
+    Ok(())
+}
+
+/// Prepares the corporate-action feed, except in production.
+///
+/// FIXME: temporary production gate. Remove once the snapshot-repair baseline
+/// operation ships so production can establish a cursor and run the feed. See
+/// docs/runbooks/corporate-action-feed-boundary.md.
+///
+/// The feed fails the whole service closed on first production start: an
+/// authenticated stream with no committed cursor returns `BaselineRequired`,
+/// and production cannot establish a baseline until the snapshot-repair
+/// operation ships. Skip it in production until then; development
+/// auto-establishes its baseline and keeps running.
+///
+/// # Errors
+///
+/// Returns an error if the feed cannot be constructed or its development
+/// baseline cannot be established.
+async fn prepare_corporate_action_feed_unless_gated(
+    config: &Config,
+    pool: Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+) -> Result<Option<CorporateActionFeed>, anyhow::Error> {
+    if config.environment == Environment::Production {
+        tracing::info!(
+            target: "asset",
+            "Corporate-action feed disabled in production pending the \
+             snapshot-repair baseline operation"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(
+        prepare_corporate_action_feed(
+            config,
+            pool,
+            apalis_pool,
+            lifecycle_notifier,
+        )
+        .await?,
+    ))
 }
 
 async fn prepare_corporate_action_feed(
