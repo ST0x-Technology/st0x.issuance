@@ -37,7 +37,7 @@ use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt, ST0xOrchestrator,
 };
-use crate::config::{Config, Environment, LogLevel};
+use crate::config::{Config, Environment, LogFormat, LogLevel};
 use crate::mint::Mint;
 use crate::receipt_inventory::view::ReceiptInventoryViewReactor;
 use crate::tokenized_asset::{
@@ -179,11 +179,12 @@ pub fn test_config() -> Config {
         auth: test_auth_config().expect("valid test auth config"),
         behind_proxy: false,
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
-        subgraph_url: Url::parse("http://localhost:0/subgraph")
-            .expect("valid test URL"),
+        lifecycle_notifications: crate::LifecycleNotificationsConfig::disabled(
+        ),
         chains: Vec::new(),
         vault_mode_config: crate::config::VaultModeConfig::default(),
     }
@@ -1054,6 +1055,8 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
         "admin"
     } else if module.contains("::vault") {
         "vault"
+    } else if module.contains("::notifications") {
+        "notifications"
     } else {
         "startup"
     }

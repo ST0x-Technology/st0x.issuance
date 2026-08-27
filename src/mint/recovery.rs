@@ -242,23 +242,58 @@ pub(crate) async fn enqueue_scheduled_mint_recovery(
     push_mint_recovery_job(apalis_pool, issuer_request_id).await
 }
 
+/// Enqueues the recovery pass triggered by a newly recorded authorization.
+/// Its distinct idempotency key prevents a recovery job that is concurrently
+/// retiring its pre-authorization snapshot from swallowing the wake-up.
+pub(crate) async fn enqueue_authorized_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &SqlitePool,
+    issuer_request_id: IssuerMintRequestId,
+) -> Result<(), anyhow::Error> {
+    let idempotency_key = format!("{issuer_request_id}:authorization");
+    release_terminal_job(pool, mint_recovery_job_type(), &idempotency_key)
+        .await?;
+    push_recovery_job(
+        apalis_pool,
+        MintRecoveryJob {
+            issuer_request_id: issuer_request_id.clone(),
+            manual: false,
+        },
+        idempotency_key.clone(),
+    )
+    .await?;
+    debug!(target: "mint", %issuer_request_id, %idempotency_key,
+        "Enqueued mint recovery after recording authorization"
+    );
+    Ok(())
+}
+
 /// Admin-reprocess variant of [`enqueue_scheduled_mint_recovery`]: the pushed
 /// job carries the `manual` flag, permitting exactly one re-drive of a
-/// classified failure the automatic loop refuses. A concurrent ACTIVE
-/// automatic job for the same mint dedups this push (idempotency key), but a
-/// classified mint's automatic job has already concluded and been released
-/// here, so the admin path is not raced in practice.
+/// classified failure the automatic loop refuses. Its distinct idempotency key
+/// prevents an active automatic recovery from swallowing the operator's
+/// explicitly authorized re-drive.
 pub(crate) async fn enqueue_manual_mint_recovery(
     pool: &Pool<Sqlite>,
     apalis_pool: &SqlitePool,
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
-    release_terminal_recovery_job(pool, &issuer_request_id).await?;
+    let idempotency_key = format!("{issuer_request_id}:manual");
+    release_terminal_job(pool, mint_recovery_job_type(), &idempotency_key)
+        .await?;
     push_recovery_job(
         apalis_pool,
-        MintRecoveryJob { issuer_request_id, manual: true },
+        MintRecoveryJob {
+            issuer_request_id: issuer_request_id.clone(),
+            manual: true,
+        },
+        idempotency_key.clone(),
     )
-    .await
+    .await?;
+    debug!(target: "mint", %issuer_request_id, %idempotency_key,
+        "Enqueued operator-authorized mint recovery"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,9 +445,11 @@ pub(crate) async fn push_mint_recovery_job(
     apalis_pool: &SqlitePool,
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
+    let idempotency_key = issuer_request_id.to_string();
     push_recovery_job(
         apalis_pool,
         MintRecoveryJob { issuer_request_id, manual: false },
+        idempotency_key,
     )
     .await
 }
@@ -420,6 +457,7 @@ pub(crate) async fn push_mint_recovery_job(
 async fn push_recovery_job(
     apalis_pool: &SqlitePool,
     job: MintRecoveryJob,
+    idempotency_key: String,
 ) -> Result<(), anyhow::Error> {
     let mut attempt = 0;
     // The queue handle is reusable across attempts
@@ -432,17 +470,14 @@ async fn push_recovery_job(
         attempt += 1;
 
         match queue
-            .push_with_idempotency_key(
-                job.clone(),
-                issuer_request_id.to_string(),
-            )
+            .push_with_idempotency_key(job.clone(), idempotency_key.clone())
             .await
         {
             Ok(()) => return Ok(()),
             Err(error) if attempt < ENQUEUE_ATTEMPTS => {
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    attempt, error = %error,
-                    "Failed to enqueue scheduled mint recovery; retrying after backoff"
+                    %idempotency_key, attempt, error = %error,
+                    "Failed to enqueue mint recovery; retrying after backoff"
                 );
                 tokio::time::sleep(ENQUEUE_BACKOFF).await;
             }
@@ -543,18 +578,17 @@ pub(crate) async fn vacuum_terminal_recovery_jobs(
     Ok(())
 }
 
-/// Flips mint-recovery jobs left `Running` by a dead process back to `Pending`,
-/// clearing their lock columns (`lock_at`, `lock_by`).
+/// Flips mint recovery and side-effect jobs left `Running` by a dead process
+/// back to `Pending`, clearing their lock columns (`lock_at`, `lock_by`).
 ///
 /// At startup no worker from this process is running yet, so any `Running` row
-/// is an orphan from the previous process; without this reset a crashed-mid-run
-/// recovery job blocks its mint until apalis's orphan re-enqueue timeout
-/// (`reenqueue_orphaned_after`, default ~300s). Scoped to
-/// [`mint_recovery_job_type`] so `Running` rows of other apalis job types
-/// sharing the `Jobs` table are left for their own recovery. Runs on the
-/// event-store pool because both pools address the same SQLite file (see
-/// [`vacuum_terminal_recovery_jobs`]).
-pub(crate) async fn reset_orphaned_recovery_jobs(
+/// is an orphan from the previous process. Without this reset a job crashed
+/// during submit, confirmation, callback, or recovery blocks the same
+/// idempotency key until apalis's orphan re-enqueue timeout. The query is scoped
+/// to the four mint job types so unrelated apalis jobs sharing the table are
+/// left for their own recovery. Runs on the event-store pool because both pools
+/// address the same SQLite file (see [`vacuum_terminal_recovery_jobs`]).
+pub(crate) async fn reset_orphaned_mint_jobs(
     pool: &Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -565,11 +599,14 @@ pub(crate) async fn reset_orphaned_recovery_jobs(
             lock_at = NULL,
             lock_by = NULL
         WHERE
-            job_type = ?
+            job_type IN (?, ?, ?, ?)
             AND status = 'Running'
         ",
     )
     .bind(mint_recovery_job_type())
+    .bind(job_type::<SubmitMintJob>())
+    .bind(job_type::<ConfirmMintJob>())
+    .bind(job_type::<SendCallbackJob>())
     .execute(pool)
     .await?;
 
@@ -603,39 +640,6 @@ pub(crate) async fn vacuum_terminal_mint_side_effect_jobs(
                     status IN ('Done', 'Killed')
                     OR (status = 'Failed' AND max_attempts <= attempts)
                 )
-            ",
-        )
-        .bind(side_effect_job_type)
-        .execute(pool)
-        .await?;
-    }
-
-    Ok(())
-}
-
-/// Flips submit/confirm/callback jobs left `Running` by a dead process back to
-/// `Pending`, clearing their lock columns. Mirrors
-/// [`reset_orphaned_recovery_jobs`] for the per-state side-effect chain so a
-/// crash mid-job does not strand recovery behind apalis's orphan timeout
-/// (re-enqueue would otherwise dedupe against the orphaned `Running` row).
-pub(crate) async fn reset_orphaned_mint_side_effect_jobs(
-    pool: &Pool<Sqlite>,
-) -> Result<(), sqlx::Error> {
-    for side_effect_job_type in [
-        job_type::<SubmitMintJob>(),
-        job_type::<ConfirmMintJob>(),
-        job_type::<SendCallbackJob>(),
-    ] {
-        sqlx::query(
-            "
-            UPDATE Jobs
-            SET
-                status = 'Pending',
-                lock_at = NULL,
-                lock_by = NULL
-            WHERE
-                job_type = ?
-                AND status = 'Running'
             ",
         )
         .bind(side_effect_job_type)
@@ -1803,7 +1807,7 @@ mod tests {
         RecoveredReceipt, Shares,
     };
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -2286,6 +2290,122 @@ mod tests {
             queued, 1,
             "re-enqueue for the same mint must collapse to one job row"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_recovery_is_not_deduplicated_by_an_active_automatic_job() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+        enqueue_manual_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        let idempotency_keys: Vec<String> = sqlx::query_scalar(
+            "
+            SELECT idempotency_key
+            FROM Jobs
+            WHERE job_type = ?
+            ORDER BY idempotency_key
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            idempotency_keys,
+            vec![
+                issuer_request_id.to_string(),
+                format!("{issuer_request_id}:manual"),
+            ],
+            "an active automatic recovery must not suppress the operator's \
+             manual re-drive"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "manual_recovery_is_not_deduplicated_by_an_active_automatic_job",
+                "Enqueued operator-authorized mint recovery",
+                "idempotency_key",
+                ":manual"
+            ]
+        ));
+    }
+
+    /// An authorization wake uses a distinct automatic key, so an already
+    /// scheduled pass cannot swallow the signal that unblocks a waiting mint.
+    #[traced_test]
+    #[tokio::test]
+    async fn authorization_recovery_is_distinct_and_remains_automatic() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+        enqueue_authorized_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        let queued_jobs: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "
+            SELECT idempotency_key, job
+            FROM Jobs
+            WHERE job_type = ?
+            ORDER BY idempotency_key
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            queued_jobs
+                .iter()
+                .map(|(idempotency_key, _)| idempotency_key)
+                .collect::<Vec<_>>(),
+            vec![
+                &issuer_request_id.to_string(),
+                &format!("{issuer_request_id}:authorization"),
+            ]
+        );
+
+        let authorization_job: MintRecoveryJob =
+            serde_json::from_slice(&queued_jobs[1].1).unwrap();
+        assert!(
+            !authorization_job.manual,
+            "an authorization wake must remain an automatic recovery"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "authorization_recovery_is_distinct_and_remains_automatic",
+                "Enqueued mint recovery after recording authorization",
+                &format!("{issuer_request_id}:authorization")
+            ]
+        ));
     }
 
     /// The periodic reconciler pushes WITHOUT releasing terminal jobs, so a mint
@@ -2820,15 +2940,48 @@ mod tests {
         );
     }
 
-    /// The startup reset must flip a `Running` job orphaned by a dead process
-    /// back to `Pending` with its lock columns cleared, so the fresh worker
-    /// picks it up without waiting out apalis's orphan re-enqueue timeout.
+    /// The startup reset must flip every `Running` mint job orphaned by a dead
+    /// process back to `Pending` with its lock columns cleared, so the fresh
+    /// workers pick them up without waiting out apalis's orphan timeout.
     #[tokio::test]
-    async fn reset_orphaned_recovery_jobs_flips_running_to_pending() {
+    async fn reset_orphaned_mint_jobs_flips_every_running_job_to_pending() {
         let harness = TestHarness::new().await;
         let issuer_request_id = test_issuer_request_id();
+        let idempotency_key = issuer_request_id.to_string();
 
         push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+        JobQueue::<SubmitMintJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                SubmitMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: VAULT,
+                    chain_id: ANVIL_CHAIN_ID,
+                },
+                &idempotency_key,
+            )
+            .await
+            .unwrap();
+        JobQueue::<ConfirmMintJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                ConfirmMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: VAULT,
+                    chain_id: ANVIL_CHAIN_ID,
+                    tx_id: TxId::Legacy("orphaned-confirm".to_string()),
+                },
+                &idempotency_key,
+            )
+            .await
+            .unwrap();
+        JobQueue::<SendCallbackJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                SendCallbackJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+                &idempotency_key,
+            )
             .await
             .unwrap();
 
@@ -2855,34 +3008,50 @@ mod tests {
             WHERE idempotency_key = ?
             ",
         )
-        .bind(issuer_request_id.to_string())
+        .bind(&idempotency_key)
         .execute(&harness.pool)
         .await
         .unwrap();
 
-        reset_orphaned_recovery_jobs(&harness.pool).await.unwrap();
+        reset_orphaned_mint_jobs(&harness.pool).await.unwrap();
 
-        let (status, lock_at, lock_by): (String, Option<i64>, Option<String>) =
+        let jobs: Vec<(String, String, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "
-                SELECT status, lock_at, lock_by
+                SELECT job_type, status, lock_at, lock_by
                 FROM Jobs
                 WHERE idempotency_key = ?
                 ",
             )
-            .bind(issuer_request_id.to_string())
-            .fetch_one(&harness.pool)
+            .bind(&idempotency_key)
+            .fetch_all(&harness.pool)
             .await
             .unwrap();
 
+        let mut actual_types: Vec<String> =
+            jobs.iter().map(|(job_type, ..)| job_type.clone()).collect();
+        actual_types.sort();
+        let mut expected_types = vec![
+            mint_recovery_job_type().to_owned(),
+            job_type::<SubmitMintJob>().to_owned(),
+            job_type::<ConfirmMintJob>().to_owned(),
+            job_type::<SendCallbackJob>().to_owned(),
+        ];
+        expected_types.sort();
+        assert_eq!(actual_types, expected_types);
+
         assert_eq!(
-            status, "Pending",
-            "an orphaned Running job must flip back to Pending"
+            jobs.len(),
+            4,
+            "the fixture must cover the recovery and three side-effect jobs"
         );
         assert!(
-            lock_at.is_none() && lock_by.is_none(),
-            "the reset must clear the lock columns, got lock_at={lock_at:?} \
-             lock_by={lock_by:?}"
+            jobs.iter()
+                .all(|(_, status, lock_at, lock_by)| status == "Pending"
+                    && lock_at.is_none()
+                    && lock_by.is_none()),
+            "the reset must make every orphaned mint job pending and unlocked; \
+             got {jobs:?}"
         );
     }
 

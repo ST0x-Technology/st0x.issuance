@@ -9,13 +9,17 @@ async fn main() -> anyhow::Result<()> {
         match hyperdx.setup_telemetry() {
             Ok(guard) => Some(guard),
             Err(err) => {
-                eprintln!("Failed to setup telemetry: {err}");
-                setup_tracing(&config.log_level);
+                setup_tracing(&config.log_level, config.log_format);
+                tracing::error!(
+                    target: "startup",
+                    error = %err,
+                    "Telemetry setup failed; using local tracing"
+                );
                 None
             }
         }
     } else {
-        setup_tracing(&config.log_level);
+        setup_tracing(&config.log_level, config.log_format);
         None
     };
 

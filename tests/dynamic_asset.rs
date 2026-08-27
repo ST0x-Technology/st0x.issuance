@@ -8,9 +8,11 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
+use st0x_issuance::Network;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
+
+use crate::harness::initialize_rocket;
 
 /// Tests that adding a new tokenized asset at runtime is picked up by the
 /// receipt backfill loop and the transfer poller on their next polling pass,
@@ -57,8 +59,7 @@ async fn test_new_asset_triggers_backfills_and_monitors()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -183,8 +184,7 @@ async fn test_address_change_picked_up_on_next_pass()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

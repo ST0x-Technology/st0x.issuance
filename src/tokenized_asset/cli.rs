@@ -23,8 +23,9 @@ use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
-    VaultModeConfig, VaultModeKind, load_vault_mode_config, setup_tracing,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
+    LogLevel, VaultModeConfig, VaultModeKind, load_vault_mode_config,
+    setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -38,7 +39,7 @@ use crate::redemption::force_complete::{
 };
 use crate::underlying::{
     AssetStatus, Underlying, UnderlyingCommand, UnderlyingViewError,
-    load_freeze_status,
+    load_freeze_status, with_freeze_admission,
 };
 use crate::vault::onboarding::{
     ApprovalOutcome, check_orchestrator_readiness, ensure_unlimited_approval,
@@ -56,7 +57,7 @@ use crate::wallet::{SignerConfig, SignerEnv};
 /// asset is not supported, the operator aborts a mutation, or the command
 /// dispatch fails.
 pub async fn run_issuer_cli() -> anyhow::Result<()> {
-    setup_tracing(&LogLevel::Info);
+    setup_tracing(&LogLevel::Info, LogFormat::Text);
     IssuerCli::parse().dispatch().await
 }
 
@@ -194,6 +195,15 @@ struct ForceCompleteRedemptionArgs {
     /// unresolved signed transaction different from `--burn-tx-hash`.
     #[arg(long)]
     acknowledged_unresolved_burn_tx_hash: Option<B256>,
+
+    /// Log query link printed after the command, with the id placeholder
+    /// replaced by the issuer request id. Unset prints nothing.
+    #[arg(
+        long,
+        env = "LOG_QUERY_URL_TEMPLATE",
+        value_parser = parse_log_query_url_template
+    )]
+    log_query_url_template: Option<LogQueryUrlTemplate>,
 
     #[arg(
         long = "database-url",
@@ -493,7 +503,17 @@ impl IssuerCli {
                 run_asset_command(AssetAction::Status, &args).await
             }
             IssuerCommand::ForceCompleteRedemption(args) => {
-                run_force_complete_redemption(*args, prompt_confirm).await
+                let id = args.issuer_request_id.to_string();
+                let template = args.log_query_url_template.clone();
+                let result =
+                    run_force_complete_redemption(*args, prompt_confirm).await;
+                let link = write_log_query_url(
+                    &mut io::stdout(),
+                    template.as_ref(),
+                    &id,
+                )
+                .map_err(anyhow::Error::from);
+                result.and(link)
             }
             IssuerCommand::BurnExcess(command) => {
                 run_burn_excess_cli(*command, prompt_confirm).await
@@ -525,6 +545,57 @@ impl IssuerCli {
             }
         }
     }
+}
+
+/// Placeholder in a log query url template replaced with the id being
+/// linked.
+const LOG_QUERY_ID_PLACEHOLDER: &str = "{id}";
+
+/// Log query link template printed after id-bearing commands.
+///
+/// Construction proves the template contains the id placeholder and parses
+/// as a URL once the placeholder is substituted, so [`Self::substitute`]
+/// needs no re-validation of either half.
+#[derive(Clone, Debug)]
+struct LogQueryUrlTemplate(String);
+
+impl LogQueryUrlTemplate {
+    /// The template with the id placeholder replaced by `id`.
+    fn substitute(&self, id: &str) -> String {
+        self.0.replace(LOG_QUERY_ID_PLACEHOLDER, id)
+    }
+}
+
+/// Refuses a log query url template that cannot carry the id it links or
+/// that is not a URL once the id is substituted.
+fn parse_log_query_url_template(
+    value: &str,
+) -> Result<LogQueryUrlTemplate, String> {
+    if !value.contains(LOG_QUERY_ID_PLACEHOLDER) {
+        return Err(format!(
+            "template must contain the {LOG_QUERY_ID_PLACEHOLDER} placeholder"
+        ));
+    }
+
+    let sample = value.replace(LOG_QUERY_ID_PLACEHOLDER, "sample-id");
+    if let Err(error) = Url::parse(&sample) {
+        return Err(format!("template is not a valid URL: {error}"));
+    }
+
+    Ok(LogQueryUrlTemplate(value.to_string()))
+}
+
+/// Writes the log query link with the id placeholder substituted. `None`
+/// writes nothing.
+fn write_log_query_url<W: Write>(
+    stdout: &mut W,
+    template: Option<&LogQueryUrlTemplate>,
+    id: &str,
+) -> io::Result<()> {
+    let Some(template) = template else {
+        return Ok(());
+    };
+    writeln!(stdout, "Logs: {}", template.substitute(id))
 }
 
 /// Verifies an operator-supplied transaction as a Failed redemption's landed
@@ -1306,8 +1377,11 @@ async fn execute(
                 FreezeOutcome::Froze => {
                     println!("Froze {underlying} on all networks.");
                 }
-                FreezeOutcome::AlreadyFrozen => {
-                    println!("{underlying} was already frozen.");
+                FreezeOutcome::OperatorHoldEnsured => {
+                    println!(
+                        "{underlying} was already frozen across all networks; \
+                         operator hold ensured."
+                    );
                 }
             }
             Ok(())
@@ -1323,6 +1397,9 @@ async fn execute(
                 UnfreezeOutcome::AlreadyEnabled => {
                     println!("{underlying} was already enabled.");
                 }
+                UnfreezeOutcome::RemainsFrozen => {
+                    println!("{underlying} remains frozen by another hold.");
+                }
             }
             Ok(())
         }
@@ -1332,21 +1409,21 @@ async fn execute(
 /// Issuer-host admin for freezing/unfreezing supported underlyings.
 ///
 /// Opens the same SQLite event store the server uses and dispatches the CQRS
-/// `Freeze` / `Unfreeze` commands through the event-sorcery `Store` — never
-/// writing the `events` table directly.
+/// operator-hold `Freeze` / `Unfreeze` commands through the event-sorcery
+/// `Store` — never writing the `events` table directly.
 pub(crate) struct AssetAdmin {
     store: Arc<Store<Underlying>>,
     pool: Pool<Sqlite>,
 }
 
-/// Outcome of a freeze request, so the caller can report an idempotent no-op
-/// distinctly from an actual state change. An underlying with no listing is an
-/// `AssetAdminError::NotFound`, not an outcome: `execute` rejects unknown
-/// underlyings up front, so `freeze` only runs against one that exists.
+/// Outcome of a freeze request, so the caller can distinguish the first hold
+/// from ensuring the operator owns a hold on an already-frozen underlying. An
+/// underlying with no listing is an `AssetAdminError::NotFound`, not an outcome:
+/// `execute` rejects unknown underlyings up front.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FreezeOutcome {
     Froze,
-    AlreadyFrozen,
+    OperatorHoldEnsured,
 }
 
 /// Outcome of an unfreeze request. An underlying with no listing is an
@@ -1355,6 +1432,7 @@ pub(crate) enum FreezeOutcome {
 pub(crate) enum UnfreezeOutcome {
     Unfroze,
     AlreadyEnabled,
+    RemainsFrozen,
 }
 
 /// An underlying's freeze status, formatted for the CLI.
@@ -1461,9 +1539,11 @@ impl AssetAdmin {
 
     /// Freezes the underlying on all networks. Always dispatches `Freeze`
     /// through the store so the aggregate — the source of truth — decides the
-    /// final state; an already-frozen underlying is a zero-event no-op there,
-    /// so it is guaranteed frozen afterwards even if a concurrent writer
-    /// changed it since the operator's status read. The returned
+    /// final state. If another owner already holds the freeze, this acquires the
+    /// operator hold too; if the operator hold is already present it is a
+    /// zero-event no-op. The underlying is therefore guaranteed frozen
+    /// afterwards even if a concurrent writer changed it since the operator's
+    /// status read. The returned
     /// `FreezeOutcome` only labels the message from a status read taken
     /// immediately before dispatch: it is best-effort under a concurrent
     /// write, but the persisted state is always correct. Deriving the label
@@ -1479,27 +1559,29 @@ impl AssetAdmin {
             Some(AssetStatus::Frozen)
         );
 
-        self.store
-            .send(
-                underlying,
-                UnderlyingCommand::Freeze { underlying: underlying.clone() },
-            )
-            .await?;
+        with_freeze_admission(|| async {
+            self.store
+                .send(
+                    underlying,
+                    UnderlyingCommand::Freeze {
+                        underlying: underlying.clone(),
+                    },
+                )
+                .await
+        })
+        .await?;
 
         Ok(if already_frozen {
-            FreezeOutcome::AlreadyFrozen
+            FreezeOutcome::OperatorHoldEnsured
         } else {
             FreezeOutcome::Froze
         })
     }
 
-    /// Unfreezes the underlying. Always dispatches `Unfreeze` through the store
-    /// so the aggregate decides the final state; an already-enabled underlying
-    /// is a zero-event no-op there. The returned `UnfreezeOutcome` labels the
-    /// message from a pre-dispatch status read (best-effort under a concurrent
-    /// write); the persisted state is always correct. See `freeze` for why the
-    /// label is derived from the live store rather than a caller-supplied
-    /// snapshot.
+    /// Releases the operator freeze hold. Always dispatches `Unfreeze` through
+    /// the store so the underlying aggregate decides the final state. The
+    /// post-dispatch status distinguishes a full unfreeze from an underlying
+    /// that remains frozen by another owner.
     pub(crate) async fn unfreeze(
         &self,
         underlying: &UnderlyingSymbol,
@@ -1516,7 +1598,14 @@ impl AssetAdmin {
             )
             .await?;
 
-        Ok(if already_enabled {
+        let remains_frozen = matches!(
+            self.status(underlying).await?.map(|report| report.status),
+            Some(AssetStatus::Frozen)
+        );
+
+        Ok(if remains_frozen {
+            UnfreezeOutcome::RemainsFrozen
+        } else if already_enabled {
             UnfreezeOutcome::AlreadyEnabled
         } else {
             UnfreezeOutcome::Unfroze
@@ -1576,6 +1665,7 @@ mod tests {
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent,
     };
+    use crate::underlying::{FreezeHoldId, FreezeWindow};
 
     const TEST_SIGNER_KEY: &str =
         "0x0000000000000000000000000000000000000000000000000000000000000001";
@@ -1705,15 +1795,14 @@ mod tests {
 
         // A second freeze of an already-frozen underlying (and a second
         // unfreeze of an already-enabled one) is a zero-event no-op the
-        // aggregate dedups, and is reported as the AlreadyFrozen /
-        // AlreadyEnabled label.
+        // reported as the OperatorHoldEnsured / AlreadyEnabled label.
         assert_eq!(
             admin.freeze(&underlying).await.unwrap(),
             FreezeOutcome::Froze
         );
         assert_eq!(
             admin.freeze(&underlying).await.unwrap(),
-            FreezeOutcome::AlreadyFrozen
+            FreezeOutcome::OperatorHoldEnsured
         );
 
         assert_eq!(
@@ -1723,6 +1812,58 @@ mod tests {
         assert_eq!(
             admin.unfreeze(&underlying).await.unwrap(),
             UnfreezeOutcome::AlreadyEnabled
+        );
+    }
+
+    #[tokio::test]
+    async fn unfreeze_reports_when_a_corporate_action_keeps_the_asset_frozen() {
+        let admin = admin_with_asset("SGOV", &[Network::Base]).await;
+        let underlying = UnderlyingSymbol::new("SGOV").unwrap();
+        let freeze_at = chrono::Utc::now();
+        let unfreeze_at = freeze_at + chrono::Duration::hours(1);
+        let hold_id = || {
+            FreezeHoldId::corporate_action(
+                FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
+            )
+        };
+        admin.freeze(&underlying).await.unwrap();
+        admin
+            .store
+            .send(
+                &underlying,
+                UnderlyingCommand::AcquireFreezeHold {
+                    underlying: underlying.clone(),
+                    hold_id: hold_id(),
+                    acquired_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admin.unfreeze(&underlying).await.unwrap(),
+            UnfreezeOutcome::RemainsFrozen
+        );
+        assert_eq!(
+            admin.status(&underlying).await.unwrap().expect("exists").status,
+            AssetStatus::Frozen
+        );
+
+        admin
+            .store
+            .send(
+                &underlying,
+                UnderlyingCommand::ReleaseFreezeHold {
+                    underlying: underlying.clone(),
+                    hold_id: hold_id(),
+                    released_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            admin.status(&underlying).await.unwrap().expect("exists").status,
+            AssetStatus::Enabled
         );
     }
 
@@ -2085,6 +2226,48 @@ mod tests {
         };
 
         *args
+    }
+
+    /// A template without the id placeholder can never carry the id it
+    /// exists to link, so argument parsing refuses it.
+    #[test]
+    fn log_query_url_template_requires_the_id_placeholder() {
+        parse_log_query_url_template("https://logs.example/q?id=missing")
+            .unwrap_err();
+
+        let template =
+            parse_log_query_url_template("https://logs.example/q?id={id}")
+                .unwrap();
+        assert_eq!(
+            template.substitute("red-1"),
+            "https://logs.example/q?id=red-1"
+        );
+    }
+
+    /// A template that is not a URL would print a dead link after every
+    /// command, so argument parsing refuses it even with the placeholder
+    /// present.
+    #[test]
+    fn log_query_url_template_must_be_a_url() {
+        parse_log_query_url_template("not a url {id}").unwrap_err();
+    }
+
+    /// The link is deployment config: no template writes nothing, a template
+    /// writes one line with the id substituted verbatim.
+    #[test]
+    fn write_log_query_url_substitutes_id_and_skips_when_unset() {
+        let mut out = Vec::new();
+        write_log_query_url(&mut out, None, "red-1").unwrap();
+        assert!(out.is_empty(), "no template must write nothing");
+
+        let template =
+            parse_log_query_url_template("https://logs.example/q?id={id}")
+                .unwrap();
+        write_log_query_url(&mut out, Some(&template), "red-1").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Logs: https://logs.example/q?id=red-1\n"
+        );
     }
 
     /// The two independent statements of where the command runs must agree

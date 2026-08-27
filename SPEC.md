@@ -644,8 +644,21 @@ on-chain transfer through calling Alpaca to burning tokens.
 **Commands:**
 
 - `Detect` - Transfer to redemption wallet detected
-- `RecordAlpacaCall` - Alpaca redeem API called successfully
-- `RecordAlpacaFailure` - Alpaca redeem API call failed
+- `Hold` - Park a detected redemption of a frozen asset before the Alpaca redeem
+  call. Valid from `Detected` (emits `RedemptionHeld`) and idempotent from
+  `Held` (no event), so concurrent guard paths cannot race each other. Holding
+  happens strictly **before** the Alpaca call: past that boundary Alpaca has
+  decremented its side, and holding the burn would leave on-chain supply above
+  the Alpaca count — the exact divergence the freeze prevents. A held redemption
+  is deferred, never dropped (its tokens are already committed on-chain).
+- `ClaimAlpacaCall` - Persist the right to make the external Alpaca call. Valid
+  from `Detected` or `Held`; emits `AlpacaCallClaimed` while holding the same
+  admission guard used by every operator and corporate-action freeze
+  acquisition.
+- `RecordAlpacaCall` - Alpaca redeem API called successfully. Valid only from
+  `AlpacaCallClaimed`.
+- `RecordAlpacaFailure` - Alpaca redeem API call failed (valid only from
+  `AlpacaCallClaimed`).
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
@@ -760,6 +773,24 @@ on-chain transfer through calling Alpaca to burning tokens.
   force-completed; ops use `CloseRedemption` after off-chain reconciliation
   instead.
 
+**Pre-call threat and recovery boundary.** The protected asset is the equality
+between on-chain supply and Alpaca's share count during a freeze. The credible
+abuse cases are temporal tampering (a freeze racing the last status read),
+repudiation after a crash (no durable proof that the Alpaca call was admitted),
+and duplicate execution by concurrent recovery workers. Every production freeze
+acquisition and `ClaimAlpacaCall` uses one issuer-process admission guard. A
+freeze that commits first forces `RedemptionHeld`; a claim that commits first is
+durable and recovery resumes the external call without re-entering the freeze
+gate. A worker that observes another committed claim does not call Alpaca. This
+adds no identity, authorization, disclosure, or privilege surface.
+
+The on-call question is "did the freeze or redemption claim win, and did the
+winner make progress?" The signals are the structured hold/claim/call lifecycle
+logs plus the persisted events. The indexer question is "can the pre-call order
+be reconstructed after restart?" It consumes `RedemptionHeld`,
+`AlpacaCallClaimed`, `AlpacaCalled`, and the Underlying freeze-hold events; no
+raw redemption amounts are emitted in the admission log.
+
 **Events:**
 
 - `RedemptionDetected` - Transfer to redemption wallet detected. Gains one
@@ -769,6 +800,12 @@ on-chain transfer through calling Alpaca to burning tokens.
   asset's resolved `VaultMode` at detection time, before any possible burn
   submission; this anchors mode-derivation for the redemption the same way
   `Initiated.mint_mode` anchors it for Mint
+- `RedemptionHeld` - Redemption of a frozen asset parked before the Alpaca
+  redeem call. Carries only `held_at`; detection metadata stays in the aggregate
+  from `RedemptionDetected`. The resume driver drains held redemptions in
+  detection order once the asset unfreezes.
+- `AlpacaCallClaimed` - Durable pre-call admission. Carries `claimed_at`; the
+  aggregate retains detection metadata and recovery resumes this state directly.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
@@ -882,7 +919,9 @@ on-chain transfer through calling Alpaca to burning tokens.
 | Command                                  | Events                             | Notes                                                                                                                                                                                                                                              |
 | ---------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                  |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                                                                                                                                                                                                                  |
+| `Hold`                                   | `RedemptionHeld`                   | Asset frozen; park pre-Alpaca (idempotent)                                                                                                                                                                                                         |
+| `ClaimAlpacaCall`                        | `AlpacaCallClaimed`                | Durable pre-call admission, serialized with every freeze acquisition                                                                                                                                                                               |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called after durable admission                                                                                                                                                                                                          |
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                                                                                                                                                                                   |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                                                                                                                                                                                   |
 | `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
@@ -1080,6 +1119,14 @@ pre-multichain store keyed by bare `UnderlyingSymbol`.
 - `underlying`, `token`: Symbol identifiers
 - `network`: Blockchain network
 - `vault`: On-chain vault contract address
+- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
+  rejected; the asset stays supported, newly detected redemptions are held
+  before the Alpaca call, and redemptions already past it still complete). This
+  value is not aggregate-owned freeze state: the `Underlying` aggregate's freeze
+  holds are the single cross-network authority, and every freeze gate (mint
+  admission, the pre-Alpaca redemption hold) reads the `Underlying` view, never
+  a per-listing copy. `status` exists on the wire contract as the projection of
+  that underlying state onto each listing.
 - `added_at`: Timestamp
 
 **Commands:**
@@ -1116,56 +1163,72 @@ token symbol) stays on `TokenizedAsset`.
 
 **Aggregate State:**
 
-- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
-  rejected across all networks, but listings stay supported and in-flight
-  redemptions still complete)
+- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty
+  set of typed, independently owned `FreezeHoldId`s. Mints are rejected across
+  all networks while any hold remains, but listings stay supported and in-flight
+  redemptions still complete.
 
-A stream originates on the first `Frozen` event; an underlying with no stream is
-`Enabled` by definition.
+A stream originates on the first legacy `Frozen` or new `FreezeHoldAcquired`
+event; an underlying with no stream is `Enabled` by definition.
 
 **Commands:**
 
-- `Freeze` - Stop accepting new mints for every listing of this underlying
-  (idempotent — freezing a frozen underlying is a no-op).
-- `Unfreeze` - Resume accepting mints (idempotent; a no-op when no stream
-  exists).
+- `Freeze` - Acquire the operator hold for every listing of this underlying
+  (idempotent when that hold is already active).
+- `Unfreeze` - Release only the operator hold. Mints resume only when no other
+  hold remains (idempotent when the operator hold is absent).
+- `AcquireFreezeHold { hold_id }` - Acquire an independently owned freeze hold.
+- `ReleaseFreezeHold { hold_id }` - Release only the named freeze hold.
 
 **Events:**
 
-- `Frozen { frozen_at }` - Underlying frozen (new mints rejected on all
-  networks)
-- `Unfrozen { unfrozen_at }` - Underlying unfrozen (mints resume)
+- `Frozen { frozen_at }` - Legacy operator-freeze event retained for replay.
+- `Unfrozen { unfrozen_at }` - Legacy operator-unfreeze event retained for
+  replay.
+- `FreezeHoldAcquired { hold_id, acquired_at }` - Named freeze hold acquired.
+- `FreezeHoldReleased { hold_id, released_at }` - Named freeze hold released.
 
 **Command -> Event Mappings:**
 
-| Command    | Events Produced | Notes                                    |
-| ---------- | --------------- | ---------------------------------------- |
-| `Freeze`   | `Frozen`        | No event if already frozen (idempotent)  |
-| `Unfreeze` | `Unfrozen`      | No event if already enabled (idempotent) |
+| Command             | Events Produced      | Notes                                                                              |
+| ------------------- | -------------------- | ---------------------------------------------------------------------------------- |
+| `Freeze`            | `FreezeHoldAcquired` | Acquires the operator hold                                                         |
+| `Unfreeze`          | `FreezeHoldReleased` | Releases only the operator hold                                                    |
+| `AcquireFreezeHold` | `FreezeHoldAcquired` | No event if that hold is already active or its corporate-action window has elapsed |
+| `ReleaseFreezeHold` | `FreezeHoldReleased` | No event if that hold is absent                                                    |
 
 **Freeze State Machine:**
 
 ```
-Enabled ⇄ Frozen
-   Freeze:   Enabled -> Frozen
-   Unfreeze: Frozen  -> Enabled
+Enabled -> Frozen: first hold acquired
+Frozen  -> Frozen: additional hold acquired or one of several holds released
+Frozen  -> Enabled: final hold released
 ```
 
-**Freeze invariant — frozen is not de-listed.** Freezing only gates _new_ mints:
-`POST /inkind/issuance` rejects a frozen asset with a distinct `AssetFrozen`
-error (separate from `AssetNotAvailable`), so the rejection is observable and
-not conflated with de-listing. A frozen asset stays in `list_enabled_assets()`,
-so in-flight redemption detection (`src/redemption/`) keeps working — issuance
-reacts to on-chain transfers and has no "reject redemption" point. Preventing
-_new_ redemptions of a frozen asset is the liquidity rebalance guard's job,
-which reads the per-asset status endpoint (see "Tokenized Assets Data
-Endpoint"). This issuance-side freeze plus the liquidity guard form the single
-dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze is
-involved here (that is separate, heavier supply-control work and out of scope).
+**Freeze invariant — frozen is not de-listed.** Freezing gates _new_ mints and
+holds _new_ redemptions at the supply boundary: `POST /inkind/issuance` rejects
+a frozen asset with a distinct `AssetFrozen` error (separate from
+`AssetNotAvailable`), so the rejection is observable and not conflated with
+de-listing. A frozen asset stays in `list_enabled_assets()`, so in-flight
+redemption detection (`src/redemption/`) keeps working — issuance reacts to
+on-chain transfers and has no "reject redemption" point. A redemption detected
+during a freeze window is **held, never dropped**: the `RedeemCallManager` reads
+the asset's freeze status in-process before the Alpaca redeem call and
+dispatches `Hold` instead of calling Alpaca, so on-chain supply stays equal to
+Alpaca's snapshot; held redemptions resume in order on unfreeze. A redemption
+already past the Alpaca call completes — holding the burn after Alpaca has
+decremented would leave on-chain supply above the Alpaca count, the exact
+divergence the freeze prevents. Issuance is the supply authority and this hold
+is the authoritative lock; the liquidity bot's guards (the rebalance trigger's
+RAI-1038 gate and its redemption send-guard) are the agent declining to send —
+defense-in-depth that keeps the bot's own funds out of the wallet mid-freeze,
+not the lock itself. No on-chain wrapper-contract freeze is involved here (that
+is separate, heavier supply-control work and out of scope).
 
-The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
-in M1 and automatically by the dividend scheduler in M3 — the same command path
-either way.
+The issuer-host CLI acquires and releases the operator hold. The dividend
+scheduler independently acquires and releases a hold identified by the complete
+corporate-action window, preventing either trigger from releasing another
+owner's freeze.
 
 **Issuer CLI.** A dedicated `issuer` binary (separate from the HTTP server
 binary) is the M1 manual freeze trigger. It runs on the issuer host (over SSH)
@@ -1576,6 +1639,225 @@ CLI. Listing-scoped subcommands (asset addition and any future per-listing
 action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
+
+**Scheduled freeze windows.** For a corporate action known in advance (an
+ex-date), the freeze/unfreeze pair can be armed ahead of time instead of fired
+by hand at the exact instants. `POST /admin/freeze-schedules` (internal
+API-key + IP-allowlist auth, like all admin endpoints) takes an underlying and a
+`freeze_at`/`unfreeze_at` window and enqueues two durable apalis jobs — acquire
+that window's underlying-scoped hold at `freeze_at` and release it at
+`unfreeze_at`. Scheduled transitions survive restarts (apalis persists the due
+time), re-posting an identical window is an idempotent no-op while its jobs are
+pending or running (jobs are keyed by underlying + both window boundaries), and
+overlapping windows remain frozen until the final active hold is released. A
+window whose job reached a terminal state (done, killed, or out of retries)
+releases its key on re-arm, so an infrastructure failure never permanently
+blocks a window. At startup, orphaned `Running` rows reset to `Pending`.
+Terminal release rows also reset to `Pending` with a fresh attempt budget and
+are replayed because releasing a hold is idempotent and deleting the row could
+strand the asset frozen. Terminal acquisition rows remain terminal and are
+vacuumed so an elapsed window cannot refreeze the asset; transitions that died
+without applying (killed or out of retries) are surfaced at ERROR before their
+rows are removed. An underlying with no listing is rejected with 404 (the
+`Underlying` commands would succeed for any symbol, so an unchecked typo would
+arm a freeze that gates nothing while reporting success; the check lives in the
+scheduler itself so every schedule source inherits it); an inverted or
+sub-second window is rejected with 422 (apalis schedules at second granularity,
+so a sub-second window has no defined execution order); a fully elapsed window
+is rejected rather than flapping the asset; a `freeze_at` already in the past
+with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
+the manual/operator schedule mechanism; the automated corporate-actions feed
+uses the same underlying freeze-hold commands through its own action-keyed
+alignment jobs.
+
+**Corporate-actions sourcing.** Issuance consumes Alpaca's authenticated Market
+Data SSE stream (`GET /v1beta1/events/corporate-actions`) as a durable mutation
+source. Production and staging accept only HTTPS on
+`stream.data.alpaca.markets`; development may use plain HTTP only when the URL
+targets a loopback IP and the request carries no Alpaca credential headers. The
+credential-free development transport may establish its initial cursor from the
+first validated mock frame through the ordinary decoder and projection path;
+authenticated environments still require the fail-closed snapshot-repair
+baseline described below. The accepted contract is exactly US-region
+`cash_dividend_corporateaction_event` and `stock_dividend_corporateaction_event`
+frames with `insert`, `update`, or `delete`. Any other mutation kind or
+discriminator, another region, malformed identity, or invalid date is a typed
+poison boundary and cannot advance the cursor. A valid accepted event for an
+underlying that issuance does not list is instead an explicit no-op: the
+projection transaction records the event with a typed
+`no_op_unlisted_underlying` outcome and advances the cursor without creating an
+action projection, schedule, transition job, or hold, while retaining the
+canonical mutation payload. After an asset listing commits, a service-owned
+reactor selects the latest retained mutation per action for that underlying. It
+atomically creates pending revisions for the latest non-delete mutations and
+records their source event IDs without changing the stream cursor or rewriting
+the historical no-op outcomes. The ordinary alignment path then applies future
+windows and immediately acquires holds for windows already active; tests cover
+both cases. A latest retained delete creates no revision because no source hold
+was acquired. Listed events record a `schedule_revision` outcome with the
+resulting revision in that same transaction. Each listed action's stable Alpaca
+ID owns one source hold and one current schedule revision, so updates replace
+that action's prior window and deletes release only that action's hold. An
+operator hold or another action on the same underlying is never affected.
+
+Unlisted canonical state is bounded: one latest row is upserted per
+`(region, underlying, action_id)`, while a separate audit row keeps only the
+event ID, action ID, mutation kind, typed outcome, payload fingerprint, and
+acceptance time. Production requires positive audit-TTL and global
+unlisted-action-capacity settings. Expired audit rows may be removed; canonical
+rows may be removed only after listing promotion reconciles, or after a
+delete/elapsed window has no schedule or hold. Reaching capacity before any row
+is eligible blocks the feed rather than silently evicting promotion or release
+state. The projection transaction stores the current replay cursor together with
+a single durable cursor-echo record containing that event ID and the fixed
+32-byte fingerprint of its canonical accepted content. This bounded record is
+replaced only when the cursor advances and is never removed by audit compaction,
+so inclusive replay can still verify the committed anchor after its audit row
+expires.
+
+The streaming decoder bounds untrusted input before JSON decoding: one SSE frame
+is at most 64 KiB, with only the separator bytes buffered beyond that limit, and
+an Alpaca action ID is 1 through 128 bytes. An oversized frame is a typed poison
+boundary before JSON or action allocation and cannot advance the cursor. Empty
+or oversized action IDs are likewise typed poison boundaries.
+
+The window is the full UTC ex-date day — freeze at ex-date 00:00 UTC and
+unfreeze at 00:00 UTC the next day — which brackets the US/Eastern trading
+session on both sides. An immediate idempotent alignment job reconciles a new
+revision against the current time and underlying before its boundary jobs run.
+The projection transaction persists the mutation, action revision, pending
+alignment marker, and replay cursor together. Apalis jobs and aggregate hold
+events are recoverable second-phase effects; startup aligns every pending
+revision before reconnecting. A null reconciled marker plus a pending or running
+alignment row is `pending`; a null marker plus a killed or retry-exhausted row
+is `terminal_failed`; a marker equal to the current source event ID is
+`reconciled`. Exhausting retries never advances the marker. On startup, issuance
+first enqueues one deduplicated sync-failure notification per terminal
+alignment, then resets the same keyed job to pending with a fresh retry budget.
+Restart tests cover both killed and retry-exhausted rows and prove the marker
+stays null until the re-armed alignment succeeds.
+
+Each projected revision enqueues durable `AlignCorporateActionFreeze` jobs keyed
+by action ID and event ID. Projection commits and the alignment job's
+expected-event check plus action-owned hold effects share one process-wide
+revision guard; the single-writer issuer therefore cannot commit a newer
+revision between the check and those effects. Insert/update alignment acquires
+exactly that Alpaca-owned hold when the current revision is inside its active
+window and releases the same hold from any superseded underlying. A delete or
+elapsed window schedules release-only alignment. At startup, `Running`
+transition and alignment jobs reset to `Pending`; `Killed` or exhausted
+alignment jobs are re-armed because the projection remains pending, and each
+terminal alignment key enqueues one deduplicated sync-failure lifecycle
+notification. `Done` alignment jobs and terminal transition jobs are vacuumed
+after dead transitions are logged. A valid mutation for an unlisted underlying
+bypasses projection and alignment entirely.
+
+Event IDs are canonical uppercase ULIDs ordered by their encoded value. An exact
+replay is a duplicate. The projection transaction looks up its accepted-mutation
+row by `event_id`: matching canonical content leaves the mutation, schedule,
+revision, and cursor unchanged, while different content for the same ID persists
+a typed poison boundary. If compaction removed that row, the current cursor ID
+is verified against the durable cursor echo instead. A lower ID with neither a
+retained audit row nor the cursor echo cannot be proven to be the same
+historical event; it persists a typed replay-evidence-unavailable boundary and
+stops the feed rather than being accepted as a duplicate. An unseen lower ID is
+a cursor regression. Before a poison or regression stops the feed, issuance
+persists the last accepted cursor, an optional canonical provider event ID, the
+typed reason, and a fixed 32-byte SHA-256 fingerprint computed incrementally
+over the rejected frame. Oversized or malformed frames therefore persist a
+blocked boundary even when no event ID can be parsed, without retaining the
+frame beyond the decoder limit. Startup refuses to reconnect while that blocked
+boundary remains. Operators follow
+@docs/runbooks/corporate-action-feed-boundary.md to inspect the exact stored
+boundary and cursor, preserve incident evidence, and invoke no unsafe SQL
+override. Restart tests cover malformed and oversized frames without an event
+ID. The first install has no cursor and cannot establish a production baseline
+from the documented Alpaca contracts: neither an unbounded `since` replay nor
+the paginated GET endpoint proves a complete state at an SSE event ID. Minting
+and normal consumption remain gated until an operator restores a full issuance
+database backup with a cursor that inclusive replay still accepts. A controlled
+mock stream may establish a development fixture cursor only. Subsequent
+production connections use inclusive `since_id=<committed-event-id>` replay, and
+the first data frame must echo that cursor. `Last-Event-Id` is never sent,
+because Alpaca gives that header precedence over `since_id`. A rejected anchor
+or non-echoing first frame is a replay gap: no later or live event is accepted.
+
+A replay-retention gap is not repaired by resetting the cursor or combining an
+uncertified GET page set with a live buffer. Alpaca documents neither a REST
+snapshot watermark nor a consistency relationship between GET pagination and an
+SSE event ID, so an empty buffer, a first live frame, and `since_id` cannot
+prove a safe cutover. Issuance remains gated at the durable replay-gap boundary
+until an operator restores a full database backup whose cursor can be
+echo-verified by inclusive replay, or Alpaca adds a documented atomic
+snapshot/replay boundary. Without either input, recovery is intentionally
+unavailable.
+
+Every durable ingestion boundary that gates consumption — poison (including
+replay-evidence-unavailable), cursor regression, rejected anchor, or replay-
+retention gap — owns one active durable operator alert. Its deduplication
+identity is `(boundary_kind, stored_cursor_or_none, fingerprint)`, and its
+payload includes the typed stored reason, cursor, and fingerprint; reconnect
+attempts and notification retries reuse that identity instead of paging
+repeatedly. The alert remains active in health and operator status until the
+corresponding boundary is removed in the same recovery transaction that records
+a restored cursor and a successful inclusive replay verification. Clearing or
+acknowledging the alert alone never ungates issuance. Resolution queues one
+deduplicated recovery notification for that alert identity.
+
+The Market Data GET endpoint is diagnostic only. Every diagnostic request uses
+`region=us`, `data_quality=all`, and exactly
+`types=cash_dividend,stock_dividend`, exhausts pagination, and rejects a row
+whose declared region is missing or not US. GET rows and absences never mutate
+the action projection, release a hold, or advance the SSE cursor.
+
+Only a full backup restore followed by echo-verified inclusive replay, or a
+future implementation of a documented provider snapshot/replay boundary, may
+clear a replay-gap boundary. Until one is available and validated, a blocked
+production feed remains stopped and the corporate-actions feature cannot be
+re-enabled by editing its cursor or projection tables.
+
+The reconnect signals answer two separate on-call questions. A structured WARN
+with `state=reconnect_threshold_exceeded`, `consecutive_failures`, and
+`backoff_secs` answers how long and how aggressively the client has been
+retrying. A single `CorporateActionsSyncFailed` lifecycle notification when the
+fifth consecutive connection ends without an accepted mutation answers whether
+an operator needs to investigate. Backoff is exponential with jitter, bounded
+between five and sixty seconds, and both the counter and backoff reset only
+after a connection accepts a mutation.
+
+Corporate-action scheduling and failure notifications follow the shared operator
+lifecycle notification contract below.
+
+## Operator lifecycle notifications
+
+The V1 corporate-actions workflow sends operator notifications to the same
+Telegram chat, topic, and bot used by the liquidity service. Issuance reports a
+newly scheduled or approaching corporate action, a freeze or unfreeze that was
+applied, a redemption that was held or resumed, and failures in those workflows.
+The liquidity dividend-bump command reports the completed NAV bump through that
+same channel.
+
+Notifications describe the lifecycle transition and its correlation identifier
+but never include wallet balances, raw token quantities, credentials, or signing
+material. Delivery happens only after the corresponding durable state transition
+succeeds. Telegram unavailability cannot roll back or fail the financial
+workflow. A separately queued `SendLifecycleNotification` job returns delivery
+failures to apalis so the durable row retries; direct best-effort delivery after
+an already-committed transition records a structured error instead. Failure to
+queue a notification increments `notification_enqueue_failures` but does not
+abort corporate-action processing or prevent the remaining windows from being
+armed. If post-commit outcome inspection fails, the applied transition remains
+durable, its `FreezeApplied` or `UnfreezeApplied` notification is suppressed,
+and a structured ERROR is emitted. A failed freeze transition has one durable
+failure notification per underlying, hold, and transition; retries reuse that
+row rather than emitting one message per attempt. Replaying an idempotent
+command that produces no new domain transition does not emit another
+notification.
+
+Telegram configuration is all-or-none: bot token and chat id must either both be
+present or both be absent, and the forum topic is optional only when the channel
+is configured. Partial configuration fails startup. The bot token is redacted
+from all debug and error output.
 
 ## Orchestrator Migration (ST0xOrchestrator)
 
@@ -2139,6 +2421,7 @@ sequenceDiagram
     Blockchain->>Us: Transfer event detected
     Note right of Us: Detect command<br/>Event: RedemptionDetected
 
+    Note right of Us: ClaimAlpacaCall command<br/>Event: AlpacaCallClaimed
     Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled
@@ -3461,6 +3744,7 @@ sequenceDiagram
     Blockchain->>Us: Transfer event detected
     Note right of Us: Detect command<br/>Event: RedemptionDetected<br/>Status: detected
 
+    Note right of Us: ClaimAlpacaCall command<br/>Event: AlpacaCallClaimed<br/>Status: detected
     Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
@@ -3775,8 +4059,13 @@ struct BurnResult {
 ```mermaid
 stateDiagram-v2
     [*] --> Detected: Detect
-    Detected --> AlpacaCalled: RecordAlpacaCall
+    Detected --> AlpacaCallClaimed: ClaimAlpacaCall
+    Detected --> Held: Hold (asset frozen)
     Detected --> Failed: MarkFailed
+    Held --> AlpacaCallClaimed: ClaimAlpacaCall (asset unfrozen)
+    Held --> Failed: MarkFailed
+    AlpacaCallClaimed --> AlpacaCalled: RecordAlpacaCall
+    AlpacaCallClaimed --> Failed: RecordAlpacaFailure
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn
@@ -3818,6 +4107,8 @@ struct StoredRedemption {
     quantity: Quantity,
     status: RedemptionStatus,
     detected_at: DateTime<Utc>,
+    held_at: Option<DateTime<Utc>>,
+    alpaca_call_claimed_at: Option<DateTime<Utc>>,
     alpaca_called_at: Option<DateTime<Utc>>,
     alpaca_completed_at: Option<DateTime<Utc>>,
     burned_at: Option<DateTime<Utc>>,
@@ -3825,6 +4116,8 @@ struct StoredRedemption {
 
 enum RedemptionStatus {
     Detected,
+    Held,
+    AlpacaCallClaimed,
     AlpacaCalled,
     Burning,
     Completed,
@@ -4527,25 +4820,23 @@ effects on that chain:
 - HTTP JSON-RPC provider (Alloy)
 - `VaultService` (Turnkey or local signer, bound to that chain's `chain_id`)
 - `backfill_start_block` for receipt backfill
-- Subgraph URL for receipt indexing
 
 Constructed once at startup from config; immutable for the process lifetime.
 Alpaca calls a single issuer URL; payload `network` selects the runtime.
 
 **ChainRegistry:** Each configured network uses one complete environment group:
-`CHAIN_<NETWORK>_RPC_URL`, `CHAIN_<NETWORK>_CHAIN_ID`,
-`CHAIN_<NETWORK>_SUBGRAPH_URL`, and `CHAIN_<NETWORK>_BACKFILL_START_BLOCK`.
-Supplying any field requires all four, so partial chain configuration fails at
-startup. An absent additional-network group keeps that chain disabled.
-`CHAIN_<NETWORK>_CHAIN_ID` must be the network's canonical id (Base `8453`,
-Ethereum `1`, HyperEVM `999`); a mismatch fails at startup, because the receipt
-inventory is keyed by chain id and a mislabeled network orphans every existing
-aggregate. The legacy flat `CHAIN_ID` is exempt so local development can point
-Base at Anvil. `CHAIN_BASE_*` overrides the legacy flat Base values; when it is
-absent, `RPC_URL`, `SUBGRAPH_URL`, `CHAIN_ID`, and `BACKFILL_START_BLOCK`
-continue to produce the single Base entry unchanged. This lets one deployed
-artifact start Base-only and later activate another chain through a config
-update and restart.
+`CHAIN_<NETWORK>_RPC_URL`, `CHAIN_<NETWORK>_CHAIN_ID`, and
+`CHAIN_<NETWORK>_BACKFILL_START_BLOCK`. Supplying any field requires all three,
+so partial chain configuration fails at startup. An absent additional-network
+group keeps that chain disabled. `CHAIN_<NETWORK>_CHAIN_ID` must be the
+network's canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`); a mismatch
+fails at startup, because the receipt inventory is keyed by chain id and a
+mislabeled network orphans every existing aggregate. The legacy flat `CHAIN_ID`
+is exempt so local development can point Base at Anvil. `CHAIN_BASE_*` overrides
+the legacy flat Base values; when it is absent, `RPC_URL`, `CHAIN_ID`, and
+`BACKFILL_START_BLOCK` continue to produce the single Base entry unchanged. This
+lets one deployed artifact start Base-only and later activate another chain
+through a config update and restart.
 
 Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under

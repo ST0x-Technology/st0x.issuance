@@ -19,17 +19,17 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use st0x_issuance::Network;
 use st0x_issuance::bindings::IST0xOrchestratorV1;
 use st0x_issuance::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Instance;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
 
 use crate::harness::{
     MintFlowRequest, TEST_API_KEY, authenticated_get_json, bot_provider,
     confirm_mint_journal, create_provider, fetch_stuck_entries,
-    initiate_mint_request, orchestrator_vault_modes, tokens,
+    initialize_rocket, initiate_mint_request, orchestrator_vault_modes, tokens,
 };
 
 const USER_PRIVATE_KEY: B256 =
@@ -323,7 +323,7 @@ async fn orchestrator_mint_end_to_end() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -461,7 +461,7 @@ async fn wrong_signer_authorization_is_rejected_and_nothing_mints()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -546,11 +546,10 @@ async fn wrong_signer_authorization_is_rejected_and_nothing_mints()
 }
 
 /// Production ordering the happy path cannot prove: Alpaca confirms the
-/// journal on its own schedule, so the mint routinely reaches `Minting`
-/// before the liquidity bot delivers the recipient authorization. The submit
-/// job defers (never falls back to vault-direct), and the authorization's
-/// arrival wakes recovery — the mint must still complete end-to-end: exactly
-/// one `Minted` log and the Alpaca callback fired.
+/// journal before the liquidity bot delivers the recipient authorization.
+/// After those externally observable operations occur in that order, the mint
+/// must still complete end-to-end with exactly one `Minted` log and one Alpaca
+/// callback.
 #[tokio::test]
 async fn authorization_after_journal_confirmation_still_completes()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -578,7 +577,7 @@ async fn authorization_after_journal_confirmation_still_completes()
     )
     .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -604,14 +603,12 @@ async fn authorization_after_journal_confirmation_still_completes()
     )
     .await?;
 
-    // Journal first: the mint enters `Minting` with no authorization and the
-    // submit job's defer branch parks it — no event, no vault call.
+    // Complete the journal-confirmation request before delivering the
+    // authorization through the authorization-delivery service endpoint.
     confirm_mint_journal(&client, tokenization_request_id, &issuer_request_id)
         .await?;
 
-    // The late delivery is the wake-up: the endpoint records the
-    // authorization and kicks recovery, which re-drives the deferred
-    // submission.
+    // The later authorization request must still lead to one completed mint.
     let nonce = B256::with_last_byte(2);
     let signature = signed_mint_authorization(
         &evm,
@@ -737,7 +734,7 @@ async fn recovery_of_landed_orchestrator_mint_is_a_noop()
     let bot_nonce_before =
         reader.get_transaction_count(evm.wallet_address).await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -866,7 +863,7 @@ async fn nonce_collision_fails_for_manual_reconciliation()
     ));
     seed_mint_events(&db_url, &issuer_request_id, &events).await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -994,7 +991,7 @@ async fn unresolved_replay_parks_then_reconciles_after_restart()
     // Phase 1: recovery re-drives the seeded mint; the guard finds the
     // nonce consumed with no log inside the buffered window and parks the
     // mint unresolved.
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -1028,7 +1025,7 @@ async fn unresolved_replay_parks_then_reconciles_after_restart()
     // Phase 2: the restarted service's recovery reconciles with the widened
     // window, full-matches the landing, and drives the mint to its
     // callback.
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,
@@ -1111,7 +1108,7 @@ async fn mixed_mode_assets_each_take_their_own_mint_path()
     harness::preseed_tokenized_asset(&db_url, vault2_address, "AAPL", "tAAPL")
         .await?;
 
-    let (config, _mock_subgraph) = harness::create_config_with_vault_modes(
+    let config = harness::create_config_with_vault_modes(
         &db_url,
         &mock_alpaca,
         &evm,

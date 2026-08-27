@@ -8,11 +8,11 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
+use st0x_issuance::Network;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 const UNDERLYING: &str = "TSLA";
 const TOKEN: &str = "tTSLA";
@@ -81,8 +81,7 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 

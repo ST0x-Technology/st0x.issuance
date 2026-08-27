@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
-use super::rain_meta::OaSchemaCache;
 use super::{
     BurnRange, BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
     MintTxStatus, MintedLogQuery, MintedLogScan, MultiBurnResult,
@@ -94,7 +93,6 @@ const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 ///   replacement transaction to double-burn.
 pub(crate) struct RealBlockchainService {
     provider: RealBlockchainServiceProvider,
-    oa_schema_cache: Arc<OaSchemaCache>,
     wallet_nonce_lock: Arc<Mutex<()>>,
 }
 
@@ -104,16 +102,8 @@ impl RealBlockchainService {
     /// # Arguments
     ///
     /// * `provider` - Alloy provider for blockchain communication
-    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
-    pub(crate) fn new(
-        provider: RealBlockchainServiceProvider,
-        oa_schema_cache: Arc<OaSchemaCache>,
-    ) -> Self {
-        Self {
-            provider,
-            oa_schema_cache,
-            wallet_nonce_lock: Arc::new(Mutex::new(())),
-        }
+    pub(crate) fn new(provider: RealBlockchainServiceProvider) -> Self {
+        Self { provider, wallet_nonce_lock: Arc::new(Mutex::new(())) }
     }
 
     /// Decodes the typed revert reason of a mined-but-reverted orchestrator
@@ -239,8 +229,7 @@ impl VaultService for RealBlockchainService {
         let external_tx_id = external_tx_id.unwrap_or_else(|| {
             format!("mint-{}", receipt_info.issuer_request_id)
         });
-        let oa_schema = self.oa_schema_cache.get(vault).await;
-        let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
+        let receipt_info_bytes = receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
@@ -653,16 +642,6 @@ impl VaultService for RealBlockchainService {
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
 
-        let needs_encoding = params.burns.iter().any(|burn| {
-            burn.receipt_info_bytes.is_none() && burn.receipt_info.is_some()
-        });
-
-        let oa_schema = if needs_encoding {
-            self.oa_schema_cache.get(params.vault).await
-        } else {
-            None
-        };
-
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
@@ -673,7 +652,7 @@ impl VaultService for RealBlockchainService {
                 } else {
                     burn.receipt_info
                         .as_ref()
-                        .map(|info| info.encode(oa_schema.as_deref()))
+                        .map(super::ReceiptInformation::encode)
                         .transpose()?
                         .unwrap_or_default()
                 };
@@ -1099,9 +1078,7 @@ impl VaultService for RealBlockchainService {
             params.external_tx_id.clone().unwrap_or_else(|| {
                 format!("mint-{}", params.receipt_info.issuer_request_id)
             });
-        let oa_schema = self.oa_schema_cache.get(params.token).await;
-        let receipt_info_bytes =
-            params.receipt_info.encode(oa_schema.as_deref())?;
+        let receipt_info_bytes = params.receipt_info.encode()?;
 
         let orchestrator_contract =
             IST0xOrchestratorV1::new(params.orchestrator, &self.provider);
@@ -1449,7 +1426,6 @@ mod tests {
     use alloy::sol_types::{SolCall, SolError, SolEvent};
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -1468,15 +1444,11 @@ mod tests {
     use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
     use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::vault::orchestrator::BurnProofKind;
-    use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
         BurnRequestOrigin, BurnTxStatus, MintTxStatus, MintedLogScan,
         MultiBurnEntry, MultiBurnParams, PreparedMintTx, ReceiptInformation,
         SendableTxWithHash, TxId, VaultError, VaultService,
     };
-
-    const TEST_OA_SCHEMA: &str =
-        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
@@ -1576,10 +1548,7 @@ mod tests {
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        RealBlockchainService::new(
-            provider,
-            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
-        )
+        RealBlockchainService::new(provider)
     }
 
     async fn sign_test_transaction(
@@ -1618,10 +1587,7 @@ mod tests {
             .connect(&evm.endpoint)
             .await
             .expect("provider should connect");
-        let service = RealBlockchainService::new(
-            provider.clone(),
-            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
-        );
+        let service = RealBlockchainService::new(provider.clone());
         let recipient = address!("0x3333333333333333333333333333333333333333");
 
         let mineable = sign_test_transaction(
@@ -1812,10 +1778,7 @@ mod tests {
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter.clone());
-        let service = RealBlockchainService::new(
-            provider,
-            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
-        );
+        let service = RealBlockchainService::new(provider);
 
         let prepared = service
             .prepare_mint_tx(
@@ -1943,10 +1906,7 @@ mod tests {
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter.clone());
-        let service = RealBlockchainService::new(
-            provider,
-            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
-        );
+        let service = RealBlockchainService::new(provider);
 
         let prepared = service
             .prepare_mint_tx(
@@ -3781,10 +3741,8 @@ mod tests {
         // The calldata must carry exactly the signed (token, to, amount,
         // nonce) plus the CBOR receipt information — no previewDeposit, no
         // multicall.
-        let expected_receipt_info = params
-            .receipt_info
-            .encode(Some(TEST_OA_SCHEMA))
-            .expect("receipt info must encode");
+        let expected_receipt_info =
+            params.receipt_info.encode().expect("receipt info must encode");
         let expected_calldata = IST0xOrchestratorV1::mintCall {
             token: params.token,
             to: params.to,

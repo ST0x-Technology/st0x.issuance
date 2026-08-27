@@ -2902,6 +2902,8 @@ impl BurnExecutionPlan {
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
     match aggregate {
         Redemption::Detected { .. } => "Detected",
+        Redemption::Held { .. } => "Held",
+        Redemption::AlpacaCallClaimed { .. } => "AlpacaCallClaimed",
         Redemption::AlpacaCalled { .. } => "AlpacaCalled",
         Redemption::Burning { .. } => "Burning",
         Redemption::BurnSubmitted { .. } => "BurnSubmitted",
@@ -3383,6 +3385,16 @@ mod tests {
         store
             .send(
                 issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::RecordAlpacaCall {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id,
@@ -3588,6 +3600,16 @@ mod tests {
                     ),
                     block_number: 12345,
                     network: Network::Base,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
                 },
             )
             .await
@@ -6082,6 +6104,16 @@ mod tests {
         store
             .send(
                 &issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &issuer_request_id,
                 RedemptionCommand::RecordAlpacaCall {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id,
@@ -6343,6 +6375,16 @@ mod tests {
                     tx_hash,
                     block_number: 12345,
                     burn_mode: VaultMode::VaultDirect,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
                 },
             )
             .await
@@ -6789,6 +6831,15 @@ mod tests {
             )
             .await
             .expect("Detect failed");
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ClaimAlpacaCall failed");
         store
             .send(
                 issuer_request_id,

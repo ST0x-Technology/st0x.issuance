@@ -40,8 +40,8 @@ alloy = { version = "1.0.41", features = [
 ] }
 rust_decimal = { version = "1.39.0", features = ["serde"] }
 tokio = { workspace = true, features = ["time"] }
-reqwest = { workspace = true, features = ["blocking", "gzip"] }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+reqwest = { workspace = true, features = ["blocking", "gzip", "stream"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.31.0"
 opentelemetry = "0.30.0"
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
@@ -87,6 +87,7 @@ event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", 
   "test-support",
 ] }
 httpmock = { workspace = true }
+parking_lot = "0.12.5"
 proptest = "1.10.0"
 rust_decimal_macros = "1.40.0"
 st0x-issuance-client = { path = "crates/client" }

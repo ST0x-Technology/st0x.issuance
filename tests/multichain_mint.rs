@@ -11,7 +11,9 @@ use sqlx::sqlite::SqlitePoolOptions;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network, initialize_rocket};
+use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network};
+
+use crate::harness::initialize_rocket;
 
 /// Verifies mint routing through `ChainRegistry`: Base mints land on the Base
 /// Anvil vault; Ethereum-network mints land on the second Anvil chain.
@@ -59,12 +61,11 @@ async fn test_multichain_mint_routes_by_network()
     .await?;
     pool.close().await;
 
-    let (config, _mock_subgraph) = harness::create_multichain_config_with_db(
+    let config = harness::create_multichain_config_with_db(
         &db_url,
         &mock_alpaca,
         &base_evm,
         &eth_evm,
-        eth_vault_address,
     )?;
 
     let rocket = initialize_rocket(config).await?;

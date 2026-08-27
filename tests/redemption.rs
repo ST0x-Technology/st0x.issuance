@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 
 use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 
 use crate::harness::create_provider;
+use crate::harness::initialize_rocket;
 
 async fn perform_mint_flow(
     client: &Client,
@@ -296,8 +296,7 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -450,8 +449,7 @@ async fn test_redemption_recovery_after_restart()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -502,14 +500,15 @@ async fn test_redemption_recovery_after_restart()
         "Bot should have shares during redemption"
     );
 
-    // "Crash" - drop the client and rocket instance
-    drop(client);
+    // Stop the first service completely before starting a second instance on
+    // the same database. Dropping a tracked client only starts graceful
+    // shutdown, so its burn job can otherwise race startup reconciliation.
+    client.terminate().await;
 
     // Flip the flag so polls now return "completed"
     poll_should_succeed.store(true, Ordering::SeqCst);
 
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;

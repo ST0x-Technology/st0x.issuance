@@ -36,16 +36,17 @@ async fn tokenized_asset_status_via_client()
     )
     .await?;
 
+    let (frozen_vault, _) = evm.deploy_additional_vault().await?;
+
     harness::preseed_frozen_tokenized_asset(
         &db_url,
-        evm.vault_address,
+        frozen_vault,
         FROZEN_UNDERLYING,
         FROZEN_TOKEN,
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let base_url = harness::spawn_http_server(config).await?;
     let client = IssuanceClient::new(base_url, INTERNAL_API_KEY)?;

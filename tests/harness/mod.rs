@@ -7,7 +7,6 @@
 
 pub mod alpaca_mocks;
 
-use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::fillers::{
@@ -30,21 +29,20 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::IST0xOrchestratorV1;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
+use st0x_issuance::initialize_rocket as initialize_application;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
 };
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, ChainConfig, Config, Environment, IpWhitelist,
-    LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
+    LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
 };
 
 /// The internal API key every harness-built config and request header share:
 /// the config value and the `X-API-KEY` header must stay identical, or every
 /// authenticated assertion fails with a 401 that hides the real cause.
 pub const TEST_API_KEY: &str = "test-key-12345678901234567890123456";
-
 pub type TestProviderBuilder = ProviderBuilder<
     Identity,
     JoinFill<
@@ -55,6 +53,37 @@ pub type TestProviderBuilder = ProviderBuilder<
         ChainIdFiller,
     >,
 >;
+
+/// Initializes the application after establishing the corporate-action
+/// baseline required by the fail-closed production startup path.
+pub async fn initialize_rocket(
+    config: Config,
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    pool.close().await;
+
+    initialize_application(config).await
+}
+
+pub fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
+    const PATH: &str = "/v1beta1/events/corporate-actions";
+    const EVENT_TYPES: &str = "cash_dividend_corporateaction_event,stock_dividend_corporateaction_event";
+
+    mock_alpaca.mock(|when, then| {
+        when.method(GET).path(PATH);
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(
+                "id: 01J9RPMV5TKB8WX3M4F1KZ7QH2\nevent: insert\ndata: {\"event_type\":\"cash_dividend_corporateaction_event\",\"region\":\"us\",\"ca\":{\"id\":\"development-baseline\",\"symbol\":\"UNLISTED\",\"ex_date\":\"2026-08-21\"}}\n\n",
+            );
+    });
+
+    format!("{}{PATH}?type={EVENT_TYPES}&region=us", mock_alpaca.base_url())
+}
 
 pub async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
@@ -119,17 +148,12 @@ pub async fn wait_for_mock_hit(
     wait_for_mock_hits(mock, 1).await
 }
 
-/// Polls the event store until the mint's terminal `MintCompleted` event is
-/// COMMITTED. A callback-mock hit alone is not terminality: the mock counts
-/// the request on arrival, while the service still has to process the
-/// response and persist `RecordCallbackSent -> MintCompleted` — a window a
-/// fast test can win locally and lose on a loaded CI runner. Anything that
-/// gates on the mint being terminal (service shutdown before a custody
-/// migration's quiescence check, restarts asserting no recovery work) must
-/// wait on this, not on the mock.
-pub async fn wait_for_mint_completed(
+/// Polls until the named aggregate event is committed.
+pub async fn wait_for_event(
     db_url: &str,
-    issuer_request_id: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -144,12 +168,14 @@ pub async fn wait_for_mint_completed(
             "
             SELECT COUNT(*)
             FROM events
-            WHERE aggregate_type = 'Mint'
+            WHERE aggregate_type = ?
               AND aggregate_id = ?
-              AND event_type = 'MintEvent::MintCompleted'
+              AND event_type = ?
             ",
         )
-        .bind(issuer_request_id)
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(event_type)
         .fetch_one(&pool)
         .await?;
 
@@ -161,8 +187,8 @@ pub async fn wait_for_mint_completed(
         if start.elapsed() >= timeout {
             pool.close().await;
             return Err(format!(
-                "Timeout waiting for MintCompleted on {issuer_request_id} \
-                 after {}s",
+                "Timeout waiting for {event_type} on \
+                 {aggregate_type}/{aggregate_id} after {}s",
                 timeout.as_secs()
             )
             .into());
@@ -170,6 +196,27 @@ pub async fn wait_for_mint_completed(
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Polls the event store until the mint's terminal `MintCompleted` event is
+/// COMMITTED. A callback-mock hit alone is not terminality: the mock counts
+/// the request on arrival, while the service still has to process the
+/// response and persist `RecordCallbackSent -> MintCompleted` — a window a
+/// fast test can win locally and lose on a loaded CI runner. Anything that
+/// gates on the mint being terminal (service shutdown before a custody
+/// migration's quiescence check, restarts asserting no recovery work) must
+/// wait on this, not on the mock.
+pub async fn wait_for_mint_completed(
+    db_url: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_event(
+        db_url,
+        "Mint",
+        issuer_request_id,
+        "MintEvent::MintCompleted",
+    )
+    .await
 }
 
 pub async fn wait_for_mock_hits(
@@ -331,14 +378,14 @@ pub async fn seed_tokenized_asset_with(
 /// This allows `initialize_rocket` to discover the asset during startup,
 /// so that receipt backfill and redemption monitoring are wired for this vault.
 ///
-/// Seeds the `events` table with a `TokenizedAsset::Added` event before the
-/// Rocket service starts.
+/// Seeds a `TokenizedAsset::Added` event before Rocket starts.
 ///
 /// Per AGENTS.md "Setup phase exception", direct event store seeding is
 /// permitted in e2e test setup phases. The tokenized asset view is rebuilt
 /// from events by `initialize_rocket` during startup (via the
 /// `TokenizedAsset` projection's catch-up in `StoreBuilder::build`), so only
-/// the event needs to be seeded.
+/// the event needs to be seeded for the aggregate. The credential-free
+/// development feed establishes its own cursor through the running service.
 pub async fn preseed_tokenized_asset(
     db_url: &str,
     vault: Address,
@@ -534,153 +581,86 @@ pub async fn setup_account(
     link_body
 }
 
-/// Schema hash used by the mock subgraph in e2e tests.
-pub const TEST_OA_SCHEMA_HASH: &str =
-    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
-
-/// Builds a mock Rain meta v1 `information` hex string containing the given
-/// schema hash, suitable for the subgraph `receiptVaultInformations` response.
-fn mock_information_hex(schema_hash: &str) -> String {
-    let schema_hex = hex::encode(schema_hash);
-    let payload_hex = format!("78{:02x}{schema_hex}", schema_hash.len());
-
-    // Rain meta v1 prefix + OA_SCHEMA CBOR item + OA_HASH_LIST CBOR item
-    format!(
-        "0xff0a89c674ee7874\
-         a40058020000011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465\
-         a200{payload_hex}011bff9fae3cc645f463"
-    )
-}
-
-/// Sets up a mock subgraph server that returns `OA_SCHEMA` hashes for specific
-/// vaults. Each entry maps a vault address to a schema hash. The mock validates
-/// the request body contains the expected vault address (as lowercase hex),
-/// ensuring `OaSchemaCache` sends correct per-vault GraphQL queries.
-pub fn setup_mock_subgraph(
-    vault_schemas: &HashMap<Address, &str>,
-) -> MockServer {
-    let server = MockServer::start();
-
-    for (vault, schema_hash) in vault_schemas {
-        let vault_hex = format!("{vault:#x}");
-        let information = mock_information_hex(schema_hash);
-
-        server.mock(|when, then| {
-            when.method(POST).path("/").body_includes(&vault_hex);
-            then.status(200).json_body(json!({
-                "data": {
-                    "receiptVaultInformations": [{
-                        "information": information
-                    }]
-                }
-            }));
-        });
-    }
-
-    server
-}
-
-/// Returns `(Config, MockServer)` — the caller must keep the `MockServer` alive
-/// for the duration of the test so the subgraph mock remains reachable.
+/// Builds a test [`Config`] with a single Base chain wired to `evm`.
 pub fn create_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     evm: &LocalEvm,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+) -> Result<Config, Box<dyn std::error::Error>> {
     let rpc_url = Url::parse(&evm.endpoint)?;
 
-    Ok((
-        Config {
-            database_url: db_path.to_string(),
-            database_max_connections: 5,
-            rpc_url: rpc_url.clone(),
-            chain_id: evm.chain_id,
-            signer: SignerConfig::Local(evm.private_key),
-            backfill_start_block: 0,
-            receipt_poll_interval: tokio::time::Duration::from_millis(500),
-            auth: AuthConfig {
-                issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
-                alpaca_ip_ranges: IpWhitelist::single(
-                    "127.0.0.1/32".parse().expect("Valid IP range"),
-                ),
-                internal_ip_ranges: "127.0.0.0/8,::1/128"
-                    .parse()
-                    .expect("Valid IP ranges"),
-            },
-            behind_proxy: false,
-            log_level: LogLevel::Debug,
-            environment: Environment::Development,
-            hyperdx: None,
-            alpaca: AlpacaConfig {
-                api_base_url: mock_alpaca.base_url(),
-                account_id: "test-account".to_string(),
-                api_key: "test-key".to_string(),
-                api_secret: "test-secret".to_string(),
-                connect_timeout_secs: 10,
-                request_timeout_secs: 30,
-            },
-            subgraph_url: subgraph_url.clone(),
-            chains: vec![ChainConfig {
-                network: Network::Base,
-                chain_id: evm.chain_id,
-                rpc_url,
-                subgraph_url,
-                backfill_start_block: 0,
-            }],
-            vault_mode_config: VaultModeConfig::default(),
+    Ok(Config {
+        database_url: db_path.to_string(),
+        database_max_connections: 5,
+        rpc_url: rpc_url.clone(),
+        chain_id: evm.chain_id,
+        signer: SignerConfig::Local(evm.private_key),
+        backfill_start_block: 0,
+        receipt_poll_interval: tokio::time::Duration::from_millis(500),
+        auth: AuthConfig {
+            issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
         },
-        mock_subgraph,
-    ))
+        behind_proxy: false,
+        log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
+        environment: Environment::Development,
+        hyperdx: None,
+        alpaca: AlpacaConfig {
+            api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: setup_corporate_actions_stream_mock(
+                mock_alpaca,
+            ),
+        },
+        lifecycle_notifications:
+            st0x_issuance::LifecycleNotificationsConfig::disabled(),
+        chains: vec![ChainConfig {
+            network: Network::Base,
+            chain_id: evm.chain_id,
+            rpc_url,
+            backfill_start_block: 0,
+        }],
+        vault_mode_config: VaultModeConfig::default(),
+    })
 }
 
 /// Builds a [`Config`] wired to two Anvil chains: Base and Ethereum, both
-/// entries in `Config::chains`. Both chains share the mock subgraph.
-/// `eth_vault_address` is passed explicitly rather than read from `eth_evm`:
-/// both Anvil chains deploy from the same key and nonce, so
-/// `eth_evm.vault_address` equals `base_evm.vault_address`, and twin
-/// addresses would make cross-chain routing assertions vacuous. Multichain
-/// tests deploy an additional vault on the Ethereum chain and use its address.
+/// entries in `Config::chains`.
 pub fn create_multichain_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     base_evm: &LocalEvm,
     eth_evm: &LocalEvm,
-    eth_vault_address: Address,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let vault_schemas = HashMap::from([
-        (base_evm.vault_address, TEST_OA_SCHEMA_HASH),
-        (eth_vault_address, TEST_OA_SCHEMA_HASH),
-    ]);
-    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
-
-    let (mut base_config, _) =
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut base_config =
         create_config_with_db(db_path, mock_alpaca, base_evm)?;
-    base_config.subgraph_url = subgraph_url.clone();
     base_config.chains = vec![
         ChainConfig {
             network: Network::Base,
             chain_id: base_evm.chain_id,
             rpc_url: Url::parse(&base_evm.endpoint)?,
-            subgraph_url: subgraph_url.clone(),
             backfill_start_block: 0,
         },
         ChainConfig {
             network: Network::Ethereum,
             chain_id: eth_evm.chain_id,
             rpc_url: Url::parse(&eth_evm.endpoint)?,
-            subgraph_url,
             backfill_start_block: 0,
         },
     ];
 
-    Ok((base_config, mock_subgraph))
+    Ok(base_config)
 }
 
 /// Same as [`create_config_with_db`] but with a per-asset `VaultModeConfig`
@@ -690,11 +670,10 @@ pub fn create_config_with_vault_modes(
     mock_alpaca: &MockServer,
     evm: &LocalEvm,
     vault_mode_config: VaultModeConfig,
-) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
-    let (mut config, mock_subgraph) =
-        create_config_with_db(db_path, mock_alpaca, evm)?;
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut config = create_config_with_db(db_path, mock_alpaca, evm)?;
     config.vault_mode_config = vault_mode_config;
-    Ok((config, mock_subgraph))
+    Ok(config)
 }
 
 /// Mints `amount` share-wei of the primary vault's token to

@@ -11,8 +11,8 @@ use serde_json::json;
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use harness::create_provider;
+use harness::initialize_rocket;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::LocalEvm;
 
@@ -118,8 +118,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -204,8 +203,7 @@ async fn test_mint_burn_mint_nonce_synchronization()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

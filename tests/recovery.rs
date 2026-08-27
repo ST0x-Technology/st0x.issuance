@@ -18,10 +18,9 @@ use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::{
     self, OffchainAssetReceiptVaultInstance,
 };
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 static RECOVERY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -39,7 +38,7 @@ async fn wait_for_event_count(
     let pool =
         SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
     let start = tokio::time::Instant::now();
-    let timeout = Duration::from_secs(10);
+    let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_millis(100);
 
     loop {
@@ -207,8 +206,7 @@ async fn test_mint_recovery_after_view_deletion()
     let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -247,8 +245,8 @@ async fn test_mint_recovery_after_view_deletion()
     )
     .await?;
 
-    // "Crash" - drop the service
-    drop(client1);
+    // Stop the first service before mutating its persisted state and restarting.
+    client1.terminate().await;
 
     // Connect to the database to manipulate state
     let query_pool =
@@ -290,8 +288,7 @@ async fn test_mint_recovery_after_view_deletion()
 
     // Restart service — views are cleared and rebuilt repopulates views from events,
     // recovery finds the JournalConfirmed mint and resumes it.
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -378,8 +375,7 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
     let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -454,8 +450,7 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
     // Restart — views are cleared and rebuilt repopulates from events, recovery
     // finds the MintIntended mint and checks the backfilled receipt before
     // attempting another broadcast.
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -508,8 +503,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // First start the service to set up the database schema and seed data
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -520,7 +514,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Now insert events directly to create a mint stuck in Minting state
     // WITHOUT any on-chain transaction
@@ -544,8 +538,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     query_pool.close().await;
 
     // Start service - recovery should find the stuck mint and retry it
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -633,8 +626,7 @@ async fn test_mint_recovery_prevents_double_mint()
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Start service to set up database
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -642,7 +634,7 @@ async fn test_mint_recovery_prevents_double_mint()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Insert events to create a mint stuck in Minting state with matching issuer_request_id
     let query_pool =
@@ -672,8 +664,7 @@ async fn test_mint_recovery_prevents_double_mint()
     let shares_before = vault.balanceOf(bot_wallet).call().await?;
 
     // Start service - recovery should find the existing receipt and NOT mint again
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -756,8 +747,7 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
     // Phase 1: Start service to set up DB schema, seed asset and account.
     // We need to stop and restart so the receipt monitor has vault configs
     // (assets must exist in the DB before initialize_rocket for monitors to spawn).
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -765,12 +755,11 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Restart service. The receipt monitor will spawn (asset exists).
     // Auto-recovery runs but finds NO stuck mints (we haven't inserted any yet).
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -878,8 +867,7 @@ async fn test_mint_recovery_from_minting_failed_state()
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Start service to set up database schema
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -889,7 +877,7 @@ async fn test_mint_recovery_from_minting_failed_state()
     let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Insert events to create a mint in MintingFailed state
     let query_pool =
@@ -932,8 +920,7 @@ async fn test_mint_recovery_from_minting_failed_state()
     query_pool.close().await;
 
     // Start service - recovery should find the failed mint and retry it
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -995,8 +982,7 @@ async fn test_startup_clears_and_rebuilds_views()
     let (redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Phase 1: Start service and set up account + asset via API
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -1004,7 +990,7 @@ async fn test_startup_clears_and_rebuilds_views()
     harness::setup_account(&client1, user_wallet).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a Detected redemption for the LINKED wallet into events
     let query_pool =
@@ -1038,8 +1024,7 @@ async fn test_startup_clears_and_rebuilds_views()
     // Phase 3: Restart — views are cleared and rebuilt from events.
     // The seeded Detected event gets a view row from the rebuild.
     // Recovery finds it and calls Alpaca (wallet is linked).
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -1116,8 +1101,7 @@ async fn test_detected_redemption_auto_failed_when_no_account()
     let (redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Phase 1: Start service to set up DB, seed asset and account
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -1126,7 +1110,7 @@ async fn test_detected_redemption_auto_failed_when_no_account()
 
     let link_body = harness::setup_account(&client1, user_wallet).await;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a Detected redemption for an UNKNOWN wallet (no linked account)
     let orphan_wallet = Address::random();
@@ -1159,8 +1143,7 @@ async fn test_detected_redemption_auto_failed_when_no_account()
     query_pool.close().await;
 
     // Phase 3: Restart service — recovery should auto-fail the orphaned redemption
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let client2 = rocket::local::asynchronous::Client::tracked(rocket2).await?;
 
@@ -1261,8 +1244,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Phase 1: Start service to set up DB schema, seed asset and account
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -1271,7 +1253,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 
     let _link_body = harness::setup_account(&client1, user_wallet).await;
 
-    drop(client1);
+    client1.terminate().await;
 
     // Phase 2: Seed a BurnFailed redemption directly in the event store
     let query_pool =
@@ -1352,8 +1334,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 
     // Phase 3: Restart service — bot has 0 shares on fresh Anvil, so recovery
     // should detect insufficient balance and auto-fail the stuck redemption
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
@@ -1520,8 +1501,7 @@ async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
     let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -1548,8 +1528,6 @@ async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
         &user_provider,
     );
     let shares_before = harness::wait_for_shares(&vault, user_wallet).await?;
-    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
-
     wait_for_event_count(
         &db_url,
         "Mint",
@@ -1558,6 +1536,11 @@ async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
         1,
     )
     .await?;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        1,
+        "the initial mint must persist completion after exactly one callback"
+    );
 
     let deposits_before =
         count_vault_deposits(&user_provider, evm.vault_address).await?;
@@ -1604,20 +1587,10 @@ async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
     );
 
     // Restart: recovery re-enqueues ConfirmMint for the same hash.
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
-
-    harness::wait_for_mock_hits(&mint_callback_mock, 2).await?;
-    // Settle briefly then re-assert exact count so late extra callbacks fail.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        mint_callback_mock.calls_async().await,
-        2,
-        "recovery must deliver exactly one additional mint callback (no extras)"
-    );
 
     let completed_count = wait_for_event_count(
         &db_url,
@@ -1627,6 +1600,14 @@ async fn test_mined_deposit_with_unrecorded_confirm_must_not_double_mint()
         1,
     )
     .await?;
+    // Settle briefly then re-assert exact count so late extra callbacks fail.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "recovery must deliver exactly one additional mint callback (no extras)"
+    );
+
     assert_eq!(
         completed_count, 1,
         "recovery must complete the mint exactly once"
@@ -1715,8 +1696,7 @@ async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
     let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
@@ -1743,8 +1723,6 @@ async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
         &user_provider,
     );
     let shares_before = harness::wait_for_shares(&vault, user_wallet).await?;
-    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
-
     wait_for_event_count(
         &db_url,
         "Mint",
@@ -1753,6 +1731,11 @@ async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
         1,
     )
     .await?;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        1,
+        "the initial mint must persist completion after exactly one callback"
+    );
 
     let deposits_before =
         count_vault_deposits(&user_provider, evm.vault_address).await?;
@@ -1762,19 +1745,10 @@ async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
 
     poison_mint_to_minting_failed(&db_url, &issuer_request_id).await?;
 
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
-
-    harness::wait_for_mock_hits(&mint_callback_mock, 2).await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        mint_callback_mock.calls_async().await,
-        2,
-        "MintingFailed recovery must deliver exactly one additional callback"
-    );
 
     let completed_count = wait_for_event_count(
         &db_url,
@@ -1784,6 +1758,13 @@ async fn test_minting_failed_after_mined_deposit_must_not_double_mint()
         1,
     )
     .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "MintingFailed recovery must deliver exactly one additional callback"
+    );
+
     assert_eq!(
         completed_count, 1,
         "MintingFailed recovery must complete the mint exactly once"

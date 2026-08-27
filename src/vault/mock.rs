@@ -1115,9 +1115,7 @@ impl VaultService for MockVaultService {
         }
 
         // Pre-compute the MintResult for confirm_mint to return.
-        let receipt_info_bytes = match receipt_info.encode(Some(
-            "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm",
-        )) {
+        let receipt_info_bytes = match receipt_info.encode() {
             Ok(bytes) => bytes,
             Err(err) => {
                 return Err(VaultError::ReceiptEncode(err));

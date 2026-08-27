@@ -7,24 +7,37 @@ use alloy::primitives::{U256, b256};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
-use std::collections::HashMap;
 use url::Url;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
-    initialize_rocket,
+    IpWhitelist, LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig,
 };
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
+
+fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
+    mock_alpaca.mock(|when, then| {
+        when.method(GET).path("/v1beta1/events/corporate-actions");
+        then.status(200).header("content-type", "text/event-stream").body("");
+    });
+
+    format!(
+        "{}/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us",
+        mock_alpaca.base_url()
+    )
+}
 
 #[tokio::test]
 async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("unwhitelist.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     let bot_wallet = evm.wallet_address;
     let user_private_key = b256!(
@@ -38,16 +51,9 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
     let (redeem_mock, _poll_mock) =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, harness::TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = harness::setup_mock_subgraph(&vault_schemas);
-
     let rpc_url = Url::parse(&evm.endpoint)?;
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
-
     let config = Config {
-        database_url: ":memory:".to_string(),
+        database_url: db_url,
         database_max_connections: 5,
         rpc_url: rpc_url.clone(),
         chain_id: ANVIL_CHAIN_ID,
@@ -67,6 +73,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         },
         behind_proxy: false,
         log_level: LogLevel::Debug,
+        log_format: LogFormat::Text,
         environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {
@@ -76,13 +83,17 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: setup_corporate_actions_stream_mock(
+                &mock_alpaca,
+            ),
         },
-        subgraph_url: subgraph_url.clone(),
+        lifecycle_notifications:
+            st0x_issuance::LifecycleNotificationsConfig::disabled(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             rpc_url,
-            subgraph_url,
             backfill_start_block: 0,
         }],
         vault_mode_config: VaultModeConfig::default(),

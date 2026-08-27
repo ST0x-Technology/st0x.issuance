@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+pub(crate) const DEFAULT_CORPORATE_ACTIONS_STREAM_URL: &str = "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us";
+
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
     RedeemResponse, TokenizationRequest,
@@ -58,6 +60,22 @@ pub struct AlpacaConfig {
         help = "Alpaca API request timeout in seconds"
     )]
     pub request_timeout_secs: u64,
+
+    #[arg(
+        long = "alpaca-corporate-actions-read-timeout-secs",
+        env = "ALPACA_CORPORATE_ACTIONS_READ_TIMEOUT_SECS",
+        default_value = "90",
+        help = "Idle-read timeout for the Alpaca corporate-actions SSE stream"
+    )]
+    pub corporate_actions_read_timeout_secs: u64,
+
+    #[arg(
+        long = "alpaca-corporate-actions-stream-url",
+        env = "ALPACA_CORPORATE_ACTIONS_STREAM_URL",
+        default_value = DEFAULT_CORPORATE_ACTIONS_STREAM_URL,
+        help = "Alpaca corporate-actions SSE stream URL"
+    )]
+    pub corporate_actions_stream_url: String,
 }
 
 impl std::fmt::Debug for AlpacaConfig {
@@ -69,6 +87,14 @@ impl std::fmt::Debug for AlpacaConfig {
             .field("api_secret", &"<redacted>")
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field(
+                "corporate_actions_read_timeout_secs",
+                &self.corporate_actions_read_timeout_secs,
+            )
+            .field(
+                "corporate_actions_stream_url",
+                &self.corporate_actions_stream_url,
+            )
             .finish()
     }
 }
@@ -96,6 +122,9 @@ impl AlpacaConfig {
             api_secret: "test".to_string(),
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
+            corporate_actions_read_timeout_secs: 90,
+            corporate_actions_stream_url: DEFAULT_CORPORATE_ACTIONS_STREAM_URL
+                .to_string(),
         }
     }
 }

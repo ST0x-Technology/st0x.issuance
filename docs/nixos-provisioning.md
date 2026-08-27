@@ -57,9 +57,9 @@ Bootstrap overwrites each `host-{env}` with the real key and runs `ragenix -r`.
 
 Per environment (`staging`, then `prod`):
 
-| File                                              | Contents                                  |
-| ------------------------------------------------- | ----------------------------------------- |
-| `secret/st0x-issuance-{env}.env.age`              | Service env (from `.env.secrets.example`) |
+| File                                 | Contents                                  |
+| ------------------------------------ | ----------------------------------------- |
+| `secret/st0x-issuance-{env}.env.age` | Service env (from `.env.secrets.example`) |
 
 Shared:
 
@@ -73,9 +73,12 @@ $EDITOR infra/terraform.tfvars
 nix run .#tfEditVars -- -i "$SSH_IDENTITY"
 
 nix run .#rekey -- -i "$SSH_IDENTITY"
-git add secret/*.age infra/terraform.tfvars.age keys.nix
+git add secret/*.age infra/*.age infra/.remote-*.age keys.nix
 git commit -m "ops: encrypted secrets for provisioning"
 ```
+
+`rekey` refreshes service secrets, Terraform files, and remote IP caches from
+their current roles in `keys.nix`.
 
 ---
 

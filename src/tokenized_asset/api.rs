@@ -14,7 +14,7 @@ use tracing::{error, warn};
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    UnderlyingSymbol, view::TokenizedAssetView,
+    UnderlyingSymbol, VAULT_CLAIM_CONFLICT_TOKEN, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
@@ -227,8 +227,8 @@ pub(crate) async fn list_tokenized_assets(
         (status = 201, description = "Asset added (idempotent: also 201 if it already existed)",
             body = AddTokenizedAssetResponse),
         (status = 422, description = "Empty underlying symbol, network \
-            without a chain configuration, or vault address already used on \
-            another network"),
+            without a chain configuration, or vault address already serving \
+            another underlying on the same network"),
         (status = 500, description = "Failed to add asset")
     ),
     security(("internal_api_key" = []))
@@ -262,7 +262,8 @@ pub(crate) async fn add_tokenized_asset(
     }
 
     // Same guard as boot-time backfill: reject before the Add lands so a
-    // shared vault across networks never waits until the next restart to fail.
+    // vault serving two underlyings on one network never waits until the
+    // next restart to fail.
     let mut assets = super::view::list_enabled_assets(pool.inner())
         .await
         .map_err(|error| {
@@ -281,15 +282,16 @@ pub(crate) async fn add_tokenized_asset(
         added_at: chrono::Utc::now(),
     });
     if let Err(collision) =
-        super::validate_no_cross_network_vault_collisions(&assets)
+        super::validate_one_underlying_per_network_vault(&assets)
     {
         warn!(
             target: "asset",
             vault = %collision.vault,
+            network = %collision.network,
             first = %collision.first,
             second = %collision.second,
             "Rejected tokenized-asset registration: vault address already \
-             used on another network"
+             serves another underlying on this network"
         );
         return Err(Status::UnprocessableEntity);
     }
@@ -311,8 +313,19 @@ pub(crate) async fn add_tokenized_asset(
             _ => Err(err),
         })
         .map_err(|err| {
-            error!(target: "asset", "Failed to add tokenized asset: {err}");
-            Status::InternalServerError
+            if err.to_string().contains(VAULT_CLAIM_CONFLICT_TOKEN) {
+                warn!(
+                    target: "asset",
+                    vault = %request.vault,
+                    network = %request.network,
+                    "Rejected tokenized-asset registration: (network, vault) \
+                     already serves another underlying (concurrent add)"
+                );
+                Status::UnprocessableEntity
+            } else {
+                error!(target: "asset", "Failed to add tokenized asset: {err}");
+                Status::InternalServerError
+            }
         })?;
 
     Ok((
@@ -894,9 +907,85 @@ mod tests {
         assert!(asset.is_none(), "aggregate must not exist: {asset:?}");
     }
 
+    /// Deterministic (CREATE2) deploys give one underlying the same vault
+    /// address on every network, so registering a second network with the
+    /// same address must succeed.
     #[traced_test]
     #[tokio::test]
-    async fn test_add_asset_rejects_vault_shared_across_networks() {
+    async fn test_add_asset_accepts_vault_shared_across_networks() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+        let shared_vault =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("RKLB").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                    token: TokenSymbol::new("tRKLB"),
+                    network: Network::Base,
+                    vault: shared_vault,
+                },
+            )
+            .await
+            .expect("base asset should add");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(store.clone())
+            .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([
+                Network::Base,
+                Network::Ethereum,
+            ]))
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "RKLB",
+            "token": "tRKLB",
+            "network": "ethereum",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Created);
+        // Scope to the Ethereum add so it cannot pass on the RKLB Base setup
+        // log above, which shares the underlying and vault.
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "RKLB", "ethereum"]
+        ));
+
+        let key = AssetKey::new(
+            UnderlyingSymbol::new("RKLB").unwrap(),
+            Network::Ethereum,
+        );
+        let asset = store.load(&key).await.expect("load must succeed");
+        assert!(asset.is_some(), "aggregate must exist after add");
+    }
+
+    /// Two underlyings behind one `(network, vault)` cannot be told apart by
+    /// redemption transfer matching, so that registration stays rejected.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_add_asset_rejects_vault_shared_within_network() {
         let pool = migrated_in_memory_pool().await;
         let store = setup_tokenized_asset_store(&pool).await;
         let shared_vault =
@@ -923,10 +1012,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store.clone())
             .manage(pool)
-            .manage(ConfiguredNetworks::from_iter([
-                Network::Base,
-                Network::Ethereum,
-            ]))
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -936,7 +1022,7 @@ mod tests {
         let request_body = serde_json::json!({
             "underlying": "MSFT",
             "token": "tMSFT",
-            "network": "ethereum",
+            "network": "base",
             "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         });
 
@@ -952,15 +1038,202 @@ mod tests {
         assert_eq!(response.status(), Status::UnprocessableEntity);
         assert!(logs_contain_at!(
             tracing::Level::WARN,
-            &["vault address already", "another network"]
+            &["vault address already", "another underlying on this network"]
         ));
 
         let key = AssetKey::new(
             UnderlyingSymbol::new("MSFT").unwrap(),
-            Network::Ethereum,
+            Network::Base,
         );
         let asset = store.load(&key).await.expect("load must succeed");
         assert!(asset.is_none(), "aggregate must not exist: {asset:?}");
+    }
+
+    /// The (network, vault) claim is enforced at the event-append boundary, not
+    /// only by the read-model pre-check: a second `Added` for a different
+    /// underlying on one (network, vault) is rejected by the store itself.
+    #[traced_test]
+    #[tokio::test]
+    async fn tokenized_asset_vault_claim_rejects_second_owner_at_store() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .expect("first owner claims the (network, vault)");
+
+        let error = store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("MSFT").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("MSFT").unwrap(),
+                    token: TokenSymbol::new("tMSFT"),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .expect_err(
+                "second owner on the same (network, vault) is rejected",
+            );
+
+        assert!(
+            !matches!(error, AggregateError::AggregateConflict),
+            "the vault guard must not be misclassified as a same-aggregate \
+             conflict: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(VAULT_CLAIM_CONFLICT_TOKEN),
+            "store must reject the second owner via the (network, vault) claim, \
+             got: {error:?}"
+        );
+
+        // This path runs the aggregate handler, which logs the add attempt
+        // before the append is rejected. The rejection WARN is the HTTP
+        // handler's job (asserted in the handler tests); the store boundary
+        // emits only this attempt log.
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "MSFT"]
+        ));
+
+        let msft = store
+            .load(&AssetKey::new(
+                UnderlyingSymbol::new("MSFT").unwrap(),
+                Network::Base,
+            ))
+            .await
+            .expect("load must succeed");
+        assert!(msft.is_none(), "rejected owner must not persist: {msft:?}");
+    }
+
+    /// Two concurrent registrations for different underlyings on one
+    /// (network, vault) must not both commit. The projection they read lags the
+    /// event store, so the database claim is the real arbiter: exactly one wins
+    /// with 201, the other is rejected with 422 (not 500), and only one
+    /// aggregate persists.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_add_asset_concurrent_shared_vault_admits_one() {
+        // Five connections so both handlers can read the projection before
+        // either commits, letting the database claim be the arbiter instead of
+        // serializing on one connection. The database is file backed, not
+        // :memory:, because a multi connection :memory: pool gives each
+        // connection its own empty database; the connections must share one
+        // schema and rows.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = temp_dir.path().join("concurrent.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .expect("Failed to create database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+        let store = setup_tokenized_asset_store(&pool).await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(store.clone())
+            .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let body = |underlying: &str, token: &str| {
+            serde_json::json!({
+                "underlying": underlying,
+                "token": token,
+                "network": "base",
+                "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            })
+            .to_string()
+        };
+
+        let (first, second) = tokio::join!(
+            async {
+                client
+                    .post("/tokenized-assets")
+                    .header(ContentType::JSON)
+                    .header(internal_api_key())
+                    .remote("127.0.0.1:8000".parse().unwrap())
+                    .body(body("AAPL", "tAAPL"))
+                    .dispatch()
+                    .await
+                    .status()
+            },
+            async {
+                client
+                    .post("/tokenized-assets")
+                    .header(ContentType::JSON)
+                    .header(internal_api_key())
+                    .remote("127.0.0.1:8000".parse().unwrap())
+                    .body(body("MSFT", "tMSFT"))
+                    .dispatch()
+                    .await
+                    .status()
+            },
+        );
+
+        assert!(
+            (first == Status::Created && second == Status::UnprocessableEntity)
+                || (first == Status::UnprocessableEntity
+                    && second == Status::Created),
+            "exactly one concurrent add wins, the other is rejected: \
+             {first:?}, {second:?}"
+        );
+
+        // The loser WARNs a rejection through one of two guards depending on the
+        // race: the projection read, or the database claim when both reads
+        // passed. Both carry these fields, so this holds either way; the
+        // database claim path is covered on its own by
+        // tokenized_asset_vault_claim_rejects_second_owner_at_store.
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Rejected tokenized-asset registration", "another underlying"]
+        ));
+
+        let aapl = store
+            .load(&AssetKey::new(
+                UnderlyingSymbol::new("AAPL").unwrap(),
+                Network::Base,
+            ))
+            .await
+            .expect("load must succeed");
+        let msft = store
+            .load(&AssetKey::new(
+                UnderlyingSymbol::new("MSFT").unwrap(),
+                Network::Base,
+            ))
+            .await
+            .expect("load must succeed");
+        assert!(
+            aapl.is_some() ^ msft.is_some(),
+            "exactly one aggregate must persist for the shared vault"
+        );
     }
 
     async fn migrated_in_memory_pool() -> sqlx::Pool<sqlx::Sqlite> {
@@ -1223,7 +1496,18 @@ mod tests {
         let pool = migrated_in_memory_pool().await;
         let store = setup_tokenized_asset_store(&pool).await;
 
-        for (underlying, token) in [("AAPL", "tAAPL"), ("MSFT", "tMSFT")] {
+        for (underlying, token, vault) in [
+            (
+                "AAPL",
+                "tAAPL",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
+            (
+                "MSFT",
+                "tMSFT",
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ),
+        ] {
             let underlying = UnderlyingSymbol::new(underlying).unwrap();
             let key = AssetKey::new(underlying.clone(), Network::Base);
             store
@@ -1233,9 +1517,7 @@ mod tests {
                         underlying,
                         token: TokenSymbol::new(token),
                         network: Network::Base,
-                        vault: address!(
-                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        ),
+                        vault,
                     },
                 )
                 .await

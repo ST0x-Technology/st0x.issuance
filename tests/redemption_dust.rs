@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex};
 use harness::alpaca_mocks::setup_mint_mocks;
 use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 
 use crate::harness::create_provider;
+use crate::harness::initialize_rocket;
 
 /// Quantity with >9 decimal precision (18 decimals on-chain).
 /// Represents: 0.450574852280275235 shares
@@ -318,8 +318,7 @@ async fn test_redemption_returns_dust_to_user()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -420,8 +419,7 @@ async fn test_redemption_no_dust_when_9_decimals()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

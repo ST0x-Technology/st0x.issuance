@@ -147,6 +147,11 @@ pub(crate) enum RedemptionEvent {
         #[serde(default)]
         burn_mode: VaultMode,
     },
+    /// Durable admission record written before the external Alpaca call.
+    AlpacaCallClaimed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        claimed_at: DateTime<Utc>,
+    },
     AlpacaCalled {
         issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -164,6 +169,16 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         failed_at: DateTime<Utc>,
+    },
+    /// Redemption of a frozen asset parked before the Alpaca redeem call.
+    /// Held is a deferral, never a drop — the tokens are already committed
+    /// on-chain, so the redemption resumes through `AlpacaCallClaimed` once
+    /// the asset unfreezes. Detection
+    /// metadata stays in the aggregate from `Detected`, so this event carries
+    /// only the hold timestamp.
+    RedemptionHeld {
+        issuer_request_id: IssuerRedemptionRequestId,
+        held_at: DateTime<Utc>,
     },
     AlpacaJournalCompleted {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -370,11 +385,17 @@ impl DomainEvent for RedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Detected { .. } => "RedemptionEvent::Detected".to_string(),
+            Self::AlpacaCallClaimed { .. } => {
+                "RedemptionEvent::AlpacaCallClaimed".to_string()
+            }
             Self::AlpacaCalled { .. } => {
                 "RedemptionEvent::AlpacaCalled".to_string()
             }
             Self::AlpacaCallFailed { .. } => {
                 "RedemptionEvent::AlpacaCallFailed".to_string()
+            }
+            Self::RedemptionHeld { .. } => {
+                "RedemptionEvent::RedemptionHeld".to_string()
             }
             Self::AlpacaJournalCompleted { .. } => {
                 "RedemptionEvent::AlpacaJournalCompleted".to_string()
@@ -471,6 +492,18 @@ mod tests {
             event.event_type(),
             "RedemptionEvent::AlpacaJournalCompleted"
         );
+    }
+
+    #[test]
+    fn alpaca_call_claimed_event_type_and_round_trip() {
+        let event = RedemptionEvent::AlpacaCallClaimed {
+            issuer_request_id: test_redemption_id(),
+            claimed_at: Utc::now(),
+        };
+
+        assert_eq!(event.event_type(), "RedemptionEvent::AlpacaCallClaimed");
+        let value = to_value(&event).unwrap();
+        assert_eq!(from_value::<RedemptionEvent>(value).unwrap(), event);
     }
 
     #[test]

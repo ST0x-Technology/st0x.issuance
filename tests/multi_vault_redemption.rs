@@ -7,11 +7,11 @@ use alloy::primitives::{U256, b256};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
+use st0x_issuance::Network;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 /// Tests that redemptions are detected and completed on ALL vaults, not just one.
 ///
@@ -60,8 +60,7 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
     harness::preseed_tokenized_asset(&db_url, vault2_address, "TSLA", "tTSLA")
         .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -226,8 +225,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     // === Phase 1: Start service, add TSLA via API, mint on vault2 ===
     let rocket = initialize_rocket(config).await?;
@@ -301,8 +299,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     // === Phase 4: Restart service ===
     // TSLA is now in the DB (added via API in phase 1). The second service
     // should detect it at startup and backfill the transfer.
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;

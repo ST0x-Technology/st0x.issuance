@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network, initialize_rocket};
+use st0x_issuance::{ETHEREUM_TEST_CHAIN_ID, Network};
+
+use crate::harness::initialize_rocket;
 
 /// Verifies redemption routing through `ChainRegistry`: a transfer to the bot
 /// wallet on the Ethereum vault triggers Alpaca redeem with `network=ethereum`
@@ -69,12 +71,11 @@ async fn test_multichain_redemption_routes_by_network()
     .await?;
     pool.close().await;
 
-    let (config, _mock_subgraph) = harness::create_multichain_config_with_db(
+    let config = harness::create_multichain_config_with_db(
         &db_url,
         &mock_alpaca,
         &base_evm,
         &eth_evm,
-        eth_vault_address,
     )?;
 
     let rocket = initialize_rocket(config).await?;

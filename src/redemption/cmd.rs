@@ -69,6 +69,13 @@ pub(crate) enum RedemptionCommand {
         /// caller that forgot to resolve the mode.
         burn_mode: VaultMode,
     },
+    /// Durably claims ownership of the external Alpaca call after the freeze
+    /// admission check. A committed claim establishes that the call precedes
+    /// any later freeze and lets recovery resume after a crash without
+    /// re-entering the freeze gate.
+    ClaimAlpacaCall {
+        issuer_request_id: IssuerRedemptionRequestId,
+    },
     RecordAlpacaCall {
         issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -80,6 +87,14 @@ pub(crate) enum RedemptionCommand {
     RecordAlpacaFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
+    },
+    /// Parks a redemption of a frozen asset before the Alpaca redeem call.
+    /// Valid from `Detected` (produces `RedemptionHeld`) and idempotent from
+    /// `Held` (no event) so concurrent guard paths cannot race each other.
+    /// The redemption is deferred, never dropped — the resume driver re-runs
+    /// detection handling once the asset unfreezes.
+    Hold {
+        issuer_request_id: IssuerRedemptionRequestId,
     },
     ConfirmAlpacaComplete {
         issuer_request_id: IssuerRedemptionRequestId,

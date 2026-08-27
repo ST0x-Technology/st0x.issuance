@@ -23,13 +23,12 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::test_utils::{LocalEvm, ROLE_DEPOSIT, ROLE_WITHDRAW};
 use st0x_issuance::{
     ETHEREUM_TEST_CHAIN_ID, Network, VaultModeConfig, VaultModeKind,
-    initialize_rocket,
 };
 use std::collections::HashMap;
 
 use crate::harness::{
-    MintFlowRequest, TEST_API_KEY, confirm_mint_journal, initiate_mint_request,
-    tokens,
+    MintFlowRequest, TEST_API_KEY, confirm_mint_journal, initialize_rocket,
+    initiate_mint_request, tokens,
 };
 
 const USER_PRIVATE_KEY: B256 =
@@ -124,10 +123,9 @@ async fn orchestrator_operations_route_to_each_networks_own_orchestrator()
     let base_orchestrator = base_evm.deploy_orchestrator().await?;
 
     // Both Anvils deploy from the same key, so the default vault addresses
-    // collide across chains — and the service refuses one vault address on
-    // two networks. The Ethereum asset therefore lives on a freshly deployed
-    // vault; its extra deployments also shift the deployer nonce, so the
-    // Ethereum orchestrator lands at a genuinely different address and the
+    // collide across chains. The Ethereum asset lives on a freshly deployed
+    // vault so its extra deployments shift the deployer nonce, landing the
+    // Ethereum orchestrator at a genuinely different address, so the
     // per-network keying under test cannot hold vacuously.
     let (eth_vault_address, eth_authorizer_address) =
         eth_evm.deploy_additional_vault().await?;
@@ -193,14 +191,12 @@ async fn orchestrator_operations_route_to_each_networks_own_orchestrator()
     .await?;
     pool.close().await;
 
-    let (mut config, _mock_subgraph) =
-        harness::create_multichain_config_with_db(
-            &db_url,
-            &mock_alpaca,
-            &base_evm,
-            &eth_evm,
-            eth_vault_address,
-        )?;
+    let mut config = harness::create_multichain_config_with_db(
+        &db_url,
+        &mock_alpaca,
+        &base_evm,
+        &eth_evm,
+    )?;
     config.vault_mode_config = VaultModeConfig::new(
         HashMap::from([
             ("AAPL".to_string(), VaultModeKind::Orchestrator),

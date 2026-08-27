@@ -161,6 +161,7 @@
           environments = envNames;
         };
         rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
+        rekeyInfra = ''ragenix --rules ./infra/secrets.nix -i "$identity" -r'';
 
         deployScripts =
           (import ./deploy.nix {
@@ -360,6 +361,7 @@
                 ${infraPkgs.parseIdentity}
                 trap _cleanup_identity EXIT
                 ${rekeySecrets}
+                ${rekeyInfra}
               '';
             };
           }
@@ -370,7 +372,15 @@
         # `nix flake check` (run in both rainix.yaml CI jobs) evaluates the
         # `checks` output, not `packages`; aliasing the crate derivations here is
         # what builds them and runs the TypeScript exporter in CI.
-        checks = issuanceBuilds;
+        checks = issuanceBuilds // {
+          rekey-all-encrypted-files = pkgs.runCommand "rekey-all-encrypted-files" { } ''
+            grep -F -- "--rules ./secret/secrets.nix" ${packages.rekey}/bin/rekey
+            grep -F -- "--rules ./infra/secrets.nix" ${packages.rekey}/bin/rekey
+            grep -F -- '".remote-prod.age"' ${./infra/secrets.nix}
+            grep -F -- '".remote-staging.age"' ${./infra/secrets.nix}
+            touch "$out"
+          '';
+        };
 
         devShell = pkgs.mkShell (
           {

@@ -10,12 +10,12 @@ use st0x_issuance_dto::{MintAuthorizationRequest, MintAuthorizationResponse};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::ErrorResponse;
 use crate::auth::InternalAuth;
 use crate::config::VaultMode;
-use crate::mint::recovery::enqueue_scheduled_mint_recovery;
+use crate::mint::recovery::enqueue_authorized_mint_recovery;
 use crate::mint::view::find_issuer_id_by_tokenization_request_id;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, MintError, TokenizationRequestId,
@@ -62,6 +62,7 @@ pub(crate) enum MintAuthorizationApiError {
 /// liquidity bot's delivery request open indefinitely.
 #[cfg(not(test))]
 const ON_CHAIN_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTHORIZATION_RECORD_ATTEMPTS: usize = 3;
 
 /// Unit tests hang the mock validation forever to exercise the deadline; a
 /// millisecond-scale bound keeps that test fast in real time. A paused
@@ -335,22 +336,39 @@ pub(crate) async fn authorize_mint(
         }
     })?;
 
-    mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::AuthorizeMint {
-                issuer_request_id: issuer_request_id.clone(),
-                mint_authorization: authorization,
-            },
-        )
-        .await
-        .map_err(|err| {
-            map_authorize_command_error(
+    let mut attempt = 1;
+    loop {
+        let result = mint_store
+            .send(
                 &issuer_request_id,
-                &tokenization_request_id,
-                &err,
+                MintCommand::AuthorizeMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mint_authorization: authorization.clone(),
+                },
             )
-        })?;
+            .await;
+        match result {
+            Ok(()) => break,
+            Err(AggregateError::AggregateConflict)
+                if attempt < AUTHORIZATION_RECORD_ATTEMPTS =>
+            {
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                    attempt,
+                    max_attempts = AUTHORIZATION_RECORD_ATTEMPTS,
+                    "Mint changed while recording authorization; retrying"
+                );
+                attempt += 1;
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                return Err(map_authorize_command_error(
+                    &issuer_request_id,
+                    &tokenization_request_id,
+                    &error,
+                ));
+            }
+        }
+    }
 
     info!(target: "mint", issuer_request_id = %issuer_request_id,
         tokenization_request_id = %tokenization_request_id,
@@ -379,7 +397,7 @@ async fn wake_mint_recovery(
     apalis_pool: &ApalisSqlitePool,
     issuer_request_id: &IssuerMintRequestId,
 ) {
-    if let Err(error) = enqueue_scheduled_mint_recovery(
+    if let Err(error) = enqueue_authorized_mint_recovery(
         pool,
         apalis_pool,
         issuer_request_id.clone(),
@@ -661,7 +679,7 @@ mod tests {
             ",
         )
         .bind(type_name::<MintRecoveryJob>())
-        .bind(issuer_request_id.to_string())
+        .bind(format!("{issuer_request_id}:authorization"))
         .fetch_one(&harness.pool)
         .await
         .unwrap();

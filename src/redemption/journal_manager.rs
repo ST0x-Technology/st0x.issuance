@@ -684,6 +684,16 @@ mod tests {
         store
             .send(
                 issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::RecordAlpacaCall {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
