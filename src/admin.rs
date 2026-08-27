@@ -3767,7 +3767,7 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
-        let Redemption::BurnIntended { sendable_tx, .. } = store
+        let Redemption::BurnIntended { .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -3783,7 +3783,7 @@ mod tests {
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
-                    tx_id: sendable_tx.hash.into(),
+                    tx_id: tx_id.clone(),
                     planned_burns: vec![],
                 },
             )
@@ -4419,7 +4419,7 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
-        let Redemption::BurnIntended { sendable_tx, .. } = store
+        let Redemption::BurnIntended { .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -4435,7 +4435,7 @@ mod tests {
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
-                    tx_id: sendable_tx.hash.into(),
+                    tx_id: tx_id.clone(),
                     planned_burns: vec![],
                 },
             )
@@ -4837,7 +4837,7 @@ mod tests {
             )
             .await
             .expect("IntendBurn failed");
-        let Redemption::BurnIntended { sendable_tx, .. } = store
+        let Redemption::BurnIntended { .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -4853,7 +4853,7 @@ mod tests {
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
-                    tx_id: sendable_tx.hash.into(),
+                    tx_id: tx_id.clone(),
                 },
             )
             .await
