@@ -2663,7 +2663,7 @@ impl BurnManager {
                             issuer_request_id,
                             execution,
                             &tx_id,
-                            err,
+                            &err,
                         )
                         .await;
                 }
@@ -2698,7 +2698,7 @@ impl BurnManager {
                             issuer_request_id,
                             execution,
                             &tx_id,
-                            err,
+                            &err,
                         )
                         .await;
                 }
@@ -2739,7 +2739,7 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         execution: &BurnExecutionPlan,
         tx_id: &TxId,
-        error: VaultError,
+        error: &VaultError,
     ) -> Result<(), BurnManagerError> {
         match super::map_confirm_burn_error(error, tx_id) {
             RedemptionError::Vault {
@@ -8179,6 +8179,75 @@ mod tests {
         );
     }
 
+    /// Discovers the funding receipt, reserves it, and drives `IntendBurn` so
+    /// the redemption reaches `BurnIntended` with a persisted signed
+    /// transaction, asserting the transaction was prepared exactly once.
+    async fn seed_burn_intended(
+        harness: &TestHarness,
+        vault_mock: &MockVaultService,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        recovery_owner: Address,
+    ) {
+        let TestHarness { store, receipt_service, .. } = harness;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        create_test_redemption_in_burning_state(store, issuer_request_id).await;
+
+        // Seed a reservation so the test verifies it is settled on confirm.
+        receipt_service
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: uint!(99_U256),
+                    shares_burned: uint!(100_000000000000000000_U256),
+                }],
+            )
+            .await
+            .expect("seeding reservation should succeed");
+
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: uint!(99_U256),
+                            burn_shares: uint!(100_000000000000000000_U256),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: recovery_owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("IntendBurn should succeed");
+
+        let aggregate = load_aggregate(store, issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::BurnIntended { .. }),
+            "Expected BurnIntended with sendable_tx, got {aggregate:?}"
+        );
+        assert_eq!(
+            vault_mock.burn_preparation_call_count(),
+            1,
+            "the signed transaction must be prepared before the restart"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_recover_burn_intended_rebroadcasts_persisted_transaction() {
@@ -8215,70 +8284,19 @@ mod tests {
                 .expect("Failed to create apalis test pool");
         let harness =
             TestHarness::with_pool(vault_mock.clone(), pool, apalis_pool).await;
-        let TestHarness { store, receipt_service, .. } = &harness;
-
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        harness
-            .discover_receipt(
-                vault,
-                uint!(99_U256),
-                uint!(100_000000000000000000_U256),
-            )
-            .await;
-
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-
-        // Seed a reservation so the test verifies it is settled on confirm.
-        receipt_service
-            .reserve_burn(
-                ANVIL_CHAIN_ID,
-                vault,
-                issuer_request_id.clone(),
-                vec![BurnRecord {
-                    receipt_id: uint!(99_U256),
-                    shares_burned: uint!(100_000000000000000000_U256),
-                }],
-            )
-            .await
-            .expect("seeding reservation should succeed");
-
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::IntendBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault,
-                        burns: vec![MultiBurnEntry {
-                            receipt_id: uint!(99_U256),
-                            burn_shares: uint!(100_000000000000000000_U256),
-                            receipt_info: None,
-                            receipt_info_bytes: None,
-                        }],
-                        dust_shares: U256::ZERO,
-                        owner: recovery_owner,
-                    },
-                    external_tx_id: None,
-                },
-            )
-            .await
-            .expect("IntendBurn should succeed");
-
-        let aggregate = load_aggregate(store, &issuer_request_id).await;
-        assert!(
-            matches!(aggregate, Redemption::BurnIntended { .. }),
-            "Expected BurnIntended with sendable_tx, got {aggregate:?}"
-        );
-        assert_eq!(
-            vault_mock.burn_preparation_call_count(),
-            1,
-            "the signed transaction must be prepared before the restart"
-        );
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            recovery_owner,
+        )
+        .await;
 
         let restarted_pool = SqlitePoolOptions::new()
             .max_connections(5)

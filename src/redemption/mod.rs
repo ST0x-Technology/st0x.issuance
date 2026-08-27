@@ -433,6 +433,14 @@ struct BurnInput {
     external_tx_id: Option<BurnExternalTxId>,
 }
 
+/// On-chain landing metadata for a confirmed burn, grouped to keep the
+/// record-confirmed handlers within the argument limit.
+struct BurnTxMeta {
+    tx_hash: B256,
+    gas_used: u64,
+    block_number: u64,
+}
+
 /// Maps a `VaultError` into the serializable `RedemptionError::Vault`,
 /// computing the reservation-release flag, recoverable tx id, and typed
 /// classification at the aggregate boundary where the typed error is last
@@ -448,21 +456,21 @@ pub(crate) fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
 
 /// Maps the `VaultError` from a burn *confirmation* call into a
 /// `RedemptionError`, distinguishing the still pending case (retryable, keeps
-/// the reservation) from a definitive vault error. Shared by the aggregate's
-/// `ConfirmBurn` handler and `BurnManager`'s inline confirm path so both
-/// classify an identical vault error identically.
+/// the reservation) from a definitive vault error. Used by `BurnManager`'s
+/// confirm path so every confirm failure classifies an identical vault error
+/// identically.
 pub(crate) fn map_confirm_burn_error(
-    error: VaultError,
+    error: &VaultError,
     tx_id: &TxId,
 ) -> RedemptionError {
-    if is_pending_burn_confirmation(&error) {
+    if is_pending_burn_confirmation(error) {
         return RedemptionError::BurnConfirmationPending {
             tx_id: tx_id.clone(),
             message: error.to_string(),
         };
     }
 
-    vault_error_to_redemption(&error)
+    vault_error_to_redemption(error)
 }
 
 /// Maps a typed `VaultError` to the burn-failure classification persisted on
@@ -706,11 +714,9 @@ impl Redemption {
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
         tx_id: TxId,
-        tx_hash: B256,
         burns: Vec<BurnRecord>,
         dust_returned: U256,
-        gas_used: u64,
-        block_number: u64,
+        meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let stored_tx_id = match self {
             Self::BurnSubmitted { tx_id, .. } => tx_id.clone(),
@@ -732,11 +738,11 @@ impl Redemption {
 
         Ok(vec![RedemptionEvent::TokensBurned(TokensBurnedData {
             issuer_request_id,
-            tx_hash,
+            tx_hash: meta.tx_hash,
             burns,
             dust_returned,
-            gas_used,
-            block_number,
+            gas_used: meta.gas_used,
+            block_number: meta.block_number,
             burned_at: Utc::now(),
         })])
     }
@@ -749,11 +755,9 @@ impl Redemption {
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
         tx_id: TxId,
-        tx_hash: B256,
         shares_burned: U256,
         burn_range: BurnRange,
-        gas_used: u64,
-        block_number: u64,
+        meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let (stored_tx_id, alpaca_quantity, dust_quantity) = match self {
             Self::BurnSubmitted {
@@ -804,12 +808,12 @@ impl Redemption {
 
         Ok(vec![RedemptionEvent::OrchestratorTokensBurned {
             issuer_request_id,
-            tx_hash,
+            tx_hash: meta.tx_hash,
             shares_burned,
             burn_range,
             dust_retained,
-            gas_used,
-            block_number,
+            gas_used: meta.gas_used,
+            block_number: meta.block_number,
             burned_at: Utc::now(),
         }])
     }
@@ -2110,11 +2114,9 @@ impl EventSourced for Redemption {
             } => self.handle_record_burn_confirmed(
                 issuer_request_id,
                 tx_id,
-                tx_hash,
                 burns,
                 dust_returned,
-                gas_used,
-                block_number,
+                &BurnTxMeta { tx_hash, gas_used, block_number },
             ),
             RedemptionCommand::RecordOrchestratorBurnConfirmed {
                 issuer_request_id,
@@ -2127,11 +2129,9 @@ impl EventSourced for Redemption {
             } => self.handle_record_orchestrator_burn_confirmed(
                 issuer_request_id,
                 tx_id,
-                tx_hash,
                 shares_burned,
                 burn_range,
-                gas_used,
-                block_number,
+                &BurnTxMeta { tx_hash, gas_used, block_number },
             ),
             RedemptionCommand::RecordBurnTxSubmitted {
                 issuer_request_id,
@@ -2235,6 +2235,21 @@ impl EventSourced for Redemption {
                 )
                 .await
             }
+            command => self.transition_burn_recovery(command, services).await,
+        }
+    }
+}
+
+impl Redemption {
+    /// Dispatches the burn-recovery bookkeeping commands. `transition` routes
+    /// only these variants here through its wildcard arm; the wildcard below is
+    /// unreachable in practice and fails closed rather than panicking.
+    async fn transition_burn_recovery(
+        &self,
+        command: RedemptionCommand,
+        services: &RedemptionServices,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        match command {
             RedemptionCommand::RecordBurnRecoveryAttempt {
                 issuer_request_id,
                 tx_hash,
@@ -2279,11 +2294,13 @@ impl EventSourced for Redemption {
                 )
                 .await
             }
+            _ => Err(RedemptionError::InvalidState {
+                expected: "a burn-recovery command".to_string(),
+                found: self.state_name().to_string(),
+            }),
         }
     }
-}
 
-impl Redemption {
     fn apply_event(&mut self, event: RedemptionEvent) {
         match &event {
             RedemptionEvent::Detected { .. }

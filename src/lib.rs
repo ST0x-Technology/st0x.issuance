@@ -331,58 +331,19 @@ pub async fn initialize_rocket(
         &redemption_store,
         &receipt_inventory_store,
         &pool,
-        bot_wallet,
         lifecycle_notifier.clone(),
         &apalis_pool,
     )?;
 
-    // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Each replay clears its view table first to remove
-    // stale/corrupt data, then rebuilds from the event store.
-    debug!(target: "startup", "Rebuilding all views from events");
-    rebuild_receipt_inventory_view(&pool).await?;
-    rebuild_redemption_view(&pool).await?;
-    rebuild_receipt_burns_view(&pool).await?;
-
-    validate_configured_asset_networks(&pool, &chain_registry).await?;
-
-    // Receipt backfill must run before recovery so that recovery can check
-    // receipt inventory to detect already-minted receipts (prevents double-mints).
-    let vault_configs = run_all_receipt_backfills(
+    run_startup_recovery(
         &pool,
         &chain_registry,
         &receipt_inventory_store,
         bot_wallet,
+        &apalis_pool,
+        &managers,
     )
     .await?;
-
-    if let Err(error) = run_startup_reconciliation_for_vaults(
-        &chain_registry,
-        &vault_configs,
-        &receipt_inventory_store,
-        bot_wallet,
-    )
-    .await
-    {
-        error.log();
-    }
-
-    // The synchronous recovery pass runs with a timeout before the HTTP server
-    // starts. Mints that need deferred or pending follow-up are handed to
-    // detached background scheduled-recovery tasks that intentionally outlive
-    // this timeout and run concurrently with request handling; their safety
-    // rests on cqrs-es optimistic concurrency and externalTxId
-    // idempotency, not on completing before the server is up. If the
-    // synchronous pass hangs it is cancelled and any remaining stuck aggregates
-    // are left for manual admin intervention.
-    let receipt_vaults: Vec<(u64, Address)> = vault_configs
-        .iter()
-        .map(|config| (config.chain_id, config.vault))
-        .collect();
-
-    run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
-        .await;
-
     // FIXME: temporary production gate. Remove once the snapshot-repair
     // baseline operation ships so production can establish a cursor and run
     // the feed. See docs/runbooks/corporate-action-feed-boundary.md.
@@ -550,6 +511,64 @@ pub async fn initialize_rocket(
             handles: background_task_handles,
         },
     }))
+}
+
+/// Rebuilds views, backfills receipts, reconciles inventory, and runs the timed
+/// startup recovery pass before the HTTP server accepts traffic. Reprojections
+/// complete BEFORE recovery so it queries up-to-date views; receipt backfill
+/// runs before recovery so already-minted receipts are visible (prevents
+/// double-mints).
+async fn run_startup_recovery<P: Provider + Clone>(
+    pool: &Pool<Sqlite>,
+    chain_registry: &ChainRegistry<P>,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
+    bot_wallet: Address,
+    apalis_pool: &ApalisSqlitePool,
+    managers: &RedemptionManagers,
+) -> Result<(), anyhow::Error> {
+    debug!(target: "startup", "Rebuilding all views from events");
+    rebuild_receipt_inventory_view(pool).await?;
+    rebuild_redemption_view(pool).await?;
+    rebuild_receipt_burns_view(pool).await?;
+
+    validate_configured_asset_networks(pool, chain_registry).await?;
+
+    let vault_configs = run_all_receipt_backfills(
+        pool,
+        chain_registry,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await?;
+
+    if let Err(error) = run_startup_reconciliation_for_vaults(
+        chain_registry,
+        &vault_configs,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await
+    {
+        error.log();
+    }
+
+    // The synchronous recovery pass runs with a timeout before the HTTP server
+    // starts. Mints that need deferred or pending follow-up are handed to
+    // detached background scheduled-recovery tasks that intentionally outlive
+    // this timeout and run concurrently with request handling; their safety
+    // rests on cqrs-es optimistic concurrency and externalTxId idempotency, not
+    // on completing before the server is up. If the synchronous pass hangs it
+    // is cancelled and any remaining stuck aggregates are left for manual admin
+    // intervention.
+    let receipt_vaults: Vec<(u64, Address)> = vault_configs
+        .iter()
+        .map(|config| (config.chain_id, config.vault))
+        .collect();
+
+    run_recovery_with_timeout(pool, apalis_pool, managers, &receipt_vaults)
+        .await;
+
+    Ok(())
 }
 
 async fn prepare_corporate_action_feed(
@@ -1014,10 +1033,10 @@ fn setup_redemption_managers(
     redemption_store: &Arc<Store<Redemption>>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
-    bot_wallet: Address,
     lifecycle_notifier: Arc<dyn LifecycleNotifier>,
     apalis_pool: &ApalisSqlitePool,
 ) -> Result<RedemptionManagers, anyhow::Error> {
+    let bot_wallet = config.signer.address()?;
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),

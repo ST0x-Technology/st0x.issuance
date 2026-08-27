@@ -30,7 +30,7 @@ use crate::vault::TxId;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BurnJobError {
     #[error(transparent)]
-    Manager(#[from] BurnManagerError),
+    Manager(Box<BurnManagerError>),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
     #[error(transparent)]
@@ -75,7 +75,7 @@ impl Job<SubmitBurnContext> for SubmitBurnJob {
             Err(BurnManagerError::Redemption(RedemptionError::Vault {
                 ..
             })) => Ok(()),
-            Err(other) => Err(BurnJobError::Manager(other)),
+            Err(other) => Err(BurnJobError::Manager(Box::new(other))),
         }
     }
 }
@@ -138,14 +138,14 @@ impl Job<ConfirmBurnContext> for ConfirmBurnJob {
             )
             .await
         {
-            Ok(()) => Ok(()),
             // A definitive or uncertain confirm failure is handled inside the
-            // manager (recorded, or left for the recovery reconciler); this is
-            // not an apalis redrive.
-            Err(BurnManagerError::Redemption(RedemptionError::Vault {
+            // manager (recorded, or left for the recovery reconciler), so an Ok
+            // confirm and a swallowed Vault error both mean no apalis redrive.
+            Ok(())
+            | Err(BurnManagerError::Redemption(RedemptionError::Vault {
                 ..
             })) => Ok(()),
-            Err(other) => Err(BurnJobError::Manager(other)),
+            Err(other) => Err(BurnJobError::Manager(Box::new(other))),
         }
     }
 }
