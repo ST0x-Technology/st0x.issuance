@@ -683,10 +683,10 @@ mod tests {
         backfill_start_block: u64,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
         let pool = setup_test_db_with_asset(vault, ap_wallet).await;
-        build_poller(bot_wallet, asserter, backfill_start_block, pool)
+        build_poller(bot_wallet, asserter, backfill_start_block, pool).await
     }
 
-    fn build_poller(
+    async fn build_poller(
         bot_wallet: Address,
         asserter: &Asserter,
         backfill_start_block: u64,
@@ -699,9 +699,10 @@ mod tests {
             backfill_start_block,
             pool,
         )
+        .await
     }
 
-    fn build_poller_on_network(
+    async fn build_poller_on_network(
         network: Network,
         bot_wallet: Address,
         asserter: &Asserter,
@@ -729,6 +730,10 @@ mod tests {
 
         let vault_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
+
+        let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
+            .await
+            .expect("apalis test pool should connect");
         let burn_manager = Arc::new(
             crate::redemption::burn_manager::BurnManager::new_for_tests(
                 vault_service,
@@ -737,6 +742,7 @@ mod tests {
                 receipt_service,
                 bot_wallet,
                 ANVIL_CHAIN_ID,
+                apalis_pool,
             ),
         );
 
@@ -912,7 +918,7 @@ mod tests {
         asserter.push_success(&Vec::<Log>::new());
         asserter.push_success(&Vec::<Log>::new());
 
-        let setup = build_poller(bot_wallet, &asserter, 0, pool);
+        let setup = build_poller(bot_wallet, &asserter, 0, pool).await;
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
@@ -983,7 +989,8 @@ mod tests {
             &asserter,
             0,
             pool,
-        );
+        )
+        .await;
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
@@ -1141,7 +1148,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        let setup = build_poller(bot_wallet, &asserter, 0, pool);
+        let setup = build_poller(bot_wallet, &asserter, 0, pool).await;
 
         setup.poller.poll_once().await.unwrap();
 
@@ -1178,7 +1185,7 @@ mod tests {
             .await
             .unwrap();
 
-        let setup = build_poller(bot_wallet, &asserter, 0, pool);
+        let setup = build_poller(bot_wallet, &asserter, 0, pool).await;
 
         let result = setup.poller.poll_once().await;
 

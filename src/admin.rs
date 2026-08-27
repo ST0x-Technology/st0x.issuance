@@ -3767,31 +3767,28 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
+        let Redemption::BurnIntended { sendable_tx, .. } = store
+            .load(&metadata.issuer_request_id)
+            .await
+            .expect("aggregate should load")
+            .expect("redemption should exist")
+        else {
+            panic!("expected BurnIntended");
+        };
         store
             .send(
                 &metadata.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordBurnTxSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault: address!(
-                            "0xcccccccccccccccccccccccccccccccccccccccc"
-                        ),
-                        burns: vec![MultiBurnEntry {
-                            receipt_id: U256::from(99),
-                            burn_shares: U256::from(100),
-                            receipt_info: None,
-                            receipt_info_bytes: None,
-                        }],
-                        dust_shares: U256::ZERO,
-                        owner: Address::ZERO,
-                    },
-                    external_tx_id: Some(BurnExternalTxId::base(
+                    external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
-                    )),
+                    ),
+                    tx_id: sendable_tx.hash.into(),
+                    planned_burns: vec![],
                 },
             )
             .await
-            .expect("BurnTokens failed");
+            .expect("BurnTxSubmitted should persist");
 
         store
             .send(
@@ -4422,24 +4419,28 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
+        let Redemption::BurnIntended { sendable_tx, .. } = store
+            .load(&metadata.issuer_request_id)
+            .await
+            .expect("aggregate should load")
+            .expect("redemption should exist")
+        else {
+            panic!("expected BurnIntended");
+        };
         store
             .send(
                 &metadata.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordBurnTxSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault: address!(
-                            "0xcccccccccccccccccccccccccccccccccccccccc"
-                        ),
-                        burns,
-                        dust_shares: U256::ZERO,
-                        owner: Address::ZERO,
-                    },
-                    external_tx_id,
+                    external_tx_id: BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    ),
+                    tx_id: sendable_tx.hash.into(),
+                    planned_burns: vec![],
                 },
             )
             .await
-            .expect("BurnTokens failed");
+            .expect("BurnTxSubmitted should persist");
 
         store
             .send(
@@ -4836,21 +4837,27 @@ mod tests {
             )
             .await
             .expect("IntendBurn failed");
+        let Redemption::BurnIntended { sendable_tx, .. } = store
+            .load(&metadata.issuer_request_id)
+            .await
+            .expect("aggregate should load")
+            .expect("redemption should exist")
+        else {
+            panic!("expected BurnIntended");
+        };
         store
             .send(
                 &metadata.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    params: BurnParams::Orchestrator {
-                        token,
-                        amount: burn_amount,
-                        owner: Address::ZERO,
-                    },
-                    external_tx_id,
+                    external_tx_id: BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    ),
+                    tx_id: sendable_tx.hash.into(),
                 },
             )
             .await
-            .expect("BurnTokens failed");
+            .expect("BurnTxSubmitted should persist");
         store
             .send(
                 &metadata.issuer_request_id,

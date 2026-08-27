@@ -440,7 +440,6 @@ pub async fn initialize_rocket(
         ),
     );
 
-
     for (network, runtime) in chain_registry.runtimes() {
         background_task_handles.push(spawn_periodic_receipt_backfills(
             PeriodicBackfillSpawn {

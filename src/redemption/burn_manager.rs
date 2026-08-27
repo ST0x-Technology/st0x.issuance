@@ -132,13 +132,17 @@ pub(crate) enum RecoveryOutcome {
     AlreadyAdvanced,
 }
 
-/// Orchestrates the on-chain burning process in response to `AlpacaJournalCompleted` events.
+/// Orchestrates the on-chain burning process in response to
+/// `AlpacaJournalCompleted` events.
 ///
-/// The manager reacts to `AlpacaJournalCompleted` events by querying for a suitable receipt,
-/// then issues a `BurnTokens` command to the Redemption aggregate. The aggregate's command
-/// handler calls the vault service to perform the actual burn operation.
+/// The manager prepares and signs the burn, persists the intention, then
+/// enqueues the durable `SubmitBurnJob` and `ConfirmBurnJob`. Those jobs call
+/// back into `submit_intended_burn` and `confirm_submitted_burn`, which perform
+/// the vault I/O outside any aggregate transition and record each outcome
+/// through a pure command (`RecordBurnTxSubmitted`, `RecordBurnConfirmed`).
 ///
-/// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
+/// On burn failure, the manager issues a `RecordBurnFailure` command to record
+/// the error.
 #[derive(Clone)]
 pub(crate) struct BurnManager {
     /// Per-network vault services and chain ids for recovery paths.
@@ -3228,9 +3232,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnManager, BurnManagerError, DefinitiveConfirmFailure,
-        MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, RecoveryOutcome, Redemption,
-        RedemptionCommand, should_release_reserved_burn,
+        BurnExecutionPlan, BurnManager, BurnManagerError,
+        DefinitiveConfirmFailure, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+        RecoveryOutcome, Redemption, RedemptionCommand,
+        should_release_reserved_burn,
     };
     use crate::burn_excess::BurnExcessEvent;
     use crate::config::VaultMode;
@@ -3257,7 +3262,8 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnRange, BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
+        BurnRange, BurnRequestOrigin, BurnTxStatus, MultiBurnEntry,
+        MultiBurnParams, NetworkVaultServices, OrchestratorBurnParams,
         OrchestratorBurnReadiness, OrchestratorBurnResult,
         OrchestratorRevertReason, ReceiptInformation, SendableTxWithHash, TxId,
         VaultError, VaultService, VerifiedBurn, VerifiedShareTransfer,
@@ -3656,6 +3662,141 @@ mod tests {
         store.load(issuer_request_id).await.unwrap().unwrap()
     }
 
+    /// Reconstructs the `BurnExecutionPlan` the enqueued `SubmitBurnJob` would
+    /// carry from the persisted `BurnIntended` state, so a test can drive the
+    /// submit and confirm steps inline (the harness runs no apalis worker).
+    async fn intended_execution(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) -> BurnExecutionPlan {
+        let aggregate = load_aggregate(store, issuer_request_id).await;
+        let Redemption::BurnIntended {
+            metadata,
+            alpaca_quantity,
+            dust_quantity,
+            planned_burns,
+            external_tx_id,
+            ..
+        } = aggregate
+        else {
+            panic!("expected BurnIntended, got {aggregate:?}");
+        };
+        let dust_shares = dust_quantity.to_u256_with_18_decimals().unwrap();
+        let params = match &metadata.burn_mode {
+            VaultMode::VaultDirect => {
+                let burns = planned_burns
+                    .iter()
+                    .map(|burn| MultiBurnEntry {
+                        receipt_id: burn.receipt_id,
+                        burn_shares: burn.shares_burned,
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    })
+                    .collect();
+                BurnParams::VaultDirect {
+                    vault,
+                    burns,
+                    dust_shares,
+                    owner: TEST_WALLET,
+                }
+            }
+            VaultMode::Orchestrator { .. } => BurnParams::Orchestrator {
+                token: vault,
+                amount: alpaca_quantity.to_u256_with_18_decimals().unwrap(),
+                owner: TEST_WALLET,
+            },
+        };
+        BurnExecutionPlan {
+            network: metadata.network,
+            vault,
+            params,
+            planned_burns,
+            dust_shares,
+            external_tx_id,
+        }
+    }
+
+    /// Drives the enqueued submit then confirm chain inline from `BurnIntended`
+    /// to `Completed`, mirroring `SubmitBurnJob` then `ConfirmBurnJob`.
+    async fn drive_intended_burn_to_completion(
+        manager: &BurnManager,
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) {
+        let execution =
+            intended_execution(store, issuer_request_id, vault).await;
+        let tx_id = manager
+            .submit_intended_burn(issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
+        manager
+            .confirm_submitted_burn(issuer_request_id, &execution, tx_id)
+            .await
+            .expect("confirm_submitted_burn should record the confirmation");
+    }
+
+    /// Reconstructs the confirm-only execution a recovery `ConfirmBurnJob`
+    /// carries from the persisted `BurnSubmitted` state, plus the submitted
+    /// `tx_id`, mirroring `recovery_confirm_execution`.
+    async fn submitted_confirm_execution(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) -> (BurnExecutionPlan, TxId) {
+        let aggregate = load_aggregate(store, issuer_request_id).await;
+        let Redemption::BurnSubmitted {
+            metadata,
+            dust_quantity,
+            tx_id,
+            planned_burns,
+            ..
+        } = aggregate
+        else {
+            panic!("expected BurnSubmitted, got {aggregate:?}");
+        };
+        let dust_shares = dust_quantity.to_u256_with_18_decimals().unwrap();
+        let params = match &metadata.burn_mode {
+            VaultMode::VaultDirect => BurnParams::VaultDirect {
+                vault,
+                burns: vec![],
+                dust_shares,
+                owner: TEST_WALLET,
+            },
+            VaultMode::Orchestrator { .. } => BurnParams::Orchestrator {
+                token: vault,
+                amount: U256::ZERO,
+                owner: TEST_WALLET,
+            },
+        };
+        let execution = BurnExecutionPlan {
+            network: metadata.network,
+            vault,
+            params,
+            planned_burns,
+            dust_shares,
+            external_tx_id: None,
+        };
+        (execution, tx_id)
+    }
+
+    /// Drives the enqueued recovery `ConfirmBurnJob` inline from `BurnSubmitted`
+    /// to its confirmation outcome.
+    async fn drive_submitted_burn_confirm(
+        manager: &BurnManager,
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) {
+        let (execution, tx_id) =
+            submitted_confirm_execution(store, issuer_request_id, vault).await;
+        manager
+            .confirm_submitted_burn(issuer_request_id, &execution, tx_id)
+            .await
+            .expect("confirm_submitted_burn should record the confirmation");
+    }
+
     async fn persist_test_burn_intent(
         store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -3902,6 +4043,7 @@ mod tests {
             recording.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -3935,6 +4077,14 @@ mod tests {
             .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
             .await
             .expect("orchestrator burn should complete");
+
+        drive_intended_burn_to_completion(
+            &setup.manager,
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
 
         let aggregate =
             load_aggregate(&setup.harness.store, &setup.issuer_request_id)
@@ -4129,9 +4279,25 @@ mod tests {
         ))
         .await;
 
-        let result = setup
+        setup
             .manager
             .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("orchestrator intent should persist");
+        let execution = intended_execution(
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+        let tx_id = setup
+            .manager
+            .submit_intended_burn(&setup.issuer_request_id, &execution)
+            .await
+            .expect("submit should broadcast the orchestrator burn");
+        let result = setup
+            .manager
+            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
             .await;
         assert!(result.is_err(), "revert must surface as an error");
 
@@ -4278,19 +4444,39 @@ mod tests {
             )
             .await
             .expect("orchestrator intent should persist");
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await
+        else {
+            panic!("expected BurnIntended");
+        };
+        let submitted = setup
+            .vault_mock
+            .submit_orchestrator_burn(
+                &OrchestratorBurnParams {
+                    orchestrator: setup.vault,
+                    token: setup.vault,
+                    amount: uint!(100_000000000000000000_U256),
+                    owner: TEST_WALLET,
+                    issuer_request_id: setup.issuer_request_id.clone(),
+                    detected_tx_hash: B256::ZERO,
+                    external_tx_id: None,
+                },
+                &sendable_tx,
+            )
+            .await
+            .expect("mock orchestrator submit should succeed");
         setup
             .harness
             .store
             .send(
                 &setup.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
                     issuer_request_id: setup.issuer_request_id.clone(),
-                    params: BurnParams::Orchestrator {
-                        token: setup.vault,
-                        amount: uint!(100_000000000000000000_U256),
-                        owner: TEST_WALLET,
-                    },
-                    external_tx_id: None,
+                    external_tx_id: BurnExternalTxId::from_string(
+                        submitted.external_tx_id,
+                    ),
+                    tx_id: submitted.tx_id,
                 },
             )
             .await
@@ -4299,6 +4485,13 @@ mod tests {
 
         setup.vault_mock.set_burn_tx_status(BurnTxStatus::Mined);
         setup.manager.recover_unresolved_burns().await;
+        drive_submitted_burn_confirm(
+            &setup.manager,
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
 
         let aggregate =
             load_aggregate(&setup.harness.store, &setup.issuer_request_id)
@@ -4320,7 +4513,11 @@ mod tests {
         );
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Burn confirmed successfully during recovery"]
+            &["Recovering BurnSubmitted redemption - enqueuing confirm job"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Burn confirmed successfully"]
         ));
     }
 
@@ -4347,19 +4544,39 @@ mod tests {
             )
             .await
             .expect("orchestrator intent should persist");
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await
+        else {
+            panic!("expected BurnIntended");
+        };
+        let submitted = setup
+            .vault_mock
+            .submit_orchestrator_burn(
+                &OrchestratorBurnParams {
+                    orchestrator: setup.vault,
+                    token: setup.vault,
+                    amount: uint!(100_000000000000000000_U256),
+                    owner: TEST_WALLET,
+                    issuer_request_id: setup.issuer_request_id.clone(),
+                    detected_tx_hash: B256::ZERO,
+                    external_tx_id: None,
+                },
+                &sendable_tx,
+            )
+            .await
+            .expect("mock orchestrator submit should succeed");
         setup
             .harness
             .store
             .send(
                 &setup.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
                     issuer_request_id: setup.issuer_request_id.clone(),
-                    params: BurnParams::Orchestrator {
-                        token: setup.vault,
-                        amount: uint!(100_000000000000000000_U256),
-                        owner: TEST_WALLET,
-                    },
-                    external_tx_id: None,
+                    external_tx_id: BurnExternalTxId::from_string(
+                        submitted.external_tx_id,
+                    ),
+                    tx_id: submitted.tx_id,
                 },
             )
             .await
@@ -4624,9 +4841,31 @@ mod tests {
         ))
         .await;
 
-        let result = setup
+        setup
             .manager
             .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("enqueuing the submit job is not an error");
+
+        // No apalis worker drains the queue in unit tests, so drive the
+        // enqueued submit then confirm inline. The sticky orchestrator revert
+        // fails the confirm the same way the old inline path did.
+        let execution = intended_execution(
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+        let tx_id = setup
+            .manager
+            .submit_intended_burn(&setup.issuer_request_id, &execution)
+            .await
+            .expect(
+                "submit_intended_burn should broadcast the orchestrator burn",
+            );
+        let result = setup
+            .manager
+            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
             .await;
         assert!(result.is_err(), "the reverted burn must surface as an error");
         assert_eq!(setup.vault_mock.orchestrator_submit_call_count(), 1);
@@ -4636,6 +4875,26 @@ mod tests {
         // retry (ResumeBurn -> handle_burning_started) rather than the
         // orchestrator-with-tx deferral or the vault-direct confirm path.
         setup.manager.recover_unresolved_burns().await;
+
+        // The recovery pass re-enqueued the submit; drive it and the confirm
+        // inline. The sticky revert fails the retry the same way.
+        let execution = intended_execution(
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+        let tx_id = setup
+            .manager
+            .submit_intended_burn(&setup.issuer_request_id, &execution)
+            .await
+            .expect(
+                "submit_intended_burn should broadcast the orchestrator burn",
+            );
+        let _ = setup
+            .manager
+            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
+            .await;
 
         assert_eq!(
             setup.vault_mock.orchestrator_submit_call_count(),
@@ -4699,19 +4958,23 @@ mod tests {
             )
             .await
             .expect("orchestrator intent should persist");
+        let Redemption::BurnIntended { sendable_tx, metadata, .. } =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await
+        else {
+            panic!("expected BurnIntended");
+        };
         setup
             .harness
             .store
             .send(
                 &setup.issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
                     issuer_request_id: setup.issuer_request_id.clone(),
-                    params: BurnParams::Orchestrator {
-                        token: setup.vault,
-                        amount: uint!(100_000000000000000000_U256),
-                        owner: TEST_WALLET,
-                    },
-                    external_tx_id: None,
+                    external_tx_id: BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    ),
+                    tx_id: sendable_tx.hash.into(),
                 },
             )
             .await
@@ -4804,6 +5067,14 @@ mod tests {
             .set_orchestrator_readiness(OrchestratorBurnReadiness::Ready);
         setup.manager.recover_unresolved_burns().await;
 
+        drive_intended_burn_to_completion(
+            &setup.manager,
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+
         let aggregate =
             load_aggregate(&setup.harness.store, &setup.issuer_request_id)
                 .await;
@@ -4862,6 +5133,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4883,6 +5155,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
@@ -4948,6 +5228,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5087,6 +5368,7 @@ mod tests {
             recording.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5161,6 +5443,7 @@ mod tests {
             recording.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5250,6 +5533,7 @@ mod tests {
                 recording.clone(),
                 owner,
                 ANVIL_CHAIN_ID,
+                harness.apalis_pool.clone(),
             );
 
             let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5344,6 +5628,7 @@ mod tests {
             recording.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5416,6 +5701,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5475,6 +5761,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5518,6 +5805,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -5559,6 +5847,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         // An unknown redemption is Uninitialized — force-complete must refuse
@@ -5603,6 +5892,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5676,6 +5966,13 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
+
         let params = vault_mock
             .get_last_multi_burn_params()
             .expect("Expected multi_burn to have been called");
@@ -5713,6 +6010,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let receipt_info = ReceiptInformation::new(
@@ -5752,11 +6050,49 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
+            .await
+            .expect("handle_burning_started only enqueues now");
 
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+        let intended = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::BurnIntended {
+            metadata,
+            dust_quantity,
+            planned_burns,
+            external_tx_id,
+            ..
+        } = intended
+        else {
+            panic!("expected BurnIntended, got {intended:?}");
+        };
+        let dust_shares = dust_quantity.to_u256_with_18_decimals().unwrap();
+        let burns: Vec<MultiBurnEntry> = planned_burns
+            .iter()
+            .map(|burn| MultiBurnEntry {
+                receipt_id: burn.receipt_id,
+                burn_shares: burn.shares_burned,
+                receipt_info: Some(receipt_info.clone()),
+                receipt_info_bytes: None,
+            })
+            .collect();
+        let execution = BurnExecutionPlan {
+            network: metadata.network,
+            vault,
+            params: BurnParams::VaultDirect {
+                vault,
+                burns,
+                dust_shares,
+                owner: TEST_WALLET,
+            },
+            planned_burns,
+            dust_shares,
+            external_tx_id,
+        };
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
 
         let params = vault_mock
             .get_last_multi_burn_params()
@@ -5799,6 +6135,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let receipt_info = ReceiptInformation::new(
@@ -5827,7 +6164,7 @@ mod tests {
                     source: ReceiptSource::Itn {
                         issuer_request_id: IssuerMintRequestId::random(),
                     },
-                    receipt_info: Some(Box::new(receipt_info)),
+                    receipt_info: Some(Box::new(receipt_info.clone())),
                     receipt_info_bytes: Some(raw_bytes.clone()),
                 },
             )
@@ -5840,11 +6177,49 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
+            .await
+            .expect("handle_burning_started only enqueues now");
 
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+        let intended = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::BurnIntended {
+            metadata,
+            dust_quantity,
+            planned_burns,
+            external_tx_id,
+            ..
+        } = intended
+        else {
+            panic!("expected BurnIntended, got {intended:?}");
+        };
+        let dust_shares = dust_quantity.to_u256_with_18_decimals().unwrap();
+        let burns: Vec<MultiBurnEntry> = planned_burns
+            .iter()
+            .map(|burn| MultiBurnEntry {
+                receipt_id: burn.receipt_id,
+                burn_shares: burn.shares_burned,
+                receipt_info: Some(receipt_info.clone()),
+                receipt_info_bytes: Some(raw_bytes.clone()),
+            })
+            .collect();
+        let execution = BurnExecutionPlan {
+            network: metadata.network,
+            vault,
+            params: BurnParams::VaultDirect {
+                vault,
+                burns,
+                dust_shares,
+                owner: TEST_WALLET,
+            },
+            planned_burns,
+            dust_shares,
+            external_tx_id,
+        };
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
 
         let params = vault_mock
             .get_last_multi_burn_params()
@@ -5878,6 +6253,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5894,8 +6270,19 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("handle_burning_started only enqueues now");
+
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        let tx_id = manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit ok");
+        let result = manager
+            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
             .await;
 
         assert!(
@@ -5953,6 +6340,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -5968,9 +6356,15 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
+            .await
+            .expect("handle_burning_started only enqueues now");
+
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        let result =
+            manager.submit_intended_burn(&issuer_request_id, &execution).await;
 
         assert!(
             matches!(
@@ -6015,6 +6409,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6030,9 +6425,15 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
+            .await
+            .expect("handle_burning_started only enqueues now");
+
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        let result =
+            manager.submit_intended_burn(&issuer_request_id, &execution).await;
 
         assert!(
             matches!(
@@ -6077,6 +6478,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6092,8 +6494,19 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
-        let result = manager
+        manager
             .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("handle_burning_started only enqueues now");
+
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        let tx_id = manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit ok");
+        let result = manager
+            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
             .await;
 
         assert!(
@@ -6135,6 +6548,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6177,6 +6591,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6241,6 +6656,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6262,6 +6678,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
@@ -6291,6 +6715,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6373,6 +6798,14 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
+
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
@@ -6399,6 +6832,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6420,6 +6854,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -6447,6 +6889,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6477,6 +6920,14 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
+
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
@@ -6503,6 +6954,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6545,6 +6997,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         manager.recover_burning_redemptions().await;
@@ -6565,6 +7018,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6672,6 +7126,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6688,6 +7143,14 @@ mod tests {
             .await;
 
         manager.recover_burning_redemptions().await;
+
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
@@ -6722,6 +7185,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6763,6 +7227,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6828,6 +7293,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6869,6 +7335,14 @@ mod tests {
         // Recovery should find the BurnFailed view and retry
         manager.recover_burn_failed_redemptions().await;
 
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
+
         // Burn should have been retried
         assert_eq!(
             vault_mock.get_multi_burn_call_count(),
@@ -6907,6 +7381,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -6983,6 +7458,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7118,6 +7594,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7187,6 +7664,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7212,6 +7690,14 @@ mod tests {
             .expect("RecordBurnFailure failed");
 
         manager.recover_burn_failed_redemptions().await;
+
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         let aggregate = load_aggregate(store, &issuer_request_id).await;
         assert!(
@@ -7245,6 +7731,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7298,6 +7785,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7396,6 +7884,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -7500,6 +7989,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let tx_id = TxId::random();
 
@@ -7583,8 +8073,9 @@ mod tests {
         ));
     }
 
-    /// Recovery must re-broadcast the exact persisted transaction before
-    /// confirming it, covering a crash after persistence but before broadcast.
+    /// Exhausts the automatic recovery budget: each pass now enqueues a
+    /// durable job (never broadcasts inline), and reaching the cap persists
+    /// exhaustion, keeps the reservation, and signs no further transaction.
     async fn exhaust_restarted_recovery_budget(
         manager: &BurnManager,
         vault_mock: &MockVaultService,
@@ -7597,10 +8088,15 @@ mod tests {
         let (prepared_tx, replacement_tx) = transactions;
         vault_mock.set_burn_tx_status(BurnTxStatus::StillMineable);
 
+        // Recovery now enqueues a SubmitBurnJob per pass instead of
+        // broadcasting inline; the broadcast count reflects only the two
+        // drives the caller already performed (persisted tx + replacement).
+        let broadcasts_before = vault_mock.get_multi_burn_call_count();
+
         for _ in 0..3 {
             assert!(matches!(
                 manager.recover_single_burning(issuer_request_id).await,
-                Ok(RecoveryOutcome::Executed)
+                Ok(RecoveryOutcome::EnqueuedBurnJob)
             ));
         }
         let classifications_at_cap =
@@ -7637,8 +8133,9 @@ mod tests {
         );
         assert_eq!(
             vault_mock.get_multi_burn_call_count(),
-            5,
-            "only five automatic recovery broadcasts are allowed"
+            broadcasts_before,
+            "enqueue-only recovery must not broadcast inline, and a \
+             BurnSubmitted burn is never re-broadcast"
         );
         assert!(
             receipt_service
@@ -7650,13 +8147,8 @@ mod tests {
         );
         assert_eq!(
             vault_mock.submitted_burn_txs(),
-            vec![
-                prepared_tx,
-                replacement_tx.clone(),
-                replacement_tx.clone(),
-                replacement_tx.clone(),
-                replacement_tx.clone(),
-            ]
+            vec![prepared_tx, replacement_tx.clone()],
+            "only the two driven broadcasts reached the chain"
         );
         let aggregate_id = issuer_request_id.to_string();
         let exhaustion_events: i64 = sqlx::query_scalar(
@@ -7712,7 +8204,17 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("file-backed database should connect");
-        let harness = TestHarness::with_pool(vault_mock.clone(), pool).await;
+        let apalis_options =
+            apalis_sqlite::SqliteConnectOptions::from_str(&database_url)
+                .expect("valid sqlite url")
+                .pragma("journal_mode", "WAL")
+                .busy_timeout(Duration::from_secs(5));
+        let apalis_pool =
+            apalis_sqlite::SqlitePool::connect_with(apalis_options)
+                .await
+                .expect("Failed to create apalis test pool");
+        let harness =
+            TestHarness::with_pool(vault_mock.clone(), pool, apalis_pool).await;
         let TestHarness { store, receipt_service, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -7814,15 +8316,25 @@ mod tests {
             restarted_receipt_service.clone(),
             recovery_owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let result = manager.recover_single_burning(&issuer_request_id).await;
 
-        assert!(matches!(result, Ok(RecoveryOutcome::Executed)));
+        // Recovery now enqueues a SubmitBurnJob rather than broadcasting
+        // inline; drive the enqueued submit to broadcast the persisted tx.
+        assert!(matches!(result, Ok(RecoveryOutcome::EnqueuedBurnJob)));
+        let execution =
+            intended_execution(&restarted_store, &issuer_request_id, vault)
+                .await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("driving the enqueued submit should broadcast");
 
         assert_eq!(
             vault_mock.get_multi_burn_call_count(),
             1,
-            "recovery must broadcast the persisted transaction exactly once"
+            "driving recovery must broadcast the persisted transaction exactly once"
         );
         assert_eq!(
             vault_mock.burn_preparation_call_count(),
@@ -7839,6 +8351,19 @@ mod tests {
         let updated =
             load_aggregate(&restarted_store, &issuer_request_id).await;
         assert!(matches!(updated, Redemption::BurnSubmitted { .. }));
+
+        // Idempotency: re-running the submit job against the now-BurnSubmitted
+        // redemption must NOT re-broadcast (submit_intended_burn short-circuits
+        // on BurnSubmitted), so the broadcast count stays flat.
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("a rerun submit on a BurnSubmitted redemption is a no-op");
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            1,
+            "a BurnSubmitted redemption must never be re-broadcast"
+        );
 
         assert!(
             restarted_receipt_service
@@ -7863,8 +8388,22 @@ mod tests {
         vault_mock.set_prepared_tx(replacement_tx.clone());
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::Executed)
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
         ));
+        // The provably-dead replacement was signed and enqueued; drive its
+        // submit so the fresh replacement actually broadcasts.
+        let replacement_execution =
+            intended_execution(&restarted_store, &issuer_request_id, vault)
+                .await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &replacement_execution)
+            .await
+            .expect("driving the enqueued replacement submit should broadcast");
+        assert_eq!(
+            vault_mock.submitted_burn_txs(),
+            vec![prepared_tx.clone(), replacement_tx.clone()],
+            "the replacement path must broadcast the fresh replacement"
+        );
         assert!(
             restarted_receipt_service
                 .reserved_redemptions(ANVIL_CHAIN_ID, vault)
@@ -7923,6 +8462,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8049,6 +8589,7 @@ mod tests {
             receipt_service.clone(),
             recovery_owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8078,8 +8619,14 @@ mod tests {
 
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::Executed)
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
         ));
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the replacement");
         assert_eq!(
             vault_mock.submitted_burn_txs(),
             vec![replacement_tx.clone()]
@@ -8182,6 +8729,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
@@ -8265,9 +8813,15 @@ mod tests {
 
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::Executed)
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
         ));
         assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the replacement");
         assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
     }
 
@@ -8352,6 +8906,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
@@ -8388,9 +8943,15 @@ mod tests {
 
         assert!(matches!(
             manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::Executed)
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
         ));
         assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the replacement");
         assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
     }
 
@@ -8433,6 +8994,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -8462,6 +9024,13 @@ mod tests {
             .await
             .expect("the burn must proceed once the excess stream resolves");
         release.await.unwrap();
+        drive_intended_burn_to_completion(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         assert_eq!(
             vault_mock.get_multi_burn_call_count(),
@@ -8506,6 +9075,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8600,6 +9170,7 @@ mod tests {
             receipt_service.clone(),
             owner,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8666,6 +9237,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8767,6 +9339,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8834,6 +9407,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
@@ -8900,7 +9474,59 @@ mod tests {
             Bytes::from_static(&[0xca, 0xfe]),
         );
         vault_mock.set_prepared_tx(replacement_tx.clone());
+        // The recovery reconciler now enqueues durable jobs instead of
+        // confirming/broadcasting inline; drive each enqueued step to
+        // reproduce the full failed-recovery retry.
+        //
+        // Pass 1: the reverted persisted burn is routed to a ConfirmBurnJob.
         manager.recover_unresolved_burns().await;
+        // Drive the confirm: the revert reserves the fifth (final) recovery
+        // attempt as a Replace and releases the reservation.
+        let reverted_confirm = BurnExecutionPlan {
+            network: Network::Base,
+            vault,
+            params: BurnParams::VaultDirect {
+                vault,
+                burns: vec![],
+                dust_shares: U256::ZERO,
+                owner: TEST_WALLET,
+            },
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(99_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            dust_shares: U256::ZERO,
+            external_tx_id: None,
+        };
+        manager
+            .confirm_submitted_burn(
+                &issuer_request_id,
+                &reverted_confirm,
+                persisted_tx.hash.into(),
+            )
+            .await
+            .expect_err("the reverted persisted burn confirmation must fail");
+        // Pass 2: the failed-state pass resumes the burn and enqueues the
+        // scheduled fresh replacement submit.
+        manager.recover_unresolved_burns().await;
+        let replacement_execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &replacement_execution)
+            .await
+            .expect("driving the replacement submit should broadcast");
+        // Drive the replacement confirm: it reverts too, and with the budget
+        // now at the cap this records exhaustion and terminalizes.
+        let (replacement_confirm, replacement_tx_id) =
+            submitted_confirm_execution(store, &issuer_request_id, vault).await;
+        manager
+            .confirm_submitted_burn(
+                &issuer_request_id,
+                &replacement_confirm,
+                replacement_tx_id,
+            )
+            .await
+            .expect_err("the reverted replacement confirmation must fail");
 
         assert!(matches!(
             load_aggregate(store, &issuer_request_id).await,
@@ -8947,7 +9573,7 @@ mod tests {
         assert_eq!(exhaustion_events, 1);
         assert!(logs_contain_at!(
             tracing::Level::WARN,
-            &["BurnIntended confirmation failed during recovery"]
+            &["Burn confirmation failed"]
         ));
 
         assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
@@ -8991,6 +9617,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
@@ -9005,9 +9632,15 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
+        manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("handle_burning_started should enqueue the submit");
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
         assert!(
             manager
-                .handle_burning_started(&issuer_request_id, &aggregate)
+                .submit_intended_burn(&issuer_request_id, &execution)
                 .await
                 .is_err(),
             "ambiguous broadcast failure must be reported"
@@ -9072,6 +9705,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
@@ -9085,9 +9719,19 @@ mod tests {
             create_test_redemption_in_burning_state(store, &issuer_request_id)
                 .await;
 
+        manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("handle_burning_started should enqueue the submit");
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        let tx_id = manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
         assert!(
             manager
-                .handle_burning_started(&issuer_request_id, &aggregate)
+                .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
                 .await
                 .is_err(),
             "an unresolved confirmation must remain visible to the caller"
@@ -9133,6 +9777,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -9224,6 +9869,7 @@ mod tests {
             receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -9265,27 +9911,51 @@ mod tests {
             .await
             .expect("IntendBurn should succeed");
 
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(store, &issuer_request_id).await
+        else {
+            panic!("expected BurnIntended");
+        };
+        let submitted = vault_mock
+            .submit_burn(
+                MultiBurnParams {
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(99_U256),
+                        burn_shares: uint!(100_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: TEST_WALLET,
+                    user: TEST_WALLET,
+                    origin: BurnRequestOrigin::Redemption(
+                        issuer_request_id.clone(),
+                    ),
+                    detected_tx_hash: B256::ZERO,
+                    external_tx_id: None,
+                },
+                sendable_tx.clone(),
+            )
+            .await
+            .expect("mock burn submit should succeed");
         store
             .send(
                 &issuer_request_id,
-                RedemptionCommand::BurnTokens {
+                RedemptionCommand::RecordBurnTxSubmitted {
                     issuer_request_id: issuer_request_id.clone(),
-                    params: BurnParams::VaultDirect {
-                        vault,
-                        burns: vec![crate::vault::MultiBurnEntry {
-                            receipt_id: uint!(99_U256),
-                            burn_shares: uint!(100_000000000000000000_U256),
-                            receipt_info: None,
-                            receipt_info_bytes: None,
-                        }],
-                        dust_shares: U256::ZERO,
-                        owner: TEST_WALLET,
-                    },
-                    external_tx_id: None,
+                    external_tx_id: BurnExternalTxId::from_string(
+                        submitted.external_tx_id,
+                    ),
+                    tx_id: submitted.tx_id,
+                    planned_burns: vec![BurnRecord {
+                        receipt_id: uint!(99_U256),
+                        shares_burned: uint!(100_000000000000000000_U256),
+                    }],
                 },
             )
             .await
-            .expect("BurnTokens should succeed");
+            .expect("BurnTxSubmitted should persist");
 
         // Verify aggregate is in BurnSubmitted state
         let aggregate = load_aggregate(store, &issuer_request_id).await;
@@ -9301,6 +9971,13 @@ mod tests {
         // is BurnSubmitted) and confirm the existing transaction
         // without submitting a new burn.
         manager.recover_burning_redemptions().await;
+        drive_submitted_burn_confirm(
+            &manager,
+            store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         // Verify: no new submit_burn calls — recovery confirmed the existing tx
         assert_eq!(
@@ -9358,6 +10035,7 @@ mod tests {
             harness.receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         // Receipt 1 funds the real burn; receipt 2 will hold the stuck
@@ -9387,6 +10065,13 @@ mod tests {
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await
             .unwrap();
+        drive_intended_burn_to_completion(
+            &manager,
+            &harness.store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
 
         seed_stuck_reservation(
             &harness,
@@ -9438,6 +10123,7 @@ mod tests {
             harness.receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         harness
@@ -9467,6 +10153,13 @@ mod tests {
             .handle_burning_started(&vault_direct_id, &vault_direct_aggregate)
             .await
             .unwrap();
+        drive_intended_burn_to_completion(
+            &manager,
+            &harness.store,
+            &vault_direct_id,
+            vault,
+        )
+        .await;
         seed_stuck_reservation(
             &harness,
             vault,
@@ -9489,6 +10182,13 @@ mod tests {
             .handle_burning_started(&orchestrator_id, &orchestrator_aggregate)
             .await
             .unwrap();
+        drive_intended_burn_to_completion(
+            &manager,
+            &harness.store,
+            &orchestrator_id,
+            vault,
+        )
+        .await;
 
         let reserved_before = harness
             .receipt_service
@@ -9553,6 +10253,7 @@ mod tests {
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
+            harness.apalis_pool.clone(),
         );
 
         harness
@@ -9580,6 +10281,13 @@ mod tests {
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await
             .unwrap();
+        drive_intended_burn_to_completion(
+            &manager,
+            &harness.store,
+            &issuer_request_id,
+            vault,
+        )
+        .await;
         assert!(matches!(
             load_aggregate(&harness.store, &issuer_request_id).await,
             Redemption::Completed { .. }
@@ -9610,6 +10318,7 @@ mod tests {
             harness.store.clone(),
             settle_failing,
             TEST_WALLET,
+            harness.apalis_pool.clone(),
         );
 
         failing_manager
@@ -9665,6 +10374,7 @@ mod tests {
             harness.receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         harness
@@ -9684,6 +10394,15 @@ mod tests {
         .await;
         let _ = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+        let execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        let tx_id = manager
+            .submit_intended_burn(&issuer_request_id, &execution)
+            .await
+            .expect("submit_intended_burn should broadcast the persisted burn");
+        let _ = manager
+            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
             .await;
         assert!(matches!(
             load_aggregate(&harness.store, &issuer_request_id).await,
@@ -9728,6 +10447,7 @@ mod tests {
             harness.receipt_service.clone(),
             TEST_WALLET,
             ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
         );
 
         harness

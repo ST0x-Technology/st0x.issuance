@@ -9,7 +9,7 @@ use crate::redemption::event::BurnFailureClassification;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{BurnRange, MultiBurnEntry, TxId};
 
-/// Mode-specific burn parameters carried by `IntendBurn` and `BurnTokens`.
+/// Mode-specific burn parameters carried by `IntendBurn`.
 ///
 /// The handler cross-checks the variant against the redemption's persisted
 /// `burn_mode` anchor and rejects a mismatch, so a caller can never drive a
@@ -102,27 +102,6 @@ pub(crate) enum RedemptionCommand {
     MarkFailed {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
-    },
-    /// Broadcasts the exact transaction persisted by `IntendBurn`.
-    /// Produces `BurnTxSubmitted` (vault-direct) or
-    /// `OrchestratorBurnSubmitted` (orchestrator) on success, or the caller
-    /// records failure.
-    BurnTokens {
-        issuer_request_id: IssuerRedemptionRequestId,
-        params: BurnParams,
-        /// Optional deterministic transaction `externalTxId` override.
-        /// Used when retrying a replacement burn after a prior accepted
-        /// transaction burn terminally failed.
-        #[serde(default)]
-        external_tx_id: Option<BurnExternalTxId>,
-    },
-
-    /// Confirms a previously submitted burn transaction.
-    /// Polls the signing backend and produces `TokensBurned` or error.
-    ConfirmBurn {
-        issuer_request_id: IssuerRedemptionRequestId,
-        tx_id: TxId,
-        dust_shares: U256,
     },
 
     /// Records a VaultDirect burn BROADCAST performed by the durable
