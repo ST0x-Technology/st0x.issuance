@@ -387,7 +387,12 @@ pub async fn initialize_rocket(
             )),
             bot: bot_wallet,
         },
+        shutdown_rx.clone(),
+    ));
+    background_task_handles.extend(spawn_redemption_background_tasks(
         managers.burn.clone(),
+        pool.clone(),
+        apalis_pool.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -2112,12 +2117,11 @@ struct MintJobWorkers {
     bot: Address,
 }
 
-/// Starts mint recovery, per-step mint jobs, and burn reconciliation only after
-/// the synchronous startup recovery pass has completed. This prevents a stale
-/// durable job and startup recovery from driving the same side effect at once.
+/// Starts mint recovery and the per-step mint jobs only after the synchronous
+/// startup recovery pass has completed. This prevents a stale durable job and
+/// startup recovery from driving the same side effect at once.
 fn spawn_mint_background_tasks(
     workers: MintJobWorkers,
-    burn: Arc<BurnManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = vec![
@@ -2134,15 +2138,23 @@ fn spawn_mint_background_tasks(
             workers.apalis_pool.clone(),
             shutdown.clone(),
         ),
-        spawn_burn_recovery_reconciler(burn.clone(), shutdown.clone()),
     ];
-    handles.extend(spawn_burn_job_workers(
-        burn,
-        workers.pool.clone(),
-        workers.apalis_pool.clone(),
-        shutdown.clone(),
-    ));
     handles.extend(spawn_mint_job_workers(workers, shutdown));
+    handles
+}
+
+/// Starts burn reconciliation and the per-step burn jobs only after the
+/// synchronous startup recovery pass has completed. This prevents a stale
+/// durable job and startup recovery from driving the same side effect at once.
+fn spawn_redemption_background_tasks(
+    burn: Arc<BurnManager>,
+    pool: Pool<Sqlite>,
+    apalis_pool: ApalisSqlitePool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    let mut handles =
+        vec![spawn_burn_recovery_reconciler(burn.clone(), shutdown.clone())];
+    handles.extend(spawn_burn_job_workers(burn, pool, apalis_pool, shutdown));
     handles
 }
 
