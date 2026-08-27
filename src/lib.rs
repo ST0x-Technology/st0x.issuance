@@ -748,7 +748,14 @@ fn log_background_task_failure(
     }
 }
 
-/// Server address and client-IP source, which move together.
+/// Port Rocket listens on when it is the public listener itself.
+pub(crate) const DIRECT_PORT: u16 = 8000;
+
+/// Port Rocket listens on behind the nginx TLS proxy. Deliberately not
+/// [`DIRECT_PORT`]: see [`server_figment`].
+pub(crate) const PROXIED_PORT: u16 = 8001;
+
+/// Listening socket and client-IP source, which move together.
 ///
 /// Behind the proxy (`nix/ingress.nix`, `st0x.ingress.behindProxy`) Rocket
 /// binds loopback so nginx is the only way in, and the client IP the auth
@@ -760,15 +767,34 @@ fn log_background_task_failure(
 /// Without the proxy, header-based detection stays off and the TCP source is
 /// the client IP. Rocket has no PROXY-protocol support, so a proxy that
 /// preserves the source only at the network layer is not an option.
+///
+/// # Why the port differs between the two modes
+///
+/// The unit carrying `BEHIND_PROXY` sets `restartIfChanged = false`
+/// (`nix/upgradeable-services.nix`), so a system-profile activation writes a
+/// new value into the unit file without restarting the running process. On
+/// its own that lets nginx start proxying while the app still reads the TCP
+/// source, and every proxied request then arrives as `127.0.0.1` -- inside
+/// `INTERNAL_IP_RANGES`, which drops the two proxied `InternalAuth` routes to
+/// a bare check of a key Alpaca also holds.
+///
+/// Giving each mode its own port makes that state fail closed instead: nginx
+/// proxies to [`PROXIED_PORT`], so a process still running in direct mode is
+/// simply not there and nginx answers 502. A missed restart is a loud outage
+/// rather than a silent loss of the IP whitelist.
 fn server_figment(behind_proxy: bool) -> rocket::figment::Figment {
-    let figment = rocket::Config::figment().merge(("port", 8000));
+    let figment = rocket::Config::figment();
 
     if behind_proxy {
         figment
+            .merge(("port", PROXIED_PORT))
             .merge(("address", "127.0.0.1"))
             .merge(("ip_header", "X-Real-IP"))
     } else {
-        figment.merge(("address", "0.0.0.0")).merge(("ip_header", false))
+        figment
+            .merge(("port", DIRECT_PORT))
+            .merge(("address", "0.0.0.0"))
+            .merge(("ip_header", false))
     }
 }
 
@@ -2290,12 +2316,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BURN_RECOVERY_RECONCILE_INTERVAL, BackgroundTasks, Environment,
-        Quantity, QuantityConversionError, ReceiptContractAddress,
-        ReconciliationFailures, VaultAddress, VaultBackfillConfig,
-        cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
-        run_burn_recovery_reconciler, run_startup_reconciliation_for_vaults,
-        server_figment,
+        BURN_RECOVERY_RECONCILE_INTERVAL, BackgroundTasks, DIRECT_PORT,
+        Environment, PROXIED_PORT, Quantity, QuantityConversionError,
+        ReceiptContractAddress, ReconciliationFailures, VaultAddress,
+        VaultBackfillConfig, cached_receipt_contract, mount_api_docs,
+        next_receipt_backfill_block, run_burn_recovery_reconciler,
+        run_startup_reconciliation_for_vaults, server_figment,
     };
     use crate::chain::{ChainRegistry, ChainRegistryError};
     use crate::receipt_inventory::ReceiptInventory;
@@ -2332,15 +2358,23 @@ mod tests {
         );
     }
 
+    /// The ports must differ. nginx proxies to the proxied port only, so a
+    /// process that missed the restart and is still in direct mode cannot be
+    /// reached through it: nginx 502s instead of handing the app requests it
+    /// would read as coming from 127.0.0.1 and wave past the IP whitelist.
     #[test]
-    fn both_server_shapes_listen_on_the_same_port() {
-        assert_eq!(
-            server_figment(false).extract_inner::<u16>("port").unwrap(),
-            8000
-        );
-        assert_eq!(
-            server_figment(true).extract_inner::<u16>("port").unwrap(),
-            8000
+    fn each_server_shape_listens_on_its_own_port() {
+        let direct =
+            server_figment(false).extract_inner::<u16>("port").unwrap();
+        let proxied =
+            server_figment(true).extract_inner::<u16>("port").unwrap();
+
+        assert_eq!(direct, DIRECT_PORT);
+        assert_eq!(proxied, PROXIED_PORT);
+        assert_ne!(
+            direct, proxied,
+            "a shared port lets a stale direct-mode process serve proxied \
+             requests as loopback"
         );
     }
 

@@ -160,6 +160,15 @@ The http-01 challenge is what needs port 80. If it cannot be reached, the
 deploy-rs rolls the generation back. Re-run the deploy once the record and the
 firewall rule exist.
 
+**Flipping `st0x.ingress.behindProxy` needs `DeployAll`, not `DeployNixos`.**
+The system profile carries nginx and the firewall; only the service profile
+restarts the app, and that unit sets `restartIfChanged = false`, so a
+system-only deploy never moves the app into proxy mode. The app binds a
+different port in each mode (8000 direct, 8001 proxied), so a half-applied
+flip shows up as nginx returning 502 rather than as requests reaching the app
+with a spoofable source address. Run `nix run .#<env>DeployAll` and let both
+profiles land.
+
 ---
 
 ## Database (one-time, per environment)

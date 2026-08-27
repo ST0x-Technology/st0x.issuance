@@ -26,6 +26,12 @@
 # http://<ip>:8000 moved to the HTTPS name, and the port-8000 firewall rule
 # dropped from infra/.
 #
+# Deploy the flip with `nix run .#<env>DeployAll`, never `.#<env>DeployNixos`.
+# The system profile carries the nginx and firewall half; only the service
+# profile restarts the app onto the proxied port. A system-only deploy leaves
+# nginx proxying to a port nothing is listening on, so the endpoint 502s until
+# the service profile follows.
+#
 # Deploy prerequisites (both are outside this file and neither is enforced by
 # the deploy scripts, so a fresh environment must do them first, see
 # docs/nixos-provisioning.md):
@@ -55,8 +61,18 @@ let
   # X-Real-IP comes from recommendedProxySettings, which appends nixpkgs'
   # proxy-header include to every proxyPass location and sets it to
   # $remote_addr, overwriting whatever the client sent.
+  #
+  # 8001, not 8000, and that difference is load-bearing. The service unit sets
+  # `restartIfChanged = false` (nix/upgradeable-services.nix), so activating
+  # the system profile alone rewrites BEHIND_PROXY in the unit file without
+  # restarting the running process: nginx would begin proxying while the app
+  # still read the TCP source, handing it requests that look like 127.0.0.1 --
+  # inside INTERNAL_IP_RANGES, so the two InternalAuth routes below would fall
+  # back to a bare check of a key Alpaca also holds. Because the app only
+  # binds 8001 once it is actually in proxy mode (see `server_figment` in
+  # src/lib.rs), that window fails closed as a 502 instead.
   proxied = {
-    proxyPass = "http://127.0.0.1:8000";
+    proxyPass = "http://127.0.0.1:8001";
   };
 
   # The regexes match the DECODED path: nginx normalizes before location
