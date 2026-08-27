@@ -86,10 +86,14 @@ impl SubmitBurnJob {
         ctx: &SubmitBurnContext,
         tx_id: TxId,
     ) -> Result<(), BurnJobError> {
+        let idempotency_key = BurnManager::confirm_burn_idempotency_key(
+            &self.issuer_request_id,
+            &tx_id,
+        );
         release_terminal_job(
             &ctx.pool,
             job_type::<ConfirmBurnJob>(),
-            &self.issuer_request_id.to_string(),
+            &idempotency_key,
         )
         .await?;
 
@@ -101,7 +105,7 @@ impl SubmitBurnJob {
                     execution: self.execution.clone(),
                     tx_id,
                 },
-                self.issuer_request_id.to_string(),
+                idempotency_key,
             )
             .await?;
 

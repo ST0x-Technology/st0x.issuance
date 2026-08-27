@@ -718,9 +718,16 @@ impl Redemption {
         dust_returned: U256,
         meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let stored_tx_id = match self {
-            Self::BurnSubmitted { tx_id, .. } => tx_id.clone(),
-            Self::BurnIntended { sendable_tx, .. } => sendable_tx.hash.into(),
+        let (stored_tx_id, burn_mode) = match self {
+            // Terminal states already recorded the burn; a durable-job rerun
+            // after the confirming event landed is an idempotent no-op.
+            Self::Completed { .. } | Self::Closed { .. } => return Ok(vec![]),
+            Self::BurnSubmitted { tx_id, metadata, .. } => {
+                (tx_id.clone(), metadata.burn_mode)
+            }
+            Self::BurnIntended { sendable_tx, metadata, .. } => {
+                (sendable_tx.hash.into(), metadata.burn_mode)
+            }
             _ => {
                 return Err(RedemptionError::InvalidState {
                     expected: "BurnSubmitted or BurnIntended".to_string(),
@@ -728,6 +735,13 @@ impl Redemption {
                 });
             }
         };
+
+        if let VaultMode::Orchestrator { .. } = burn_mode {
+            return Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::Orchestrator,
+                found: VaultModeKind::VaultDirect,
+            });
+        }
 
         if stored_tx_id != tx_id {
             return Err(RedemptionError::TxIdMismatch {
@@ -759,25 +773,51 @@ impl Redemption {
         burn_range: BurnRange,
         meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let (stored_tx_id, alpaca_quantity, dust_quantity) = match self {
-            Self::BurnSubmitted {
-                tx_id,
-                alpaca_quantity,
-                dust_quantity,
-                ..
-            } => (tx_id.clone(), alpaca_quantity, dust_quantity),
-            Self::BurnIntended {
-                sendable_tx,
-                alpaca_quantity,
-                dust_quantity,
-                ..
-            } => (sendable_tx.hash.into(), alpaca_quantity, dust_quantity),
-            _ => {
-                return Err(RedemptionError::InvalidState {
-                    expected: "BurnSubmitted or BurnIntended".to_string(),
-                    found: self.state_name().to_string(),
-                });
-            }
+        let (stored_tx_id, alpaca_quantity, dust_quantity, burn_mode) =
+            match self {
+                // Terminal states already recorded the burn; a durable-job
+                // rerun after the confirming event landed is an idempotent
+                // no-op.
+                Self::Completed { .. } | Self::Closed { .. } => {
+                    return Ok(vec![]);
+                }
+                Self::BurnSubmitted {
+                    tx_id,
+                    alpaca_quantity,
+                    dust_quantity,
+                    metadata,
+                    ..
+                } => (
+                    tx_id.clone(),
+                    alpaca_quantity,
+                    dust_quantity,
+                    metadata.burn_mode,
+                ),
+                Self::BurnIntended {
+                    sendable_tx,
+                    alpaca_quantity,
+                    dust_quantity,
+                    metadata,
+                    ..
+                } => (
+                    sendable_tx.hash.into(),
+                    alpaca_quantity,
+                    dust_quantity,
+                    metadata.burn_mode,
+                ),
+                _ => {
+                    return Err(RedemptionError::InvalidState {
+                        expected: "BurnSubmitted or BurnIntended".to_string(),
+                        found: self.state_name().to_string(),
+                    });
+                }
+            };
+
+        let VaultMode::Orchestrator { .. } = burn_mode else {
+            return Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::VaultDirect,
+                found: VaultModeKind::Orchestrator,
+            });
         };
 
         if stored_tx_id != tx_id {
@@ -5330,6 +5370,188 @@ mod tests {
                 ),
                 "expected BurnModeMismatch, got {error:?}"
             );
+        }
+
+        let confirm_cases = [
+            (
+                orchestrator_burn_submitted_given_events(
+                    &issuer_request_id,
+                    tx_hash,
+                ),
+                RedemptionCommand::RecordBurnConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_id: TxId::Hash(tx_hash),
+                    tx_hash,
+                    burns: vec![],
+                    dust_returned: U256::ZERO,
+                    gas_used: 0,
+                    block_number: 0,
+                },
+            ),
+            (
+                burn_submitted_given_events(&issuer_request_id),
+                RedemptionCommand::RecordOrchestratorBurnConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_id: TxId::random(),
+                    tx_hash,
+                    shares_burned: U256::ZERO,
+                    burn_range: BurnRange {
+                        first_receipt_id: U256::ZERO,
+                        next_burn_receipt_id_after: U256::ZERO,
+                    },
+                    gas_used: 0,
+                    block_number: 0,
+                },
+            ),
+        ];
+        for (given, command) in confirm_cases {
+            let error = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(command)
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        RedemptionError::BurnModeMismatch { .. }
+                    )
+                ),
+                "expected BurnModeMismatch, got {error:?}"
+            );
+        }
+    }
+
+    /// A durable `SubmitBurnJob` rerun after the redemption advanced past
+    /// `BurnIntended` must be an idempotent no-op, so `RecordBurnTxSubmitted`
+    /// and `RecordOrchestratorBurnSubmitted` emit nothing from `BurnSubmitted`
+    /// and every terminal state.
+    #[tokio::test]
+    async fn record_submit_commands_noop_once_advanced() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let mut completed = burn_submitted_given_events(&issuer_request_id);
+        completed.push(RedemptionEvent::TokensBurned(TokensBurnedData {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash,
+            burns: vec![],
+            dust_returned: U256::ZERO,
+            gas_used: 0,
+            block_number: 46_000_000,
+            burned_at: Utc::now(),
+        }));
+
+        let mut closed = burn_submitted_given_events(&issuer_request_id);
+        closed.push(RedemptionEvent::RedemptionClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "closed by admin".to_string(),
+            acknowledged_unresolved_burn_tx_hash: None,
+            closed_at: Utc::now(),
+        });
+
+        let states = [
+            burn_submitted_given_events(&issuer_request_id),
+            completed,
+            failed_from(
+                burning_given_events(&issuer_request_id),
+                &issuer_request_id,
+            ),
+            closed,
+        ];
+
+        for given in states {
+            for command in [
+                RedemptionCommand::RecordBurnTxSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    external_tx_id: BurnExternalTxId::base(&tx_hash),
+                    tx_id: TxId::Hash(tx_hash),
+                    planned_burns: vec![],
+                },
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    external_tx_id: BurnExternalTxId::base(&tx_hash),
+                    tx_id: TxId::Hash(tx_hash),
+                },
+            ] {
+                let events = TestHarness::<Redemption>::with(mock_services())
+                    .given(given.clone())
+                    .when(command)
+                    .await
+                    .events();
+
+                assert!(
+                    events.is_empty(),
+                    "expected idempotent no-op, got {events:?}"
+                );
+            }
+        }
+    }
+
+    /// After the confirming event has landed the redemption is `Completed`
+    /// (or admin-`Closed`); an at-least-once `ConfirmBurnJob` rerun must be an
+    /// idempotent no-op rather than an `InvalidState` error that apalis would
+    /// redrive.
+    #[tokio::test]
+    async fn record_confirm_commands_noop_from_terminal_states() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let mut completed = burn_submitted_given_events(&issuer_request_id);
+        completed.push(RedemptionEvent::TokensBurned(TokensBurnedData {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash,
+            burns: vec![],
+            dust_returned: U256::ZERO,
+            gas_used: 0,
+            block_number: 46_000_000,
+            burned_at: Utc::now(),
+        }));
+
+        let mut closed = burn_submitted_given_events(&issuer_request_id);
+        closed.push(RedemptionEvent::RedemptionClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "closed by admin".to_string(),
+            acknowledged_unresolved_burn_tx_hash: None,
+            closed_at: Utc::now(),
+        });
+
+        for given in [completed, closed] {
+            for command in [
+                RedemptionCommand::RecordBurnConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_id: TxId::Hash(tx_hash),
+                    tx_hash,
+                    burns: vec![],
+                    dust_returned: U256::ZERO,
+                    gas_used: 0,
+                    block_number: 0,
+                },
+                RedemptionCommand::RecordOrchestratorBurnConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_id: TxId::Hash(tx_hash),
+                    tx_hash,
+                    shares_burned: U256::ZERO,
+                    burn_range: BurnRange {
+                        first_receipt_id: U256::ZERO,
+                        next_burn_receipt_id_after: U256::ZERO,
+                    },
+                    gas_used: 0,
+                    block_number: 0,
+                },
+            ] {
+                let events = TestHarness::<Redemption>::with(mock_services())
+                    .given(given.clone())
+                    .when(command)
+                    .await
+                    .events();
+
+                assert!(
+                    events.is_empty(),
+                    "expected idempotent no-op, got {events:?}"
+                );
+            }
         }
     }
 

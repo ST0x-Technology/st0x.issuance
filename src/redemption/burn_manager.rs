@@ -2213,18 +2213,33 @@ impl BurnManager {
         Ok(())
     }
 
-    /// Enqueues the durable `ConfirmBurnJob` under the redemption's idempotency
-    /// key, freeing any terminal prior row so the push is not silently dropped.
+    /// Idempotency key for a redemption's `ConfirmBurnJob`. Keyed by the
+    /// transaction as well as the redemption so a `ReplaceDeadBurn` replacement
+    /// enqueues its own confirm instead of collapsing onto the dead
+    /// transaction's still-active job; a rerun for the same persisted `tx_id`
+    /// still collapses.
+    pub(crate) fn confirm_burn_idempotency_key(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_id: &TxId,
+    ) -> String {
+        format!("{issuer_request_id}:{tx_id}")
+    }
+
+    /// Enqueues the durable `ConfirmBurnJob` under the
+    /// redemption-and-transaction idempotency key, freeing any terminal prior
+    /// row so the push is not silently dropped.
     pub(crate) async fn enqueue_confirm_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         execution: BurnExecutionPlan,
         tx_id: TxId,
     ) -> Result<(), BurnManagerError> {
+        let idempotency_key =
+            Self::confirm_burn_idempotency_key(issuer_request_id, &tx_id);
         release_terminal_job(
             &self.view_pool,
             job_type::<ConfirmBurnJob>(),
-            &issuer_request_id.to_string(),
+            &idempotency_key,
         )
         .await?;
         JobQueue::<ConfirmBurnJob>::new(&self.apalis_pool)
@@ -2234,7 +2249,7 @@ impl BurnManager {
                     execution,
                     tx_id,
                 },
-                issuer_request_id.to_string(),
+                idempotency_key,
             )
             .await?;
         Ok(())
