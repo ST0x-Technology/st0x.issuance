@@ -197,7 +197,6 @@ impl VaultModeConfig {
 }
 
 /// Default chain ID (Base mainnet)
-/// Default blockchain chain ID (Base mainnet: 8453).
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
 
 /// Default SQLite database URL when `DATABASE_URL` is unset. Production overrides
