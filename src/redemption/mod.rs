@@ -441,12 +441,20 @@ struct BurnTxMeta {
     block_number: u64,
 }
 
-/// Maps a `VaultError` into the serializable `RedemptionError::Vault`,
-/// computing the reservation-release flag, recoverable tx id, and typed
-/// classification at the aggregate boundary where the typed error is last
-/// visible.
-pub(crate) fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
-    RedemptionError::Vault {
+/// The fields of a definitive burn `VaultError`, computed at the aggregate
+/// boundary where the typed error is last visible. Callers build the
+/// serializable `RedemptionError::Vault` from these, so no code has to
+/// destructure a value that is always the same variant.
+pub(crate) struct VaultFailure {
+    pub(crate) message: String,
+    pub(crate) release_reservation: bool,
+    pub(crate) tx_id: Option<TxId>,
+    pub(crate) classification: BurnFailureClassification,
+}
+
+/// Computes the [`VaultFailure`] fields for a definitive burn `VaultError`.
+pub(crate) fn vault_error_to_redemption(error: &VaultError) -> VaultFailure {
+    VaultFailure {
         release_reservation: should_release_reserved_burn(error),
         tx_id: extract_tx_hash(error).map(Into::into),
         classification: burn_failure_classification(error),
@@ -470,7 +478,14 @@ pub(crate) fn map_confirm_burn_error(
         };
     }
 
-    vault_error_to_redemption(error)
+    let VaultFailure { message, release_reservation, tx_id, classification } =
+        vault_error_to_redemption(error);
+    RedemptionError::Vault {
+        message,
+        release_reservation,
+        tx_id,
+        classification,
+    }
 }
 
 /// Maps a typed `VaultError` to the burn-failure classification persisted on
@@ -719,9 +734,12 @@ impl Redemption {
         meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let (stored_tx_id, burn_mode) = match self {
-            // Terminal states already recorded the burn; a durable-job rerun
-            // after the confirming event landed is an idempotent no-op.
-            Self::Completed { .. } | Self::Closed { .. } => return Ok(vec![]),
+            // Terminal states: the redemption already reached Completed,
+            // Closed, or a recorded Failure, so a redelivered ConfirmBurnJob is
+            // an idempotent no-op, matching the record-submit handlers.
+            Self::Completed { .. }
+            | Self::Closed { .. }
+            | Self::Failed { .. } => return Ok(vec![]),
             Self::BurnSubmitted { tx_id, metadata, .. } => {
                 (tx_id.clone(), metadata.burn_mode)
             }
@@ -775,10 +793,13 @@ impl Redemption {
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let (stored_tx_id, alpaca_quantity, dust_quantity, burn_mode) =
             match self {
-                // Terminal states already recorded the burn; a durable-job
-                // rerun after the confirming event landed is an idempotent
-                // no-op.
-                Self::Completed { .. } | Self::Closed { .. } => {
+                // Terminal states: the redemption already reached Completed,
+                // Closed, or a recorded Failure, so a redelivered
+                // ConfirmBurnJob is an idempotent no-op, matching the
+                // record-submit handlers.
+                Self::Completed { .. }
+                | Self::Closed { .. }
+                | Self::Failed { .. } => {
                     return Ok(vec![]);
                 }
                 Self::BurnSubmitted {
@@ -5517,7 +5538,12 @@ mod tests {
             closed_at: Utc::now(),
         });
 
-        for given in [completed, closed] {
+        let failed = failed_from(
+            burn_submitted_given_events(&issuer_request_id),
+            &issuer_request_id,
+        );
+
+        for given in [completed, closed, failed] {
             for command in [
                 RedemptionCommand::RecordBurnConfirmed {
                     issuer_request_id: issuer_request_id.clone(),

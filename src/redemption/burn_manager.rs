@@ -16,12 +16,12 @@ use super::view::{
 use super::{
     BurnExternalTxId, BurnParams, BurnRecoveryAction, ExistingBurnProof,
     IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
-    RedemptionEvent, next_burn_retry_external_tx_id_from_history,
+    RedemptionEvent, VaultFailure, next_burn_retry_external_tx_id_from_history,
     vault_error_to_redemption,
 };
 use crate::Quantity;
 use crate::burn_excess::has_unresolved_excess_burn_intent;
-use crate::config::VaultMode;
+use crate::config::{VaultMode, VaultModeKind};
 use crate::jobs::{JobQueue, QueuePushError, job_type};
 use crate::mint::QuantityConversionError;
 use crate::mint::recovery::release_terminal_job;
@@ -1131,7 +1131,7 @@ impl BurnManager {
             );
         }
 
-        let execution = self.recovery_confirm_execution(
+        let execution = Self::recovery_confirm_plan(
             metadata.network,
             vault,
             metadata.burn_mode,
@@ -2231,7 +2231,7 @@ impl BurnManager {
     pub(crate) async fn enqueue_confirm_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-        execution: BurnExecutionPlan,
+        execution: BurnConfirmPlan,
         tx_id: TxId,
     ) -> Result<(), BurnManagerError> {
         let idempotency_key =
@@ -2255,37 +2255,26 @@ impl BurnManager {
         Ok(())
     }
 
-    /// Builds the plan a recovery-driven `ConfirmBurnJob` needs: confirm reads
-    /// only `network`, the params variant, `vault`, and `dust_shares`, so the
-    /// submit-only fields carry no receipt payload.
-    fn recovery_confirm_execution(
-        &self,
+    /// Builds the confirm-only plan a recovery-driven `ConfirmBurnJob` needs
+    /// from the redemption's persisted anchor. Unlike the submit plan it carries
+    /// no `BurnParams`, so no burn parameters are invented for a step that never
+    /// reads them.
+    fn recovery_confirm_plan(
         network: Network,
         vault: Address,
         burn_mode: VaultMode,
         dust_shares: U256,
         planned_burns: &[BurnRecord],
-    ) -> BurnExecutionPlan {
-        let params = match burn_mode {
-            VaultMode::VaultDirect => BurnParams::VaultDirect {
-                vault,
-                burns: vec![],
-                dust_shares,
-                owner: self.bot_wallet,
-            },
-            VaultMode::Orchestrator { .. } => BurnParams::Orchestrator {
-                token: vault,
-                amount: U256::ZERO,
-                owner: self.bot_wallet,
-            },
-        };
-        BurnExecutionPlan {
+    ) -> BurnConfirmPlan {
+        BurnConfirmPlan {
             network,
             vault,
-            params,
-            planned_burns: planned_burns.to_vec(),
             dust_shares,
-            external_tx_id: None,
+            planned_burns: planned_burns.to_vec(),
+            mode: match burn_mode {
+                VaultMode::VaultDirect => VaultModeKind::VaultDirect,
+                VaultMode::Orchestrator { .. } => VaultModeKind::Orchestrator,
+            },
         }
     }
 
@@ -2572,15 +2561,12 @@ impl BurnManager {
         execution: &BurnExecutionPlan,
         error: VaultError,
     ) -> Result<TxId, BurnManagerError> {
-        let RedemptionError::Vault {
+        let VaultFailure {
             message,
             release_reservation,
             tx_id,
             classification,
-        } = vault_error_to_redemption(&error)
-        else {
-            unreachable!("vault_error_to_redemption always returns Vault");
-        };
+        } = vault_error_to_redemption(&error);
 
         warn!(target: "redemption", issuer_request_id = %issuer_request_id,
             error = %message,
@@ -2651,7 +2637,7 @@ impl BurnManager {
     pub(crate) async fn confirm_submitted_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-        execution: &BurnExecutionPlan,
+        execution: &BurnConfirmPlan,
         tx_id: TxId,
     ) -> Result<(), BurnManagerError> {
         // Performs the confirmation I/O here, then records the outcome through
@@ -2752,7 +2738,7 @@ impl BurnManager {
     async fn handle_confirm_vault_error(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-        execution: &BurnExecutionPlan,
+        execution: &BurnConfirmPlan,
         tx_id: &TxId,
         error: &VaultError,
     ) -> Result<(), BurnManagerError> {
@@ -3121,6 +3107,43 @@ impl BurnExecutionPlan {
     pub(crate) const fn is_orchestrator(&self) -> bool {
         matches!(self.params, BurnParams::Orchestrator { .. })
     }
+
+    /// Projects the confirm-only plan a `ConfirmBurnJob` carries, dropping the
+    /// submit `BurnParams` the confirmation step never reads.
+    pub(crate) fn confirm_plan(&self) -> BurnConfirmPlan {
+        BurnConfirmPlan {
+            network: self.network,
+            vault: self.vault,
+            dust_shares: self.dust_shares,
+            planned_burns: self.planned_burns.clone(),
+            mode: if self.is_orchestrator() {
+                VaultModeKind::Orchestrator
+            } else {
+                VaultModeKind::VaultDirect
+            },
+        }
+    }
+}
+
+/// The confirm-only projection of a burn plan. A `ConfirmBurnJob` carries this
+/// instead of the full `BurnExecutionPlan` so its serialized row never holds
+/// invented burn parameters: confirmation reads only the network, vault, dust,
+/// planned burns, and mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BurnConfirmPlan {
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) dust_shares: U256,
+    pub(crate) planned_burns: Vec<BurnRecord>,
+    pub(crate) mode: VaultModeKind,
+}
+
+impl BurnConfirmPlan {
+    /// Whether the burn runs through the orchestrator, in which case the
+    /// receipt-inventory reserve/settle/release lifecycle does not apply.
+    pub(crate) const fn is_orchestrator(&self) -> bool {
+        matches!(self.mode, VaultModeKind::Orchestrator)
+    }
 }
 
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
@@ -3240,6 +3263,7 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3247,13 +3271,13 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnExecutionPlan, BurnManager, BurnManagerError,
+        BurnConfirmPlan, BurnExecutionPlan, BurnManager, BurnManagerError,
         DefinitiveConfirmFailure, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
         RecoveryOutcome, Redemption, RedemptionCommand,
         should_release_reserved_burn,
     };
     use crate::burn_excess::BurnExcessEvent;
-    use crate::config::VaultMode;
+    use crate::config::{VaultMode, VaultModeKind};
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
@@ -3368,6 +3392,19 @@ mod tests {
         pool: sqlx::Pool<sqlx::Sqlite>,
         asset_store: Arc<Store<TokenizedAsset>>,
         apalis_pool: apalis_sqlite::SqlitePool,
+        /// Temp directory backing the file database when the harness owns it;
+        /// removed on drop. `None` when the caller supplied the pool.
+        database_dir: Option<PathBuf>,
+    }
+
+    impl Drop for TestHarness {
+        fn drop(&mut self) {
+            // Remove the file database and its `-wal`/`-shm` sidecars when the
+            // harness owns the directory. Best effort: the test is ending.
+            if let Some(dir) = self.database_dir.take() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 
     struct SettleFailingReceiptService {
@@ -3471,9 +3508,16 @@ mod tests {
         }
 
         async fn with_vault_mock(vault_mock: Arc<MockVaultService>) -> Self {
-            let database_path = std::env::temp_dir()
-                .join(format!("st0x-burn-test-{}.db", uuid::Uuid::new_v4()));
-            let database_url = format!("sqlite:{}", database_path.display());
+            // A shared file database lets the sqlx and apalis pools see the same
+            // `Jobs` table; the directory is removed when the harness drops.
+            let database_dir = std::env::temp_dir()
+                .join(format!("st0x-burn-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&database_dir)
+                .expect("test temp directory should be created");
+            let database_url = format!(
+                "sqlite:{}",
+                database_dir.join("burn-test.db").display()
+            );
 
             let options =
                 sqlx::sqlite::SqliteConnectOptions::from_str(&database_url)
@@ -3497,7 +3541,10 @@ mod tests {
                     .await
                     .expect("Failed to create apalis test pool");
 
-            Self::with_pool(vault_mock, pool, apalis_pool).await
+            let mut harness =
+                Self::with_pool(vault_mock, pool, apalis_pool).await;
+            harness.database_dir = Some(database_dir);
+            harness
         }
 
         async fn with_pool(
@@ -3546,6 +3593,7 @@ mod tests {
                 pool,
                 asset_store,
                 apalis_pool,
+                database_dir: None,
             }
         }
 
@@ -3747,19 +3795,23 @@ mod tests {
             .await
             .expect("submit_intended_burn should broadcast the persisted burn");
         manager
-            .confirm_submitted_burn(issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await
             .expect("confirm_submitted_burn should record the confirmation");
     }
 
-    /// Reconstructs the confirm-only execution a recovery `ConfirmBurnJob`
-    /// carries from the persisted `BurnSubmitted` state, plus the submitted
-    /// `tx_id`, mirroring `recovery_confirm_execution`.
+    /// Reconstructs the confirm-only plan a recovery `ConfirmBurnJob` carries
+    /// from the persisted `BurnSubmitted` state, plus the submitted `tx_id`,
+    /// mirroring `recovery_confirm_plan`.
     async fn submitted_confirm_execution(
         store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
-    ) -> (BurnExecutionPlan, TxId) {
+    ) -> (BurnConfirmPlan, TxId) {
         let aggregate = load_aggregate(store, issuer_request_id).await;
         let Redemption::BurnSubmitted {
             metadata,
@@ -3772,28 +3824,17 @@ mod tests {
             panic!("expected BurnSubmitted, got {aggregate:?}");
         };
         let dust_shares = dust_quantity.to_u256_with_18_decimals().unwrap();
-        let params = match &metadata.burn_mode {
-            VaultMode::VaultDirect => BurnParams::VaultDirect {
-                vault,
-                burns: vec![],
-                dust_shares,
-                owner: TEST_WALLET,
-            },
-            VaultMode::Orchestrator { .. } => BurnParams::Orchestrator {
-                token: vault,
-                amount: U256::ZERO,
-                owner: TEST_WALLET,
-            },
-        };
-        let execution = BurnExecutionPlan {
+        let plan = BurnConfirmPlan {
             network: metadata.network,
             vault,
-            params,
-            planned_burns,
             dust_shares,
-            external_tx_id: None,
+            planned_burns,
+            mode: match metadata.burn_mode {
+                VaultMode::VaultDirect => VaultModeKind::VaultDirect,
+                VaultMode::Orchestrator { .. } => VaultModeKind::Orchestrator,
+            },
         };
-        (execution, tx_id)
+        (plan, tx_id)
     }
 
     /// Drives the enqueued recovery `ConfirmBurnJob` inline from `BurnSubmitted`
@@ -4312,7 +4353,11 @@ mod tests {
             .expect("submit should broadcast the orchestrator burn");
         let result = setup
             .manager
-            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &setup.issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
         assert!(result.is_err(), "revert must surface as an error");
 
@@ -4880,7 +4925,11 @@ mod tests {
             );
         let result = setup
             .manager
-            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &setup.issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
         assert!(result.is_err(), "the reverted burn must surface as an error");
         assert_eq!(setup.vault_mock.orchestrator_submit_call_count(), 1);
@@ -4908,7 +4957,11 @@ mod tests {
             );
         let _ = setup
             .manager
-            .confirm_submitted_burn(&setup.issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &setup.issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
 
         assert_eq!(
@@ -6297,7 +6350,11 @@ mod tests {
             .await
             .expect("submit ok");
         let result = manager
-            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
 
         assert!(
@@ -6521,7 +6578,11 @@ mod tests {
             .await
             .expect("submit ok");
         let result = manager
-            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
 
         assert!(
@@ -9534,7 +9595,7 @@ mod tests {
         manager
             .confirm_submitted_burn(
                 &issuer_request_id,
-                &reverted_confirm,
+                &reverted_confirm.confirm_plan(),
                 persisted_tx.hash.into(),
             )
             .await
@@ -9764,7 +9825,11 @@ mod tests {
             .expect("submit_intended_burn should broadcast the persisted burn");
         assert!(
             manager
-                .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
+                .confirm_submitted_burn(
+                    &issuer_request_id,
+                    &execution.confirm_plan(),
+                    tx_id
+                )
                 .await
                 .is_err(),
             "an unresolved confirmation must remain visible to the caller"
@@ -10435,7 +10500,11 @@ mod tests {
             .await
             .expect("submit_intended_burn should broadcast the persisted burn");
         let _ = manager
-            .confirm_submitted_burn(&issuer_request_id, &execution, tx_id)
+            .confirm_submitted_burn(
+                &issuer_request_id,
+                &execution.confirm_plan(),
+                tx_id,
+            )
             .await;
         assert!(matches!(
             load_aggregate(&harness.store, &issuer_request_id).await,

@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 
-use super::burn_manager::{BurnExecutionPlan, BurnManager, BurnManagerError};
+use super::burn_manager::{
+    BurnConfirmPlan, BurnExecutionPlan, BurnManager, BurnManagerError,
+};
 use super::{IssuerRedemptionRequestId, RedemptionError};
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::mint::recovery::release_terminal_job;
@@ -102,7 +104,7 @@ impl SubmitBurnJob {
             .push_with_idempotency_key(
                 ConfirmBurnJob {
                     issuer_request_id: self.issuer_request_id.clone(),
-                    execution: self.execution.clone(),
+                    execution: self.execution.confirm_plan(),
                     tx_id,
                 },
                 idempotency_key,
@@ -117,7 +119,7 @@ impl SubmitBurnJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConfirmBurnJob {
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
-    pub(crate) execution: BurnExecutionPlan,
+    pub(crate) execution: BurnConfirmPlan,
     pub(crate) tx_id: TxId,
 }
 
