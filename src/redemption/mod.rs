@@ -734,9 +734,12 @@ impl Redemption {
         meta: &BurnTxMeta,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let (stored_tx_id, burn_mode) = match self {
-            // Terminal states: the redemption already reached Completed,
-            // Closed, or a recorded Failure, so a redelivered ConfirmBurnJob is
-            // an idempotent no-op, matching the record-submit handlers.
+            // A redelivered ConfirmBurnJob is a no-op here. From Completed or
+            // Closed the burn was already recorded, so the rerun is a genuine
+            // duplicate. From Failed nothing was recorded: a successful confirm
+            // is dropped, and recover_burn_failed_redemptions re-inspects the
+            // persisted transaction on chain and records it via
+            // RecordExistingBurn.
             Self::Completed { .. }
             | Self::Closed { .. }
             | Self::Failed { .. } => return Ok(vec![]),
@@ -793,10 +796,12 @@ impl Redemption {
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let (stored_tx_id, alpaca_quantity, dust_quantity, burn_mode) =
             match self {
-                // Terminal states: the redemption already reached Completed,
-                // Closed, or a recorded Failure, so a redelivered
-                // ConfirmBurnJob is an idempotent no-op, matching the
-                // record-submit handlers.
+                // A redelivered ConfirmBurnJob is a no-op here. From Completed
+                // or Closed the burn was already recorded, so the rerun is a
+                // genuine duplicate. From Failed nothing was recorded: a
+                // successful confirm is dropped, and
+                // recover_burn_failed_redemptions re-inspects the persisted
+                // transaction on chain and records it via RecordExistingBurn.
                 Self::Completed { .. }
                 | Self::Closed { .. }
                 | Self::Failed { .. } => {
