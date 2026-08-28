@@ -309,7 +309,6 @@ pub async fn initialize_rocket(
     let chain_registry = config.create_chain_registry().await?;
     let base = chain_registry.base()?;
     let alpaca_service = config.alpaca.service()?;
-    let rocket_alpaca = alpaca_service.clone();
     let bot_wallet = config.signer.address()?;
     info!(
         target: "startup",
@@ -325,15 +324,16 @@ pub async fn initialize_rocket(
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(&pool, &network_vault_services).await?;
 
-    let managers = setup_redemption_managers(
-        &config,
-        network_vault_services.clone(),
-        &redemption_store,
-        &receipt_inventory_store,
-        &pool,
-        lifecycle_notifier.clone(),
-        &apalis_pool,
-    )?;
+    let managers = setup_redemption_managers(RedemptionManagerParams {
+        config: &config,
+        vault_services: network_vault_services.clone(),
+        redemption_store: &redemption_store,
+        receipt_inventory_store: &receipt_inventory_store,
+        pool: &pool,
+        lifecycle_notifier: lifecycle_notifier.clone(),
+        apalis_pool: &apalis_pool,
+        bot_wallet,
+    })?;
 
     run_startup_recovery(
         &pool,
@@ -504,7 +504,7 @@ pub async fn initialize_rocket(
         tokenized_asset_store,
         mint_store,
         redemption_store,
-        alpaca_service: rocket_alpaca,
+        alpaca_service: alpaca_service.clone(),
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
@@ -1032,16 +1032,32 @@ async fn clear_canonical_projection_for_aggregate(
     Ok(())
 }
 
-fn setup_redemption_managers(
-    config: &Config,
+struct RedemptionManagerParams<'a> {
+    config: &'a Config,
     vault_services: NetworkVaultServices,
-    redemption_store: &Arc<Store<Redemption>>,
-    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
-    pool: &Pool<Sqlite>,
+    redemption_store: &'a Arc<Store<Redemption>>,
+    receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
+    pool: &'a Pool<Sqlite>,
     lifecycle_notifier: Arc<dyn LifecycleNotifier>,
-    apalis_pool: &ApalisSqlitePool,
+    apalis_pool: &'a ApalisSqlitePool,
+    bot_wallet: Address,
+}
+
+/// Builds the redemption managers. `bot_wallet` is derived once in
+/// `initialize_rocket` and passed in so the derivation is not duplicated.
+fn setup_redemption_managers(
+    params: RedemptionManagerParams<'_>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
-    let bot_wallet = config.signer.address()?;
+    let RedemptionManagerParams {
+        config,
+        vault_services,
+        redemption_store,
+        receipt_inventory_store,
+        pool,
+        lifecycle_notifier,
+        apalis_pool,
+        bot_wallet,
+    } = params;
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
