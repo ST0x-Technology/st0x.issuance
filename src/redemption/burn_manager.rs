@@ -3399,8 +3399,11 @@ mod tests {
 
     impl Drop for TestHarness {
         fn drop(&mut self) {
-            // Remove the file database and its `-wal`/`-shm` sidecars when the
-            // harness owns the directory. Best effort: the test is ending.
+            // Best-effort removal of the file database and its `-wal`/`-shm`
+            // sidecars. This runs before the pool fields drop, so the files are
+            // unlinked while the sqlx and apalis pools still hold them: that
+            // succeeds on Linux, where the tests run, but a platform that locks
+            // open files would leave the directory until process exit.
             if let Some(dir) = self.database_dir.take() {
                 let _ = std::fs::remove_dir_all(dir);
             }
