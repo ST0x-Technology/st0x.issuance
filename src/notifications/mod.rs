@@ -184,7 +184,9 @@ pub(crate) struct LifecycleNotificationError {
 }
 
 impl LifecycleNotificationError {
-    fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
         Self { source: Box::new(source) }
     }
 }

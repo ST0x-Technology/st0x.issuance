@@ -127,6 +127,7 @@ mod tests {
             "/admin/reprocess/mint/{aggregate_id}",
             "/admin/close/mint/{aggregate_id}",
             "/admin/freeze-schedules",
+            "/admin/network-telemetry",
             "/internal/mints/{tokenization_request_id}/authorization",
         ] {
             assert!(

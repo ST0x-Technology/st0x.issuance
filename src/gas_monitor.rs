@@ -93,12 +93,27 @@ impl<P: Provider> GasMonitor<P> {
 
         let (next_state, outcome) =
             evaluate(state, balance, self.threshold, GAS_REALERT_INTERVAL, now);
-        self.act_on_outcome(outcome, balance).await;
 
-        next_state
+        if self.act_on_outcome(outcome, balance).await {
+            next_state
+        } else {
+            // The alert did not reach the operator, so keep the prior dedup
+            // state: advancing `last_alerted` here would suppress every retry
+            // for a full `GAS_REALERT_INTERVAL`, silently leaving a low wallet
+            // unpaged. Retaining it re-alerts on the next poll instead.
+            state
+        }
     }
 
-    async fn act_on_outcome(&self, outcome: PollOutcome, balance: U256) {
+    /// Acts on one poll's outcome and reports whether the alert transition may
+    /// stand. Returns `true` when nothing needed delivery or delivery
+    /// succeeded, and `false` when an alert was attempted but its delivery
+    /// failed, so the caller retains the prior deduplication state.
+    async fn act_on_outcome(
+        &self,
+        outcome: PollOutcome,
+        balance: U256,
+    ) -> bool {
         match outcome {
             PollOutcome::DroppedBelow | PollOutcome::StillLowRealert => {
                 error!(
@@ -110,14 +125,29 @@ impl<P: Provider> GasMonitor<P> {
                     "Issuer wallet native balance is below the low gas \
                      threshold"
                 );
-                self.notifier
-                    .notify(&LifecycleNotification::LowGasBalance {
+                match self
+                    .notifier
+                    .deliver(&LifecycleNotification::LowGasBalance {
                         network: self.network,
                         wallet: self.wallet,
                         balance,
                         threshold: self.threshold,
                     })
-                    .await;
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(delivery_error) => {
+                        warn!(
+                            target: "gas",
+                            network = %self.network,
+                            wallet = %self.wallet,
+                            error = %delivery_error,
+                            "Low gas alert delivery failed; retrying on the \
+                             next poll"
+                        );
+                        false
+                    }
+                }
             }
             PollOutcome::Recovered => {
                 info!(
@@ -129,8 +159,9 @@ impl<P: Provider> GasMonitor<P> {
                     "Issuer wallet native balance recovered above the \
                      low gas threshold"
                 );
+                true
             }
-            PollOutcome::StillHealthy | PollOutcome::StillLowSuppressed => {}
+            PollOutcome::StillHealthy | PollOutcome::StillLowSuppressed => true,
         }
     }
 }
@@ -240,10 +271,54 @@ mod tests {
         }
     }
 
+    /// Notifier that fails its first `fail_first` deliveries, then succeeds,
+    /// recording only the deliveries that succeed.
+    struct FlakyNotifier {
+        fail_remaining: Mutex<usize>,
+        delivered: Mutex<Vec<LifecycleNotification>>,
+    }
+
+    impl FlakyNotifier {
+        fn new(fail_first: usize) -> Arc<Self> {
+            Arc::new(Self {
+                fail_remaining: Mutex::new(fail_first),
+                delivered: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn delivered(&self) -> Vec<LifecycleNotification> {
+            self.delivered.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LifecycleNotifier for FlakyNotifier {
+        async fn deliver(
+            &self,
+            notification: &LifecycleNotification,
+        ) -> Result<(), LifecycleNotificationError> {
+            let should_fail = {
+                let mut remaining = self.fail_remaining.lock();
+                let fail = *remaining > 0;
+                if fail {
+                    *remaining -= 1;
+                }
+                fail
+            };
+            if should_fail {
+                return Err(LifecycleNotificationError::new(
+                    std::io::Error::other("telegram unavailable"),
+                ));
+            }
+            self.delivered.lock().push(notification.clone());
+            Ok(())
+        }
+    }
+
     fn monitor(
         asserter: &Asserter,
         threshold: U256,
-        notifier: Arc<CapturingNotifier>,
+        notifier: Arc<dyn LifecycleNotifier>,
         telemetry: Arc<NetworkTelemetry>,
     ) -> GasMonitor<impl alloy::providers::Provider> {
         GasMonitor {
@@ -428,5 +503,47 @@ mod tests {
             Level::INFO,
             &["recovered above", "base", "balance=200"]
         ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn failed_alert_retries_on_the_next_poll() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(5));
+        asserter.push_success(&U256::from(5));
+        // The first delivery fails, the second succeeds.
+        let notifier = FlakyNotifier::new(1);
+        let telemetry = Arc::new(NetworkTelemetry::new([Network::Base]));
+        let monitor = monitor(
+            &asserter,
+            U256::from(100),
+            notifier.clone(),
+            telemetry.clone(),
+        );
+
+        // First poll: balance is low but the alert fails to deliver, so the
+        // dedup state must stay Normal rather than advancing to Low; otherwise
+        // the retry would be suppressed for a full GAS_REALERT_INTERVAL.
+        let state = monitor.poll_once(AlertState::Normal, Instant::now()).await;
+        assert_eq!(state, AlertState::Normal);
+        assert!(notifier.delivered().is_empty());
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Low gas alert delivery failed", "base"]
+        ));
+
+        // Second poll: still low, delivery now succeeds, so the alert lands
+        // and the state advances to Low.
+        let state = monitor.poll_once(state, Instant::now()).await;
+        assert!(matches!(state, AlertState::Low { .. }));
+        assert_eq!(
+            notifier.delivered(),
+            vec![LifecycleNotification::LowGasBalance {
+                network: Network::Base,
+                wallet: monitor.wallet,
+                balance: U256::from(5),
+                threshold: U256::from(100),
+            }]
+        );
     }
 }
