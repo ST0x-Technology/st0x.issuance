@@ -742,12 +742,14 @@ struct ChainGroupEnv<'env> {
 }
 
 /// Parses one chain's low gas threshold from its decimal native token string
-/// (e.g. `"0.05"`) into wei. Digits beyond 18 decimals are sub-wei and are
-/// truncated by `parse_ether`. Zero is rejected: a zero threshold never
-/// alerts, which reads as monitored while monitoring nothing. A negative sign
-/// is rejected too, because `parse_ether` would otherwise reinterpret it as a
+/// (e.g. `"0.05"`) into wei. Zero is rejected: a zero threshold never alerts,
+/// which reads as monitored while monitoring nothing. A negative sign is
+/// rejected too, because `parse_ether` would otherwise reinterpret it as a
 /// near-`U256::MAX` two's-complement value (a sign typo silently making every
-/// balance read below threshold) instead of failing.
+/// balance read below threshold) instead of failing. A value carrying a
+/// non-zero digit finer than wei (beyond 18 decimal places) is rejected
+/// rather than silently truncated, so lost precision fails fast; trailing
+/// zeros beyond 18 places carry no value and are kept.
 fn parse_low_gas_threshold(
     network: Network,
     value: Option<&str>,
@@ -758,6 +760,23 @@ fn parse_low_gas_threshold(
 
     if value.trim_start().starts_with('-') {
         return Err(ConfigError::NegativeLowGasThreshold {
+            network,
+            value: value.to_string(),
+        });
+    }
+
+    // `parse_ether` truncates decimals beyond 18 (finer than wei) without
+    // error, silently dropping precision from a financial value. Reject a
+    // non-zero digit past the 18th fractional place before parsing;
+    // `chars().skip` avoids byte-boundary indexing panics on non-ASCII input,
+    // and non-digits fall through to `parse_ether`'s own error.
+    if let Some((_, fraction)) = value.split_once('.')
+        && fraction
+            .chars()
+            .skip(18)
+            .any(|digit| digit.is_ascii_digit() && digit != '0')
+    {
+        return Err(ConfigError::ExcessiveLowGasThresholdPrecision {
             network,
             value: value.to_string(),
         });
@@ -922,6 +941,11 @@ pub enum ConfigError {
          must be a positive native token amount"
     )]
     NegativeLowGasThreshold { network: Network, value: String },
+    #[error(
+        "low gas threshold '{value}' for {network} has more than 18 decimal \
+         places; a threshold cannot be finer than one wei"
+    )]
+    ExcessiveLowGasThresholdPrecision { network: Network, value: String },
     #[error(
         "no RPC URL configured for {network}; set {hint} in the service \
          environment (deployment secrets / .env)"
@@ -1493,6 +1517,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A non-zero digit finer than wei is a precision the threshold cannot
+    /// hold; `parse_ether` would silently truncate it, so it is rejected.
+    #[test]
+    fn subwei_precision_is_refused() {
+        let result = parse_low_gas_threshold(
+            Network::Base,
+            Some("1.0000000000000000005"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ExcessiveLowGasThresholdPrecision {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    /// Trailing zeros beyond 18 decimals carry no value, so a wei-precise
+    /// amount padded with them parses unchanged rather than being refused.
+    #[test]
+    fn trailing_zeros_beyond_wei_precision_are_kept() {
+        let result = parse_low_gas_threshold(
+            Network::Base,
+            Some("0.0500000000000000000"),
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(U256::from(50_000_000_000_000_000_u64)));
     }
 
     /// HyperEVM's testnet id (998) one keystroke away from mainnet (999) is
