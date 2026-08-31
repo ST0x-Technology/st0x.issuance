@@ -14,15 +14,13 @@
 //! a job error that apalis redrives.
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 
 use super::burn_manager::{
     BurnConfirmPlan, BurnExecutionPlan, BurnManager, BurnManagerError,
 };
 use super::{IssuerRedemptionRequestId, RedemptionError};
-use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
-use crate::mint::recovery::release_terminal_job;
+use crate::jobs::Job;
 use crate::vault::TxId;
 
 /// Failure of a burn side effect job. A domain rejection is recorded by the
@@ -33,10 +31,6 @@ use crate::vault::TxId;
 pub(crate) enum BurnJobError {
     #[error(transparent)]
     Manager(Box<BurnManagerError>),
-    #[error(transparent)]
-    Enqueue(#[from] QueuePushError),
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
 }
 
 /// Broadcasts the persisted burn transaction, then hands off to
@@ -49,10 +43,6 @@ pub(crate) struct SubmitBurnJob {
 
 pub(crate) struct SubmitBurnContext {
     pub(crate) burn_manager: Arc<BurnManager>,
-    pub(crate) confirm_queue: JobQueue<ConfirmBurnJob>,
-    /// Event-store pool; `release_terminal_job` frees a terminal prior confirm
-    /// row so the handoff re-push is not silently dropped.
-    pub(crate) pool: Pool<Sqlite>,
 }
 
 impl Job<SubmitBurnContext> for SubmitBurnJob {
@@ -88,30 +78,14 @@ impl SubmitBurnJob {
         ctx: &SubmitBurnContext,
         tx_id: TxId,
     ) -> Result<(), BurnJobError> {
-        let idempotency_key = BurnManager::confirm_burn_idempotency_key(
-            &self.issuer_request_id,
-            &tx_id,
-        );
-        release_terminal_job(
-            &ctx.pool,
-            job_type::<ConfirmBurnJob>(),
-            &idempotency_key,
-        )
-        .await?;
-
-        ctx.confirm_queue
-            .clone()
-            .push_with_idempotency_key(
-                ConfirmBurnJob {
-                    issuer_request_id: self.issuer_request_id.clone(),
-                    execution: self.execution.confirm_plan(),
-                    tx_id,
-                },
-                idempotency_key,
+        ctx.burn_manager
+            .enqueue_confirm_burn(
+                &self.issuer_request_id,
+                self.execution.confirm_plan(),
+                tx_id,
             )
-            .await?;
-
-        Ok(())
+            .await
+            .map_err(|error| BurnJobError::Manager(Box::new(error)))
     }
 }
 

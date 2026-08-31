@@ -3399,7 +3399,7 @@ mod tests {
 
     impl Drop for TestHarness {
         fn drop(&mut self) {
-            // Best-effort removal of the file database and its `-wal`/`-shm`
+            // Best effort removal of the file database and its `-wal`/`-shm`
             // sidecars. This runs before the pool fields drop, so the files are
             // unlinked while the sqlx and apalis pools still hold them: that
             // succeeds on Linux, where the tests run, but a platform that locks

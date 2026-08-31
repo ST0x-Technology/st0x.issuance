@@ -391,7 +391,6 @@ pub async fn initialize_rocket(
     ));
     background_task_handles.extend(spawn_redemption_background_tasks(
         managers.burn.clone(),
-        pool.clone(),
         apalis_pool.clone(),
         shutdown_rx.clone(),
     ));
@@ -2164,13 +2163,12 @@ fn spawn_mint_background_tasks(
 /// durable job and startup recovery from driving the same side effect at once.
 fn spawn_redemption_background_tasks(
     burn: Arc<BurnManager>,
-    pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles =
         vec![spawn_burn_recovery_reconciler(burn.clone(), shutdown.clone())];
-    handles.extend(spawn_burn_job_workers(burn, pool, apalis_pool, shutdown));
+    handles.extend(spawn_burn_job_workers(burn, apalis_pool, shutdown));
     handles
 }
 
@@ -2237,10 +2235,9 @@ fn spawn_mint_job_workers(
 
 /// Spawns the two drainer workers for the burn side-effect job chain. Each
 /// gets an `Arc<BurnManager>` so it can perform its external call and record
-/// the outcome, and the submit worker gets the queue for the confirm handoff.
+/// the outcome, and the submit worker hands the confirm step to the manager.
 fn spawn_burn_job_workers(
     burn_manager: Arc<BurnManager>,
-    pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
@@ -2250,8 +2247,6 @@ fn spawn_burn_job_workers(
             apalis_pool.clone(),
             Arc::new(SubmitBurnContext {
                 burn_manager: burn_manager.clone(),
-                confirm_queue: JobQueue::new(&apalis_pool),
-                pool,
             }),
             shutdown.clone(),
             "burn-submit-worker",
