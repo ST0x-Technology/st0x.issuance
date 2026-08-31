@@ -348,6 +348,7 @@ mod tests {
             signer: SignerConfig::Local(B256::ZERO),
             backfill_start_block: 0,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,

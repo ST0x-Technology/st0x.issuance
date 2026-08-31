@@ -160,6 +160,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+        gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,
@@ -1015,6 +1016,13 @@ impl LocalEvm {
 #[cfg(test)]
 pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     let module = module.strip_suffix("::tests").unwrap_or(module);
+
+    if module.contains("::gas_monitor") {
+        return "gas";
+    }
+    if module.contains("::network_telemetry") {
+        return "network_telemetry";
+    }
 
     if module.contains("::mint") {
         "mint"

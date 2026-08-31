@@ -4695,6 +4695,31 @@ and all mints in recoverable states (`JournalConfirmed`, `Minting`,
 persisted signed transactions so operators can discover wallet-nonce holders via
 the stuck list.
 
+### Network Telemetry
+
+Reports per network operational health so a degraded chain is visible without
+log access.
+
+**Endpoint:** `GET /admin/network-telemetry`
+
+Returns one row per configured network, sorted by network wire name:
+
+- `transfer_poller`: pass counters for that network's `TransferPoller`
+  (`passes`, `failures`, `consecutive_failures`, `failure_rate`,
+  `last_success_at`, `last_failure_at`) plus `lag_blocks`, the worst per vault
+  distance between the chain head and the vault's transfer checkpoint measured
+  at the start of the most recent successful pass.
+- `receipt_backfill`: the same counter shape for the periodic receipt backfill
+  loop, with `lag_blocks` measured against the receipt backfill checkpoints.
+- `gas`: the gas monitor's latest reading for the issuer wallet:
+  `{"status": "ok" | "low", "balance_wei", "threshold_wei", "checked_at"}`,
+  `{"status": "unavailable", "error"}` when the last balance read failed, or
+  `{"status": "unmonitored"}` when no low gas threshold is configured.
+
+Counters live in process memory and reset on restart; `failure_rate` is
+`failures / passes` and is absent until the first pass completes. See "Per
+network monitoring" for what counts as a failed pass.
+
 ## Configuration
 
 ### Environment Variables
@@ -4893,3 +4918,75 @@ rekey change itself.
 | Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
 | Shared `VaultService` with runtime chain_id switch        | Signing backends bind `chain_id` at construction; a runtime switch is error-prone                       |
 | Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |
+
+## Per network monitoring
+
+Every configured chain carries two operator facing safeguards: a low gas monitor
+on the issuer wallet's native balance and per network telemetry for the long
+running loops. Both are keyed by `Network`, so a chain added to the
+`ChainRegistry` is covered without further wiring.
+
+### Gas balance monitoring
+
+Signed transactions (mints, burns, receipt moves) spend the chain's native token
+from the single issuer wallet: ETH on Base and Ethereum, HYPE on HyperEVM. An
+empty wallet halts issuance on that chain, so the bot polls `eth_getBalance` for
+the issuer wallet on every configured chain and alerts before the wallet runs
+dry. This complements the move receipts CLI's transfer gas ceiling check, which
+gates one CLI invocation rather than watching the running service.
+
+**Configuration:** each chain group takes a low gas threshold denominated in the
+chain's native token with 18 decimals (`"0.05"` = 0.05 ETH):
+
+- `CHAIN_BASE_LOW_GAS_THRESHOLD`, `CHAIN_ETHEREUM_LOW_GAS_THRESHOLD`,
+  `CHAIN_HYPEREVM_LOW_GAS_THRESHOLD` for the grouped chain config, each
+  requiring its group's `CHAIN_<NETWORK>_RPC_URL`.
+- `LOW_GAS_THRESHOLD` for the legacy flat Base group, mirroring how the flat
+  `CHAIN_ID` and `BACKFILL_START_BLOCK` map to the single Base entry.
+
+A zero or malformed threshold is a startup error. Thresholds are all or nothing
+across configured chains: setting a threshold for one chain while another
+configured chain has none is a startup error naming the missing network, because
+a partially monitored deployment is exactly the gap this feature closes (HYPE on
+chain 999 going unwatched while Base is covered). With no thresholds at all the
+monitor is disabled and startup logs a WARN, so local development needs no extra
+variables.
+
+**Behavior:** one monitor task per configured chain polls the issuer wallet's
+native balance every 60 seconds:
+
+- Balance drops below the threshold: ERROR log plus a `LowGasBalance` lifecycle
+  notification (Telegram when configured) carrying the network, wallet, balance,
+  and threshold in the chain's native token.
+- Still below the threshold: alert again at most once per hour, so a sustained
+  low balance cannot flood the operator channel.
+- Recovers above the threshold: INFO log only. Recovery resets the repeat alert
+  timer, so oscillation around the threshold cannot page repeatedly.
+- Balance read fails: WARN log, alert state unchanged (a transient RPC blip must
+  not fire or clear alerts), and the telemetry gas status degrades to
+  `unavailable`.
+
+Alert state lives in process memory; a restart alerts once more for a wallet
+still below the threshold, which is the desired behavior for an unresolved
+condition.
+
+### Per network telemetry
+
+An in memory registry, created at startup for the configured networks,
+aggregates what each per network loop reports; `GET /admin/network-telemetry`
+(see Admin API) is its read surface.
+
+- **Transfer poller:** each pass records success or failure and, on success,
+  `lag_blocks` -- the worst per vault distance between the chain head and the
+  vault's cursor at the start of the pass. A pass counts as failed when nothing
+  progressed: the asset view read or head fetch failed, or every vault failed.
+  Partial vault failures keep the pass successful and surface as growing
+  `lag_blocks` instead, matching the poller's WARN/ERROR escalation semantics.
+- **Receipt backfill:** the periodic loop records the same shape per pass, with
+  the same failure rule (skipped pass or every vault failed) and `lag_blocks`
+  measured against the receipt backfill checkpoints.
+- **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
+  `unavailable` with the read error); unconfigured chains report `unmonitored`.
+
+The registry is deliberately not persisted: it describes the running process,
+and the durable signals (checkpoints, event store) already survive restarts.

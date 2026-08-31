@@ -4,6 +4,7 @@
 //! for on-chain side effects, built once at startup from complete per-network
 //! configuration groups.
 
+use alloy::primitives::U256;
 use alloy::providers::fillers::BlobGasFiller;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -38,6 +39,10 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub rpc_url: Url,
     pub backfill_start_block: u64,
+    /// Low gas alert threshold for the issuer wallet's native balance, in
+    /// wei. `None` disables gas monitoring; mixing `Some` and `None` across
+    /// configured chains is rejected by [`validate_chain_configs`].
+    pub low_gas_threshold: Option<U256>,
 }
 
 pub(crate) struct ChainRuntime<P> {
@@ -46,6 +51,7 @@ pub(crate) struct ChainRuntime<P> {
     pub(crate) vault_service: Arc<dyn VaultService>,
     pub(crate) http_provider: P,
     pub(crate) backfill_start_block: u64,
+    pub(crate) low_gas_threshold: Option<U256>,
 }
 
 pub(crate) struct ChainRegistry<P> {
@@ -126,6 +132,11 @@ pub enum ChainRegistryError {
     InvalidRpcScheme(#[from] InvalidRpcScheme),
     #[error("Failed to resolve signer: {0}")]
     SignerResolve(#[from] SignerResolveError),
+    #[error(
+        "low gas thresholds are all or nothing across configured chains; \
+         missing for {missing:?}"
+    )]
+    PartialLowGasThresholds { missing: Vec<Network> },
 }
 
 impl<P> ChainRegistry<P> {
@@ -217,7 +228,31 @@ pub(crate) fn validate_chain_configs(
         }
 
         Ok(())
-    })
+    })?;
+
+    // Thresholds are all or nothing across configured chains: a partially
+    // monitored deployment is exactly the gap gas monitoring closes, so a
+    // chain silently dropping out of coverage must fail startup instead.
+    if configs.iter().any(|config| config.low_gas_threshold.is_some()) {
+        let missing: Vec<Network> = configs
+            .iter()
+            .filter(|config| config.low_gas_threshold.is_none())
+            .map(|config| config.network)
+            .collect();
+        if !missing.is_empty() {
+            warn!(
+                target: "startup",
+                ?missing,
+                "Low gas thresholds configured for some chains but missing \
+                 for others"
+            );
+            return Err(ChainRegistryError::PartialLowGasThresholds {
+                missing,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn build_chain_registry(
@@ -240,8 +275,13 @@ async fn build_chain_runtime(
     config: ChainConfig,
     signer: &SignerConfig,
 ) -> Result<ChainRuntime<impl Provider + Clone + use<>>, ChainRegistryError> {
-    let ChainConfig { network, chain_id, rpc_url, backfill_start_block } =
-        config;
+    let ChainConfig {
+        network,
+        chain_id,
+        rpc_url,
+        backfill_start_block,
+        low_gas_threshold,
+    } = config;
 
     let http_url = wss_to_http(&rpc_url)?;
     let http_provider = ProviderBuilder::new().connect_http(http_url);
@@ -283,6 +323,7 @@ async fn build_chain_runtime(
         vault_service,
         http_provider,
         backfill_start_block,
+        low_gas_threshold,
     })
 }
 
@@ -308,6 +349,7 @@ mod tests {
             chain_id,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
             backfill_start_block: 1,
+            low_gas_threshold: None,
         }
     }
 
@@ -321,6 +363,7 @@ mod tests {
                 chain_id: 8453,
                 rpc_url: Url::parse("wss://localhost:8546").unwrap(),
                 backfill_start_block: 1,
+                low_gas_threshold: None,
             },
         ];
 
@@ -328,6 +371,51 @@ mod tests {
             validate_chain_configs(&configs),
             Err(ChainRegistryError::DuplicateChainId { .. })
         ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn validate_rejects_partial_low_gas_thresholds() {
+        let mut base = base_config(8453);
+        base.low_gas_threshold = Some(U256::from(1));
+        let configs = vec![
+            base,
+            ChainConfig {
+                network: Network::Ethereum,
+                chain_id: 1,
+                rpc_url: Url::parse("wss://localhost:8546").unwrap(),
+                backfill_start_block: 1,
+                low_gas_threshold: None,
+            },
+        ];
+
+        assert!(matches!(
+            validate_chain_configs(&configs),
+            Err(ChainRegistryError::PartialLowGasThresholds { missing })
+                if missing == vec![Network::Ethereum]
+        ));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Low gas thresholds configured", "missing=[Ethereum]"]
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_uniform_low_gas_thresholds() {
+        let mut base = base_config(8453);
+        base.low_gas_threshold = Some(U256::from(1));
+        let mut ethereum = base_config(8453);
+        ethereum.network = Network::Ethereum;
+        ethereum.chain_id = 1;
+        ethereum.low_gas_threshold = Some(U256::from(2));
+
+        validate_chain_configs(&[base.clone(), ethereum]).unwrap();
+        validate_chain_configs(&[{
+            let mut unmonitored = base;
+            unmonitored.low_gas_threshold = None;
+            unmonitored
+        }])
+        .unwrap();
     }
 
     #[traced_test]
@@ -490,6 +578,7 @@ mod tests {
                 as Arc<dyn VaultService>,
             http_provider: (),
             backfill_start_block: 1,
+            low_gas_threshold: None,
         };
         let registry = ChainRegistry {
             runtimes: HashMap::from([(Network::Base, base_runtime)]),

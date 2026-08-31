@@ -2,6 +2,7 @@
 
 mod telegram;
 
+use alloy::primitives::{Address, U256, utils::format_ether};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 
 use crate::jobs::{Job, job_type};
 use crate::redemption::IssuerRedemptionRequestId;
-use crate::tokenized_asset::UnderlyingSymbol;
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
 use telegram::TelegramNotifier;
 
@@ -26,6 +27,7 @@ pub(crate) enum NotificationKind {
     RedemptionHeld,
     RedemptionResumed,
     RedemptionResumeFailed,
+    LowGasBalance,
 }
 
 impl NotificationKind {
@@ -40,6 +42,7 @@ impl NotificationKind {
             Self::RedemptionHeld => "redemption_held",
             Self::RedemptionResumed => "redemption_resumed",
             Self::RedemptionResumeFailed => "redemption_resume_failed",
+            Self::LowGasBalance => "low_gas_balance",
         }
     }
 }
@@ -76,6 +79,12 @@ pub(crate) enum LifecycleNotification {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
     },
+    LowGasBalance {
+        network: Network,
+        wallet: Address,
+        balance: U256,
+        threshold: U256,
+    },
 }
 
 impl LifecycleNotification {
@@ -100,6 +109,7 @@ impl LifecycleNotification {
             Self::RedemptionResumeFailed { .. } => {
                 NotificationKind::RedemptionResumeFailed
             }
+            Self::LowGasBalance { .. } => NotificationKind::LowGasBalance,
         }
     }
 
@@ -144,6 +154,15 @@ impl LifecycleNotification {
             Self::RedemptionResumeFailed { issuer_request_id, underlying } => {
                 format!(
                     "Redemption resume failed: {issuer_request_id} {underlying}; check structured logs"
+                )
+            }
+            Self::LowGasBalance { network, wallet, balance, threshold } => {
+                let currency = network.native_currency();
+                format!(
+                    "Low gas on {network}: issuer wallet {wallet} holds {} \
+                     {currency} (threshold {} {currency})",
+                    format_ether(*balance),
+                    format_ether(*threshold)
                 )
             }
         }
@@ -510,7 +529,7 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::b256;
+    use alloy::primitives::{address, b256, utils::parse_ether};
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use tracing::Level;
@@ -619,6 +638,37 @@ mod tests {
             assert!(!notification.message().contains("quantity"));
             assert!(!notification.message().contains("balance"));
         }
+    }
+
+    #[test]
+    fn low_gas_message_uses_the_network_native_currency() {
+        let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let base = LifecycleNotification::LowGasBalance {
+            network: Network::Base,
+            wallet,
+            balance: parse_ether("0.05").unwrap(),
+            threshold: parse_ether("0.10").unwrap(),
+        };
+        assert_eq!(
+            base.message(),
+            "Low gas on base: issuer wallet \
+             0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
+             0.050000000000000000 ETH (threshold 0.100000000000000000 ETH)"
+        );
+
+        let hyperevm = LifecycleNotification::LowGasBalance {
+            network: Network::HyperEvm,
+            wallet,
+            balance: parse_ether("1").unwrap(),
+            threshold: parse_ether("2").unwrap(),
+        };
+        assert_eq!(
+            hyperevm.message(),
+            "Low gas on hyperevm: issuer wallet \
+             0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
+             1.000000000000000000 HYPE (threshold 2.000000000000000000 HYPE)"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::burn_excess::{
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
 };
+use crate::gas_monitor::GasMonitor;
 use crate::jobs::{JobQueue, work};
 use crate::mint::job::{
     ConfirmMintContext, ConfirmMintJob, SendCallbackContext, SendCallbackJob,
@@ -45,6 +46,7 @@ use crate::mint::{
         vacuum_terminal_recovery_jobs,
     },
 };
+use crate::network_telemetry::NetworkTelemetry;
 use crate::notifications::LifecycleNotifier;
 use crate::receipt_inventory::backfill::{
     NoOpItnHandler, ReceiptBackfillDeps, ReceiptBackfiller,
@@ -86,7 +88,9 @@ pub(crate) mod burn_excess;
 pub(crate) mod catchers;
 pub(crate) mod chain;
 pub(crate) mod config;
+pub(crate) mod gas_monitor;
 pub(crate) mod jobs;
+pub(crate) mod network_telemetry;
 pub(crate) mod notifications;
 mod openapi;
 pub(crate) mod poll_checkpoint;
@@ -318,6 +322,9 @@ pub async fn initialize_rocket(
 
     let configured_networks = chain_registry.configured_networks();
     let network_vault_services = chain_registry.network_vault_services();
+    let network_telemetry = Arc::new(NetworkTelemetry::new(
+        chain_registry.runtimes().map(|(network, _)| *network),
+    ));
 
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(&pool, &network_vault_services).await?;
@@ -436,56 +443,21 @@ pub async fn initialize_rocket(
         ),
     );
 
-    for (network, runtime) in chain_registry.runtimes() {
-        background_task_handles.push(spawn_periodic_receipt_backfills(
-            PeriodicBackfillSpawn {
-                pool: pool.clone(),
-                provider: runtime.http_provider.clone(),
-                network: *network,
-                chain_id: runtime.chain_id,
-                receipt_inventory_store: receipt_inventory_store.clone(),
-                bot_wallet,
-                backfill_start_block: runtime.backfill_start_block,
-                receipt_poll_interval: config.receipt_poll_interval,
-                handler: MintRecoveryHandler::new(
-                    pool.clone(),
-                    apalis_pool.clone(),
-                ),
-                shutdown: shutdown_rx.clone(),
-            },
-        ));
-    }
-
-    {
-        for (network, runtime) in chain_registry.runtimes() {
-            info!(
-                target: "redemption",
-                network = %network,
-                "Spawning dynamic transfer poller for network"
-            );
-
-            let poller = TransferPoller::new(TransferPollerConfig {
-                network: *network,
-                provider: runtime.http_provider.clone(),
-                bot_wallet,
-                backfill_start_block: runtime.backfill_start_block,
-                store: redemption_store.clone(),
-                pool: pool.clone(),
-                redeem_call_manager: managers.redeem_call.clone(),
-                journal_manager: managers.journal.clone(),
-                burn_manager: managers.burn.clone(),
-                vault_mode_config: config.vault_mode_config.clone(),
-            });
-
-            let mut poller_shutdown = shutdown_rx.clone();
-            background_task_handles.push(tokio::spawn(async move {
-                tokio::select! {
-                    () = poller.run() => {}
-                    _ = poller_shutdown.changed() => {}
-                }
-            }));
-        }
-    }
+    background_task_handles.extend(spawn_per_network_tasks(
+        &PerNetworkTaskDeps {
+            chain_registry: &chain_registry,
+            config: &config,
+            pool: &pool,
+            apalis_pool: &apalis_pool,
+            receipt_inventory_store: &receipt_inventory_store,
+            redemption_store: &redemption_store,
+            managers: &managers,
+            bot_wallet,
+            lifecycle_notifier: &lifecycle_notifier,
+            network_telemetry: &network_telemetry,
+            shutdown: &shutdown_rx,
+        },
+    ));
 
     maintain_background_job_tables(&pool, &apalis_pool).await;
 
@@ -541,6 +513,7 @@ pub async fn initialize_rocket(
         configured_networks,
         freeze_scheduler,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+        network_telemetry,
         background_tasks: BackgroundTasks {
             shutdown: shutdown_tx,
             handles: background_task_handles,
@@ -654,6 +627,8 @@ struct RocketState {
     /// Receipt inventory reads for the admin close-mint safety gate (the
     /// vault-direct landed check).
     receipts: Arc<dyn ReceiptService>,
+    /// Per network loop and gas balance telemetry for the admin surface.
+    network_telemetry: Arc<NetworkTelemetry>,
     background_tasks: BackgroundTasks,
 }
 
@@ -806,6 +781,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.apalis_pool)
         .manage(state.freeze_scheduler)
         .manage(state.receipts)
+        .manage(state.network_telemetry)
         .mount(
             "/",
             routes![
@@ -828,6 +804,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::list_stuck,
                 admin::schedule_freeze_window,
                 admin::orchestrator_health,
+                admin::network_telemetry,
             ],
         )
         .register("/", catchers::json_catchers());
@@ -1549,11 +1526,13 @@ struct PeriodicBackfillCtx<'a, P, H> {
     handler: &'a H,
 }
 
+/// Runs one vault's periodic receipt backfill pass and returns the block the
+/// scan resumed from, for the pass's lag measurement.
 async fn run_periodic_receipt_backfill_for_config<P, H>(
     ctx: &PeriodicBackfillCtx<'_, P, H>,
     config: VaultBackfillConfig,
     head_block: u64,
-) -> Result<(), anyhow::Error>
+) -> Result<u64, anyhow::Error>
 where
     P: Provider + Clone,
     H: ItnReceiptHandler,
@@ -1594,7 +1573,7 @@ where
         "Periodic receipt backfill complete for vault"
     );
 
-    Ok(())
+    Ok(from_block)
 }
 
 /// Owned dependencies needed to spawn the periodic receipt-backfill task.
@@ -1611,6 +1590,7 @@ struct PeriodicBackfillSpawn<P, H> {
     receipt_poll_interval: Duration,
     handler: H,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    telemetry: Arc<NetworkTelemetry>,
 }
 
 /// Spawns the periodic receipt-backfill reconciliation loop. Each pass re-reads
@@ -1636,6 +1616,7 @@ where
         receipt_poll_interval,
         handler,
         mut shutdown,
+        telemetry,
     } = spawn;
 
     tokio::spawn(async move {
@@ -1680,6 +1661,7 @@ where
                         "Failed to list enabled assets; skipping receipt \
                          backfill pass"
                     );
+                    telemetry.record_receipt_backfill_failure(network);
                     continue;
                 }
             };
@@ -1703,6 +1685,7 @@ where
                         "Failed to fetch chain head; skipping this receipt \
                          backfill pass"
                     );
+                    telemetry.record_receipt_backfill_failure(network);
                     continue;
                 }
             };
@@ -1710,6 +1693,7 @@ where
             // Per-vault failures log at DEBUG (loop-body rule); the pass emits a
             // single WARN summary below if any vault failed.
             let mut failed_vaults: Vec<Address> = Vec::new();
+            let mut lag_blocks = 0_u64;
 
             for asset in &assets {
                 let receipt_contract = match cached_receipt_contract(
@@ -1740,19 +1724,28 @@ where
                     receipt_contract: receipt_contract.0,
                 };
 
-                if let Err(error) = run_periodic_receipt_backfill_for_config(
+                match run_periodic_receipt_backfill_for_config(
                     &ctx, config, head_block,
                 )
                 .await
                 {
-                    debug!(
-                        target: "receipt",
-                        error = %error,
-                        vault = %asset.vault,
-                        "Periodic receipt backfill failed; next run will resume \
-                         from the last checkpoint"
-                    );
-                    failed_vaults.push(asset.vault);
+                    Ok(from_block) => {
+                        lag_blocks = lag_blocks.max(
+                            head_block
+                                .saturating_add(1)
+                                .saturating_sub(from_block),
+                        );
+                    }
+                    Err(error) => {
+                        debug!(
+                            target: "receipt",
+                            error = %error,
+                            vault = %asset.vault,
+                            "Periodic receipt backfill failed; next run will \
+                             resume from the last checkpoint"
+                        );
+                        failed_vaults.push(asset.vault);
+                    }
                 }
             }
 
@@ -1766,8 +1759,153 @@ where
                      resumes from its checkpoint next pass"
                 );
             }
+
+            // A pass where nothing progressed is a telemetry failure; partial
+            // vault failures keep the pass successful and surface through
+            // `lag_blocks` instead, mirroring the transfer poller.
+            if failed_vaults.len() == assets.len() {
+                telemetry.record_receipt_backfill_failure(network);
+            } else {
+                telemetry.record_receipt_backfill_success(network, lag_blocks);
+            }
         }
     })
+}
+
+/// Everything the per network background loops need, bundled to keep the
+/// spawn signature within argument limits.
+struct PerNetworkTaskDeps<'a, P> {
+    chain_registry: &'a ChainRegistry<P>,
+    config: &'a Config,
+    pool: &'a Pool<Sqlite>,
+    apalis_pool: &'a ApalisSqlitePool,
+    receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
+    redemption_store: &'a Arc<Store<Redemption>>,
+    managers: &'a RedemptionManagers,
+    bot_wallet: Address,
+    lifecycle_notifier: &'a Arc<dyn LifecycleNotifier>,
+    network_telemetry: &'a Arc<NetworkTelemetry>,
+    shutdown: &'a tokio::sync::watch::Receiver<bool>,
+}
+
+/// Spawns the per network background loops: one periodic receipt backfill,
+/// one transfer poller, and one gas monitor per configured chain.
+fn spawn_per_network_tasks<P>(
+    deps: &PerNetworkTaskDeps<'_, P>,
+) -> Vec<JoinHandle<()>>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    let mut handles = Vec::new();
+
+    for (network, runtime) in deps.chain_registry.runtimes() {
+        handles.push(spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
+            pool: deps.pool.clone(),
+            provider: runtime.http_provider.clone(),
+            network: *network,
+            chain_id: runtime.chain_id,
+            receipt_inventory_store: deps.receipt_inventory_store.clone(),
+            bot_wallet: deps.bot_wallet,
+            backfill_start_block: runtime.backfill_start_block,
+            receipt_poll_interval: deps.config.receipt_poll_interval,
+            handler: MintRecoveryHandler::new(
+                deps.pool.clone(),
+                deps.apalis_pool.clone(),
+            ),
+            shutdown: deps.shutdown.clone(),
+            telemetry: deps.network_telemetry.clone(),
+        }));
+    }
+
+    for (network, runtime) in deps.chain_registry.runtimes() {
+        info!(
+            target: "redemption",
+            network = %network,
+            "Spawning dynamic transfer poller for network"
+        );
+
+        let poller = TransferPoller::new(TransferPollerConfig {
+            network: *network,
+            provider: runtime.http_provider.clone(),
+            bot_wallet: deps.bot_wallet,
+            backfill_start_block: runtime.backfill_start_block,
+            store: deps.redemption_store.clone(),
+            pool: deps.pool.clone(),
+            redeem_call_manager: deps.managers.redeem_call.clone(),
+            journal_manager: deps.managers.journal.clone(),
+            burn_manager: deps.managers.burn.clone(),
+            vault_mode_config: deps.config.vault_mode_config.clone(),
+            telemetry: deps.network_telemetry.clone(),
+        });
+
+        let mut poller_shutdown = deps.shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::select! {
+                () = poller.run() => {}
+                _ = poller_shutdown.changed() => {}
+            }
+        }));
+    }
+
+    handles.extend(spawn_gas_monitors(
+        deps.chain_registry,
+        deps.config,
+        deps.bot_wallet,
+        deps.lifecycle_notifier,
+        deps.network_telemetry,
+        deps.shutdown,
+    ));
+
+    handles
+}
+
+/// Spawns one gas balance monitor per configured chain that carries a
+/// low gas threshold. `validate_chain_configs` already enforced all or nothing
+/// thresholds, so either every chain spawns a monitor or none does; the WARN
+/// makes the disabled state operator visible.
+fn spawn_gas_monitors<P>(
+    chain_registry: &ChainRegistry<P>,
+    config: &Config,
+    bot_wallet: Address,
+    lifecycle_notifier: &Arc<dyn LifecycleNotifier>,
+    network_telemetry: &Arc<NetworkTelemetry>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    chain_registry
+        .runtimes()
+        .filter_map(|(network, runtime)| {
+            let Some(threshold) = runtime.low_gas_threshold else {
+                warn!(
+                    target: "gas",
+                    network = %network,
+                    "No low gas threshold configured; gas balance monitoring \
+                     is disabled for this chain"
+                );
+                return None;
+            };
+
+            let monitor = GasMonitor {
+                network: *network,
+                provider: runtime.http_provider.clone(),
+                wallet: bot_wallet,
+                threshold,
+                poll_interval: config.gas_poll_interval,
+                notifier: lifecycle_notifier.clone(),
+                telemetry: network_telemetry.clone(),
+            };
+
+            let mut monitor_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                tokio::select! {
+                    () = monitor.run() => {}
+                    _ = monitor_shutdown.changed() => {}
+                }
+            }))
+        })
+        .collect()
 }
 
 /// A vault's own address, as opposed to the address of the ERC-1155 receipt

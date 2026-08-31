@@ -22,6 +22,7 @@ use super::{
 };
 use crate::bindings;
 use crate::config::VaultModeConfig;
+use crate::network_telemetry::NetworkTelemetry;
 use crate::poll_checkpoint::{
     self, CheckpointError, TRANSFER_POLL, advance_transfer_poll,
     load_transfer_poll,
@@ -91,6 +92,7 @@ pub(crate) struct TransferPoller<P> {
     journal_manager: Arc<JournalManager>,
     burn_manager: Arc<BurnManager>,
     vault_mode_config: VaultModeConfig,
+    telemetry: Arc<NetworkTelemetry>,
 }
 
 /// Configuration for constructing a [`TransferPoller`].
@@ -105,6 +107,7 @@ pub(crate) struct TransferPollerConfig<P> {
     pub(crate) journal_manager: Arc<JournalManager>,
     pub(crate) burn_manager: Arc<BurnManager>,
     pub(crate) vault_mode_config: VaultModeConfig,
+    pub(crate) telemetry: Arc<NetworkTelemetry>,
 }
 
 impl<P> TransferPoller<P> {
@@ -120,6 +123,7 @@ impl<P> TransferPoller<P> {
             journal_manager: config.journal_manager,
             burn_manager: config.burn_manager,
             vault_mode_config: config.vault_mode_config,
+            telemetry: config.telemetry,
         }
     }
 }
@@ -171,11 +175,18 @@ where
         // outage is indistinguishable from a single blip in the logs.
         let mut consecutive_failures = 0_usize;
         loop {
-            if let Err(error) = self.poll_once().await {
-                consecutive_failures += 1;
-                log_poll_failure(&error, consecutive_failures);
-                tokio::time::sleep(RETRY_INTERVAL).await;
-                continue;
+            match self.poll_once().await {
+                Err(error) => {
+                    consecutive_failures += 1;
+                    log_poll_failure(&error, consecutive_failures);
+                    self.telemetry.record_transfer_poll_failure(self.network);
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    continue;
+                }
+                Ok(lag_blocks) => {
+                    self.telemetry
+                        .record_transfer_poll_success(self.network, lag_blocks);
+                }
             }
 
             consecutive_failures = 0;
@@ -253,7 +264,9 @@ where
 
     /// Runs a single poll pass: re-read this network's enabled asset set,
     /// then scan each of its vaults from its own checkpoint to the chain
-    /// head.
+    /// head. Returns the pass's lag: the worst per vault distance between
+    /// the chain head and the vault's cursor at the start of the pass, from
+    /// the vaults that scanned successfully.
     ///
     /// The asset list is loaded ONCE per pass and that same snapshot drives
     /// both the vault set and per-log asset attribution
@@ -261,7 +274,7 @@ where
     /// re-point mid-pass cannot turn an already-fetched log into a
     /// non-transient skip (the vault its log came from is always present in
     /// the snapshot the pass was built from).
-    async fn poll_once(&self) -> Result<(), TransferPollError> {
+    async fn poll_once(&self) -> Result<u64, TransferPollError> {
         // Re-read the monitored asset set every pass so assets added or
         // re-pointed at runtime are covered without a restart — scoped to
         // this poller's network, so no pass scans (or checkpoints) another
@@ -273,7 +286,7 @@ where
             .collect::<Vec<_>>();
         let vaults = enabled_vaults(&assets);
         if vaults.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // One `head` for the whole pass so every vault scans to a consistent
@@ -291,17 +304,24 @@ where
         // fetch — still propagate, since they block every vault.)
         let mut failed_vaults: Vec<Address> = Vec::new();
         let total_vaults = vaults.len();
+        let mut lag_blocks = 0_u64;
 
         for vault in vaults {
-            if let Err(error) = self.poll_vault(&assets, vault, head).await {
-                debug!(
-                    target: "redemption",
-                    %vault,
-                    error = %error,
-                    "Failed to poll vault; will retry next pass from its \
-                     checkpoint"
-                );
-                failed_vaults.push(vault);
+            match self.poll_vault(&assets, vault, head).await {
+                Ok(cursor) => {
+                    lag_blocks = lag_blocks
+                        .max(head.saturating_add(1).saturating_sub(cursor));
+                }
+                Err(error) => {
+                    debug!(
+                        target: "redemption",
+                        %vault,
+                        error = %error,
+                        "Failed to poll vault; will retry next pass from its \
+                         checkpoint"
+                    );
+                    failed_vaults.push(vault);
+                }
             }
         }
 
@@ -322,20 +342,21 @@ where
             }
         }
 
-        Ok(())
+        Ok(lag_blocks)
     }
 
     /// Scans one vault from its per-vault checkpoint (or `backfill_start_block`
     /// when it has none — a runtime-added or re-pointed vault) up to `head`,
     /// processing each Transfer and advancing the vault's checkpoint per chunk.
     /// Per-vault checkpoints are why a first-seen vault scans its full history
-    /// instead of inheriting a global cursor already past it.
+    /// instead of inheriting a global cursor already past it. Returns the
+    /// cursor the scan started from, for the pass's lag measurement.
     async fn poll_vault(
         &self,
         assets: &[TokenizedAssetView],
         vault: Address,
         head: u64,
-    ) -> Result<(), TransferPollError> {
+    ) -> Result<u64, TransferPollError> {
         let last_processed =
             load_transfer_poll(&self.pool, self.network, vault).await?;
 
@@ -360,7 +381,7 @@ where
                 head,
                 "Vault caught up; skipping"
             );
-            return Ok(());
+            return Ok(cursor);
         }
 
         debug!(
@@ -418,7 +439,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(cursor)
     }
 
     /// Fetches Transfer logs for one vault where topic2 (to) == bot_wallet.
@@ -630,6 +651,7 @@ mod tests {
     use super::{TransferPollError, watch_redemption_flow};
     use crate::alpaca::mock::MockAlpacaService;
     use crate::config::VaultModeConfig;
+    use crate::network_telemetry::NetworkTelemetry;
     use crate::notifications::NoopLifecycleNotifier;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
@@ -755,6 +777,7 @@ mod tests {
             journal_manager,
             burn_manager,
             vault_mode_config: VaultModeConfig::default(),
+            telemetry: Arc::new(NetworkTelemetry::new([network])),
         });
 
         TestPollerSetup { poller, pool }

@@ -1,4 +1,7 @@
-use alloy::primitives::Address;
+use alloy::primitives::{
+    Address, U256,
+    utils::{UnitsError, parse_ether},
+};
 use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
@@ -220,6 +223,10 @@ pub struct Config {
     /// `RECEIPT_POLL_INTERVAL` in production; tests lower it so they don't
     /// have to wait a full production interval for a reconciliation pass.
     pub receipt_poll_interval: Duration,
+    /// Interval between gas balance polls. Defaults to
+    /// `gas_monitor::GAS_POLL_INTERVAL` in production; tests lower it so
+    /// they don't have to wait a full production interval for a reading.
+    pub gas_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     /// Console log output format; see [`LogFormat`].
@@ -333,6 +340,15 @@ struct Env {
     )]
     backfill_start_block: u64,
 
+    #[arg(
+        long,
+        env = "LOW_GAS_THRESHOLD",
+        help = "Low gas alert threshold for the legacy flat Base group, in \
+                native token units with 18 decimals (e.g. \"0.05\"); ignored \
+                when CHAIN_BASE_* overrides the flat Base configuration"
+    )]
+    low_gas_threshold: Option<String>,
+
     #[clap(flatten)]
     auth: AuthConfig,
 
@@ -396,6 +412,15 @@ struct Env {
 
     #[arg(
         long,
+        env = "CHAIN_BASE_LOW_GAS_THRESHOLD",
+        requires = "chain_base_rpc_url",
+        help = "Low gas alert threshold for the Base group, in ETH \
+                (e.g. \"0.05\")"
+    )]
+    chain_base_low_gas_threshold: Option<String>,
+
+    #[arg(
+        long,
         env = "CHAIN_ETHEREUM_RPC_URL",
         requires_all = [
             "chain_ethereum_chain_id",
@@ -421,6 +446,15 @@ struct Env {
         help = "Receipt-backfill start block for the Ethereum group"
     )]
     chain_ethereum_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_ETHEREUM_LOW_GAS_THRESHOLD",
+        requires = "chain_ethereum_rpc_url",
+        help = "Low gas alert threshold for the Ethereum group, in ETH \
+                (e.g. \"0.05\")"
+    )]
+    chain_ethereum_low_gas_threshold: Option<String>,
 
     #[arg(
         long,
@@ -450,6 +484,15 @@ struct Env {
         help = "Receipt-backfill start block for the HyperEVM group"
     )]
     chain_hyperevm_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_HYPEREVM_LOW_GAS_THRESHOLD",
+        requires = "chain_hyperevm_rpc_url",
+        help = "Low gas alert threshold for the HyperEVM group, in HYPE \
+                (e.g. \"1.0\")"
+    )]
+    chain_hyperevm_low_gas_threshold: Option<String>,
 
     #[arg(
         long,
@@ -513,6 +556,7 @@ impl Env {
             signer,
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
             log_format: self.log_format,
@@ -541,6 +585,7 @@ impl Env {
                 rpc_url: self.chain_base_rpc_url.as_ref(),
                 chain_id: self.chain_base_chain_id,
                 backfill_start_block: self.chain_base_backfill_start_block,
+                low_gas_threshold: self.chain_base_low_gas_threshold.as_deref(),
             },
         )? {
             // Both forms set is a legitimate state — the legacy flat vars
@@ -572,6 +617,10 @@ impl Env {
                 chain_id: self.chain_id,
                 rpc_url,
                 backfill_start_block: self.backfill_start_block,
+                low_gas_threshold: parse_low_gas_threshold(
+                    Network::Base,
+                    self.low_gas_threshold.as_deref(),
+                )?,
             }
         };
         let ethereum = Self::optional_chain_config(
@@ -580,6 +629,9 @@ impl Env {
                 rpc_url: self.chain_ethereum_rpc_url.as_ref(),
                 chain_id: self.chain_ethereum_chain_id,
                 backfill_start_block: self.chain_ethereum_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_ethereum_low_gas_threshold
+                    .as_deref(),
             },
         )?;
         let hyperevm = Self::optional_chain_config(
@@ -588,6 +640,9 @@ impl Env {
                 rpc_url: self.chain_hyperevm_rpc_url.as_ref(),
                 chain_id: self.chain_hyperevm_chain_id,
                 backfill_start_block: self.chain_hyperevm_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_hyperevm_low_gas_threshold
+                    .as_deref(),
             },
         )?;
         let mut chains = vec![base.clone()];
@@ -601,10 +656,26 @@ impl Env {
         network: Network,
         group: &ChainGroupEnv<'_>,
     ) -> Result<Option<ChainConfig>, ConfigError> {
-        let &ChainGroupEnv { rpc_url, chain_id, backfill_start_block } = group;
+        let &ChainGroupEnv {
+            rpc_url,
+            chain_id,
+            backfill_start_block,
+            low_gas_threshold,
+        } = group;
 
         match (rpc_url, chain_id, backfill_start_block) {
-            (None, None, None) => Ok(None),
+            (None, None, None) => {
+                // Clap's `requires` ties each threshold to its group's RPC
+                // URL, so this is a defensive guard like the legacy-Base
+                // `ok_or` above: a future clap edit degrades to a startup
+                // error instead of a silently dropped threshold.
+                if low_gas_threshold.is_some() {
+                    return Err(ConfigError::ParseError(clap::Error::new(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                    )));
+                }
+                Ok(None)
+            }
             (Some(rpc_url), Some(chain_id), Some(backfill_start_block)) => {
                 // A network label bound to a chain it does not name is not a
                 // recoverable misconfiguration: the receipt inventory is keyed
@@ -631,6 +702,10 @@ impl Env {
                     chain_id,
                     rpc_url: rpc_url.clone(),
                     backfill_start_block,
+                    low_gas_threshold: parse_low_gas_threshold(
+                        network,
+                        low_gas_threshold,
+                    )?,
                 }))
             }
             _ => Err(ConfigError::ParseError(clap::Error::new(
@@ -649,6 +724,33 @@ struct ChainGroupEnv<'env> {
     rpc_url: Option<&'env Url>,
     chain_id: Option<u64>,
     backfill_start_block: Option<u64>,
+    low_gas_threshold: Option<&'env str>,
+}
+
+/// Parses one chain's low gas threshold from its decimal native token string
+/// (18 decimals, e.g. `"0.05"`) into wei. Zero is rejected: a zero threshold
+/// never alerts, which reads as monitored while monitoring nothing.
+fn parse_low_gas_threshold(
+    network: Network,
+    value: Option<&str>,
+) -> Result<Option<U256>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let threshold = parse_ether(value).map_err(|source| {
+        ConfigError::InvalidLowGasThreshold {
+            network,
+            value: value.to_string(),
+            source,
+        }
+    })?;
+
+    if threshold.is_zero() {
+        return Err(ConfigError::ZeroLowGasThreshold { network });
+    }
+
+    Ok(Some(threshold))
 }
 
 #[derive(Args, Clone)]
@@ -775,6 +877,21 @@ pub enum ConfigError {
         network.as_str().to_uppercase()
     )]
     ChainIdNotForNetwork { network: Network, configured: u64, expected: u64 },
+    #[error(
+        "low gas threshold '{value}' for {network} is not a valid \
+         native token amount: {source}"
+    )]
+    InvalidLowGasThreshold {
+        network: Network,
+        value: String,
+        #[source]
+        source: UnitsError,
+    },
+    #[error(
+        "low gas threshold for {network} is zero; a zero threshold never \
+         alerts, so it reads as monitored while monitoring nothing"
+    )]
+    ZeroLowGasThreshold { network: Network },
     #[error(
         "no RPC URL configured for {network}; set {hint} in the service \
          environment (deployment secrets / .env)"
@@ -1205,6 +1322,7 @@ mod tests {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
                 chain_id: Some(8453),
                 backfill_start_block: Some(22_000_000),
+                low_gas_threshold: None,
             },
         );
 
@@ -1274,6 +1392,62 @@ mod tests {
         assert_eq!(hyperevm.backfill_start_block, 9_000_000);
     }
 
+    #[test]
+    fn grouped_threshold_parses_to_wei() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--chain-hyperevm-rpc-url",
+            "wss://hyperevm.example",
+            "--chain-hyperevm-chain-id",
+            "999",
+            "--chain-hyperevm-backfill-start-block",
+            "9000000",
+            "--chain-hyperevm-low-gas-threshold",
+            "1.5",
+            "--low-gas-threshold",
+            "0.05",
+        ]);
+
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config().unwrap();
+
+        let base = &config.chains[0];
+        assert_eq!(
+            base.low_gas_threshold,
+            Some(U256::from(50_000_000_000_000_000_u64)),
+            "the flat LOW_GAS_THRESHOLD must apply to the legacy Base entry"
+        );
+        let hyperevm = &config.chains[1];
+        assert_eq!(
+            hyperevm.low_gas_threshold,
+            Some(U256::from(1_500_000_000_000_000_000_u64))
+        );
+    }
+
+    #[test]
+    fn malformed_threshold_is_refused() {
+        let result =
+            parse_low_gas_threshold(Network::Base, Some("not-a-number"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidLowGasThreshold {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_threshold_is_refused() {
+        let result = parse_low_gas_threshold(Network::Base, Some("0"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ZeroLowGasThreshold { network: Network::Base })
+        ));
+    }
+
     /// HyperEVM's testnet id (998) one keystroke away from mainnet (999) is
     /// exactly the mislabeling the canonical-id check exists to refuse.
     #[test]
@@ -1284,6 +1458,7 @@ mod tests {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
                 chain_id: Some(998),
                 backfill_start_block: Some(9_000_000),
+                low_gas_threshold: None,
             },
         );
 
