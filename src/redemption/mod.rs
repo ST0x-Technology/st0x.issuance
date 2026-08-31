@@ -2301,15 +2301,22 @@ impl EventSourced for Redemption {
                 )
                 .await
             }
-            command => self.transition_burn_recovery(command, services).await,
+            command @ (RedemptionCommand::RecordBurnRecoveryAttempt { .. }
+            | RedemptionCommand::RecordBurnPreparationRecoveryAttempt { .. }
+            | RedemptionCommand::RecordBurnRecoveryExhausted { .. }
+            | RedemptionCommand::RecordBurnPreparationRecoveryExhausted { .. }
+            | RedemptionCommand::ReplaceDeadBurn { .. }) => {
+                self.transition_burn_recovery(command, services).await
+            }
         }
     }
 }
 
 impl Redemption {
-    /// Dispatches the burn-recovery bookkeeping commands. `transition` routes
-    /// only these variants here through its wildcard arm; the wildcard below is
-    /// unreachable in practice and fails closed rather than panicking.
+    /// Dispatches the burn recovery bookkeeping commands. `transition` lists
+    /// exactly these variants in its delegating arm, so its match stays
+    /// exhaustive and a new command fails the build there. The wildcard below
+    /// is unreachable by construction and fails closed rather than panicking.
     async fn transition_burn_recovery(
         &self,
         command: RedemptionCommand,
