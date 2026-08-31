@@ -241,9 +241,11 @@ pub(crate) struct NetworkTelemetrySnapshot {
     gas: GasStatusSnapshot,
 }
 
-/// Serialized pass counters for one loop. `failure_rate` is
-/// `failures / passes`, absent until the first pass completes; `lag_blocks`
-/// is absent until the first successful pass records one.
+/// Serialized pass counters for one loop. `passes` is every completed pass,
+/// successes and failures alike, so successes are `passes - failures`.
+/// `failure_rate` is `failures / passes`, absent until the first pass
+/// completes; `lag_blocks` is absent until the first successful pass records
+/// one.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct PassStatsSnapshot {
     passes: u32,

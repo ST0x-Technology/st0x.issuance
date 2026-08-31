@@ -206,7 +206,7 @@ fn evaluate(
             (AlertState::Normal, PollOutcome::Recovered)
         }
         (AlertState::Low { last_alerted }, true) => {
-            if now.duration_since(last_alerted) >= realert_interval {
+            if now.saturating_duration_since(last_alerted) >= realert_interval {
                 (
                     AlertState::Low { last_alerted: now },
                     PollOutcome::StillLowRealert,

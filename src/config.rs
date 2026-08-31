@@ -602,6 +602,20 @@ impl Env {
                      for the service"
                 );
             }
+            // The grouped path reads only CHAIN_BASE_LOW_GAS_THRESHOLD, so a
+            // flat LOW_GAS_THRESHOLD is dropped here. Name it rather than let
+            // Base fall through to the generic "monitoring disabled" WARN,
+            // which would read as if no threshold were set at all.
+            if self.low_gas_threshold.is_some()
+                && self.chain_base_low_gas_threshold.is_none()
+            {
+                warn!(
+                    target: "config",
+                    "Flat LOW_GAS_THRESHOLD is ignored while CHAIN_BASE_* \
+                     configures Base; set CHAIN_BASE_LOW_GAS_THRESHOLD to \
+                     monitor Base gas"
+                );
+            }
             base
         } else {
             // Clap's `required_unless_present = "chain_base_rpc_url"` on the
@@ -728,8 +742,12 @@ struct ChainGroupEnv<'env> {
 }
 
 /// Parses one chain's low gas threshold from its decimal native token string
-/// (18 decimals, e.g. `"0.05"`) into wei. Zero is rejected: a zero threshold
-/// never alerts, which reads as monitored while monitoring nothing.
+/// (e.g. `"0.05"`) into wei. Digits beyond 18 decimals are sub-wei and are
+/// truncated by `parse_ether`. Zero is rejected: a zero threshold never
+/// alerts, which reads as monitored while monitoring nothing. A negative sign
+/// is rejected too, because `parse_ether` would otherwise reinterpret it as a
+/// near-`U256::MAX` two's-complement value (a sign typo silently making every
+/// balance read below threshold) instead of failing.
 fn parse_low_gas_threshold(
     network: Network,
     value: Option<&str>,
@@ -737,6 +755,13 @@ fn parse_low_gas_threshold(
     let Some(value) = value else {
         return Ok(None);
     };
+
+    if value.trim_start().starts_with('-') {
+        return Err(ConfigError::NegativeLowGasThreshold {
+            network,
+            value: value.to_string(),
+        });
+    }
 
     let threshold = parse_ether(value).map_err(|source| {
         ConfigError::InvalidLowGasThreshold {
@@ -892,6 +917,11 @@ pub enum ConfigError {
          alerts, so it reads as monitored while monitoring nothing"
     )]
     ZeroLowGasThreshold { network: Network },
+    #[error(
+        "low gas threshold '{value}' for {network} is negative; a threshold \
+         must be a positive native token amount"
+    )]
+    NegativeLowGasThreshold { network: Network, value: String },
     #[error(
         "no RPC URL configured for {network}; set {hint} in the service \
          environment (deployment secrets / .env)"
@@ -1445,6 +1475,23 @@ mod tests {
         assert!(matches!(
             result,
             Err(ConfigError::ZeroLowGasThreshold { network: Network::Base })
+        ));
+    }
+
+    /// A leading `-` is a sign typo, not a valid threshold. `parse_ether`
+    /// would reinterpret it as a near-`U256::MAX` value that passes the zero
+    /// check and makes every balance read below threshold, so it must be
+    /// rejected at parse time.
+    #[test]
+    fn negative_threshold_is_refused() {
+        let result = parse_low_gas_threshold(Network::Base, Some("-0.05"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::NegativeLowGasThreshold {
+                network: Network::Base,
+                ..
+            })
         ));
     }
 
