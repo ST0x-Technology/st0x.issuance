@@ -14,10 +14,10 @@ use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
 use super::{
-    BurnExternalTxId, BurnParams, BurnRecoveryAction, ExistingBurnProof,
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
-    RedemptionEvent, VaultFailure, next_burn_retry_external_tx_id_from_history,
-    vault_error_to_redemption,
+    BurnExternalTxId, BurnNonceTooLowProof, BurnParams, BurnRecoveryAction,
+    ExistingBurnProof, IssuerRedemptionRequestId, Redemption,
+    RedemptionCommand, RedemptionError, RedemptionEvent, VaultFailure,
+    next_burn_retry_external_tx_id_from_history, vault_error_to_redemption,
 };
 use crate::Quantity;
 use crate::burn_excess::has_unresolved_excess_burn_intent;
@@ -52,6 +52,23 @@ struct BurnRecoveryBudget {
     attempts: u32,
     exhausted: bool,
     last_transaction: Option<(B256, u64)>,
+    nonce_too_low_transaction: Option<(B256, u64)>,
+}
+
+impl BurnRecoveryBudget {
+    fn nonce_too_low_proof(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Option<BurnNonceTooLowProof> {
+        (self.nonce_too_low_transaction
+            == Some((sendable_tx.hash, sendable_tx.nonce)))
+        .then(|| BurnNonceTooLowProof {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+        })
+    }
 }
 
 /// Shares the bot wallet must hold on-chain before a recovery-driven burn can
@@ -619,17 +636,6 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         view: &RedemptionView,
     ) -> Result<(), BurnManagerError> {
-        let replacement_already_reserved =
-            self.failed_replacement_already_reserved(issuer_request_id).await?;
-        if !replacement_already_reserved
-            && !self.recovery_budget_available(issuer_request_id, None).await?
-        {
-            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                "Skipping BurnFailed redemption with exhausted automatic recovery budget"
-            );
-            return Ok(());
-        }
-
         let RedemptionView::BurnFailed {
             underlying,
             network,
@@ -710,6 +716,20 @@ impl BurnManager {
             self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
                 .await?
         };
+
+        let replacement_already_reserved =
+            self.failed_replacement_already_reserved(issuer_request_id).await?;
+        if !replacement_already_reserved
+            && self
+                .available_recovery_budget(issuer_request_id, None)
+                .await?
+                .is_none()
+        {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Skipping BurnFailed redemption with exhausted automatic recovery budget"
+            );
+            return Ok(());
+        }
 
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
@@ -1183,20 +1203,16 @@ impl BurnManager {
             alpaca_quantity,
         } = recovery;
         let vault_service = self.vault_for(metadata.network)?;
-        let wallet_guard = vault_service.lock_wallet().await;
-        if !self
-            .recovery_budget_available(issuer_request_id, Some(sendable_tx))
-            .await?
-        {
-            debug!(target: "redemption",
-                issuer_request_id = %issuer_request_id,
-                tx_hash = %sendable_tx.hash,
-                "Skipping burn with exhausted automatic recovery budget"
-            );
-            return Ok(RecoveryOutcome::SkippedManualIntervention);
-        }
-
-        let status = vault_service
+        let already_exhausted =
+            self.burn_recovery_budget(issuer_request_id).await?.exhausted;
+        // Exhausted recovery may only observe and confirm the persisted
+        // transaction, so it cannot contend for a lock used to serialize signs.
+        let wallet_guard = if already_exhausted {
+            None
+        } else {
+            Some(vault_service.lock_wallet().await)
+        };
+        let mut status = vault_service
             .classify_burn_tx(self.bot_wallet, sendable_tx)
             .await?;
         let tx_id = sendable_tx.hash.into();
@@ -1211,6 +1227,40 @@ impl BurnManager {
                     has_submitted,
                 )
                 .await;
+        }
+
+        if already_exhausted {
+            debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                "Skipping burn recovery action after exhausting the automatic budget"
+            );
+            return Ok(RecoveryOutcome::SkippedManualIntervention);
+        }
+
+        let Some(budget) = self
+            .available_recovery_budget(issuer_request_id, Some(sendable_tx))
+            .await?
+        else {
+            debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                "Skipping burn recovery action after exhausting the automatic budget"
+            );
+            return Ok(RecoveryOutcome::SkippedManualIntervention);
+        };
+        let nonce_too_low_proof =
+            budget.nonce_too_low_proof(issuer_request_id, sendable_tx);
+        if status == BurnTxStatus::StillMineable
+            && nonce_too_low_proof.is_some()
+        {
+            status = BurnTxStatus::ProvablyDead;
+            info!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                "Treating persisted burn as dead after a deterministic nonce-too-low rejection"
+            );
         }
 
         let action = match status {
@@ -1284,31 +1334,31 @@ impl BurnManager {
                 self.enqueue_submit_burn(issuer_request_id, execution).await?;
             }
             BurnTxStatus::ProvablyDead => {
-                self.store
-                    .send(
-                        issuer_request_id,
-                        RedemptionCommand::ReplaceDeadBurn {
-                            issuer_request_id: issuer_request_id.clone(),
-                            owner: self.bot_wallet,
-                        },
-                    )
-                    .await?;
+                let command = nonce_too_low_proof.map_or_else(
+                    || RedemptionCommand::ReplaceDeadBurn {
+                        issuer_request_id: issuer_request_id.clone(),
+                        owner: self.bot_wallet,
+                    },
+                    |proof| RedemptionCommand::ReplaceNonceTooLowBurn {
+                        issuer_request_id: issuer_request_id.clone(),
+                        owner: self.bot_wallet,
+                        proof,
+                    },
+                );
+                self.store.send(issuer_request_id, command).await?;
+                self.submit_replacement_after_dead_burn(
+                    issuer_request_id,
+                    metadata.burn_mode,
+                    vault,
+                    alpaca_quantity,
+                )
+                .await?;
             }
             BurnTxStatus::Mined | BurnTxStatus::Reverted => {
                 return Err(BurnManagerError::InvalidAggregateState {
                     current_state: "terminal burn classification".to_string(),
                 });
             }
-        }
-
-        if status == BurnTxStatus::ProvablyDead {
-            self.submit_replacement_after_dead_burn(
-                issuer_request_id,
-                metadata.burn_mode,
-                vault,
-                alpaca_quantity,
-            )
-            .await?;
         }
         drop(wallet_guard);
 
@@ -1901,6 +1951,7 @@ impl BurnManager {
             WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
               AND event_type IN (
                   'RedemptionEvent::BurnRecoveryAttempted',
+                  'RedemptionEvent::BurnNonceTooLow',
                   'RedemptionEvent::BurnRecoveryExhausted'
               )
             ORDER BY sequence
@@ -1914,6 +1965,7 @@ impl BurnManager {
             attempts: 0,
             exhausted: false,
             last_transaction: None,
+            nonce_too_low_transaction: None,
         };
         for payload in payloads {
             match serde_json::from_str::<RedemptionEvent>(&payload)? {
@@ -1938,6 +1990,9 @@ impl BurnManager {
                     budget.exhausted = true;
                     budget.last_transaction = Some((tx_hash, nonce));
                 }
+                RedemptionEvent::BurnNonceTooLow { tx_hash, nonce, .. } => {
+                    budget.nonce_too_low_transaction = Some((tx_hash, nonce));
+                }
                 _ => {}
             }
         }
@@ -1945,18 +2000,18 @@ impl BurnManager {
         Ok(budget)
     }
 
-    async fn recovery_budget_available(
+    async fn available_recovery_budget(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         current_transaction: Option<&SendableTxWithHash>,
-    ) -> Result<bool, BurnManagerError> {
+    ) -> Result<Option<BurnRecoveryBudget>, BurnManagerError> {
         let _guard = self.automatic_recovery_lock.lock().await;
         let budget = self.burn_recovery_budget(issuer_request_id).await?;
         if budget.exhausted {
-            return Ok(false);
+            return Ok(None);
         }
         if budget.attempts < MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS {
-            return Ok(true);
+            return Ok(Some(budget));
         }
 
         let (tx_hash, nonce) = current_transaction
@@ -1974,7 +2029,7 @@ impl BurnManager {
             budget.attempts,
         )
         .await?;
-        Ok(false)
+        Ok(None)
     }
 
     async fn reserve_recovery_attempt(
@@ -2561,6 +2616,28 @@ impl BurnManager {
         execution: &BurnExecutionPlan,
         error: VaultError,
     ) -> Result<TxId, BurnManagerError> {
+        if let VaultError::BurnNonceTooLow { tx_hash, nonce } = error {
+            self.store
+                .send(
+                    issuer_request_id,
+                    RedemptionCommand::RecordBurnNonceTooLow {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tx_hash,
+                        nonce,
+                    },
+                )
+                .await?;
+            warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %tx_hash,
+                nonce,
+                "Persisted burn rebroadcast was rejected as nonce too low; a later pass will replace it"
+            );
+            return Err(BurnManagerError::Redemption(
+                RedemptionError::BurnNonceTooLow { tx_hash, nonce },
+            ));
+        }
+
         let VaultFailure {
             message,
             release_reservation,
@@ -3292,7 +3369,8 @@ mod tests {
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
-        IssuerRedemptionRequestId, RedemptionError, RedemptionView,
+        IssuerRedemptionRequestId, RedemptionError, RedemptionEvent,
+        RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
@@ -7849,11 +7927,19 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burn_failed_with_existing_tx_confirms_and_completes()
     {
-        let vault_mock = Arc::new(MockVaultService::new_success());
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
@@ -7880,6 +7966,31 @@ mod tests {
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
 
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner: TEST_WALLET,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("burn intent should persist");
+        record_test_recovery_attempts(
+            store,
+            &issuer_request_id,
+            &persisted_tx,
+            BurnRecoveryAction::Rebroadcast,
+            MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+        )
+        .await;
+
         receipt_service
             .reserve_burn(
                 ANVIL_CHAIN_ID,
@@ -7900,7 +8011,7 @@ mod tests {
                     classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "polling timeout".to_string(),
-                    tx_id: Some(TxId::random()),
+                    tx_id: Some(persisted_tx.hash.into()),
                     planned_burns: vec![BurnRecord {
                         receipt_id: uint!(99_U256),
                         shares_burned: uint!(100_000000000000000000_U256),
@@ -8188,28 +8299,50 @@ mod tests {
         ));
         assert_eq!(
             vault_mock.burn_classification_call_count(),
-            classifications_at_cap,
-            "reaching the durable cap must persist exhaustion before classification"
+            classifications_at_cap + 1,
+            "reaching the durable cap must still classify the persisted transaction"
         );
         assert_eq!(
             vault_mock.replacement_preparation_call_count(),
             replacements_at_cap,
             "reaching the durable cap must not sign another transaction"
         );
+        let wallet_locks_at_exhaustion =
+            vault_mock.get_wallet_lock_call_count();
+        vault_mock.set_burn_tx_status(BurnTxStatus::Mined);
         assert!(matches!(
             manager.recover_single_burning(issuer_request_id).await,
-            Ok(RecoveryOutcome::SkippedManualIntervention)
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
         ));
         assert_eq!(
             vault_mock.burn_classification_call_count(),
-            classifications_at_cap,
-            "persisted exhaustion must skip classification RPCs"
+            classifications_at_cap + 2,
+            "persisted exhaustion must not suppress read-only mined detection"
+        );
+        assert_eq!(
+            vault_mock.get_wallet_lock_call_count(),
+            wallet_locks_at_exhaustion,
+            "persisted exhaustion must classify without acquiring the wallet lock"
         );
         assert_eq!(
             vault_mock.replacement_preparation_call_count(),
             replacements_at_cap,
             "persisted exhaustion must skip replacement signing"
         );
+        let (confirm_execution, tx_id) = submitted_confirm_execution(
+            &manager.store,
+            issuer_request_id,
+            vault,
+        )
+        .await;
+        manager
+            .confirm_submitted_burn(
+                issuer_request_id,
+                &confirm_execution,
+                tx_id,
+            )
+            .await
+            .expect("the enqueued confirm step should record the mined burn");
         assert_eq!(
             vault_mock.get_multi_burn_call_count(),
             broadcasts_before,
@@ -8220,10 +8353,14 @@ mod tests {
             receipt_service
                 .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
-                .expect("exhausted reservation query should succeed")
-                .contains(issuer_request_id),
-            "exhaustion must keep the receipt reservation held"
+                .expect("completed reservation query should succeed")
+                .is_empty(),
+            "a mined transaction must settle its reservation after exhaustion"
         );
+        assert!(matches!(
+            load_aggregate(&manager.store, issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
         assert_eq!(
             vault_mock.submitted_burn_txs(),
             vec![prepared_tx, replacement_tx.clone()],
@@ -8737,6 +8874,136 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Automatic burn recovery action accepted", "Replace"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn nonce_too_low_rebroadcast_moves_to_replacement_after_one_action() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            1860,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let vault_mock = Arc::new(
+            MockVaultService::new_nonce_too_low()
+                .with_burn_tx_status(BurnTxStatus::StillMineable)
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("burn intent should persist");
+        assert!(matches!(
+            manager.recover_single_burning(&issuer_request_id).await,
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
+        ));
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        assert!(matches!(
+            manager
+                .submit_intended_burn(&issuer_request_id, &execution)
+                .await,
+            Err(BurnManagerError::Redemption(
+                RedemptionError::BurnNonceTooLow { tx_hash, nonce }
+            )) if tx_hash == persisted_tx.hash && nonce == persisted_tx.nonce
+        ));
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+        assert!(matches!(
+            manager.recover_single_burning(&issuer_request_id).await,
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
+        ));
+        let replacement_execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &replacement_execution)
+            .await
+            .expect("replacement submit should broadcast");
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(matches!(
+            aggregate,
+            Redemption::BurnSubmitted { sendable_tx, .. }
+                if sendable_tx == replacement_tx
+        ));
+        let recovery_events = sqlx::query_scalar::<_, String>(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+              AND event_type IN (
+                  'RedemptionEvent::BurnRecoveryAttempted',
+                  'RedemptionEvent::BurnNonceTooLow'
+              )
+            ORDER BY sequence
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_all(pool)
+        .await
+        .expect("recovery events should load")
+        .into_iter()
+        .map(|payload| {
+            serde_json::from_str::<RedemptionEvent>(&payload)
+                .expect("recovery event should deserialize")
+        })
+        .collect::<Vec<_>>();
+        assert!(matches!(
+            recovery_events.as_slice(),
+            [
+                RedemptionEvent::BurnRecoveryAttempted {
+                    action: BurnRecoveryAction::Rebroadcast,
+                    ..
+                },
+                RedemptionEvent::BurnNonceTooLow { .. },
+                RedemptionEvent::BurnRecoveryAttempted {
+                    action: BurnRecoveryAction::Replace,
+                    ..
+                },
+            ]
+        ));
+        assert_eq!(
+            vault_mock.burn_classification_call_count(),
+            2,
+            "the durable nonce-too-low proof must replace without another death-proof RPC"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["rebroadcast was rejected as nonce too low"]
         ));
     }
 

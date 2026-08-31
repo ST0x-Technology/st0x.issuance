@@ -362,6 +362,12 @@ pub(crate) enum RedemptionEvent {
         action: super::BurnRecoveryAction,
         attempted_at: DateTime<Utc>,
     },
+    BurnNonceTooLow {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        observed_at: DateTime<Utc>,
+    },
     BurnPreparationRecoveryAttempted {
         issuer_request_id: IssuerRedemptionRequestId,
         attempt: u32,
@@ -441,6 +447,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnRecoveryAttempted { .. } => {
                 "RedemptionEvent::BurnRecoveryAttempted".to_string()
+            }
+            Self::BurnNonceTooLow { .. } => {
+                "RedemptionEvent::BurnNonceTooLow".to_string()
             }
             Self::BurnPreparationRecoveryAttempted { .. } => {
                 "RedemptionEvent::BurnPreparationRecoveryAttempted".to_string()

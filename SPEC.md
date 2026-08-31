@@ -430,14 +430,15 @@ signer intent per nonce domain can be outstanding at a time, regardless of which
 aggregate holds it. This makes the event append itself the durable arbitration
 point: a second instance's competing intent is rejected by SQLite before it can
 commit, rather than relying on an in-memory lock or a fallible read-model
-projection. When the pre-append check finds the network occupied, a mint job
-returns `MintJobError::UnresolvedWalletIntent` and refuses to submit rather than
-risk a nonce collision, leaving the job to retry once the guard clears. When the
-race is lost between that check and the append, the trigger aborts the append
-with an explicit signer-reservation error — worded distinctly from a
-same-aggregate concurrency conflict so an operator reading the failure is
-pointed at the nonce-domain guard, not at a phantom concurrent modification of
-the aggregate.
+projection. Recovery bookkeeping, including `BurnNonceTooLow`, never releases
+this reservation; only a definitively resolved terminal event does. When the
+pre-append check finds the network occupied, a mint job returns
+`MintJobError::UnresolvedWalletIntent` and refuses to submit rather than risk a
+nonce collision, leaving the job to retry once the guard clears. When the race
+is lost between that check and the append, the trigger aborts the append with an
+explicit signer-reservation error — worded distinctly from a same-aggregate
+concurrency conflict so an operator reading the failure is pointed at the
+nonce-domain guard, not at a phantom concurrent modification of the aggregate.
 
 The issuer is a single-writer service: exactly one process may own a given
 SQLite event store and signing wallet at a time. Horizontal replicas sharing a
@@ -682,10 +683,17 @@ on-chain transfer through calling Alpaca to burning tokens.
   stored well before any burn submission), not from the vault
 - `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before its
   external side effect
+- `RecordBurnNonceTooLow` - Persist a deterministic node rejection that proves
+  the exact rebroadcast transaction's nonce is already spent. This observation
+  consumes no additional recovery action.
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
   resuming a failed redemption that has no signed burn transaction
 - `ReplaceDeadBurn` - Re-check that the persisted transaction is provably dead,
   then sign and persist a replacement at a fresh nonce
+- `ReplaceNonceTooLowBurn` - Sign and persist a fresh-nonce replacement after
+  the recovery manager matches a durable `BurnNonceTooLow` observation to this
+  redemption's current transaction and supplies a proof marker. The command
+  handler re-verifies the marker's request id, hash, and nonce before signing.
 - `RecordBurnRecoveryExhausted` - Persist that the redemption-wide automatic
   recovery budget is spent
 - `RecordBurnPreparationRecoveryExhausted` - Persist exhaustion when repeated
@@ -834,14 +842,20 @@ raw redemption amounts are emitted in the admission log.
   the persisted transaction, including its hash, nonce, action, and timestamp.
   These events form the durable redemption-wide recovery budget across process
   restarts.
+- `BurnNonceTooLow` - Records that rebroadcasting the exact persisted hash and
+  nonce received a deterministic `nonce too low` response. Later passes still
+  check the exact hash receipt first, then may use this durable observation as
+  proof that a replacement decision is required without spending more
+  rebroadcast actions.
 - `BurnPreparationRecoveryAttempted` - Records an automatic retry before a
   failed redemption without a signed burn transaction resumes preparation. These
   attempts share the same redemption-wide budget.
 - `BurnRecoveryExhausted` - Records that the automatic recovery budget is spent,
   including the latest hash, nonce, attempt count, and timestamp. It leaves the
   aggregate unresolved and the receipt reservation held for operator recovery.
-  Its first persistence emits the single actionable operator error; later
-  periodic passes observe the marker and perform no RPC or signing side effects.
+  Its first persistence emits the single actionable operator error. Later
+  periodic passes continue read-only exact-hash classification and may record a
+  mined transaction, but perform no signing or broadcast side effects.
 - `BurnPreparationRecoveryExhausted` - Records the same durable stop when
   repeated preparation failures never produced a burn hash and nonce.
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
@@ -934,8 +948,10 @@ raw redemption amounts are emitted in the admission log.
 | `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                  | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                      |
 | `RecordBurnConfirmed`                    | `TokensBurned`                     | Pure: records the confirmation `ConfirmBurnJob` performed via `BurnManager::confirm_submitted_burn`; terminal success                                                                                                                              |
 | `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                                                                                                                                                                      |
+| `RecordBurnNonceTooLow`                  | `BurnNonceTooLow`                  | Persist deterministic proof that the current transaction's nonce is spent without consuming another action                                                                                                                                         |
 | `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                                                                                                                                                                            |
 | `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
+| `ReplaceNonceTooLowBurn`                 | `BurnIntended`                     | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable nonce-too-low observation, then persist a replacement                                                      |
 | `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                                                                                                                                                                    |
 | `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                                                                                                                                                                                   |
 | `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                                                                                                                                                                     |
@@ -972,11 +988,14 @@ the latest persisted signed transaction `(H, N)` for wallet `W` in this order:
 Equivalently, the exact replacement predicate is
 `receipt(H) = None AND finalized_nonce(W) > N`. Receipt lookup is evaluated
 before the nonce comparison. A latest-but-unfinalized nonce advance is not proof
-of death because a reorganization can remove it. A missing block number,
-mismatched receipt hash, provider error, timeout, signer that differs from `W`,
-or any other identity/RPC uncertainty is unclassified and fails closed: the old
-transaction remains live, no replacement is signed, and its reservation remains
-held. Same-nonce fee replacement is not supported.
+of death because a reorganization can remove it. A deterministic `nonce too low`
+response to rebroadcasting the exact persisted bytes is the additional death
+proof: recovery durably records it against `(H, N)`, and every later pass still
+checks `receipt(H)` before using that observation to select replacement. A
+missing block number, mismatched receipt hash, provider error, timeout, signer
+that differs from `W`, or any other identity/RPC uncertainty is unclassified and
+fails closed: the old transaction remains live, no replacement is signed, and
+its reservation remains held. Same-nonce fee replacement is not supported.
 
 Automatic recovery is capped at five accepted recovery actions across the
 redemption's complete event history, including preparation retries,

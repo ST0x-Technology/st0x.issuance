@@ -11,6 +11,8 @@ use alloy::transports::TransportErrorKind;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -312,6 +314,10 @@ pub(crate) struct MockVaultService {
     /// Optional forced `submit_mint` error (e.g. uncertain broadcast).
     #[cfg(test)]
     submit_mint_error: Arc<Mutex<Option<VaultError>>>,
+    /// Rejects the next burn submission with a deterministic nonce-too-low
+    /// error, then allows subsequent submissions.
+    #[cfg(test)]
+    burn_nonce_too_low_once: Arc<AtomicBool>,
     #[cfg(test)]
     last_burn_proof_kind: Arc<Mutex<Option<BurnProofKind>>>,
 }
@@ -371,6 +377,8 @@ impl MockVaultService {
             #[cfg(test)]
             submit_mint_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            burn_nonce_too_low_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             last_burn_proof_kind: Arc::new(Mutex::new(None)),
         }
     }
@@ -386,6 +394,13 @@ impl MockVaultService {
     pub(crate) fn new_submit_failure() -> Self {
         let mut service = Self::new_success();
         service.behavior = MockBehavior::SubmitFailure;
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_nonce_too_low() -> Self {
+        let service = Self::new_success();
+        service.burn_nonce_too_low_once.store(true, Ordering::Relaxed);
         service
     }
 
@@ -560,6 +575,7 @@ impl MockVaultService {
         self.mint_tx_status_sequence.lock().unwrap().clear();
         self.confirm_mint_outcomes.lock().unwrap().clear();
         *self.submit_mint_error.lock().unwrap() = None;
+        self.burn_nonce_too_low_once.store(false, Ordering::Relaxed);
         *self.orchestrator.readiness.lock().unwrap() = None;
         *self.orchestrator.confirm_revert.lock().unwrap() = None;
         *self.orchestrator.last_params.lock().unwrap() = None;
@@ -1318,6 +1334,14 @@ impl VaultService for MockVaultService {
         }
 
         #[cfg(test)]
+        if self.burn_nonce_too_low_once.swap(false, Ordering::Relaxed) {
+            return Err(VaultError::BurnNonceTooLow {
+                tx_hash: prepared_tx.hash,
+                nonce: prepared_tx.nonce,
+            });
+        }
+
+        #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitRevert) {
             return Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH });
         }
@@ -1635,6 +1659,14 @@ impl VaultService for MockVaultService {
         #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitFailure) {
             return Err(VaultError::InvalidReceipt);
+        }
+
+        #[cfg(test)]
+        if self.burn_nonce_too_low_once.swap(false, Ordering::Relaxed) {
+            return Err(VaultError::BurnNonceTooLow {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            });
         }
 
         #[cfg(test)]
