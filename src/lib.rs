@@ -55,6 +55,9 @@ use crate::receipt_inventory::{
     burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
+use crate::redemption::job::{
+    ConfirmBurnContext, ConfirmBurnJob, SubmitBurnContext, SubmitBurnJob,
+};
 use crate::redemption::{
     Redemption, RedemptionServices,
     burn_manager::BurnManager,
@@ -306,7 +309,6 @@ pub async fn initialize_rocket(
     let chain_registry = config.create_chain_registry().await?;
     let base = chain_registry.base()?;
     let alpaca_service = config.alpaca.service()?;
-    let rocket_alpaca = alpaca_service.clone();
     let bot_wallet = config.signer.address()?;
     info!(
         target: "startup",
@@ -322,63 +324,26 @@ pub async fn initialize_rocket(
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(&pool, &network_vault_services).await?;
 
-    let managers = setup_redemption_managers(
-        &config,
-        network_vault_services.clone(),
-        &redemption_store,
-        &receipt_inventory_store,
-        &pool,
+    let managers = setup_redemption_managers(RedemptionManagerParams {
+        config: &config,
+        vault_services: network_vault_services.clone(),
+        redemption_store: &redemption_store,
+        receipt_inventory_store: &receipt_inventory_store,
+        pool: &pool,
+        lifecycle_notifier: lifecycle_notifier.clone(),
+        apalis_pool: &apalis_pool,
         bot_wallet,
-        lifecycle_notifier.clone(),
-    )?;
+    })?;
 
-    // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Each replay clears its view table first to remove
-    // stale/corrupt data, then rebuilds from the event store.
-    debug!(target: "startup", "Rebuilding all views from events");
-    rebuild_receipt_inventory_view(&pool).await?;
-    rebuild_redemption_view(&pool).await?;
-    rebuild_receipt_burns_view(&pool).await?;
-
-    validate_configured_asset_networks(&pool, &chain_registry).await?;
-
-    // Receipt backfill must run before recovery so that recovery can check
-    // receipt inventory to detect already-minted receipts (prevents double-mints).
-    let vault_configs = run_all_receipt_backfills(
+    run_startup_recovery(
         &pool,
         &chain_registry,
         &receipt_inventory_store,
         bot_wallet,
+        &apalis_pool,
+        &managers,
     )
     .await?;
-
-    if let Err(error) = run_startup_reconciliation_for_vaults(
-        &chain_registry,
-        &vault_configs,
-        &receipt_inventory_store,
-        bot_wallet,
-    )
-    .await
-    {
-        error.log();
-    }
-
-    // The synchronous recovery pass runs with a timeout before the HTTP server
-    // starts. Mints that need deferred or pending follow-up are handed to
-    // detached background scheduled-recovery tasks that intentionally outlive
-    // this timeout and run concurrently with request handling; their safety
-    // rests on cqrs-es optimistic concurrency and externalTxId
-    // idempotency, not on completing before the server is up. If the
-    // synchronous pass hangs it is cancelled and any remaining stuck aggregates
-    // are left for manual admin intervention.
-    let receipt_vaults: Vec<(u64, Address)> = vault_configs
-        .iter()
-        .map(|config| (config.chain_id, config.vault))
-        .collect();
-
-    run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
-        .await;
-
     // FIXME: temporary production gate. Remove once the snapshot-repair
     // baseline operation ships so production can establish a cursor and run
     // the feed. See docs/runbooks/corporate-action-feed-boundary.md.
@@ -422,7 +387,11 @@ pub async fn initialize_rocket(
             )),
             bot: bot_wallet,
         },
+        shutdown_rx.clone(),
+    ));
+    background_task_handles.extend(spawn_redemption_background_tasks(
         managers.burn.clone(),
+        apalis_pool.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -534,7 +503,7 @@ pub async fn initialize_rocket(
         tokenized_asset_store,
         mint_store,
         redemption_store,
-        alpaca_service: rocket_alpaca,
+        alpaca_service: alpaca_service.clone(),
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
@@ -546,6 +515,64 @@ pub async fn initialize_rocket(
             handles: background_task_handles,
         },
     }))
+}
+
+/// Rebuilds views, backfills receipts, reconciles inventory, and runs the timed
+/// startup recovery pass before the HTTP server accepts traffic. Reprojections
+/// complete BEFORE recovery so it queries up-to-date views; receipt backfill
+/// runs before recovery so already-minted receipts are visible (prevents
+/// double-mints).
+async fn run_startup_recovery<P: Provider + Clone>(
+    pool: &Pool<Sqlite>,
+    chain_registry: &ChainRegistry<P>,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
+    bot_wallet: Address,
+    apalis_pool: &ApalisSqlitePool,
+    managers: &RedemptionManagers,
+) -> Result<(), anyhow::Error> {
+    debug!(target: "startup", "Rebuilding all views from events");
+    rebuild_receipt_inventory_view(pool).await?;
+    rebuild_redemption_view(pool).await?;
+    rebuild_receipt_burns_view(pool).await?;
+
+    validate_configured_asset_networks(pool, chain_registry).await?;
+
+    let vault_configs = run_all_receipt_backfills(
+        pool,
+        chain_registry,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await?;
+
+    if let Err(error) = run_startup_reconciliation_for_vaults(
+        chain_registry,
+        &vault_configs,
+        receipt_inventory_store,
+        bot_wallet,
+    )
+    .await
+    {
+        error.log();
+    }
+
+    // The synchronous recovery pass runs with a timeout before the HTTP server
+    // starts. Mints that need deferred or pending follow-up are handed to
+    // detached background scheduled-recovery tasks that intentionally outlive
+    // this timeout and run concurrently with request handling; their safety
+    // rests on cqrs-es optimistic concurrency and externalTxId idempotency, not
+    // on completing before the server is up. If the synchronous pass hangs it
+    // is cancelled and any remaining stuck aggregates are left for manual admin
+    // intervention.
+    let receipt_vaults: Vec<(u64, Address)> = vault_configs
+        .iter()
+        .map(|config| (config.chain_id, config.vault))
+        .collect();
+
+    run_recovery_with_timeout(pool, apalis_pool, managers, &receipt_vaults)
+        .await;
+
+    Ok(())
 }
 
 async fn prepare_corporate_action_feed(
@@ -1004,15 +1031,32 @@ async fn clear_canonical_projection_for_aggregate(
     Ok(())
 }
 
-fn setup_redemption_managers(
-    config: &Config,
+struct RedemptionManagerParams<'a> {
+    config: &'a Config,
     vault_services: NetworkVaultServices,
-    redemption_store: &Arc<Store<Redemption>>,
-    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
-    pool: &Pool<Sqlite>,
-    bot_wallet: Address,
+    redemption_store: &'a Arc<Store<Redemption>>,
+    receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
+    pool: &'a Pool<Sqlite>,
     lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+    apalis_pool: &'a ApalisSqlitePool,
+    bot_wallet: Address,
+}
+
+/// Builds the redemption managers. `bot_wallet` is derived once in
+/// `initialize_rocket` and passed in so the derivation is not duplicated.
+fn setup_redemption_managers(
+    params: RedemptionManagerParams<'_>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
+    let RedemptionManagerParams {
+        config,
+        vault_services,
+        redemption_store,
+        receipt_inventory_store,
+        pool,
+        lifecycle_notifier,
+        apalis_pool,
+        bot_wallet,
+    } = params;
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
@@ -1035,6 +1079,7 @@ fn setup_redemption_managers(
         redemption_store.clone(),
         receipt_service,
         bot_wallet,
+        apalis_pool.clone(),
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -2087,12 +2132,11 @@ struct MintJobWorkers {
     bot: Address,
 }
 
-/// Starts mint recovery, per-step mint jobs, and burn reconciliation only after
-/// the synchronous startup recovery pass has completed. This prevents a stale
-/// durable job and startup recovery from driving the same side effect at once.
+/// Starts mint recovery and the per-step mint jobs only after the synchronous
+/// startup recovery pass has completed. This prevents a stale durable job and
+/// startup recovery from driving the same side effect at once.
 fn spawn_mint_background_tasks(
     workers: MintJobWorkers,
-    burn: Arc<BurnManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = vec![
@@ -2109,9 +2153,22 @@ fn spawn_mint_background_tasks(
             workers.apalis_pool.clone(),
             shutdown.clone(),
         ),
-        spawn_burn_recovery_reconciler(burn, shutdown.clone()),
     ];
     handles.extend(spawn_mint_job_workers(workers, shutdown));
+    handles
+}
+
+/// Starts burn reconciliation and the per-step burn jobs only after the
+/// synchronous startup recovery pass has completed. This prevents a stale
+/// durable job and startup recovery from driving the same side effect at once.
+fn spawn_redemption_background_tasks(
+    burn: Arc<BurnManager>,
+    apalis_pool: ApalisSqlitePool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    let mut handles =
+        vec![spawn_burn_recovery_reconciler(burn.clone(), shutdown.clone())];
+    handles.extend(spawn_burn_job_workers(burn, apalis_pool, shutdown));
     handles
 }
 
@@ -2172,6 +2229,36 @@ fn spawn_mint_job_workers(
             shutdown,
             "mint-callback-worker",
             target: "mint",
+        ),
+    ]
+}
+
+/// Spawns the two drainer workers for the burn side-effect job chain. Each
+/// gets an `Arc<BurnManager>` so it can perform its external call and record
+/// the outcome, and the submit worker hands the confirm step to the manager.
+fn spawn_burn_job_workers(
+    burn_manager: Arc<BurnManager>,
+    apalis_pool: ApalisSqlitePool,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    vec![
+        spawn_drainer_worker!(
+            ::<SubmitBurnContext, SubmitBurnJob>,
+            apalis_pool.clone(),
+            Arc::new(SubmitBurnContext {
+                burn_manager: burn_manager.clone(),
+            }),
+            shutdown.clone(),
+            "burn-submit-worker",
+            target: "redemption",
+        ),
+        spawn_drainer_worker!(
+            ::<ConfirmBurnContext, ConfirmBurnJob>,
+            apalis_pool,
+            Arc::new(ConfirmBurnContext { burn_manager }),
+            shutdown,
+            "burn-confirm-worker",
+            target: "redemption",
         ),
     ]
 }

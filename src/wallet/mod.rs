@@ -85,6 +85,7 @@ pub enum SignerConfig {
     Local(B256),
 }
 
+/// Errors during signer configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum SignerConfigError {
     #[error("exactly one of EVM_PRIVATE_KEY or TURNKEY_ORG_ID must be set")]
@@ -97,6 +98,7 @@ pub enum SignerConfigError {
     MissingAddress,
 }
 
+/// Errors during signer resolution and initialization.
 #[derive(Debug, thiserror::Error)]
 pub enum SignerResolveError {
     #[error(transparent)]

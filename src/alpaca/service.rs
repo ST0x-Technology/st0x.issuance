@@ -14,6 +14,7 @@ use super::{
 };
 use crate::mint::TokenizationRequestId;
 
+/// Configuration for Alpaca API integration including credentials and endpoints.
 #[derive(Args, Clone)]
 pub struct AlpacaConfig {
     #[arg(

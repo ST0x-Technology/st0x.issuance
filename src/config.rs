@@ -208,6 +208,7 @@ pub(crate) const DEFAULT_DATABASE_URL: &str = "sqlite:data.db";
 /// issuer CLI.
 pub(crate) const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 5;
 
+/// Top-level application configuration aggregating all subsystem settings.
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -675,6 +676,7 @@ struct LifecycleNotificationsEnv {
     message_thread_id: Option<i64>,
 }
 
+/// Logging verbosity level from trace (most verbose) to error (least verbose).
 #[derive(clap::ValueEnum, Debug, Clone)]
 pub enum LogLevel {
     Trace,
@@ -761,6 +763,7 @@ impl HyperDxEnv {
     }
 }
 
+/// Errors encountered during configuration parsing and validation.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Signer configuration error")]

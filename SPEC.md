@@ -630,10 +630,10 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `burn_mode` (orchestrator migration only): the asset's resolved `VaultMode` at
   detection time, captured on `RedemptionDetected` — the earliest possible point
   in the redemption's lifecycle, before any burn submission. Every
-  mode-dependent command (`BurnTokens`, `ConfirmBurn`, `ResumeBurn`,
-  `ForceCompleteBurn`) derives mode from this persisted fact, never re-resolved
-  from the asset's currently-configured `VaultMode` — see "Orchestrator
-  Migration"
+  mode-dependent command (`IntendBurn`, the `Record*` burn submit and confirm
+  commands, `ResumeBurn`, `ForceCompleteBurn`) derives mode from this persisted
+  fact, never re-resolved from the asset's currently-configured `VaultMode` —
+  see "Orchestrator Migration"
 - `status`: Current state in the redemption lifecycle
 - `burn_tx_hash`, `receipt_id`, `shares_burned`: Burn transaction details.
   Orchestrator-mode burns populate the analogous on-chain proof (a consumed
@@ -663,16 +663,23 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
   broadcast. Only valid from `Burning`.
-- `BurnTokens` - Broadcast the exact transaction persisted by `IntendBurn`.
-  Produces `BurnTxSubmitted` on success; it never signs a replacement.
-- `ConfirmBurn { tx_id, dust_shares }` - Confirm a previously submitted burn
-  transaction. Produces `TokensBurned` on success. `dust_shares` is
-  vault-direct-shaped (the atomic multicall dust-return amount); in orchestrator
-  mode it is unused (always `0`) — dust is instead recorded via
-  `OrchestratorTokensBurned.dust_retained`, derived by the confirm handler from
-  this redemption's own persisted `AlpacaCalled.dust_quantity` (already computed
-  and stored well before any burn submission), not from this command's
-  `dust_shares` input
+- `RecordBurnTxSubmitted` / `RecordOrchestratorBurnSubmitted` - Record the burn
+  broadcast that `SubmitBurnJob` performed via
+  `BurnManager::submit_intended_burn`, which calls the vault outside any
+  aggregate transition. Pure: emit `BurnTxSubmitted` (vault-direct) or
+  `OrchestratorBurnSubmitted` (orchestrator) from the payload. Valid from
+  `BurnIntended`; an idempotent no-op once the redemption has advanced, so an
+  at-least-once job rerun is safe.
+- `RecordBurnConfirmed` / `RecordOrchestratorBurnConfirmed` - Record the burn
+  confirmation that `ConfirmBurnJob` performed via
+  `BurnManager::confirm_submitted_burn`. Pure: emit `TokensBurned`
+  (vault-direct) or `OrchestratorTokensBurned` (orchestrator) from the payload
+  after checking the persisted `tx_id`, and for orchestrator mode that
+  `shares_burned` equals this redemption's own persisted `alpaca_quantity`. In
+  orchestrator mode dust is recorded via
+  `OrchestratorTokensBurned.dust_retained`, derived by the handler from this
+  redemption's own persisted `AlpacaCalled.dust_quantity` (already computed and
+  stored well before any burn submission), not from the vault
 - `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before its
   external side effect
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
@@ -895,8 +902,7 @@ raw redemption amounts are emitted in the admission log.
   derived directly from this redemption's own persisted
   `AlpacaCalled.dust_quantity` (already computed and stored at Alpaca-call time,
   well before any burn submission), converted to share-wei — not recomputed from
-  the on-chain `Burned` event or from `ConfirmBurn`'s `dust_shares` input, which
-  is always `0` in orchestrator mode (see `ConfirmBurn` above). The
+  the on-chain `Burned` event or from the vault confirm result. The
   orchestrator's `burn()` has no multicall to atomically return dust through
   (unlike vault-direct's `withdraw()` + `transfer()` multicall), so returning it
   would require a separate non-atomic transaction plus a new
@@ -925,8 +931,8 @@ raw redemption amounts are emitted in the admission log.
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                                                                                                                                                                                   |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                                                                                                                                                                                   |
 | `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
-| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction                                                                                                                                                                                                            |
-| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                                                                                                                                                                                                                    |
+| `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                  | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                      |
+| `RecordBurnConfirmed`                    | `TokensBurned`                     | Pure: records the confirmation `ConfirmBurnJob` performed via `BurnManager::confirm_submitted_burn`; terminal success                                                                                                                              |
 | `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                                                                                                                                                                      |
 | `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                                                                                                                                                                            |
 | `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
@@ -940,8 +946,8 @@ raw redemption amounts are emitted in the admission log.
 | `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption                                                                                                                                                                                                               |
 | `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a burn verified against this redemption's persisted `burn_mode`                                                                                                                                                                  |
 | `IntendBurn` (orchestrator mode)         | `BurnIntended`                     | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                                                                                                                                                                      |
-| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | Broadcasts the persisted bytes; no per-receipt plan to reserve first                                                                                                                                                                               |
-| `ConfirmBurn` (orchestrator mode)        | `OrchestratorTokensBurned`         | New success event; carries the consumed pointer range and `dust_retained`                                                                                                                                                                          |
+| `RecordOrchestratorBurnSubmitted`        | `OrchestratorBurnSubmitted`        | Pure: records the broadcast `SubmitBurnJob` performed; no per-receipt plan to reserve first                                                                                                                                                        |
+| `RecordOrchestratorBurnConfirmed`        | `OrchestratorTokensBurned`         | Pure: records the confirmation `ConfirmBurnJob` performed; carries the consumed pointer range and `dust_retained`                                                                                                                                  |
 | `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`        | Recovery via the orchestrator's `Burned` log; carries an `ExistingBurnProof::Orchestrator { shares_burned, burn_range, dust_retained }` payload (cross-checked against the `Failed` state's `burn_mode`); `dust_retained` for success-event parity |
 
 Burn transaction recovery runs once during startup and every five minutes while
@@ -991,38 +997,42 @@ exact transaction identity long enough to persist exhaustion safely. An
 exhausted persisted intent cannot be re-armed through the admin recover
 endpoint: the operator must force-complete a verified landed burn or close only
 after off-chain reconciliation. At every point there is at most one transaction
-hash that can still land for a redemption. **Orchestrator mode** introduces no
-new command names: `IntendBurn`, `BurnTokens`, `ConfirmBurn`,
-`RecordBurnFailure`, and `RecordExistingBurn` are reused, with the handler
-branching on `VaultMode` internally to call the orchestrator-mode `VaultService`
-methods (see "VaultService" below) instead of the vault multicall, and to emit
-the orchestrator-mode events above. The persist-before-broadcast discipline is
-identical to vault-direct: `IntendBurn` builds and signs the
+hash that can still land for a redemption. **Orchestrator mode** reuses
+`IntendBurn`, `RecordBurnFailure`, and `RecordExistingBurn`, and adds the
+orchestrator-mode record commands `RecordOrchestratorBurnSubmitted` and
+`RecordOrchestratorBurnConfirmed`. `BurnManager` calls the orchestrator-mode
+`VaultService` methods (see "VaultService" below) instead of the vault multicall
+and emits the orchestrator-mode events above. The persist-before-broadcast
+discipline is identical to vault-direct: `IntendBurn` builds and signs the
 `orchestrator.burn()` transaction via `prepare_orchestrator_burn_tx` and
 persists it in the existing `BurnIntended` event with `planned_burns: vec![]`
-(there is no per-receipt plan; the field is already tolerant of an empty list),
-then `BurnTokens` broadcasts those exact bytes via `submit_orchestrator_burn`
-and emits `OrchestratorBurnSubmitted`. The whole `(hash, nonce)`
-classify/rebroadcast/replace recovery machinery above therefore applies to
-orchestrator burns unchanged. `IntendBurn`/`BurnTokens` carry a mode-specific
-`BurnParams` enum (`VaultDirect { vault, burns, dust_shares, owner }` |
-`Orchestrator { token, amount, owner }`), and the handler rejects params whose
-mode does not match the redemption's persisted `burn_mode` anchor
-(`BurnModeMismatch`) — commands are not persisted and may change shape freely
-per AGENTS.md. `BurnManager` skips `plan_burn` and the entire
-reserve/settle/release reservation lifecycle — the orchestrator custodies
-receipts directly, so there is no bot-side inventory to reserve against — and
-derives the burn amount from redemption state (`alpaca_quantity` in share-wei;
-dust stays in the bot wallet). `RecordBurnFailure`'s existing `planned_burns`
-field carries `vec![]` for an orchestrator-mode failure (already
-`#[serde(default)]`-tolerant of that), and its `classification` field (see
-"Failure States") carries `InsufficientReceipts { shortfall }` or
-`AllowanceInsufficient` as appropriate. `IntendBurn`, `BurnTokens`,
-`ConfirmBurn`, and `ResumeBurn` all derive which mode to use for a given
-redemption from its own persisted `burn_mode` (captured on
-`RedemptionDetected`), never re-resolved from the asset's currently-configured
-`VaultMode` — see `ForceCompleteBurn` below for why this matters across a
-cutover.
+(there is no per-receipt plan; the field is already tolerant of an empty list).
+`SubmitBurnJob` then broadcasts those exact bytes through
+`BurnManager::submit_intended_burn` (`submit_orchestrator_burn`) and records
+`OrchestratorBurnSubmitted` via `RecordOrchestratorBurnSubmitted`;
+`ConfirmBurnJob` confirms through `BurnManager::confirm_submitted_burn` and
+records `OrchestratorTokensBurned` via `RecordOrchestratorBurnConfirmed`. The
+whole `(hash, nonce)` classify/rebroadcast/replace recovery machinery above
+therefore applies to orchestrator burns unchanged. `IntendBurn` carries a
+mode-specific `BurnParams` enum
+(`VaultDirect { vault, burns, dust_shares, owner }` |
+`Orchestrator { token,
+amount, owner }`), and the burn record commands
+cross-check the redemption's persisted `burn_mode` anchor (`BurnModeMismatch`) —
+commands are not persisted and may change shape freely per AGENTS.md.
+`BurnManager` skips `plan_burn` and the entire reserve/settle/release
+reservation lifecycle — the orchestrator custodies receipts directly, so there
+is no bot-side inventory to reserve against — and derives the burn amount from
+redemption state (`alpaca_quantity` in share-wei; dust stays in the bot wallet).
+`RecordBurnFailure`'s existing `planned_burns` field carries `vec![]` for an
+orchestrator-mode failure (already `#[serde(default)]`-tolerant of that), and
+its `classification` field (see "Failure States") carries
+`InsufficientReceipts { shortfall }` or `AllowanceInsufficient` as appropriate.
+`IntendBurn`, the burn submit and confirm record commands, and `ResumeBurn` all
+derive which mode to use for a given redemption from its own persisted
+`burn_mode` (captured on `RedemptionDetected`), never re-resolved from the
+asset's currently-configured `VaultMode` — see `ForceCompleteBurn` below for why
+this matters across a cutover.
 
 `ForceCompleteBurn`'s on-chain verification (`verify_burn_tx`) is broadened to
 additionally recognize `Transfer(bot -> orchestrator)` +
@@ -2446,7 +2456,7 @@ sequenceDiagram
             else simulation passes
                 Note right of Us: IntendBurn command — sign the exact<br/>burn(token, amount, burnInfo) transaction<br/>Event: BurnIntended (persisted bytes,<br/>empty receipt plan)
                 Us->>Orchestrator: broadcast the persisted bytes
-                Note right of Us: BurnTokens command<br/>Event: OrchestratorBurnSubmitted
+                    Note right of Us: SubmitBurnJob<br/>RecordOrchestratorBurnSubmitted command<br/>Event: OrchestratorBurnSubmitted
                 alt reverts (InsufficientReceipts - pool drained after simulation)
                     Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified, not auto-retried)
                 else reverts (VaultLogicMismatch / ReceiptLogicMismatch - post-hoc race)
@@ -2454,7 +2464,7 @@ sequenceDiagram
                 else succeeds
                     Orchestrator->>Orchestrator: transferFrom(bot, orchestrator, amount);<br/>consume receipts in order; advance nextBurnReceiptId
                     Orchestrator->>Us: Burned(token, amount, burn_range)
-                    Note right of Us: ConfirmBurn command<br/>Event: OrchestratorTokensBurned<br/>(dust_retained recorded, not returned)
+                    Note right of Us: ConfirmBurnJob<br/>RecordOrchestratorBurnConfirmed command<br/>Event: OrchestratorTokensBurned<br/>(dust_retained recorded, not returned)
                     Us->>AP: Redemption completed ✓
                 end
             end
@@ -2588,7 +2598,7 @@ recovery on any other chain.
   `burn()` pulls the vault's ERC-20 shares as well as consuming receipts
   (confirm the exact reachability against `IST0xOrchestratorV1.sol`, st0x.deploy
   PR #222, before implementing). This resolves like any other on-chain revert of
-  a submitted transaction: `ConfirmMintJob`/`ConfirmBurn` records it via the
+  a submitted transaction: `ConfirmMintJob`/`ConfirmBurnJob` records it via the
   existing failure-recording path, producing `MintingFailed` with
   `classification:
   MintFailureClassification::VaultLogicMismatch` or
@@ -3759,11 +3769,11 @@ sequenceDiagram
     Note right of Us: ConfirmAlpacaComplete command<br/>AlpacaJournalCompleted<br/>Status: burning
 
     Note right of Us: IntendBurn command<br/>Event: BurnIntended<br/>Exact signed burn multicall persisted
-    Note right of Us: BurnTokens command
+    Note right of Us: SubmitBurnJob<br/>RecordBurnTxSubmitted command
     Us->>Blockchain: Broadcast persisted burn multicall
     Note right of Us: Event: BurnTxSubmitted
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: ConfirmBurn command<br/>Event: TokensBurned (final success state)
+    Note right of Us: ConfirmBurnJob<br/>RecordBurnConfirmed command<br/>Event: TokensBurned (final success state)
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -4071,15 +4081,15 @@ stateDiagram-v2
     Burning --> BurnIntended: IntendBurn
     Burning --> Failed: RecordBurnFailure / MarkFailed
     Burning --> Closed: CloseRedemption (admin)
-    BurnIntended --> BurnSubmitted: BurnTokens (BurnTxSubmitted)
-    BurnIntended --> Completed: ConfirmBurn (TokensBurned, crash recovery)
+    BurnIntended --> BurnSubmitted: RecordBurnTxSubmitted (BurnTxSubmitted)
+    BurnIntended --> Completed: RecordBurnConfirmed (TokensBurned, crash recovery)
     BurnIntended --> Failed: RecordBurnFailure
     BurnIntended --> BurnIntended: ReplaceDeadBurn / recovery annotations
     BurnIntended --> Completed: ForceCompleteBurn (admin, verified on-chain)
     BurnIntended --> Closed: CloseRedemption (admin)
     BurnSubmitted --> BurnIntended: ReplaceDeadBurn
     BurnSubmitted --> BurnSubmitted: recovery annotations
-    BurnSubmitted --> Completed: ConfirmBurn (TokensBurned)
+    BurnSubmitted --> Completed: RecordBurnConfirmed (TokensBurned)
     BurnSubmitted --> Failed: RecordBurnFailure / MarkFailed
     BurnSubmitted --> Completed: ForceCompleteBurn (admin, verified on-chain)
     BurnSubmitted --> Closed: CloseRedemption (admin)
@@ -4809,9 +4819,9 @@ multiple chains, responses merge into one row whose `networks` is the union
 sorted by `(underlying, token)` ascending; `networks[]` within each row are
 sorted by network wire string. Add-asset registers vaults per `network`.
 
-**Redemption + burn:** Detect, Alpaca orchestration, aggregate
-`BurnTokens`/`ConfirmBurn`, and BurnManager recovery all sign on the aggregate's
-`network` runtime -- not Base by default.
+**Redemption + burn:** Detect, Alpaca orchestration, the `SubmitBurnJob` and
+`ConfirmBurnJob` side effects, and BurnManager recovery all sign on the
+aggregate's `network` runtime -- not Base by default.
 
 **Architecture:** One issuance process. `ChainRegistry` maps each `Network` to a
 `ChainRuntime` — the per-network bundle of everything needed for on-chain side

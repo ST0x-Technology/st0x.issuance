@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::warn;
 
+/// IP address whitelist for request filtering, either allowing all IPs or a specific set of ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpWhitelist {
     AllowAll,
@@ -83,6 +84,7 @@ impl FromStr for IpWhitelist {
     }
 }
 
+/// Errors during IP whitelist parsing and validation.
 #[derive(Debug, thiserror::Error)]
 pub enum IpWhitelistParseError {
     #[error("Failed to parse IP range: {0}")]

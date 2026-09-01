@@ -15,6 +15,7 @@ use crate::config::Config;
 pub use ip_whitelist::{InternalIpWhitelist, IpWhitelist};
 pub(crate) use rate_limit::FailedAuthRateLimiter;
 
+/// API key for authenticating issuer requests, validated for minimum length.
 #[derive(Clone)]
 pub struct IssuerApiKey(String);
 
@@ -48,6 +49,7 @@ impl FromStr for IssuerApiKey {
     }
 }
 
+/// Errors during issuer API key validation.
 #[derive(Debug, thiserror::Error)]
 pub enum IssuerApiKeyError {
     #[error("Issuer API key must be at least {min} characters, got {len}", min = IssuerApiKey::MIN_LENGTH)]
@@ -254,6 +256,7 @@ fn extract_client_ip(request: &Request<'_>) -> Option<IpAddr> {
     request.client_ip()
 }
 
+/// Authentication and authorization errors for request guards.
 #[derive(Debug)]
 pub enum AuthError {
     MissingApiKey,
@@ -307,6 +310,7 @@ pub fn test_auth_config() -> Result<AuthConfig, TestAuthConfigError> {
     })
 }
 
+/// Errors constructing test authentication configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum TestAuthConfigError {
     #[error("Invalid API key: {0}")]

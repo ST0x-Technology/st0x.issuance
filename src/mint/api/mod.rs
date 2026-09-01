@@ -27,6 +27,7 @@ pub(crate) use authorize::{__path_authorize_mint, authorize_mint};
 pub(crate) use confirm::confirm_journal;
 pub(crate) use initiate::initiate_mint;
 
+/// Response from mint operations containing the request ID and current status.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MintResponse {
     pub issuer_request_id: IssuerMintRequestId,
