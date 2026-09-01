@@ -148,7 +148,7 @@ async fn process_journal_completion(
     // Persisted BEFORE the network call so a crash between here and
     // Step 2 leaves the aggregate in Minting (recoverable) rather
     // than JournalConfirmed (which would lose track of the submission).
-    if let Err(err) = mint_store
+    let deposit_error = mint_store
         .send(
             &issuer_request_id,
             MintCommand::Deposit {
@@ -156,31 +156,40 @@ async fn process_journal_completion(
             },
         )
         .await
-    {
-        error!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "Deposit command failed"
-        );
-        return;
-    }
+        .err();
 
-    // Step 2: Resolve the vault and enqueue the submission job. The durable
-    // job chain (submit -> confirm -> callback) drives the mint to completion
-    // off the request path; each job records its outcome via an idempotent
-    // command and enqueues the next. A domain failure flips the mint to
-    // `MintingFailed`, which recovery retries on its own schedule.
+    // Step 2: Resolve the vault and enqueue the submission job. Re-load even
+    // when Deposit lost a concurrency race: startup or scheduled recovery may
+    // have committed MintingStarted after this task loaded JournalConfirmed.
+    // In that state, this path must still ensure the durable submit job exists.
     let (underlying, network) = match mint_store.load(&issuer_request_id).await
     {
         Ok(Some(Mint::Minting { underlying, network, .. })) => {
+            if let Some(error) = deposit_error {
+                info!(target: "mint", issuer_request_id = %issuer_request_id,
+                    error = ?error,
+                    "Deposit was already committed concurrently — ensuring \
+                     mint submission is enqueued"
+                );
+            }
             (underlying, network)
         }
         Ok(Some(mint)) => {
-            // Concurrent recovery may have already advanced the mint.
-            info!(target: "mint", issuer_request_id = %issuer_request_id,
-                state = %mint.state_name(),
-                "Mint not in Minting after Deposit — recovery owns it, \
-                 skipping enqueue"
-            );
+            if let Some(error) = deposit_error {
+                error!(target: "mint", issuer_request_id = %issuer_request_id,
+                    state = %mint.state_name(),
+                    error = ?error,
+                    "Deposit command failed without advancing to Minting"
+                );
+            } else {
+                // Concurrent recovery may have advanced past Minting and owns
+                // the subsequent durable step.
+                info!(target: "mint", issuer_request_id = %issuer_request_id,
+                    state = %mint.state_name(),
+                    "Mint advanced past Minting after Deposit — recovery owns \
+                     it, skipping enqueue"
+                );
+            }
             return;
         }
         Ok(None) => {
@@ -259,16 +268,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::confirm_journal;
+    use super::{confirm_journal, process_journal_completion};
     use crate::auth::FailedAuthRateLimiter;
     use crate::config::VaultMode;
+    use crate::jobs::job_type;
     use crate::mint::api::test_utils::{
         TestAccountAndAsset, TestHarness, network_vault_services, test_config,
     };
     use crate::mint::{
         ClientId, IssuerMintRequestId, Mint, MintCommand, MintView, Network,
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
-        view::find_by_issuer_request_id,
+        job::SubmitMintJob, view::find_by_issuer_request_id,
     };
     use crate::test_utils::setup_test_rocket;
 
@@ -551,9 +561,15 @@ mod tests {
         let enqueued = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let enqueued = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
+                    "
+                    SELECT COUNT(*)
+                    FROM Jobs
+                    WHERE idempotency_key = ?
+                      AND job_type = ?
+                    ",
                 )
                 .bind(&aggregate_id)
+                .bind(job_type::<SubmitMintJob>())
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -569,6 +585,89 @@ mod tests {
         assert_eq!(
             enqueued, 1,
             "a confirmed journal must enqueue exactly one submit job"
+        );
+    }
+
+    /// Startup recovery can advance `JournalConfirmed` to `Minting` between
+    /// the confirm task's command and enqueue steps. The request path must
+    /// still ensure the submit job exists rather than abandoning the mint.
+    #[tokio::test]
+    async fn journal_completion_enqueues_submit_when_recovery_wins_deposit_race()
+     {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+
+        let issuer_request_id = IssuerMintRequestId::random();
+        mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Initiate {
+                    mint_mode: VaultMode::VaultDirect,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-deposit-race",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                },
+            )
+            .await
+            .expect("mint must initialize");
+        mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("journal must confirm");
+        mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("recovery must win the deposit race");
+
+        process_journal_completion(
+            mint_store,
+            network_vault_services(vault),
+            pool.clone(),
+            apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await;
+
+        let enqueued = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE idempotency_key = ?
+              AND job_type = ?
+              AND status = 'Pending'
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .bind(job_type::<SubmitMintJob>())
+        .fetch_one(&pool)
+        .await
+        .expect("submit-job query must succeed");
+
+        assert_eq!(
+            enqueued, 1,
+            "the confirm path must enqueue after a concurrent deposit"
         );
     }
 

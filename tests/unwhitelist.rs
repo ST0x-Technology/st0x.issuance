@@ -86,6 +86,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             corporate_actions_stream_url: setup_corporate_actions_stream_mock(
                 &mock_alpaca,
             ),
+            corporate_actions_bootstrap_since: None,
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),

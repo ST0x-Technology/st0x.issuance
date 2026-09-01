@@ -17,6 +17,7 @@ use crate::mint::{
     Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     view::find_by_issuer_request_id,
 };
+use crate::underlying::with_freeze_admission;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MintRequest {
@@ -53,43 +54,56 @@ pub(crate) async fn initiate_mint(
         return Err(MintApiError::InvalidQuantity);
     }
 
-    validate_asset_exists(
-        pool.inner(),
-        &request.underlying,
-        &request.token,
-        &request.network,
-    )
-    .await?;
-
-    validate_client_eligible(pool.inner(), &request.client_id, &request.wallet)
+    let issuer_request_id = with_freeze_admission(|| async move {
+        validate_asset_exists(
+            pool.inner(),
+            &request.underlying,
+            &request.token,
+            &request.network,
+        )
         .await?;
 
-    let issuer_request_id = IssuerMintRequestId::random();
+        validate_client_eligible(
+            pool.inner(),
+            &request.client_id,
+            &request.wallet,
+        )
+        .await?;
 
-    // Resolve the asset's mode from config exactly once, here at initiate
-    // time: the persisted anchor on `Initiated` is what every later
-    // mode-dependent step derives from, even if the asset's configured
-    // vault_mode flips mid-flight. The address resolves per the request's
-    // network — each chain carries its own orchestrator deployment.
-    let mint_mode =
-        config.vault_mode_for(&request.underlying, request.network)?;
+        let issuer_request_id = IssuerMintRequestId::random();
 
-    let command = MintCommand::Initiate {
-        issuer_request_id: issuer_request_id.clone(),
-        tokenization_request_id: request.tokenization_request_id,
-        quantity: Quantity::new(request.quantity),
-        underlying: request.underlying,
-        token: request.token,
-        network: request.network,
-        client_id: request.client_id,
-        wallet: request.wallet,
-        mint_mode,
-    };
+        // Resolve the asset's mode from config exactly once, here at initiate
+        // time: the persisted anchor on `Initiated` is what every later
+        // mode-dependent step derives from, even if the asset's configured
+        // vault_mode flips mid-flight. The address resolves per the request's
+        // network — each chain carries its own orchestrator deployment.
+        let mint_mode =
+            config.vault_mode_for(&request.underlying, request.network)?;
 
-    mint_store.send(&issuer_request_id, command).await.map_err(|error| {
-        error!(target: "mint", error = %error, "Failed to execute mint command");
-        MintApiError::CommandExecutionFailed(error)
-    })?;
+        let command = MintCommand::Initiate {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: request.tokenization_request_id,
+            quantity: Quantity::new(request.quantity),
+            underlying: request.underlying,
+            token: request.token,
+            network: request.network,
+            client_id: request.client_id,
+            wallet: request.wallet,
+            mint_mode,
+        };
+
+        mint_store.send(&issuer_request_id, command).await.map_err(
+            |error| {
+                error!(target: "mint", error = %error,
+                    "Failed to execute mint command"
+                );
+                MintApiError::CommandExecutionFailed(error)
+            },
+        )?;
+
+        Ok::<_, MintApiError>(issuer_request_id)
+    })
+    .await?;
 
     let mint_view = find_by_issuer_request_id(pool.inner(), &issuer_request_id)
         .await
