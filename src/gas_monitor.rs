@@ -15,6 +15,7 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::transports::{RpcError, TransportErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -70,17 +71,19 @@ impl<P: Provider> GasMonitor<P> {
         let balance = match self.provider.get_balance(self.wallet).await {
             Ok(balance) => balance,
             Err(read_error) => {
+                // The raw error's Display can carry the provider URL and its
+                // embedded API key, so only a bounded, non-secret category
+                // reaches the log and the telemetry surface.
+                let reason = classify_balance_read_error(&read_error);
                 warn!(
                     target: "gas",
                     network = %self.network,
                     wallet = %self.wallet,
-                    error = %read_error,
+                    reason,
                     "Failed to read the issuer wallet's native balance"
                 );
-                self.telemetry.record_gas_read_failure(
-                    self.network,
-                    read_error.to_string(),
-                );
+                self.telemetry
+                    .record_gas_read_failure(self.network, reason.to_owned());
                 return state;
             }
         };
@@ -218,6 +221,24 @@ fn evaluate(
                 )
             }
         }
+    }
+}
+
+/// Maps a native-balance read error to a bounded, non-secret category. The
+/// raw error's `Display` can carry the provider URL with its embedded API
+/// key, so it must never reach the WARN log or the telemetry surface; only
+/// this fixed classification does.
+const fn classify_balance_read_error(
+    error: &RpcError<TransportErrorKind>,
+) -> &'static str {
+    match error {
+        RpcError::ErrorResp(_) => "rpc error response",
+        RpcError::NullResp => "null response",
+        RpcError::UnsupportedFeature(_) => "unsupported feature",
+        RpcError::LocalUsageError(_) => "local usage error",
+        RpcError::SerError(_) => "serialization error",
+        RpcError::DeserError { .. } => "deserialization error",
+        RpcError::Transport(_) => "transport error",
     }
 }
 
@@ -472,10 +493,24 @@ mod tests {
         assert!(notifier.delivered().is_empty());
         let snapshot = serde_json::to_value(telemetry.snapshot()).unwrap();
         assert_eq!(snapshot[0]["gas"]["status"], "unavailable");
+        // The raw error text (which could carry the provider URL and key) must
+        // not reach telemetry; only the bounded classification does.
+        let reported = snapshot[0]["gas"]["error"].as_str().unwrap();
+        assert!(
+            !reported.contains("rpc down"),
+            "raw error leaked into telemetry: {reported}"
+        );
+        assert!(
+            ["transport error", "rpc error response", "deserialization error"]
+                .contains(&reported),
+            "unexpected classification: {reported}"
+        );
         assert!(logs_contain_at!(
             Level::WARN,
             &["Failed to read the issuer wallet's native balance", "base"]
         ));
+        // The raw error must not leak into the log either.
+        assert!(!logs_contain_at!(Level::WARN, &["rpc down"]));
     }
 
     #[traced_test]

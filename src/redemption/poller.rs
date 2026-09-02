@@ -264,9 +264,9 @@ where
 
     /// Runs a single poll pass: re-read this network's enabled asset set,
     /// then scan each of its vaults from its own checkpoint to the chain
-    /// head. Returns the pass's lag: the worst per vault distance between
-    /// the chain head and the vault's cursor at the start of the pass, from
-    /// the vaults that scanned successfully.
+    /// head. Returns the pass's lag: the worst per vault distance between the
+    /// chain head and the vault's start cursor, measured before each scan so a
+    /// vault whose scan fails still contributes its backlog.
     ///
     /// The asset list is loaded ONCE per pass and that same snapshot drives
     /// both the vault set and per-log asset attribution
@@ -307,21 +307,38 @@ where
         let mut lag_blocks = 0_u64;
 
         for vault in vaults {
-            match self.poll_vault(&assets, vault, head).await {
-                Ok(cursor) => {
-                    lag_blocks = lag_blocks
-                        .max(head.saturating_add(1).saturating_sub(cursor));
-                }
+            // Read the start cursor before scanning so a vault that fails its
+            // scan still surfaces its backlog as lag, instead of vanishing
+            // when another vault succeeds and a permanently failing vault
+            // reporting zero lag forever.
+            let cursor = match self.start_cursor(vault).await {
+                Ok(cursor) => cursor,
                 Err(error) => {
                     debug!(
                         target: "redemption",
                         %vault,
                         error = %error,
-                        "Failed to poll vault; will retry next pass from its \
-                         checkpoint"
+                        "Failed to read vault checkpoint; will retry next pass"
                     );
                     failed_vaults.push(vault);
+                    continue;
                 }
+            };
+
+            lag_blocks =
+                lag_blocks.max(head.saturating_add(1).saturating_sub(cursor));
+
+            if let Err(error) =
+                self.poll_vault(&assets, vault, head, cursor).await
+            {
+                debug!(
+                    target: "redemption",
+                    %vault,
+                    error = %error,
+                    "Failed to poll vault; will retry next pass from its \
+                     checkpoint"
+                );
+                failed_vaults.push(vault);
             }
         }
 
@@ -345,33 +362,38 @@ where
         Ok(lag_blocks)
     }
 
-    /// Scans one vault from its per-vault checkpoint (or `backfill_start_block`
-    /// when it has none — a runtime-added or re-pointed vault) up to `head`,
-    /// processing each Transfer and advancing the vault's checkpoint per chunk.
-    /// Per-vault checkpoints are why a first-seen vault scans its full history
-    /// instead of inheriting a global cursor already past it. Returns the
-    /// cursor the scan started from, for the pass's lag measurement.
-    async fn poll_vault(
+    /// Computes the block a vault's scan starts from: one past its persisted
+    /// checkpoint, floored at `backfill_start_block` (a first-seen vault scans
+    /// its full history rather than inheriting a global cursor already past
+    /// it). Read up front by `poll_once` so a vault's backlog counts toward
+    /// pass lag even when its scan later fails.
+    async fn start_cursor(
         &self,
-        assets: &[TokenizedAssetView],
         vault: Address,
-        head: u64,
     ) -> Result<u64, TransferPollError> {
-        let last_processed =
-            load_transfer_poll(&self.pool, self.network, vault).await?;
-
-        let cursor = match last_processed {
-            None => self.backfill_start_block,
+        match load_transfer_poll(&self.pool, self.network, vault).await? {
+            None => Ok(self.backfill_start_block),
             Some(last_processed) => {
                 let next = last_processed.checked_add(1).ok_or(
                     TransferPollError::CheckpointOverflow {
                         last_processed_block: last_processed,
                     },
                 )?;
-                next.max(self.backfill_start_block)
+                Ok(next.max(self.backfill_start_block))
             }
-        };
+        }
+    }
 
+    /// Scans one vault from `cursor` (its start block, from [`Self::start_cursor`])
+    /// up to `head`, processing each Transfer and advancing the vault's
+    /// checkpoint per chunk.
+    async fn poll_vault(
+        &self,
+        assets: &[TokenizedAssetView],
+        vault: Address,
+        head: u64,
+        cursor: u64,
+    ) -> Result<(), TransferPollError> {
         if cursor > head {
             trace!(
                 target: "redemption",
@@ -381,7 +403,7 @@ where
                 head,
                 "Vault caught up; skipping"
             );
-            return Ok(cursor);
+            return Ok(());
         }
 
         debug!(
@@ -439,7 +461,7 @@ where
             }
         }
 
-        Ok(cursor)
+        Ok(())
     }
 
     /// Fetches Transfer logs for one vault where topic2 (to) == bot_wallet.

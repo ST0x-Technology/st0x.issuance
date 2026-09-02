@@ -1522,26 +1522,21 @@ struct PeriodicBackfillCtx<'a, P, H> {
     provider: &'a P,
     receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
-    backfill_start_block: u64,
     handler: &'a H,
 }
 
-/// Runs one vault's periodic receipt backfill pass and returns the block the
-/// scan resumed from, for the pass's lag measurement.
+/// Runs one vault's periodic receipt backfill pass from `from_block` (its
+/// start block, from [`next_backfill_from_block`]) up to `head_block`.
 async fn run_periodic_receipt_backfill_for_config<P, H>(
     ctx: &PeriodicBackfillCtx<'_, P, H>,
     config: VaultBackfillConfig,
+    from_block: u64,
     head_block: u64,
-) -> Result<u64, anyhow::Error>
+) -> Result<(), anyhow::Error>
 where
     P: Provider + Clone,
     H: ItnReceiptHandler,
 {
-    let last_block =
-        load_receipt_backfill(ctx.pool, config.network, config.vault).await?;
-    let from_block =
-        next_receipt_backfill_block(last_block, ctx.backfill_start_block)?;
-
     trace!(
         target: "receipt",
         vault = %config.vault,
@@ -1573,7 +1568,21 @@ where
         "Periodic receipt backfill complete for vault"
     );
 
-    Ok(from_block)
+    Ok(())
+}
+
+/// Computes the block a vault's receipt backfill resumes from: one past its
+/// persisted checkpoint, floored at `backfill_start_block`. Read up front by
+/// the loop so a vault's backlog counts toward pass lag even when its backfill
+/// later fails.
+async fn next_backfill_from_block(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    backfill_start_block: u64,
+) -> Result<u64, anyhow::Error> {
+    let last_block = load_receipt_backfill(pool, network, vault).await?;
+    next_receipt_backfill_block(last_block, backfill_start_block)
 }
 
 /// Owned dependencies needed to spawn the periodic receipt-backfill task.
@@ -1625,7 +1634,6 @@ where
             provider: &provider,
             receipt_inventory_store: &receipt_inventory_store,
             bot_wallet,
-            backfill_start_block,
             handler: &handler,
         };
 
@@ -1700,6 +1708,36 @@ where
             let mut lag_blocks = 0_u64;
 
             for asset in &assets {
+                // Read the vault's start block first so its backlog counts
+                // toward lag even if this vault's backfill later fails; a
+                // permanently failing vault otherwise reports zero lag while
+                // another vault succeeds.
+                let from_block = match next_backfill_from_block(
+                    &pool,
+                    network,
+                    asset.vault,
+                    backfill_start_block,
+                )
+                .await
+                {
+                    Ok(from_block) => from_block,
+                    Err(error) => {
+                        debug!(
+                            target: "receipt",
+                            error = %error,
+                            vault = %asset.vault,
+                            "Failed to read receipt backfill checkpoint; \
+                             skipping vault this pass"
+                        );
+                        failed_vaults.push(asset.vault);
+                        continue;
+                    }
+                };
+
+                lag_blocks = lag_blocks.max(
+                    head_block.saturating_add(1).saturating_sub(from_block),
+                );
+
                 let receipt_contract = match cached_receipt_contract(
                     &provider,
                     VaultAddress(asset.vault),
@@ -1728,28 +1766,19 @@ where
                     receipt_contract: receipt_contract.0,
                 };
 
-                match run_periodic_receipt_backfill_for_config(
-                    &ctx, config, head_block,
+                if let Err(error) = run_periodic_receipt_backfill_for_config(
+                    &ctx, config, from_block, head_block,
                 )
                 .await
                 {
-                    Ok(from_block) => {
-                        lag_blocks = lag_blocks.max(
-                            head_block
-                                .saturating_add(1)
-                                .saturating_sub(from_block),
-                        );
-                    }
-                    Err(error) => {
-                        debug!(
-                            target: "receipt",
-                            error = %error,
-                            vault = %asset.vault,
-                            "Periodic receipt backfill failed; next run will \
-                             resume from the last checkpoint"
-                        );
-                        failed_vaults.push(asset.vault);
-                    }
+                    debug!(
+                        target: "receipt",
+                        error = %error,
+                        vault = %asset.vault,
+                        "Periodic receipt backfill failed; next run will \
+                         resume from the last checkpoint"
+                    );
+                    failed_vaults.push(asset.vault);
                 }
             }
 
