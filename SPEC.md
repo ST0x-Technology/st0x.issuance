@@ -4985,7 +4985,8 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
 - **Receipt backfill:** the periodic loop records the same shape per pass, with
   the same failure rule (the asset list or head fetch failed, or every vault
   failed) and `lag_blocks` measured against the receipt backfill checkpoints. A
-  pass with no enabled assets does nothing and records no counter.
+  pass with no enabled assets records a success with zero lag, matching the
+  transfer poller, so the counter keeps rising to show the loop is alive.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 

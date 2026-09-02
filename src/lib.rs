@@ -1666,9 +1666,13 @@ where
                 }
             };
 
-            // With no enabled assets there is nothing to reconcile, so skip the
-            // chain-head fetch entirely.
+            // With no enabled assets there is nothing to reconcile, so skip
+            // the chain-head fetch. Record a successful pass with zero lag
+            // anyway, matching the transfer poller's empty pass, so the
+            // counter keeps rising to show the loop is alive rather than
+            // freezing in a way that reads as a stalled loop.
             if assets.is_empty() {
+                telemetry.record_receipt_backfill_success(network, 0);
                 continue;
             }
 
