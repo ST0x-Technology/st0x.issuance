@@ -4983,8 +4983,9 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
   Partial vault failures keep the pass successful and surface as growing
   `lag_blocks` instead, matching the poller's WARN/ERROR escalation semantics.
 - **Receipt backfill:** the periodic loop records the same shape per pass, with
-  the same failure rule (skipped pass or every vault failed) and `lag_blocks`
-  measured against the receipt backfill checkpoints.
+  the same failure rule (the asset list or head fetch failed, or every vault
+  failed) and `lag_blocks` measured against the receipt backfill checkpoints. A
+  pass with no enabled assets does nothing and records no counter.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 
