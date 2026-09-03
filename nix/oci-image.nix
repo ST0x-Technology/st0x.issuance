@@ -6,16 +6,21 @@
 # .github/workflows/build-oci.yml (main only).
 #
 # Image contract (consumed by the stack's docker-compose; keep in sync):
-#   Entrypoint = the `st0x-issuance` binary. Configuration arrives entirely
-#   through the environment, exactly like the systemd unit it replaces
-#   (nix/upgradeable-services.nix): DATABASE_URL, ENVIRONMENT, LOG_LEVEL,
-#   BEHIND_PROXY, CONFIG=<path to a mounted TOML>, plus the secret env vars
-#   from the compose env_file (Secret Manager on the VM, agenix on the
-#   droplet). Nothing is baked: no config file, no secrets.
+#   Entrypoint = the `st0x-issuance` binary. ALL configuration is
+#   environment variables, exactly like the systemd unit it replaces
+#   (nix/upgradeable-services.nix `staticEnvironment` + its agenix
+#   EnvironmentFile): the compose service must set DATABASE_URL,
+#   ENVIRONMENT (staging|production; the binary defaults to production,
+#   so an unset value makes a staging box present as prod), LOG_LEVEL and
+#   CONFIG=<path to a mounted TOML>, and supply the secret variables
+#   (RPC_URL, signer, Alpaca, notifications: see src/config.rs `env =`)
+#   through a compose env_file. There is no secrets-file loader in the
+#   app; a mounted secrets TOML is never read. Nothing is baked: no config
+#   file, no secrets.
 #   database_url stays sqlite:///mnt/data/issuance.db (the VM mounts its
 #   data disk there, byte-identical to the droplet).
-#   Rocket listens on 8000 (direct mode; BEHIND_PROXY moves it behind a
-#   proxy on the droplet, which the VM does not run).
+#   Rocket listens on 0.0.0.0:8000, fixed in build_rocket (src/lib.rs);
+#   there is no proxy mode or port knob on main.
 {
   pkgs,
   st0x-issuance,
