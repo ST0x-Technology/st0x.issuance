@@ -15,7 +15,7 @@ use tracing::Level;
 use tracing_test::traced_test;
 
 use super::iap::ASSERTION_HEADER;
-use super::{BreakglassOps, DebugOps, OpsApiVerifiers, ReadOps};
+use super::{BreakglassOps, CapitalOps, DebugOps, OpsApiVerifiers, ReadOps};
 use crate::config::OpsApiConfig;
 use crate::test_utils::{logs_contain_at, setup_test_rocket};
 
@@ -24,11 +24,13 @@ const IAP_ISSUER: &str = "https://cloud.google.com/iap";
 const READ_AUDIENCE: &str = "aud-read";
 const DEBUG_AUDIENCE: &str = "aud-debug";
 const BREAKGLASS_AUDIENCE: &str = "aud-break";
+const CAPITAL_AUDIENCE: &str = "aud-capital";
 
 fn ops_config() -> OpsApiConfig {
     OpsApiConfig {
         read: READ_AUDIENCE.to_string(),
         debug: DEBUG_AUDIENCE.to_string(),
+        capital: CAPITAL_AUDIENCE.to_string(),
         breakglass: BREAKGLASS_AUDIENCE.to_string(),
     }
 }
@@ -48,12 +50,23 @@ fn breakglass_probe(_auth: BreakglassOps) -> &'static str {
     "ok"
 }
 
+#[rocket::get("/probe/capital")]
+fn capital_probe(_auth: CapitalOps) -> &'static str {
+    "ok"
+}
+
 /// Probe rocket carrying only the verifiers the guards read; the probe handlers
 /// need no other state, so this isolates the guard from the real handlers.
 fn probe_rocket(verifiers: OpsApiVerifiers) -> rocket::Rocket<rocket::Build> {
-    rocket::build()
-        .manage(verifiers)
-        .mount("/", rocket::routes![read_probe, debug_probe, breakglass_probe])
+    rocket::build().manage(verifiers).mount(
+        "/",
+        rocket::routes![
+            read_probe,
+            debug_probe,
+            capital_probe,
+            breakglass_probe
+        ],
+    )
 }
 
 #[derive(Serialize)]
@@ -149,7 +162,9 @@ async fn every_tier_refuses_a_missing_assertion() {
         OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
     let client = Client::tracked(probe_rocket(verifiers)).await.unwrap();
 
-    for path in ["/probe/read", "/probe/debug", "/probe/breakglass"] {
+    for path in
+        ["/probe/read", "/probe/debug", "/probe/capital", "/probe/breakglass"]
+    {
         let response = client.get(path).dispatch().await;
         assert_eq!(response.status(), Status::Unauthorized, "{path}");
     }
@@ -174,6 +189,7 @@ async fn each_tier_accepts_an_assertion_for_its_own_audience() {
     for (path, audience) in [
         ("/probe/read", READ_AUDIENCE),
         ("/probe/debug", DEBUG_AUDIENCE),
+        ("/probe/capital", CAPITAL_AUDIENCE),
         ("/probe/breakglass", BREAKGLASS_AUDIENCE),
     ] {
         let response = client
@@ -219,6 +235,29 @@ async fn a_debug_tier_assertion_cannot_reach_the_breakglass_tier() {
     ));
 }
 
+/// The freeze tier: a debug-tier assertion is refused on the capital path, so a
+/// debug operator cannot freeze (the issue's acceptance criterion).
+#[traced_test]
+#[tokio::test]
+async fn a_debug_tier_assertion_cannot_reach_the_capital_tier() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client = Client::tracked(probe_rocket(verifiers)).await.unwrap();
+
+    let response = client
+        .get("/probe/capital")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, DEBUG_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::Unauthorized);
+}
+
 /// A read-tier assertion is likewise refused on the debug path: no tier's
 /// token verifies against another tier's pinned audience.
 #[traced_test]
@@ -258,7 +297,8 @@ async fn real_ops_routes_require_an_iap_assertion() {
             "/",
             rocket::routes![
                 crate::admin::list_stuck_ops,
-                crate::admin::reprocess_mint_ops
+                crate::admin::reprocess_mint_ops,
+                crate::admin::orchestrator_health_ops
             ],
         );
     let client = Client::tracked(rocket).await.unwrap();
@@ -271,6 +311,9 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .dispatch()
         .await;
     assert_eq!(debug.status(), Status::Unauthorized);
+
+    let health = client.get("/ops/read/orchestrator-health").dispatch().await;
+    assert_eq!(health.status(), Status::Unauthorized);
 
     assert!(logs_contain_at!(
         Level::WARN,
