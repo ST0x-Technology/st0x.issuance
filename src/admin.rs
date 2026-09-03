@@ -20,7 +20,7 @@ use crate::Quantity;
 use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
-use crate::auth::InternalAuth;
+use crate::auth::{BreakglassOps, DebugOps, InternalAuth, ReadOps};
 use crate::config::{Config, VaultMode};
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
@@ -549,17 +549,58 @@ async fn load_reprocess_context(
     ),
     security(("internal_api_key" = []))
 )]
+#[post("/admin/recover/redemption/<issuer_request_id>")]
+pub(crate) async fn recover_redemption(
+    _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+) -> Result<Json<ReprocessResponse>, Status> {
+    recover_redemption_logic(
+        store,
+        pool,
+        alpaca_service,
+        vault_services,
+        burn_recovery,
+        issuer_request_id,
+    )
+    .await
+}
+
+/// Debug-tier operator route mirroring [`recover_redemption`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/recover/redemption/<issuer_request_id>")]
+pub(crate) async fn recover_redemption_ops(
+    _auth: DebugOps,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+) -> Result<Json<ReprocessResponse>, Status> {
+    recover_redemption_logic(
+        store,
+        pool,
+        alpaca_service,
+        vault_services,
+        burn_recovery,
+        issuer_request_id,
+    )
+    .await
+}
+
 #[tracing::instrument(skip(
-    _auth,
     store,
     pool,
     alpaca_service,
     vault_services,
     burn_recovery
 ))]
-#[post("/admin/recover/redemption/<issuer_request_id>")]
-pub(crate) async fn recover_redemption(
-    _auth: InternalAuth,
+async fn recover_redemption_logic(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
@@ -1463,7 +1504,6 @@ pub(crate) struct CloseRedemptionRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool))]
 #[post(
     "/admin/close/redemption/<issuer_request_id>",
     format = "json",
@@ -1471,6 +1511,33 @@ pub(crate) struct CloseRedemptionRequest {
 )]
 pub(crate) async fn close_redemption(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<CloseRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    close_redemption_logic(store, pool, issuer_request_id, body).await
+}
+
+/// Breakglass-tier operator route mirroring [`close_redemption`], gated by IAP
+/// (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/close/redemption/<issuer_request_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn close_redemption_ops(
+    _auth: BreakglassOps,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<CloseRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    close_redemption_logic(store, pool, issuer_request_id, body).await
+}
+
+#[tracing::instrument(skip(store, pool))]
+async fn close_redemption_logic(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1566,7 +1633,6 @@ pub(crate) struct ForceCompleteRedemptionRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, burn_recovery))]
 #[post(
     "/admin/force-complete/redemption/<issuer_request_id>",
     format = "json",
@@ -1574,6 +1640,45 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 )]
 pub(crate) async fn force_complete_redemption(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<ForceCompleteRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    force_complete_redemption_logic(
+        pool,
+        burn_recovery,
+        issuer_request_id,
+        body,
+    )
+    .await
+}
+
+/// Breakglass-tier operator route mirroring [`force_complete_redemption`],
+/// gated by IAP (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/force-complete/redemption/<issuer_request_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn force_complete_redemption_ops(
+    _auth: BreakglassOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<ForceCompleteRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    force_complete_redemption_logic(
+        pool,
+        burn_recovery,
+        issuer_request_id,
+        body,
+    )
+    .await
+}
+
+#[tracing::instrument(skip(pool, burn_recovery))]
+async fn force_complete_redemption_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1733,10 +1838,36 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, apalis_pool, store, vault_services))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    aggregate_id: &str,
+) -> Result<Json<ReprocessResponse>, ReprocessMintError> {
+    reprocess_mint_logic(pool, apalis_pool, store, vault_services, aggregate_id)
+        .await
+}
+
+/// Debug-tier operator route mirroring [`reprocess_mint`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/reprocess/mint/<aggregate_id>")]
+pub(crate) async fn reprocess_mint_ops(
+    _auth: DebugOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    aggregate_id: &str,
+) -> Result<Json<ReprocessResponse>, ReprocessMintError> {
+    reprocess_mint_logic(pool, apalis_pool, store, vault_services, aggregate_id)
+        .await
+}
+
+#[tracing::instrument(skip(pool, apalis_pool, store, vault_services))]
+async fn reprocess_mint_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     store: &rocket::State<Arc<Store<Mint>>>,
@@ -1994,10 +2125,42 @@ pub(crate) struct CloseMintRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool, vault_services, receipts))]
 #[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
 pub(crate) async fn close_mint(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    receipts: &rocket::State<Arc<dyn ReceiptService>>,
+    aggregate_id: &str,
+    body: Json<CloseMintRequest>,
+) -> Result<Json<ReprocessResponse>, CloseMintError> {
+    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
+        .await
+}
+
+/// Breakglass-tier operator route mirroring [`close_mint`], gated by IAP
+/// (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/close/mint/<aggregate_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn close_mint_ops(
+    _auth: BreakglassOps,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    receipts: &rocket::State<Arc<dyn ReceiptService>>,
+    aggregate_id: &str,
+    body: Json<CloseMintRequest>,
+) -> Result<Json<ReprocessResponse>, CloseMintError> {
+    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
+        .await
+}
+
+#[tracing::instrument(skip(store, pool, vault_services, receipts))]
+async fn close_mint_logic(
     store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     vault_services: &rocket::State<NetworkVaultServices>,
@@ -2494,12 +2657,28 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, _vault_services))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
     _vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<StuckResponse>, Status> {
+    list_stuck_logic(pool).await
+}
+
+/// Read-tier operator route mirroring [`list_stuck`], gated by IAP (`ReadOps`)
+/// instead of the internal API key.
+#[get("/ops/read/stuck")]
+pub(crate) async fn list_stuck_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<StuckResponse>, Status> {
+    list_stuck_logic(pool).await
+}
+
+#[tracing::instrument(skip(pool))]
+async fn list_stuck_logic(
+    pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
     let mut stuck = Vec::new();
