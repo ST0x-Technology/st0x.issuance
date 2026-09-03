@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
-use crate::auth::FailedAuthRateLimiter;
+use crate::auth::{FailedAuthRateLimiter, OpsApiVerifiers, build_jwks_client};
 use crate::burn_excess::{
     BurnExcess, exclusion::rebuild_funding_exclusion_index,
 };
@@ -467,6 +467,7 @@ pub async fn initialize_rocket(
     }
 
     Ok(build_rocket(RocketState {
+        ops_verifiers: build_ops_verifiers(&config)?,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
@@ -656,6 +657,9 @@ struct RocketState {
     receipts: Arc<dyn ReceiptService>,
     /// Per network loop and gas balance telemetry for the admin surface.
     network_telemetry: Arc<NetworkTelemetry>,
+    /// Per-tier IAP verifiers for the role-gated operator API. `None` leaves
+    /// the `/ops/*` routes unmounted (no `[ops_api]` audiences configured).
+    ops_verifiers: Option<OpsApiVerifiers>,
     background_tasks: BackgroundTasks,
 }
 
@@ -750,6 +754,20 @@ fn log_background_task_failure(
     }
 }
 
+/// Builds the per-tier IAP verifiers when the ops-API audiences are configured.
+/// `None` leaves the role-gated `/ops/*` routes unmounted. The fallible JWKS
+/// client build surfaces here as a startup error.
+fn build_ops_verifiers(
+    config: &Config,
+) -> Result<Option<OpsApiVerifiers>, reqwest::Error> {
+    match config.ops_api.as_ref() {
+        Some(ops_api) => {
+            Ok(Some(OpsApiVerifiers::new(ops_api, &build_jwks_client()?)))
+        }
+        None => Ok(None),
+    }
+}
+
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))
@@ -835,6 +853,24 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
             ],
         )
         .register("/", catchers::json_catchers());
+
+    // The role-gated operator API is mounted only when the deployment
+    // configured its IAP audiences: a host with no load balancer in front of it
+    // must not expose `/ops/*` at all (a stronger guarantee than a 401).
+    let rocket = match state.ops_verifiers {
+        Some(verifiers) => rocket.manage(verifiers).mount(
+            "/",
+            routes![
+                admin::list_stuck_ops,
+                admin::recover_redemption_ops,
+                admin::reprocess_mint_ops,
+                admin::force_complete_redemption_ops,
+                admin::close_redemption_ops,
+                admin::close_mint_ops,
+            ],
+        ),
+        None => rocket,
+    };
 
     mount_api_docs(rocket, environment)
 }
