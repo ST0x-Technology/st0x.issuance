@@ -77,6 +77,8 @@ pub(crate) enum OpsTier {
     Read,
     /// Safe recovery: recheck, resume, reprocess, reconcile.
     Debug,
+    /// Operations that move funds or change supply.
+    Capital,
     /// Operations that override normal safety checks.
     Breakglass,
 }
@@ -87,6 +89,7 @@ impl OpsTier {
         match self {
             Self::Read => "read",
             Self::Debug => "debug",
+            Self::Capital => "capital",
             Self::Breakglass => "breakglass",
         }
     }
@@ -100,20 +103,26 @@ impl OpsTier {
 pub(crate) struct OpsApiVerifiers {
     read: IapVerifier,
     debug: IapVerifier,
+    capital: IapVerifier,
     breakglass: IapVerifier,
 }
 
 impl OpsApiVerifiers {
-    /// Builds the three per-tier verifiers from the configured audiences. The
+    /// Builds the four per-tier verifiers from the configured audiences. The
     /// `http` client MUST carry timeouts (see [`build_jwks_client`]); it is
     /// cloned per verifier, which for `reqwest::Client` is a cheap `Arc` clone
-    /// so all three share one connection pool and one JWKS document.
+    /// so all four share one connection pool and one JWKS document.
     pub(crate) fn new(config: &OpsApiConfig, http: &reqwest::Client) -> Self {
         Self {
             read: IapVerifier::new(&config.read, OpsTier::Read, http.clone()),
             debug: IapVerifier::new(
                 &config.debug,
                 OpsTier::Debug,
+                http.clone(),
+            ),
+            capital: IapVerifier::new(
+                &config.capital,
+                OpsTier::Capital,
                 http.clone(),
             ),
             breakglass: IapVerifier::new(
@@ -140,6 +149,11 @@ impl OpsApiVerifiers {
                 OpsTier::Debug,
                 jwks_url.to_string(),
             ),
+            capital: IapVerifier::with_jwks_url(
+                &config.capital,
+                OpsTier::Capital,
+                jwks_url.to_string(),
+            ),
             breakglass: IapVerifier::with_jwks_url(
                 &config.breakglass,
                 OpsTier::Breakglass,
@@ -152,6 +166,7 @@ impl OpsApiVerifiers {
         match tier {
             OpsTier::Read => &self.read,
             OpsTier::Debug => &self.debug,
+            OpsTier::Capital => &self.capital,
             OpsTier::Breakglass => &self.breakglass,
         }
     }

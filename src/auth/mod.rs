@@ -186,6 +186,21 @@ impl<'r> FromRequest<'r> for DebugOps {
     }
 }
 
+/// Guard for capital-tier operator endpoints: operations that move funds or
+/// change token supply (freeze/unfreeze, approvals).
+pub(crate) struct CapitalOps;
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for CapitalOps {
+    type Error = IapError;
+
+    async fn from_request(
+        request: &'r Request<'_>,
+    ) -> Outcome<Self, Self::Error> {
+        ops_outcome(request, OpsTier::Capital, Self).await
+    }
+}
+
 /// Guard for breakglass-tier operator endpoints: operations that override
 /// normal safety checks (force-complete, close, burn-excess).
 pub(crate) struct BreakglassOps;

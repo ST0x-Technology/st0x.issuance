@@ -309,7 +309,7 @@ impl Config {
 /// identity Google will sign for. Absent from the environment means the
 /// role-gated routes are not mounted at all, which is the correct posture for
 /// any deployment that has no load balancer in front of it. Existence of this
-/// value proves all three audiences are present, non-blank, unpadded, and
+/// value proves all four audiences are present, non-blank, unpadded, and
 /// distinct (see [`resolve_ops_api`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsApiConfig {
@@ -317,6 +317,8 @@ pub struct OpsApiConfig {
     pub read: String,
     /// Audience of the backend serving the debug tier.
     pub debug: String,
+    /// Audience of the backend serving the capital tier.
+    pub capital: String,
     /// Audience of the backend serving the breakglass tier.
     pub breakglass: String,
 }
@@ -341,6 +343,13 @@ struct OpsApiEnv {
     debug: Option<String>,
 
     #[arg(
+        long = "ops-api-capital-audience",
+        env = "OPS_API_CAPITAL_AUDIENCE",
+        help = "IAP audience for the capital-tier ops API backend"
+    )]
+    capital: Option<String>,
+
+    #[arg(
         long = "ops-api-breakglass-audience",
         env = "OPS_API_BREAKGLASS_AUDIENCE",
         help = "IAP audience for the breakglass-tier ops API backend"
@@ -361,17 +370,22 @@ struct OpsApiEnv {
 fn resolve_ops_api(
     env: OpsApiEnv,
 ) -> Result<Option<OpsApiConfig>, ConfigError> {
-    let OpsApiEnv { read, debug, breakglass } = env;
+    let OpsApiEnv { read, debug, capital, breakglass } = env;
 
-    if read.is_none() && debug.is_none() && breakglass.is_none() {
+    if read.is_none()
+        && debug.is_none()
+        && capital.is_none()
+        && breakglass.is_none()
+    {
         return Ok(None);
     }
 
     let read = validated_audience("read", read)?;
     let debug = validated_audience("debug", debug)?;
+    let capital = validated_audience("capital", capital)?;
     let breakglass = validated_audience("breakglass", breakglass)?;
 
-    let all = [&read, &debug, &breakglass];
+    let all = [&read, &debug, &capital, &breakglass];
     for (index, first) in all.iter().enumerate() {
         for second in all.iter().skip(index + 1) {
             if first == second {
@@ -380,7 +394,7 @@ fn resolve_ops_api(
         }
     }
 
-    Ok(Some(OpsApiConfig { read, debug, breakglass }))
+    Ok(Some(OpsApiConfig { read, debug, capital, breakglass }))
 }
 
 /// Validates one tier's audience: present, non-blank, and free of surrounding
@@ -2725,18 +2739,22 @@ mod tests {
     fn ops_env(
         read: Option<&str>,
         debug: Option<&str>,
+        capital: Option<&str>,
         breakglass: Option<&str>,
     ) -> OpsApiEnv {
         OpsApiEnv {
             read: read.map(String::from),
             debug: debug.map(String::from),
+            capital: capital.map(String::from),
             breakglass: breakglass.map(String::from),
         }
     }
 
     #[test]
     fn ops_api_absent_group_leaves_routes_unmounted() {
-        assert!(resolve_ops_api(ops_env(None, None, None)).unwrap().is_none());
+        assert!(
+            resolve_ops_api(ops_env(None, None, None, None)).unwrap().is_none()
+        );
     }
 
     #[test]
@@ -2744,20 +2762,26 @@ mod tests {
         let config = resolve_ops_api(ops_env(
             Some("aud-read"),
             Some("aud-debug"),
+            Some("aud-capital"),
             Some("aud-break"),
         ))
         .unwrap()
         .unwrap();
         assert_eq!(config.read, "aud-read");
         assert_eq!(config.debug, "aud-debug");
+        assert_eq!(config.capital, "aud-capital");
         assert_eq!(config.breakglass, "aud-break");
     }
 
     #[test]
     fn ops_api_partial_group_names_the_missing_tier() {
-        let error =
-            resolve_ops_api(ops_env(Some("aud-read"), None, Some("aud-break")))
-                .unwrap_err();
+        let error = resolve_ops_api(ops_env(
+            Some("aud-read"),
+            None,
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap_err();
         assert!(
             matches!(error, ConfigError::OpsApiIncomplete { tier: "debug" }),
             "got: {error}"
@@ -2769,6 +2793,7 @@ mod tests {
         let error = resolve_ops_api(ops_env(
             Some("   "),
             Some("aud-debug"),
+            Some("aud-capital"),
             Some("aud-break"),
         ))
         .unwrap_err();
@@ -2783,6 +2808,7 @@ mod tests {
         let error = resolve_ops_api(ops_env(
             Some("aud-read"),
             Some("aud-debug "),
+            Some("aud-capital"),
             Some("aud-break"),
         ))
         .unwrap_err();
@@ -2800,6 +2826,7 @@ mod tests {
         let error = resolve_ops_api(ops_env(
             Some("same"),
             Some("same"),
+            Some("aud-capital"),
             Some("aud-break"),
         ))
         .unwrap_err();

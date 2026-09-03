@@ -19,7 +19,7 @@ use crate::Quantity;
 use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
-use crate::auth::{BreakglassOps, DebugOps, InternalAuth, ReadOps};
+use crate::auth::{BreakglassOps, CapitalOps, DebugOps, InternalAuth, ReadOps};
 use crate::config::{Config, VaultMode};
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
@@ -2392,10 +2392,30 @@ pub(crate) struct OrchestratorHealthResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, config, vault_services))]
 #[get("/admin/orchestrator-health")]
 pub(crate) async fn orchestrator_health(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<OrchestratorHealthResponse>, Status> {
+    orchestrator_health_logic(pool, config, vault_services).await
+}
+
+/// Read-tier operator route mirroring [`orchestrator_health`], gated by IAP
+/// (`ReadOps`) instead of the internal API key.
+#[get("/ops/read/orchestrator-health")]
+pub(crate) async fn orchestrator_health_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<OrchestratorHealthResponse>, Status> {
+    orchestrator_health_logic(pool, config, vault_services).await
+}
+
+#[tracing::instrument(skip(pool, config, vault_services))]
+async fn orchestrator_health_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     config: &rocket::State<Config>,
     vault_services: &rocket::State<NetworkVaultServices>,
@@ -3182,10 +3202,29 @@ pub(crate) struct ScheduleFreezeWindowResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, scheduler))]
 #[post("/admin/freeze-schedules", format = "json", data = "<body>")]
 pub(crate) async fn schedule_freeze_window(
     _auth: InternalAuth,
+    scheduler: &rocket::State<FreezeScheduler>,
+    body: Json<ScheduleFreezeWindowRequest>,
+) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
+    schedule_freeze_window_logic(scheduler, body).await
+}
+
+/// Capital-tier operator route mirroring [`schedule_freeze_window`]: arming a
+/// freeze gates token supply, so it sits above debug — the issue requires that
+/// debug cannot freeze. Gated by IAP (`CapitalOps`).
+#[post("/ops/capital/freeze-schedules", format = "json", data = "<body>")]
+pub(crate) async fn schedule_freeze_window_ops(
+    _auth: CapitalOps,
+    scheduler: &rocket::State<FreezeScheduler>,
+    body: Json<ScheduleFreezeWindowRequest>,
+) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
+    schedule_freeze_window_logic(scheduler, body).await
+}
+
+#[tracing::instrument(skip(scheduler))]
+async fn schedule_freeze_window_logic(
     scheduler: &rocket::State<FreezeScheduler>,
     body: Json<ScheduleFreezeWindowRequest>,
 ) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {

@@ -867,6 +867,8 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::force_complete_redemption_ops,
                 admin::close_redemption_ops,
                 admin::close_mint_ops,
+                admin::schedule_freeze_window_ops,
+                admin::orchestrator_health_ops,
             ],
         ),
         None => rocket,
