@@ -91,6 +91,7 @@ impl TokenizationRequestId {
     }
 }
 
+/// Unique identifier for a mint request issued by this service.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IssuerMintRequestId(Uuid);
 

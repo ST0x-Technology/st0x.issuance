@@ -1,5 +1,8 @@
+/// Role identifier for vault deposit operations.
 pub const ROLE_DEPOSIT: &str = "DEPOSIT";
+/// Role identifier for vault withdraw operations.
 pub const ROLE_WITHDRAW: &str = "WITHDRAW";
+/// Role identifier for vault certify operations.
 pub const ROLE_CERTIFY: &str = "CERTIFY";
 
 use alloy::hex;
@@ -315,6 +318,7 @@ async fn seed_test_assets(
     Ok(())
 }
 
+/// Errors during local EVM test setup and contract interactions.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalEvmError {
     #[error("Signer error: {0}")]
