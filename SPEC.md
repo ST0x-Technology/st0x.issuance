@@ -4921,10 +4921,10 @@ rekey change itself.
 
 ## Per network monitoring
 
-Every configured chain carries two operator facing safeguards: a low gas monitor
-on the issuer wallet's native balance and per network telemetry for the long
-running loops. Both are keyed by `Network`, so a chain added to the
-`ChainRegistry` is covered without further wiring.
+Every configured chain gets per network telemetry for the long running loops,
+and a low gas monitor on the issuer wallet's native balance whenever a gas
+threshold is configured for it. Both are keyed by `Network`, so a chain added to
+the `ChainRegistry` is covered without further wiring.
 
 ### Gas balance monitoring
 
@@ -4960,8 +4960,10 @@ native balance every 60 seconds:
   and threshold in the chain's native token.
 - Still below the threshold: alert again at most once per hour, so a sustained
   low balance cannot flood the operator channel.
-- Recovers above the threshold: INFO log only. Recovery resets the repeat alert
-  timer, so oscillation around the threshold cannot page repeatedly.
+- Recovers above the threshold: INFO log only, and clears the repeat alert
+  timer; a later drop below the threshold then pages immediately, since the
+  hourly interval only throttles repeated alerts while the balance stays
+  continuously low.
 - Balance read fails: WARN log, alert state unchanged (a transient RPC blip must
   not fire or clear alerts), and the telemetry gas status degrades to
   `unavailable`.

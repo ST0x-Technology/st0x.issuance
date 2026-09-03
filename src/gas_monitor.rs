@@ -9,9 +9,10 @@
 //! Spam control is time based dedup, not a hysteresis band: the monitor alerts
 //! once when the balance drops below the threshold, alerts again at most once
 //! per [`GAS_REALERT_INTERVAL`] while it stays low, and only logs recovery.
-//! Recovery resets the dedup state, so oscillation around the threshold cannot
-//! page repeatedly. A failed balance read leaves the alert state unchanged: a
-//! transient RPC blip must neither fire nor clear alerts.
+//! Recovery clears the dedup state, so a later drop below the threshold pages
+//! immediately; the interval only throttles repeated alerts while the balance
+//! stays continuously low. A failed balance read leaves the alert state
+//! unchanged: a transient RPC blip must neither fire nor clear alerts.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -267,31 +268,6 @@ mod tests {
 
     const REALERT: Duration = Duration::from_secs(3600);
 
-    struct CapturingNotifier {
-        delivered: Mutex<Vec<LifecycleNotification>>,
-    }
-
-    impl CapturingNotifier {
-        fn new() -> Arc<Self> {
-            Arc::new(Self { delivered: Mutex::new(Vec::new()) })
-        }
-
-        fn delivered(&self) -> Vec<LifecycleNotification> {
-            self.delivered.lock().clone()
-        }
-    }
-
-    #[async_trait]
-    impl LifecycleNotifier for CapturingNotifier {
-        async fn deliver(
-            &self,
-            notification: &LifecycleNotification,
-        ) -> Result<(), LifecycleNotificationError> {
-            self.delivered.lock().push(notification.clone());
-            Ok(())
-        }
-    }
-
     /// Notifier that fails its first `fail_first` deliveries, then succeeds,
     /// recording only the deliveries that succeed.
     struct FlakyNotifier {
@@ -441,7 +417,7 @@ mod tests {
     async fn poll_below_threshold_notifies_and_records_telemetry() {
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(5));
-        let notifier = CapturingNotifier::new();
+        let notifier = FlakyNotifier::new(0);
         let telemetry = Arc::new(NetworkTelemetry::new([Network::Base]));
         let monitor = monitor(
             &asserter,
@@ -476,7 +452,7 @@ mod tests {
     async fn poll_read_failure_keeps_state_and_degrades_telemetry() {
         let asserter = Asserter::new();
         asserter.push_failure_msg("rpc down");
-        let notifier = CapturingNotifier::new();
+        let notifier = FlakyNotifier::new(0);
         let telemetry = Arc::new(NetworkTelemetry::new([Network::Base]));
         let monitor = monitor(
             &asserter,
@@ -518,7 +494,7 @@ mod tests {
     async fn poll_recovery_logs_without_notifying() {
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200));
-        let notifier = CapturingNotifier::new();
+        let notifier = FlakyNotifier::new(0);
         let telemetry = Arc::new(NetworkTelemetry::new([Network::Base]));
         let monitor = monitor(
             &asserter,

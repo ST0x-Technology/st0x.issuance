@@ -610,7 +610,7 @@ impl Env {
                 && self.chain_base_low_gas_threshold.is_none()
             {
                 warn!(
-                    target: "config",
+                    target: "startup",
                     "Flat LOW_GAS_THRESHOLD is ignored while CHAIN_BASE_* \
                      configures Base; set CHAIN_BASE_LOW_GAS_THRESHOLD to \
                      monitor Base gas"
@@ -1251,9 +1251,12 @@ mod tests {
     use alloy::primitives::address;
     use ipnetwork::IpNetwork;
     use tempfile::NamedTempFile;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::auth::IpWhitelist;
+    use crate::test_utils::logs_contain_at;
 
     fn minimal_args() -> Vec<&'static str> {
         vec![
@@ -1476,6 +1479,55 @@ mod tests {
             hyperevm.low_gas_threshold,
             Some(U256::from(1_500_000_000_000_000_000_u64))
         );
+    }
+
+    /// A grouped Base config with a flat `LOW_GAS_THRESHOLD` but no
+    /// `CHAIN_BASE_LOW_GAS_THRESHOLD` drops the flat value (Base ends up
+    /// unmonitored) and warns that it was ignored, rather than silently
+    /// applying it.
+    #[traced_test]
+    #[test]
+    fn grouped_base_ignores_flat_threshold_with_warning() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--chain-base-rpc-url",
+            "wss://base.example",
+            "--chain-base-chain-id",
+            "8453",
+            "--chain-base-backfill-start-block",
+            "42000000",
+            "--low-gas-threshold",
+            "0.05",
+        ]);
+
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config().unwrap();
+
+        assert_eq!(
+            config.chains[0].low_gas_threshold, None,
+            "the flat threshold must not leak into the grouped Base entry"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Flat LOW_GAS_THRESHOLD is ignored"]
+        ));
+    }
+
+    /// A threshold supplied without its group's RPC configuration is refused,
+    /// guarding against a future clap change that severs the `requires` tie.
+    #[test]
+    fn threshold_without_group_rpc_is_refused() {
+        let result = Env::optional_chain_config(
+            Network::Ethereum,
+            &ChainGroupEnv {
+                rpc_url: None,
+                chain_id: None,
+                backfill_start_block: None,
+                low_gas_threshold: Some("0.05"),
+            },
+        );
+
+        assert!(matches!(result, Err(ConfigError::ParseError(_))));
     }
 
     #[test]
