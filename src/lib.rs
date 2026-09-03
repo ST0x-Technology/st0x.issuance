@@ -337,15 +337,14 @@ pub async fn initialize_rocket(
 
     run_startup_recovery(
         &pool,
-        &apalis_pool,
         &chain_registry,
         &receipt_inventory_store,
-        &managers,
         bot_wallet,
         &apalis_pool,
         &managers,
     )
     .await?;
+
     let corporate_action_feed = prepare_corporate_action_feed_unless_gated(
         &config,
         pool.clone(),
