@@ -1,0 +1,275 @@
+name: build-oci
+
+# Issuance bot OCI image -> s01-artifacts Artifact Registry (s01-issuance
+# repo): nix build the flake's dockerTools image -> push digest -> sign
+# (GitHub/Sigstore + the s01-artifacts issuance-image KMS attestor) ->
+# roll staging once the GCP staging VM exists.
+#
+# A MERGE TO MAIN DEPLOYS GCP STAGING (roll-staging job, armed by the
+# CI_ROLLS_STAGING repository variable once the devops side flips
+# images.yaml ci_rolls: true): the staging plane is a GCE VM that pulls its
+# deploy state, so the job writes the digest into the images.env object the
+# VM's roll timer polls. The VM verifies the issuance-image attestation of
+# everything it adopts, so this job cannot make it run an unsigned image.
+#
+# Auth: GitHub OIDC -> the s01-artifacts WIF provider, bound to
+# issuance-deployer (main only; the WIF binding lives in s01.devops
+# terraform/artifacts/issuance.tf). PRs get nothing.
+#
+# Coexists with deploy-staging.yaml / deploy-prod.yaml (the DigitalOcean
+# deploy-rs path) until the staging cutover retires the staging half.
+#
+# PRODUCTION IS NOT DEPLOYED FROM THIS REPO: promote a staging-proven digest
+# via s01.devops (gated apply). This SA holds nothing in production.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-oci
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  # GitHub/Sigstore provenance attestation on every pushed digest.
+  attestations: write
+
+env:
+  REGION: europe-west3
+  AR_REPO: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+  WIF_PROVIDER: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  DEPLOYER_SA: issuance-deployer@s01-artifacts.iam.gserviceaccount.com
+  ATTESTOR: projects/s01-artifacts/attestors/issuance-image
+  ATTESTOR_KEY: projects/s01-artifacts/locations/europe-west3/keyRings/attestors/cryptoKeys/issuance-image-attestor/cryptoKeyVersions/1
+  IMAGE: s01-issuance
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-oci-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-oci-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+        with:
+          # `container binauthz` lives in the beta component.
+          install_components: beta
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build OCI image from the flake
+        run: |
+          set -euo pipefail
+          nix build .#bot-oci
+          # streamLayeredImage output is a script that streams the tar.
+          ./result | docker load
+          docker tag "s01-issuance:latest" "${AR_REPO}/${IMAGE}:${GITHUB_SHA}"
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(timeout 30 docker run --rm "${AR_REPO}/${IMAGE}:${GITHUB_SHA}" 2>&1)
+          set -e
+          printf '%s\n' "$output"
+          # With no config the binary loads, reaches its own config parsing,
+          # and exits with this marker — proof it executed and reached
+          # application code (same assertion as scripts/smoke-test-image.nu).
+          if ! printf '%s' "$output" | grep -q "Failed to parse configuration"; then
+            echo "::error::st0x-issuance binary did not start"
+            exit 1
+          fi
+
+      - name: Push image and resolve digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${AR_REPO}/${IMAGE}:${GITHUB_SHA}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${AR_REPO}/${IMAGE}:${GITHUB_SHA}")
+          echo "Pushed: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+
+      # Two independent provenance proofs: the GitHub/Sigstore attestation is
+      # non-blocking (needs a paid plan on private repos); the KMS/BinAuthz
+      # attestation below is the one the VM's roll timer verifies and MUST
+      # succeed.
+      - name: Attest build provenance (GitHub / Sigstore)
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.AR_REPO }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.sha256 }}
+
+      # Nix image builds are reproducible, so a push that does not change the
+      # image reproduces its digest, and sign-and-create 409s on the existing
+      # (attestor, digest) occurrence. Tolerating that conflict is sound: the
+      # attestation the VM verifies is already in place.
+      - name: Sign Binary Authorization attestation
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(gcloud beta container binauthz attestations sign-and-create \
+            --project="s01-artifacts" \
+            --artifact-url="${{ steps.push.outputs.digest }}" \
+            --attestor="${ATTESTOR}" \
+            --keyversion="${ATTESTOR_KEY}" 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            if printf '%s' "$output" | grep -q "is the subject of a conflict"; then
+              echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
+              exit 0
+            fi
+            exit "$status"
+          fi
+
+  # Armed by the CI_ROLLS_STAGING repository variable, set when the devops
+  # side flips images.yaml ci_rolls: true (which creates the conditioned
+  # images.env write grant this job depends on). Until then the job skips.
+  # It rewrites the BOT_IMAGE line in place and preserves every other line
+  # byte for byte — in particular GATED_SERVICE_REPLICAS, the workload gate,
+  # which must never be settable from this repo.
+  roll-staging:
+    if: vars.CI_ROLLS_STAGING != ''
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      CONFIG_BUCKET: s01-issuance-staging-config
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+
+      - name: Rewrite images.env with the digest just built
+        id: roll
+        run: |
+          set -euo pipefail
+
+          DIGEST=$(gcloud artifacts docker images describe "${AR_REPO}/${IMAGE}:${GITHUB_SHA}" \
+            --format='value(image_summary.digest)')
+          case "$DIGEST" in
+            sha256:[0-9a-f]*) ;;
+            *) echo "::error::could not resolve a digest for ${IMAGE}:${GITHUB_SHA} (got '${DIGEST}')"; exit 1 ;;
+          esac
+
+          # Generation captured BEFORE the read so the precondition on the
+          # write spans the whole read-modify-write.
+          GENERATION=$(gcloud storage objects describe \
+            "gs://${CONFIG_BUCKET}/images.env" --format='value(generation)')
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
+          cp current.env next.env
+
+          # Refuse to write a file that is missing anything: a dropped
+          # GATED_SERVICE_REPLICAS takes the whole stack unit down.
+          for key in BOT_IMAGE GATED_SERVICE_REPLICAS; do
+            grep -q "^${key}=" current.env \
+              || { echo "::error::images.env has no ${key} — refusing to write"; exit 1; }
+          done
+
+          sed -i "s|^BOT_IMAGE=.*|BOT_IMAGE=${AR_REPO}/${IMAGE}@${DIGEST}|" next.env
+
+          echo "--- images.env ---"
+          cat next.env
+
+          grep -q '^GATED_SERVICE_REPLICAS=0$' next.env \
+            && echo "gated=true" >> "$GITHUB_OUTPUT" \
+            || echo "gated=false" >> "$GITHUB_OUTPUT"
+          echo "bot=$(grep '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+
+          if cmp -s current.env next.env; then
+            echo "::notice::images.env already carries this digest — verifying adoption only"
+            echo "rolled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gcloud storage cp --if-generation-match="$GENERATION" \
+            next.env "gs://${CONFIG_BUCKET}/images.env" || {
+            echo "::error::images.env changed under us (a concurrent devops apply?) — re-run this job"
+            exit 1
+          }
+
+          # Read back: Terraform writes this object too; losing that race
+          # must be a red job, not a box that quietly rolls backwards.
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > readback.env
+          cmp -s next.env readback.env || {
+            echo "::error::images.env was overwritten by another writer — re-run this job"
+            diff -u next.env readback.env || true
+            exit 1
+          }
+
+          echo "rolled=true" >> "$GITHUB_OUTPUT"
+
+      # The roll is only real once the box has taken it: the timer publishes
+      # deployed.env after a SUCCESSFUL stack restart. Gated on `gated`
+      # ALONE, not `rolled`: after a failed roll a re-run's write is a no-op
+      # and the verification must still happen.
+      - name: Wait for the VM to adopt it
+        if: steps.roll.outputs.gated == 'false'
+        run: |
+          set -euo pipefail
+          want="${{ steps.roll.outputs.bot }}"
+          for _ in $(seq 1 40); do
+            if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
+              if grep -qxF "$want" <<<"$out"; then
+                echo "::notice::s01-issuance-staging rolled to ${GITHUB_SHA}"
+                exit 0
+              fi
+            elif grep -qiE "403|permission|denied" <<<"$out"; then
+              echo "::error::cannot READ deployed.env — the deployer SA lacks the read grant (s01.devops staging-issuance):"
+              echo "$out"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::the VM has not published this digest after 10 minutes." \
+            "Check the roll timer: gcloud compute ssh s01-issuance-staging --project s01-issuance-staging" \
+            "--zone europe-west3-a --tunnel-through-iap --command 'journalctl -u s01-issuance-staging-roll -n 50'"
+          exit 1
