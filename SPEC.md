@@ -1705,29 +1705,31 @@ source. Production and staging accept only HTTPS on
 `stream.data.alpaca.markets`; development may use plain HTTP only when the URL
 targets a loopback IP and the request carries no Alpaca credential headers. The
 credential-free development transport may establish its initial cursor from the
-first validated mock frame through the ordinary decoder and projection path;
-authenticated environments still require the fail-closed snapshot-repair
-baseline described below. The accepted contract is exactly US-region
-`cash_dividend_corporateaction_event` and `stock_dividend_corporateaction_event`
-frames with `insert`, `update`, or `delete`. Any other mutation kind or
-discriminator, another region, malformed identity, or invalid date is a typed
-poison boundary and cannot advance the cursor. A valid accepted event for an
-underlying that issuance does not list is instead an explicit no-op: the
-projection transaction records the event with a typed
-`no_op_unlisted_underlying` outcome and advances the cursor without creating an
-action projection, schedule, transition job, or hold, while retaining the
-canonical mutation payload. After an asset listing commits, a service-owned
-reactor selects the latest retained mutation per action for that underlying. It
-atomically creates pending revisions for the latest non-delete mutations and
-records their source event IDs without changing the stream cursor or rewriting
-the historical no-op outcomes. The ordinary alignment path then applies future
-windows and immediately acquires holds for windows already active; tests cover
-both cases. A latest retained delete creates no revision because no source hold
-was acquired. Listed events record a `schedule_revision` outcome with the
-resulting revision in that same transaction. Each listed action's stable Alpaca
-ID owns one source hold and one current schedule revision, so updates replace
-that action's prior window and deletes release only that action's hold. An
-operator hold or another action on the same underlying is never affected.
+first validated mock frame through the ordinary decoder and projection path. An
+authenticated first install has no provider-certified complete baseline, so it
+remains disabled unless an operator explicitly configures one bounded-history
+bootstrap timestamp as described below. The accepted contract is exactly
+US-region `cash_dividend_corporateaction_event` and
+`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
+`delete`. Any other mutation kind or discriminator, another region, malformed
+identity, or invalid date is a typed poison boundary and cannot advance the
+cursor. A valid accepted event for an underlying that issuance does not list is
+instead an explicit no-op: the projection transaction records the event with a
+typed `no_op_unlisted_underlying` outcome and advances the cursor without
+creating an action projection, schedule, transition job, or hold, while
+retaining the canonical mutation payload. After an asset listing commits, a
+service-owned reactor selects the latest retained mutation per action for that
+underlying. It atomically creates pending revisions for the latest non-delete
+mutations and records their source event IDs without changing the stream cursor
+or rewriting the historical no-op outcomes. The ordinary alignment path then
+applies future windows and immediately acquires holds for windows already
+active; tests cover both cases. A latest retained delete creates no revision
+because no source hold was acquired. Listed events record a `schedule_revision`
+outcome with the resulting revision in that same transaction. Each listed
+action's stable Alpaca ID owns one source hold and one current schedule
+revision, so updates replace that action's prior window and deletes release only
+that action's hold. An operator hold or another action on the same underlying is
+never affected.
 
 Unlisted canonical state is bounded: one latest row is upserted per
 `(region, underlying, action_id)`, while a separate audit row keeps only the
@@ -1800,26 +1802,56 @@ boundary remains. Operators follow
 @docs/runbooks/corporate-action-feed-boundary.md to inspect the exact stored
 boundary and cursor, preserve incident evidence, and invoke no unsafe SQL
 override. Restart tests cover malformed and oversized frames without an event
-ID. The first install has no cursor and cannot establish a production baseline
-from the documented Alpaca contracts: neither an unbounded `since` replay nor
-the paginated GET endpoint proves a complete state at an SSE event ID. Minting
-and normal consumption remain gated until an operator restores a full issuance
-database backup with a cursor that inclusive replay still accepts. A controlled
-mock stream may establish a development fixture cursor only. Subsequent
-production connections use inclusive `since_id=<committed-event-id>` replay, and
-the first data frame must echo that cursor. `Last-Event-Id` is never sent,
-because Alpaca gives that header precedence over `since_id`. A rejected anchor
-or non-echoing first frame is a replay gap: no later or live event is accepted.
+ID.
 
-A replay-retention gap is not repaired by resetting the cursor or combining an
-uncertified GET page set with a live buffer. Alpaca documents neither a REST
-snapshot watermark nor a consistency relationship between GET pagination and an
-SSE event ID, so an empty buffer, a first live frame, and `since_id` cannot
-prove a safe cutover. Issuance remains gated at the durable replay-gap boundary
-until an operator restores a full database backup whose cursor can be
-echo-verified by inclusive replay, or Alpaca adds a documented atomic
-snapshot/replay boundary. Without either input, recovery is intentionally
-unavailable.
+**First-install bootstrap.** Alpaca documents `since=<RFC3339>` but does not
+certify complete retention back to an arbitrary timestamp or expose an atomic
+snapshot/SSE watermark. Production and staging therefore default to disabled
+when no cursor exists. To accept that bounded-history risk explicitly, an
+operator may configure `ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE` with a
+non-future RFC3339 instant selected from independently verified operational
+history. Before the HTTP service accepts traffic, issuance captures one UTC
+cutoff and adds exactly `since=<configured instant>` and `until=<cutoff>` as
+replay-boundary parameters (never `since_id` or `Last-Event-Id`). It waits for
+Alpaca's documented bounded stream to close after its last inclusive event. EOF
+with a buffered partial SSE frame is not successful completion. Every replayed
+revision must durably project, enqueue its retry jobs, and synchronously align
+its current source-owned hold before startup can continue; any failure aborts
+startup. The live connection then uses a committed cursor, or continues from
+`since=<cutoff>` after an empty replay until the first validated mutation
+establishes one. Projection and hold alignment share the corporate-action
+revision guard and freeze-admission guard in that order; mint initiation holds
+the same admission guard from freeze-status validation through its event-store
+commit. If scheduling or alignment fails after projection commits, the fatal
+error retains admission until service shutdown. Issuance logs one structured
+WARN with the non-secret boundary and `bounded_history` mode. A malformed or
+future instant fails startup. Omitting the setting leaves the feed disabled
+without stopping issuance. The operator removes the setting immediately after
+verifying the first committed cursor. While it remains configured, the issuer
+cannot distinguish an intended first install from a lost, empty, or unmounted
+database; an established deployment with a missing cursor is a storage incident
+and must not reuse the old lower bound.
+
+Once any cursor exists, the bootstrap setting is ignored: every subsequent
+production connection uses inclusive `since_id=<committed-event-id>` replay, and
+the first data frame must echo that cursor. A response that ends before echoing
+the anchor persists a replay-gap boundary and fails closed rather than being
+treated as an ordinary disconnect. `Last-Event-Id` is never sent because Alpaca
+gives that header precedence over `since_id`. A rejected anchor or non-echoing
+first frame is a replay gap: no later or live event is accepted. A persisted
+poison, regression, or replay-gap boundary is never cleared or bypassed by the
+bootstrap setting; `load_cursor` rejects that boundary before request
+construction.
+
+A replay-retention gap is not repaired by resetting the cursor, reusing the
+first-install timestamp, or combining an uncertified GET page set with a live
+buffer. Alpaca documents neither a REST snapshot watermark nor a consistency
+relationship between GET pagination and an SSE event ID, so an empty buffer, a
+first live frame, and `since_id` cannot prove a safe cutover. Issuance remains
+gated at the durable replay-gap boundary until an operator restores a full
+database backup whose cursor can be echo-verified by inclusive replay, or Alpaca
+adds a documented atomic snapshot/replay boundary. Without either input,
+recovery is intentionally unavailable.
 
 Every durable ingestion boundary that gates consumption — poison (including
 replay-evidence-unavailable), cursor regression, rejected anchor, or replay-
@@ -4767,6 +4799,8 @@ ALPACA_API_KEY=<api_key>
 ALPACA_API_SECRET=<api_secret>
 ALPACA_BASE_URL=https://broker-api.alpaca.markets
 ALPACA_TOKENIZATION_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
+# Optional first-install boundary; omission keeps production bootstrap disabled.
+ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE=<non_future_RFC3339_timestamp>
 
 # Blockchain Configuration
 RPC_WS_URL=<ethereum_websocket_url>

@@ -622,6 +622,7 @@ pub fn create_config_with_db(
             corporate_actions_stream_url: setup_corporate_actions_stream_mock(
                 mock_alpaca,
             ),
+            corporate_actions_bootstrap_since: None,
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),
