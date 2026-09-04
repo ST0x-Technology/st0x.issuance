@@ -432,7 +432,7 @@ pub async fn initialize_rocket(
     ));
     background_task_handles.push(spawn_corporate_action_freeze_worker(
         apalis_pool.clone(),
-        underlying_store,
+        underlying_store.clone(),
         pool.clone(),
         shutdown_rx.clone(),
     ));
@@ -442,11 +442,6 @@ pub async fn initialize_rocket(
         shutdown_rx.clone(),
     ));
 
-    let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
-        &apalis_pool,
-        pool.clone(),
-    );
-
     background_task_handles.push(spawn_corporate_action_feed(
         corporate_action_feed,
         shutdown_rx.clone(),
@@ -454,7 +449,12 @@ pub async fn initialize_rocket(
     ));
 
     Ok(build_rocket(RocketState {
+        freeze_scheduler: tokenized_asset::schedule::FreezeScheduler::new(
+            &apalis_pool,
+            pool.clone(),
+        ),
         ops_verifiers: build_ops_verifiers(&config)?,
+        underlying_store,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
@@ -468,7 +468,6 @@ pub async fn initialize_rocket(
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
         configured_networks,
-        freeze_scheduler,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
         network_telemetry,
         background_tasks: BackgroundTasks {
@@ -649,6 +648,9 @@ struct RocketState {
     /// Per-tier IAP verifiers for the role-gated operator API. `None` leaves
     /// the `/ops/*` routes unmounted (no `[ops_api]` audiences configured).
     ops_verifiers: Option<OpsApiVerifiers>,
+    /// The Underlying aggregate store backing the capital-tier freeze/unfreeze
+    /// and read-tier status ops routes.
+    underlying_store: Arc<Store<Underlying>>,
     background_tasks: BackgroundTasks,
 }
 
@@ -816,6 +818,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.freeze_scheduler)
         .manage(state.receipts)
         .manage(state.network_telemetry)
+        .manage(state.underlying_store)
         .mount(
             "/",
             routes![
@@ -859,6 +862,9 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::close_mint_ops,
                 admin::schedule_freeze_window_ops,
                 admin::orchestrator_health_ops,
+                admin::asset_status_ops,
+                admin::freeze_underlying_ops,
+                admin::unfreeze_underlying_ops,
             ],
         ),
         None => rocket,
