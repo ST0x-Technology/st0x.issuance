@@ -303,7 +303,10 @@ async fn real_ops_routes_require_an_iap_assertion() {
                 crate::admin::list_stuck_ops,
                 crate::admin::reprocess_mint_ops,
                 crate::admin::orchestrator_health_ops,
-                crate::burn_excess::api::burn_excess_internal_ops
+                crate::burn_excess::api::burn_excess_internal_ops,
+                crate::tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
+                crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
+                crate::tokenized_asset::orchestrator_ops::orchestrator_approve_ops
             ],
         );
     let client = Client::tracked(rocket).await.unwrap();
@@ -327,6 +330,22 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .dispatch()
         .await;
     assert_eq!(burn.status(), Status::Unauthorized);
+
+    let preflight =
+        client.get("/ops/read/orchestrator-preflight/base").dispatch().await;
+    assert_eq!(preflight.status(), Status::Unauthorized);
+
+    let verify = client
+        .post("/ops/debug/orchestrator-verify-signing/base/AAPL")
+        .dispatch()
+        .await;
+    assert_eq!(verify.status(), Status::Unauthorized);
+
+    let approve = client
+        .post("/ops/capital/orchestrator-approve/base/AAPL")
+        .dispatch()
+        .await;
+    assert_eq!(approve.status(), Status::Unauthorized);
 
     assert!(logs_contain_at!(
         Level::WARN,
