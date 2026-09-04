@@ -31,12 +31,13 @@ const BREAKGLASS_AUDIENCE: &str = "aud-break";
 const CAPITAL_AUDIENCE: &str = "aud-capital";
 
 fn ops_config() -> OpsApiConfig {
-    OpsApiConfig {
-        read: READ_AUDIENCE.to_string(),
-        debug: DEBUG_AUDIENCE.to_string(),
-        capital: CAPITAL_AUDIENCE.to_string(),
-        breakglass: BREAKGLASS_AUDIENCE.to_string(),
-    }
+    OpsApiConfig::new(
+        Some(READ_AUDIENCE.to_string()),
+        Some(DEBUG_AUDIENCE.to_string()),
+        Some(CAPITAL_AUDIENCE.to_string()),
+        Some(BREAKGLASS_AUDIENCE.to_string()),
+    )
+    .expect("valid ops config")
 }
 
 #[rocket::get("/probe/read")]

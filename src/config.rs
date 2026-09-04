@@ -323,14 +323,87 @@ impl Config {
 /// distinct (see [`resolve_ops_api`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsApiConfig {
-    /// Audience of the backend serving the read tier.
-    pub read: String,
-    /// Audience of the backend serving the debug tier.
-    pub debug: String,
-    /// Audience of the backend serving the capital tier.
-    pub capital: String,
-    /// Audience of the backend serving the breakglass tier.
-    pub breakglass: String,
+    read: Audience,
+    debug: Audience,
+    capital: Audience,
+    breakglass: Audience,
+}
+
+impl OpsApiConfig {
+    /// Builds a validated config from the four optional tier audiences,
+    /// rejecting a missing, blank, padded, or duplicated audience. The only
+    /// constructor, so an `OpsApiConfig` that exists carries four distinct,
+    /// well-formed audiences.
+    pub(crate) fn new(
+        read: Option<String>,
+        debug: Option<String>,
+        capital: Option<String>,
+        breakglass: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let read = Audience::new("read", read)?;
+        let debug = Audience::new("debug", debug)?;
+        let capital = Audience::new("capital", capital)?;
+        let breakglass = Audience::new("breakglass", breakglass)?;
+
+        let all = [&read, &debug, &capital, &breakglass];
+        for (index, first) in all.iter().enumerate() {
+            for second in all.iter().skip(index + 1) {
+                if first == second {
+                    return Err(ConfigError::OpsApiAudiencesNotDistinct);
+                }
+            }
+        }
+
+        Ok(Self { read, debug, capital, breakglass })
+    }
+
+    #[must_use]
+    pub(crate) fn read(&self) -> &str {
+        self.read.as_str()
+    }
+
+    #[must_use]
+    pub(crate) fn debug(&self) -> &str {
+        self.debug.as_str()
+    }
+
+    #[must_use]
+    pub(crate) fn capital(&self) -> &str {
+        self.capital.as_str()
+    }
+
+    #[must_use]
+    pub(crate) fn breakglass(&self) -> &str {
+        self.breakglass.as_str()
+    }
+}
+
+/// A validated IAP backend audience: present, non-blank, and free of
+/// surrounding whitespace (the verifier pins it byte for byte). The only
+/// constructor is [`Audience::new`], so an `Audience` that exists is valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Audience(String);
+
+impl Audience {
+    /// Validates one tier's audience: present, non-blank, and free of
+    /// surrounding whitespace.
+    fn new(
+        tier: &'static str,
+        value: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let value = value.ok_or(ConfigError::OpsApiIncomplete { tier })?;
+        if value.trim().is_empty() {
+            return Err(ConfigError::OpsApiAudienceBlank { tier });
+        }
+        if value.trim() != value {
+            return Err(ConfigError::OpsApiAudiencePadded { tier });
+        }
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The raw `OPS_API_*_AUDIENCE` environment group. Each is optional at the clap
@@ -390,37 +463,7 @@ fn resolve_ops_api(
         return Ok(None);
     }
 
-    let read = validated_audience("read", read)?;
-    let debug = validated_audience("debug", debug)?;
-    let capital = validated_audience("capital", capital)?;
-    let breakglass = validated_audience("breakglass", breakglass)?;
-
-    let all = [&read, &debug, &capital, &breakglass];
-    for (index, first) in all.iter().enumerate() {
-        for second in all.iter().skip(index + 1) {
-            if first == second {
-                return Err(ConfigError::OpsApiAudiencesNotDistinct);
-            }
-        }
-    }
-
-    Ok(Some(OpsApiConfig { read, debug, capital, breakglass }))
-}
-
-/// Validates one tier's audience: present, non-blank, and free of surrounding
-/// whitespace (the verifier pins it byte for byte).
-fn validated_audience(
-    tier: &'static str,
-    value: Option<String>,
-) -> Result<String, ConfigError> {
-    let value = value.ok_or(ConfigError::OpsApiIncomplete { tier })?;
-    if value.trim().is_empty() {
-        return Err(ConfigError::OpsApiAudienceBlank { tier });
-    }
-    if value.trim() != value {
-        return Err(ConfigError::OpsApiAudiencePadded { tier });
-    }
-    Ok(value)
+    OpsApiConfig::new(read, debug, capital, breakglass).map(Some)
 }
 
 #[derive(Parser, Clone)]
@@ -3102,10 +3145,10 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(config.read, "aud-read");
-        assert_eq!(config.debug, "aud-debug");
-        assert_eq!(config.capital, "aud-capital");
-        assert_eq!(config.breakglass, "aud-break");
+        assert_eq!(config.read(), "aud-read");
+        assert_eq!(config.debug(), "aud-debug");
+        assert_eq!(config.capital(), "aud-capital");
+        assert_eq!(config.breakglass(), "aud-break");
     }
 
     #[test]

@@ -114,19 +114,19 @@ impl OpsApiVerifiers {
     /// so all four share one connection pool and one JWKS document.
     pub(crate) fn new(config: &OpsApiConfig, http: &reqwest::Client) -> Self {
         Self {
-            read: IapVerifier::new(&config.read, OpsTier::Read, http.clone()),
+            read: IapVerifier::new(config.read(), OpsTier::Read, http.clone()),
             debug: IapVerifier::new(
-                &config.debug,
+                config.debug(),
                 OpsTier::Debug,
                 http.clone(),
             ),
             capital: IapVerifier::new(
-                &config.capital,
+                config.capital(),
                 OpsTier::Capital,
                 http.clone(),
             ),
             breakglass: IapVerifier::new(
-                &config.breakglass,
+                config.breakglass(),
                 OpsTier::Breakglass,
                 http.clone(),
             ),
@@ -140,22 +140,22 @@ impl OpsApiVerifiers {
     pub(crate) fn with_jwks_url(config: &OpsApiConfig, jwks_url: &str) -> Self {
         Self {
             read: IapVerifier::with_jwks_url(
-                &config.read,
+                config.read(),
                 OpsTier::Read,
                 jwks_url.to_string(),
             ),
             debug: IapVerifier::with_jwks_url(
-                &config.debug,
+                config.debug(),
                 OpsTier::Debug,
                 jwks_url.to_string(),
             ),
             capital: IapVerifier::with_jwks_url(
-                &config.capital,
+                config.capital(),
                 OpsTier::Capital,
                 jwks_url.to_string(),
             ),
             breakglass: IapVerifier::with_jwks_url(
-                &config.breakglass,
+                config.breakglass(),
                 OpsTier::Breakglass,
                 jwks_url.to_string(),
             ),
@@ -420,6 +420,19 @@ impl IapVerifier {
         // the stale-serving policy below), and the client's timeouts bound the
         // slot claimed above.
         match self.fetch_keys().await {
+            Ok(keys) if keys.is_empty() => {
+                // A 200 carrying no usable key (an empty set, or every JWKS
+                // entry unparseable) must not overwrite good keys or pin an
+                // empty set fresh for the whole TTL — treat it exactly like a
+                // failed fetch: retain a stale set if one exists, else fail
+                // closed.
+                warn!(target: "auth", tier = self.tier.as_str(), "IAP JWKS response carried no usable signing keys");
+                if self.keys.read().await.is_some() {
+                    Ok(())
+                } else {
+                    Err(IapError::KeysUnavailable)
+                }
+            }
             Ok(keys) => {
                 *self.keys.write().await =
                     Some(CachedKeys { keys, fetched_at: Instant::now() });
@@ -531,8 +544,11 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey;
     use serde::Serialize;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::logs_contain_at;
 
     const TEST_KID: &str = "test-key";
     const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
@@ -608,6 +624,39 @@ mod tests {
         .expect("token encodes")
     }
 
+    /// Encodes a token with a caller-supplied header (to drive a missing or
+    /// unknown `kid`); otherwise a current, valid assertion for `audience`.
+    fn token_with_header(
+        key: &TestKey,
+        header: &Header,
+        audience: &str,
+    ) -> String {
+        let exp = u64::try_from(
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after epoch")
+                    .as_secs(),
+            )
+            .expect("fits i64")
+                + 300,
+        )
+        .expect("not before epoch");
+
+        encode(
+            header,
+            &TestClaims {
+                sub: "accounts.google.com:1234".to_string(),
+                email: "operator@rainlang.xyz".to_string(),
+                aud: audience.to_string(),
+                iss: IAP_ISSUER.to_string(),
+                exp,
+            },
+            &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
+        )
+        .expect("token encodes")
+    }
+
     fn jwks_server(key: &TestKey) -> MockServer {
         let server = MockServer::start();
         let body = serde_json::json!({
@@ -653,6 +702,7 @@ mod tests {
     /// that admitted it, so a lower-tier caller replaying their token against a
     /// higher-tier path must be refused even though the signature is perfectly
     /// valid.
+    #[traced_test]
     #[tokio::test]
     async fn rejects_a_token_minted_for_another_tier() {
         let key = test_key();
@@ -665,6 +715,10 @@ mod tests {
 
         assert!(matches!(error, IapError::Rejected), "got: {error:?}");
         assert_eq!(error.status(), Status::Unauthorized);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion failed validation"]
+        ));
     }
 
     #[tokio::test]
@@ -726,6 +780,7 @@ mod tests {
 
     /// A cold cache plus an unreachable key endpoint is the one case we cannot
     /// judge, and it must fail closed rather than serving the request.
+    #[traced_test]
     #[tokio::test]
     async fn fails_closed_when_the_keys_cannot_be_fetched() {
         let key = test_key();
@@ -742,6 +797,10 @@ mod tests {
 
         assert!(matches!(error, IapError::KeysUnavailable), "got: {error:?}");
         assert_eq!(error.status(), Status::ServiceUnavailable);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Could not fetch IAP signing keys"]
+        ));
     }
 
     /// Seeds the verifier's cache as if the keys were fetched two TTLs ago,
@@ -810,5 +869,53 @@ mod tests {
         // two that follow inside the interval serve the stale keys without going
         // back to Google.
         mock.assert_calls(1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_missing_key_id_is_a_malformed_assertion() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+
+        let error = verifier(READ_AUDIENCE, &jwks)
+            .verify(&token_with_header(
+                &key,
+                &Header::new(Algorithm::ES256),
+                READ_AUDIENCE,
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, IapError::MalformedAssertion),
+            "got: {error:?}"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion carries no key id"]
+        ));
+    }
+
+    /// A token naming a key the fetched set does not carry is an unknown key,
+    /// not a validation failure: the refresh succeeds, but the named `kid` is
+    /// still absent, so there is no key to judge the signature against.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_token_naming_an_absent_key_is_unknown() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("rotated-away".to_string());
+        let error = verifier(READ_AUDIENCE, &jwks)
+            .verify(&token_with_header(&key, &header, READ_AUDIENCE))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, IapError::UnknownKey), "got: {error:?}");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion names an unknown key"]
+        ));
     }
 }

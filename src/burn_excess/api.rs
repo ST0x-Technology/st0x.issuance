@@ -10,6 +10,7 @@ use alloy::primitives::{B256, U256};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, post};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use tracing::{error, warn};
@@ -22,6 +23,29 @@ use crate::config::Config;
 use crate::mint::IssuerMintRequestId;
 use crate::tokenized_asset::Network;
 
+/// An 18-decimal fixed-point share amount parsed from its decimal-string wire
+/// form at deserialize time, so an invalid or over-precise quantity is refused
+/// before the handler runs. Private inner; the [`Deserialize`] impl (via
+/// [`parse_shares`]) is the only constructor, so a `Shares` that exists is a
+/// valid on-chain amount.
+pub(crate) struct Shares(U256);
+
+impl Shares {
+    const fn into_u256(self) -> U256 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Shares {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        parse_shares(&raw).map(Self).map_err(de::Error::custom)
+    }
+}
+
 /// Operator inputs for an internal-path excess burn, mirroring the
 /// `burn-excess internal` CLI flags. `shares` is an 18-decimal fixed-point
 /// amount as a decimal string (e.g. `"0.750"`).
@@ -30,7 +54,7 @@ pub(crate) struct BurnExcessInternalRequest {
     issuer_request_id: IssuerMintRequestId,
     deposit_tx_hash: B256,
     receipt_id: U256,
-    shares: String,
+    shares: Shares,
     reason: String,
     #[serde(default)]
     incident_id: Option<String>,
@@ -67,11 +91,6 @@ pub(crate) async fn burn_excess_internal_ops(
 ) -> Result<Json<BurnExcessResponse>, Status> {
     let body = body.into_inner();
 
-    let shares = parse_shares(&body.shares).map_err(|error| {
-        warn!(target: "admin", error = %error, "Invalid burn-excess shares");
-        Status::UnprocessableEntity
-    })?;
-
     if body.chain_id != body.network.chain_id() {
         warn!(target: "admin", network = %body.network, chain_id = body.chain_id,
             "burn-excess chain_id does not match network"
@@ -85,7 +104,7 @@ pub(crate) async fn burn_excess_internal_ops(
         deposit_tx_hash: body.deposit_tx_hash,
         funding_tx_hash: None,
         receipt_id: body.receipt_id,
-        shares,
+        shares: body.shares.into_u256(),
         reason: body.reason,
         incident_id: body.incident_id,
         network: body.network,
