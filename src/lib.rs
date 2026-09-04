@@ -875,6 +875,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::asset_status_ops,
                 admin::freeze_underlying_ops,
                 admin::unfreeze_underlying_ops,
+                burn_excess::api::burn_excess_internal_ops,
             ],
         ),
         None => rocket,
