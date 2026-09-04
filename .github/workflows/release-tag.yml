@@ -37,6 +37,8 @@ jobs:
       # Needed to peel the tag: on an ANNOTATED tag push GITHUB_SHA is the
       # tag OBJECT's sha, not the commit (actions/runner#712).
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
         with:
@@ -58,8 +60,8 @@ jobs:
           digest=$(gcloud artifacts docker images describe \
             "${AR_REPO}/${IMAGE}:${COMMIT}" \
             --format='value(image_summary.digest)' 2>/dev/null) || true
-          if [ -z "${digest:-}" ]; then
-            echo "::error::no ${IMAGE} image exists for ${COMMIT}; tag a commit that main CI has built (and wait for its build to finish)."
+          if ! grep -qE '^sha256:[0-9a-f]{64}$' <<<"${digest:-}"; then
+            echo "::error::no ${IMAGE} image exists for ${COMMIT} (got '${digest:-}'); tag a commit that main CI has built (and wait for its build to finish)."
             exit 1
           fi
           attested=$(gcloud beta container binauthz attestations list \

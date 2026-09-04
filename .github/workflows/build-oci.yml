@@ -61,6 +61,8 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
@@ -205,8 +207,11 @@ jobs:
       # Armed-ness is the grant: no access to images.env means the devops
       # side has not flipped ci_rolls (or has flipped it back to pin a
       # digest by manifest), and the right outcome is a clean stand-down,
-      # not a red build. Anything other than a permission or not-found
-      # answer is a real failure.
+      # not a red build. It is a WARNING annotation (yellow on the run and
+      # in the PR checks), with the exact answer quoted, so a grant that
+      # was meant to be there but was misapplied is visible on the very
+      # next merge rather than hiding behind a green tick. Anything other
+      # than a permission or not-found answer is a real failure.
       - name: Probe the deploy state object
         id: probe
         run: |
@@ -216,7 +221,14 @@ jobs:
             echo "generation=${out}" >> "$GITHUB_OUTPUT"
             echo "armed=true" >> "$GITHUB_OUTPUT"
           elif grep -qiE "403|permission|denied|404|not found|no such object" <<<"$out"; then
-            echo "::notice::staging roll not armed (no access to gs://${CONFIG_BUCKET}/images.env); image pushed and attested, nothing deployed"
+            echo "::warning title=staging roll not armed::no access to gs://${CONFIG_BUCKET}/images.env; image pushed and attested, nothing deployed. If ci_rolls is meant to be on, the deployer's images.env grant is missing. gcloud said: ${out}"
+            {
+              echo "### staging roll: not armed"
+              echo "Image pushed and attested; no deploy. \`gcloud storage objects describe\` answered:"
+              echo '```'
+              echo "$out"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "armed=false" >> "$GITHUB_OUTPUT"
           else
             printf '%s\n' "$out"
@@ -228,10 +240,10 @@ jobs:
         id: roll
         run: |
           set -euo pipefail
-          case "$DIGEST" in
-            "${AR_REPO}/${IMAGE}@sha256:"[0-9a-f]*) ;;
-            *) echo "::error::build-push handed over an unexpected digest ('${DIGEST}')"; exit 1 ;;
-          esac
+          if ! grep -qE "^${AR_REPO}/${IMAGE}@sha256:[0-9a-f]{64}$" <<<"$DIGEST"; then
+            echo "::error::build-push handed over an unexpected digest ('${DIGEST}')"
+            exit 1
+          fi
 
           # The generation from the probe pins the precondition on the write
           # across the whole read-modify-write: a concurrent writer (a devops

@@ -9,10 +9,11 @@
 #   Entrypoint = the `st0x-issuance` binary. ALL configuration is
 #   environment variables, exactly like the systemd unit it replaces
 #   (nix/upgradeable-services.nix `staticEnvironment` + its agenix
-#   EnvironmentFile): the compose service must set DATABASE_URL,
-#   ENVIRONMENT (staging|production; the binary defaults to production,
-#   so an unset value makes a staging box present as prod), LOG_LEVEL and
-#   CONFIG=<path to a mounted TOML>, and supply the secret variables
+#   EnvironmentFile). REQUIRED compose variables: DATABASE_URL,
+#   ENVIRONMENT (staging|production: the binary defaults to production,
+#   so an omitted value makes a staging box present as prod; the compose
+#   must set it explicitly, never rely on the default), LOG_LEVEL and
+#   CONFIG=<path to a mounted TOML>; plus the secret variables
 #   (RPC_URL, signer, Alpaca, notifications: see src/config.rs `env =`)
 #   through a compose env_file. There is no secrets-file loader in the
 #   app; a mounted secrets TOML is never read. Nothing is baked: no config
