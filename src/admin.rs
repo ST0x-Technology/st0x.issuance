@@ -44,10 +44,16 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
+use crate::tokenized_asset::cli::{
+    AssetAdmin, AssetAdminError, AssetStatusReport, FreezeOutcome,
+    UnfreezeOutcome,
+};
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
 use crate::tokenized_asset::view::{find_vault, list_enabled_assets};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
-use crate::underlying::{UnderlyingViewError, load_freeze_status};
+use crate::underlying::{
+    AssetStatus, Underlying, UnderlyingViewError, load_freeze_status,
+};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
@@ -3278,6 +3284,151 @@ async fn schedule_freeze_window_logic(
         freeze_at,
         unfreeze_at,
         message: "Freeze window armed".to_string(),
+    }))
+}
+
+/// Current freeze status of an underlying, for the read-tier status route.
+#[derive(Serialize)]
+pub(crate) struct AssetStatusResponse {
+    underlying: String,
+    status: &'static str,
+}
+
+impl From<AssetStatusReport> for AssetStatusResponse {
+    fn from(report: AssetStatusReport) -> Self {
+        Self {
+            underlying: report.underlying.to_string(),
+            status: match report.status {
+                AssetStatus::Frozen => "frozen",
+                AssetStatus::Enabled => "enabled",
+            },
+        }
+    }
+}
+
+/// Outcome of a freeze or unfreeze operator request.
+#[derive(Serialize)]
+pub(crate) struct FreezeOutcomeResponse {
+    underlying: String,
+    outcome: &'static str,
+}
+
+/// Parses the path segment into a validated underlying symbol; a malformed one
+/// is a 422.
+fn parse_underlying(underlying: &str) -> Result<UnderlyingSymbol, Status> {
+    UnderlyingSymbol::new(underlying).map_err(|error| {
+        warn!(target: "admin", underlying, error = %error,
+            "Invalid underlying symbol"
+        );
+        Status::UnprocessableEntity
+    })
+}
+
+/// Maps an asset-admin failure to an HTTP status. An unknown underlying is a
+/// client 404; everything else is an internal failure.
+const fn map_asset_admin_error(error: &AssetAdminError) -> Status {
+    match error {
+        AssetAdminError::NotFound { .. } => Status::NotFound,
+        _ => Status::InternalServerError,
+    }
+}
+
+/// Refuses a mutation on an underlying with no listing on any network before it
+/// is dispatched, mirroring the CLI's up-front rejection: the freeze aggregate
+/// would otherwise create operator-hold state for an unknown symbol.
+async fn ensure_listed(
+    admin: &AssetAdmin,
+    symbol: &UnderlyingSymbol,
+) -> Result<(), Status> {
+    match admin.status(symbol).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Status::NotFound),
+        Err(error) => {
+            error!(target: "admin", underlying = %symbol, error = %error,
+                "Failed to read asset status"
+            );
+            Err(map_asset_admin_error(&error))
+        }
+    }
+}
+
+/// Read-tier freeze status of an underlying. New operator route (the verb was
+/// CLI-only), so there is no `/admin` twin.
+#[get("/ops/read/status/<underlying>")]
+pub(crate) async fn asset_status_ops(
+    _auth: ReadOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<AssetStatusResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    match admin.status(&symbol).await {
+        Ok(Some(report)) => Ok(Json(report.into())),
+        Ok(None) => Err(Status::NotFound),
+        Err(error) => {
+            error!(target: "admin", underlying, error = %error,
+                "Failed to read asset status"
+            );
+            Err(map_asset_admin_error(&error))
+        }
+    }
+}
+
+/// Capital-tier immediate freeze of an underlying on all networks. Above debug
+/// because holding a freeze gates token supply.
+#[post("/ops/capital/freeze/<underlying>")]
+pub(crate) async fn freeze_underlying_ops(
+    _auth: CapitalOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<FreezeOutcomeResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    ensure_listed(&admin, &symbol).await?;
+    let outcome = admin.freeze(&symbol).await.map_err(|error| {
+        error!(target: "admin", underlying, error = %error,
+            "Failed to freeze underlying"
+        );
+        map_asset_admin_error(&error)
+    })?;
+    Ok(Json(FreezeOutcomeResponse {
+        underlying: symbol.to_string(),
+        outcome: match outcome {
+            FreezeOutcome::Froze => "froze",
+            FreezeOutcome::OperatorHoldEnsured => "operator_hold_ensured",
+        },
+    }))
+}
+
+/// Capital-tier release of the operator freeze hold.
+#[post("/ops/capital/unfreeze/<underlying>")]
+pub(crate) async fn unfreeze_underlying_ops(
+    _auth: CapitalOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<FreezeOutcomeResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    ensure_listed(&admin, &symbol).await?;
+    let outcome = admin.unfreeze(&symbol).await.map_err(|error| {
+        error!(target: "admin", underlying, error = %error,
+            "Failed to unfreeze underlying"
+        );
+        map_asset_admin_error(&error)
+    })?;
+    Ok(Json(FreezeOutcomeResponse {
+        underlying: symbol.to_string(),
+        outcome: match outcome {
+            UnfreezeOutcome::Unfroze => "unfroze",
+            UnfreezeOutcome::AlreadyEnabled => "already_enabled",
+            UnfreezeOutcome::RemainsFrozen => "remains_frozen",
+        },
     }))
 }
 

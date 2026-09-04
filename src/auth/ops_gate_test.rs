@@ -4,6 +4,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
+use event_sorcery::StoreBuilder;
 use httpmock::prelude::*;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::ecdsa::SigningKey;
@@ -11,6 +12,8 @@ use p256::pkcs8::EncodePrivateKey;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use serde::Serialize;
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{Pool, Sqlite};
 use tracing::Level;
 use tracing_test::traced_test;
 
@@ -18,6 +21,7 @@ use super::iap::ASSERTION_HEADER;
 use super::{BreakglassOps, CapitalOps, DebugOps, OpsApiVerifiers, ReadOps};
 use crate::config::OpsApiConfig;
 use crate::test_utils::{logs_contain_at, setup_test_rocket};
+use crate::underlying::Underlying;
 
 const TEST_KID: &str = "test-key";
 const IAP_ISSUER: &str = "https://cloud.google.com/iap";
@@ -330,5 +334,108 @@ async fn role_prefixes_are_absent_without_ops_api_config() {
     let client = Client::tracked(rocket).await.unwrap();
 
     let response = client.get("/ops/read/stuck").dispatch().await;
+    assert_eq!(response.status(), Status::NotFound);
+}
+
+async fn migrated_pool() -> Pool<Sqlite> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory pool connects");
+    sqlx::migrate!("./migrations").run(&pool).await.expect("migrations run");
+    pool
+}
+
+/// Rocket carrying the verifiers plus the `Underlying` store and pool the
+/// freeze/unfreeze/status handlers need, mounting only those three routes.
+async fn underlying_ops_rocket(
+    verifiers: OpsApiVerifiers,
+) -> rocket::Rocket<rocket::Build> {
+    let pool = migrated_pool().await;
+    let (store, _projection) = StoreBuilder::<Underlying>::new(pool.clone())
+        .build(())
+        .await
+        .expect("underlying store builds");
+    rocket::build().manage(verifiers).manage(store).manage(pool).mount(
+        "/",
+        rocket::routes![
+            crate::admin::asset_status_ops,
+            crate::admin::freeze_underlying_ops,
+            crate::admin::unfreeze_underlying_ops
+        ],
+    )
+}
+
+/// The freeze/unfreeze (capital) and status (read) routes are gated: without an
+/// IAP assertion every one is refused inside the app.
+#[traced_test]
+#[tokio::test]
+async fn underlying_ops_routes_require_an_iap_assertion() {
+    let verifiers =
+        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
+    let client =
+        Client::tracked(underlying_ops_rocket(verifiers).await).await.unwrap();
+
+    let status = client.get("/ops/read/status/AAPL").dispatch().await;
+    assert_eq!(status.status(), Status::Unauthorized);
+
+    let freeze = client.post("/ops/capital/freeze/AAPL").dispatch().await;
+    assert_eq!(freeze.status(), Status::Unauthorized);
+
+    let unfreeze = client.post("/ops/capital/unfreeze/AAPL").dispatch().await;
+    assert_eq!(unfreeze.status(), Status::Unauthorized);
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["Request carries no IAP assertion"]
+    ));
+}
+
+/// A read token admits the status route and the handler runs: an unlisted
+/// underlying is a 404, proving the guard passed and the handler executed.
+#[traced_test]
+#[tokio::test]
+async fn read_status_admits_its_token_and_reports_unlisted_as_not_found() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client =
+        Client::tracked(underlying_ops_rocket(verifiers).await).await.unwrap();
+
+    let response = client
+        .get("/ops/read/status/UNLISTED")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, READ_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::NotFound);
+}
+
+/// A capital token admits the freeze route and the handler runs; freezing an
+/// unlisted underlying is refused (404) before any aggregate state is created.
+#[traced_test]
+#[tokio::test]
+async fn capital_freeze_admits_its_token_and_refuses_an_unlisted_underlying() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client =
+        Client::tracked(underlying_ops_rocket(verifiers).await).await.unwrap();
+
+    let response = client
+        .post("/ops/capital/freeze/UNLISTED")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, CAPITAL_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+
     assert_eq!(response.status(), Status::NotFound);
 }
