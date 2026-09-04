@@ -64,9 +64,10 @@ impl Job<SubmitBurnContext> for SubmitBurnJob {
             }
             // The manager recorded the failure or left an ambiguous broadcast
             // for the burn recovery reconciler; this is not an apalis redrive.
-            Err(BurnManagerError::Redemption(RedemptionError::Vault {
-                ..
-            })) => Ok(()),
+            Err(BurnManagerError::Redemption(
+                RedemptionError::Vault { .. }
+                | RedemptionError::BurnNonceTooLow { .. },
+            )) => Ok(()),
             Err(other) => Err(BurnJobError::Manager(Box::new(other))),
         }
     }

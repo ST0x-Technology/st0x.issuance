@@ -551,6 +551,7 @@ impl RedemptionView {
             | RedemptionEvent::BurnTxSubmitted { .. }
             | RedemptionEvent::OrchestratorBurnSubmitted { .. }
             | RedemptionEvent::BurnRecoveryAttempted { .. }
+            | RedemptionEvent::BurnNonceTooLow { .. }
             | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
             | RedemptionEvent::BurnRecoveryExhausted { .. }
             | RedemptionEvent::BurnPreparationRecoveryExhausted { .. } => self,

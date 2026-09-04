@@ -1033,6 +1033,10 @@ pub(crate) enum VaultError {
         "Node returned transaction hash {returned:?} for persisted transaction {expected:?}"
     )]
     BroadcastHashMismatch { expected: B256, returned: B256 },
+    /// The node rejected this exact persisted burn because its account nonce
+    /// has already advanced past the signed nonce.
+    #[error("Persisted burn transaction {tx_hash:?} has a spent nonce {nonce}")]
+    BurnNonceTooLow { tx_hash: B256, nonce: u64 },
     #[error(
         "Persisted mint transaction hash {expected:?} does not match decoded hash {decoded:?}"
     )]

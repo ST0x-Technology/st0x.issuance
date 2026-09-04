@@ -424,6 +424,22 @@ pub(crate) enum BurnRecoveryAction {
     Replace,
 }
 
+/// Marker created after recovery loads a matching durable nonce-too-low
+/// observation from this redemption's event stream. The command handler still
+/// re-verifies the request and transaction identity before signing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BurnNonceTooLowProof {
+    issuer_request_id: IssuerRedemptionRequestId,
+    tx_hash: B256,
+    nonce: u64,
+}
+
+impl BurnNonceTooLowProof {
+    const fn identity(&self) -> (&IssuerRedemptionRequestId, B256, u64) {
+        (&self.issuer_request_id, self.tx_hash, self.nonce)
+    }
+}
+
 /// Input parameters for the `IntendBurn` command handler.
 ///
 /// Groups burn-related parameters to reduce argument count. The `user` field
@@ -1666,6 +1682,21 @@ impl Redemption {
         }])
     }
 
+    fn record_nonce_low(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        self.verify_recovery_transaction(tx_hash, nonce)?;
+        Ok(vec![RedemptionEvent::BurnNonceTooLow {
+            issuer_request_id,
+            tx_hash,
+            nonce,
+            observed_at: Utc::now(),
+        }])
+    }
+
     fn handle_record_burn_preparation_recovery_attempt(
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
@@ -1748,11 +1779,12 @@ impl Redemption {
         Ok(())
     }
 
-    async fn handle_replace_dead_burn(
+    async fn replace_burn(
         &self,
         services: &RedemptionServices,
         issuer_request_id: IssuerRedemptionRequestId,
         owner: Address,
+        nonce_too_low_proof: Option<BurnNonceTooLowProof>,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let network = self
             .metadata()
@@ -1768,12 +1800,27 @@ impl Redemption {
                 found: self.state_name().to_string(),
             }
         })?;
-        if vault_service.classify_burn_tx(owner, sendable_tx).await.map_err(
-            |_| RedemptionError::BurnRecoveryClassificationFailed {
+        if let Some(proof) = nonce_too_low_proof {
+            let (proof_request_id, tx_hash, nonce) = proof.identity();
+            if proof_request_id != &issuer_request_id {
+                return Err(
+                    RedemptionError::BurnNonceTooLowProofRequestMismatch {
+                        expected: issuer_request_id,
+                        provided: proof_request_id.clone(),
+                    },
+                );
+            }
+            // The durable nonce-too-low observation is already a terminal
+            // signal; only its binding to this redemption needs re-verifying.
+            self.verify_recovery_transaction(tx_hash, nonce)?;
+        } else if vault_service
+            .classify_burn_tx(owner, sendable_tx)
+            .await
+            .map_err(|_| RedemptionError::BurnRecoveryClassificationFailed {
                 tx_hash: sendable_tx.hash,
                 nonce: sendable_tx.nonce,
-            },
-        )? != BurnTxStatus::ProvablyDead
+            })?
+            != BurnTxStatus::ProvablyDead
         {
             return Err(RedemptionError::BurnReplacementNotSafe {
                 tx_hash: sendable_tx.hash,
@@ -1873,6 +1920,15 @@ pub(crate) enum RedemptionError {
         /// recording key off it rather than parsing `message`.
         #[serde(default)]
         classification: BurnFailureClassification,
+    },
+    #[error("Persisted burn transaction {tx_hash:?} has a spent nonce {nonce}")]
+    BurnNonceTooLow { tx_hash: B256, nonce: u64 },
+    #[error(
+        "Nonce-too-low proof belongs to redemption {provided}, not {expected}"
+    )]
+    BurnNonceTooLowProofRequestMismatch {
+        expected: IssuerRedemptionRequestId,
+        provided: IssuerRedemptionRequestId,
     },
     #[error(
         "Burn params mode does not match this redemption's persisted \
@@ -2079,6 +2135,7 @@ impl EventSourced for Redemption {
                 })
             }
             RedemptionCommand::RecordBurnRecoveryAttempt { .. }
+            | RedemptionCommand::RecordBurnNonceTooLow { .. }
             | RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
                 ..
             }
@@ -2086,7 +2143,8 @@ impl EventSourced for Redemption {
             | RedemptionCommand::RecordBurnPreparationRecoveryExhausted {
                 ..
             }
-            | RedemptionCommand::ReplaceDeadBurn { .. } => {
+            | RedemptionCommand::ReplaceDeadBurn { .. }
+            | RedemptionCommand::ReplaceNonceTooLowBurn { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "BurnIntended or BurnSubmitted".to_string(),
                     found: "Uninitialized".to_string(),
@@ -2302,10 +2360,12 @@ impl EventSourced for Redemption {
                 .await
             }
             command @ (RedemptionCommand::RecordBurnRecoveryAttempt { .. }
+            | RedemptionCommand::RecordBurnNonceTooLow { .. }
             | RedemptionCommand::RecordBurnPreparationRecoveryAttempt { .. }
             | RedemptionCommand::RecordBurnRecoveryExhausted { .. }
             | RedemptionCommand::RecordBurnPreparationRecoveryExhausted { .. }
-            | RedemptionCommand::ReplaceDeadBurn { .. }) => {
+            | RedemptionCommand::ReplaceDeadBurn { .. }
+            | RedemptionCommand::ReplaceNonceTooLowBurn { .. }) => {
                 self.transition_burn_recovery(command, services).await
             }
         }
@@ -2334,6 +2394,11 @@ impl Redemption {
                 nonce,
                 action,
             ),
+            RedemptionCommand::RecordBurnNonceTooLow {
+                issuer_request_id,
+                tx_hash,
+                nonce,
+            } => self.record_nonce_low(issuer_request_id, tx_hash, nonce),
             RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
                 issuer_request_id,
                 attempt,
@@ -2360,10 +2425,19 @@ impl Redemption {
                 attempts,
             ),
             RedemptionCommand::ReplaceDeadBurn { issuer_request_id, owner } => {
-                self.handle_replace_dead_burn(
+                self.replace_burn(services, issuer_request_id, owner, None)
+                    .await
+            }
+            RedemptionCommand::ReplaceNonceTooLowBurn {
+                issuer_request_id,
+                owner,
+                proof,
+            } => {
+                self.replace_burn(
                     services,
                     issuer_request_id,
                     owner,
+                    Some(proof),
                 )
                 .await
             }
@@ -2435,6 +2509,7 @@ impl Redemption {
                 self.apply_burn_intended_event(event);
             }
             RedemptionEvent::BurnRecoveryAttempted { .. }
+            | RedemptionEvent::BurnNonceTooLow { .. }
             | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
             | RedemptionEvent::BurnRecoveryExhausted { .. }
             | RedemptionEvent::BurnPreparationRecoveryExhausted { .. } => {}
@@ -2871,11 +2946,11 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnExternalTxId, BurnFailureClassification, BurnParams, BurnRecord,
-        BurnRecoveryAction, ExistingBurnProof, IssuerRedemptionRequestId,
-        Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
-        RedemptionMetadata, RedemptionServices, TokensBurnedData,
-        has_unresolved_signer_intent,
+        BurnExternalTxId, BurnFailureClassification, BurnNonceTooLowProof,
+        BurnParams, BurnRecord, BurnRecoveryAction, ExistingBurnProof,
+        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionError, RedemptionEvent, RedemptionMetadata,
+        RedemptionServices, TokensBurnedData, has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::config::VaultMode;
@@ -3210,6 +3285,68 @@ mod tests {
                 "legacy-burn".to_string(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn nonce_too_low_observation_keeps_burn_signer_intent_reserved() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+            (3, "RedemptionEvent::BurnNonceTooLow", "{}"),
+        ] {
+            insert_redemption_event(
+                &pool,
+                "nonce-low-burn",
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test history should insert");
+        }
+
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_signer_intents \
+             WHERE aggregate_type = 'Redemption' \
+               AND aggregate_id = 'nonce-low-burn'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("signer intent count should load");
+        assert_eq!(reserved, 1, "the unresolved burn must stay reserved");
+
+        insert_redemption_event(
+            &pool,
+            "nonce-low-burn",
+            4,
+            "RedemptionEvent::TokensBurned",
+            "{}",
+        )
+        .await
+        .expect("terminal event should insert");
+        let released: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_signer_intents \
+             WHERE aggregate_type = 'Redemption' \
+               AND aggregate_id = 'nonce-low-burn'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("released signer intent count should load");
+        assert_eq!(released, 0, "terminal completion must release the intent");
     }
 
     /// The core double-signing hazard the table exists to prevent: TWO
@@ -4470,6 +4607,82 @@ mod tests {
         }
     }
 
+    fn nonce_too_low_proof(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        sendable_tx: &SendableTxWithHash,
+    ) -> BurnNonceTooLowProof {
+        BurnNonceTooLowProof {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_nonce_too_low_persists_the_exact_transaction() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let sendable_tx = SendableTxWithHash {
+            hash: B256::random(),
+            nonce: 7,
+            ..SendableTxWithHash::default()
+        };
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(intended_burn_history(
+                &issuer_request_id,
+                sendable_tx.clone(),
+            ))
+            .when(RedemptionCommand::RecordBurnNonceTooLow {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnNonceTooLow {
+                issuer_request_id: event_request_id,
+                tx_hash,
+                nonce,
+                ..
+            }] if event_request_id == &issuer_request_id
+                && *tx_hash == sendable_tx.hash
+                && *nonce == sendable_tx.nonce
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_nonce_too_low_rejects_a_different_transaction() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let sendable_tx = SendableTxWithHash {
+            hash: B256::random(),
+            nonce: 7,
+            ..SendableTxWithHash::default()
+        };
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(intended_burn_history(
+                &issuer_request_id,
+                sendable_tx.clone(),
+            ))
+            .when(RedemptionCommand::RecordBurnNonceTooLow {
+                issuer_request_id,
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce + 1,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::RecoveryTransactionMismatch { .. }
+            )
+        ));
+    }
+
     #[tokio::test]
     async fn replace_dead_burn_refuses_a_still_mineable_hash() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -4540,6 +4753,80 @@ mod tests {
             [RedemptionEvent::BurnIntended { sendable_tx, .. }]
                 if sendable_tx.hash == replacement_hash
                     && sendable_tx.nonce == 8
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonce_too_low_proof_replaces_without_reclassifying() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = old_tx.signer_for_test();
+        let proof = nonce_too_low_proof(&issuer_request_id, &old_tx);
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::StillMineable)
+                .with_prepared_tx(replacement_tx.clone()),
+        );
+
+        let events = TestHarness::<Redemption>::with(
+            RedemptionServices::with_single_vault(Network::Base, services),
+        )
+        .given(intended_burn_history(&issuer_request_id, old_tx))
+        .when(RedemptionCommand::ReplaceNonceTooLowBurn {
+            issuer_request_id,
+            owner,
+            proof,
+        })
+        .await
+        .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnIntended { sendable_tx, .. }]
+                if sendable_tx == &replacement_tx
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonce_too_low_proof_rejects_a_different_redemption() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let proof_request_id = IssuerRedemptionRequestId::random();
+        let old_tx = SendableTxWithHash {
+            hash: B256::random(),
+            nonce: 7,
+            ..SendableTxWithHash::default()
+        };
+        let proof = nonce_too_low_proof(&proof_request_id, &old_tx);
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(intended_burn_history(&issuer_request_id, old_tx.clone()))
+            .when(RedemptionCommand::ReplaceNonceTooLowBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                owner: address!("0x1111111111111111111111111111111111111111"),
+                proof,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::BurnNonceTooLowProofRequestMismatch {
+                    expected,
+                    provided,
+                }
+            ) if expected == issuer_request_id && provided == proof_request_id
         ));
     }
 

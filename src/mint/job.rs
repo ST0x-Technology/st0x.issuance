@@ -1510,6 +1510,7 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }
         | VaultError::BurnedEventMismatch { .. }
+        | VaultError::BurnNonceTooLow { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
         | VaultError::PreparedMintSignerMismatch { .. }
@@ -1554,6 +1555,7 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         // with the definitive observations so nothing uncertain-retries an
         // integrity anomaly.
         | VaultError::BurnedEventMismatch { .. }
+        | VaultError::BurnNonceTooLow { .. }
         | VaultError::BroadcastHashMismatch { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
