@@ -3874,7 +3874,7 @@ pub(crate) struct FreezeOutcomeResponse {
 /// Parses the path segment into a validated underlying symbol; a malformed one
 /// is a 422.
 fn parse_underlying(underlying: &str) -> Result<UnderlyingSymbol, Status> {
-    UnderlyingSymbol::new(underlying).map_err(|error| {
+    UnderlyingSymbol::new(underlying.to_ascii_uppercase()).map_err(|error| {
         warn!(target: "admin", underlying, error = %error,
             "Invalid underlying symbol"
         );
