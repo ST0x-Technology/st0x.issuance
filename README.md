@@ -398,3 +398,16 @@ Before submitting changes, always run in order:
 
 For detailed architectural patterns and design decisions, see
 [SPEC.md](SPEC.md).
+
+## GCP release path
+
+Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
+`st0x-issuance` binary (`nix build .#bot-oci`, contract in
+`nix/oci-image.nix`). `.github/workflows/build-oci.yml` pushes it to the
+`s01-issuance` Artifact Registry, signs its attestation, and, once the
+devops side has armed it, writes the digest into the GCP staging VM's
+deploy state (a merge to main is a staging deploy). Pushing a `vX.Y.Z` tag
+labels that commit's attested image (`release-tag.yml`); production is
+promoted from that label on the devops side, never from this repo.
+`nix run .#smoke-test-image -- <image>` runs the same startup check CI
+does.

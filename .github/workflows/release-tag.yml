@@ -1,0 +1,79 @@
+name: release-tag
+
+# Promote-on-tag: steady main -> push a vX.Y.Z tag -> the tagged artifact
+# exists. Pushing a release tag LABELS the image main CI already built and
+# attested for that commit; it does not build, does not deploy, and cannot
+# touch images.env or staging. Tagging an old commit only labels an old
+# image. The version label is what a production manifest on the devops side
+# pins against.
+#
+# Auth: NOT the deployer (its WIF binding is main-branch-only and can never
+# satisfy a refs/tags/* subject). Tags authenticate as issuance-labeler, a
+# dedicated SA bound on this repository (any ref) whose custom role can
+# create/update AR tags and read images but structurally cannot push; the
+# verify phase below means it can only ever name digests main CI built and
+# attested. s01.devops terraform/artifacts/labelers.tf.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AR_REPO: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+  IMAGE: s01-issuance
+  WIF_PROVIDER: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  LABELER_SA: issuance-labeler@s01-artifacts.iam.gserviceaccount.com
+  ATTESTOR: projects/s01-artifacts/attestors/issuance-image
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # Needed to peel the tag: on an ANNOTATED tag push GITHUB_SHA is the
+      # tag OBJECT's sha, not the commit (actions/runner#712).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.LABELER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+        with:
+          install_components: beta
+
+      - name: Label the tagged commit's attested image
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          # ^{commit} handles lightweight and annotated tags identically.
+          COMMIT=$(git rev-parse "HEAD^{commit}")
+          echo "tag ${VERSION} -> commit ${COMMIT} (GITHUB_SHA was ${GITHUB_SHA})"
+
+          digest=$(gcloud artifacts docker images describe \
+            "${AR_REPO}/${IMAGE}:${COMMIT}" \
+            --format='value(image_summary.digest)' 2>/dev/null) || true
+          if ! grep -qE '^sha256:[0-9a-f]{64}$' <<<"${digest:-}"; then
+            echo "::error::no ${IMAGE} image exists for ${COMMIT} (got '${digest:-}'); tag a commit that main CI has built (and wait for its build to finish)."
+            exit 1
+          fi
+          attested=$(gcloud beta container binauthz attestations list \
+            --project=s01-artifacts --attestor="${ATTESTOR}" \
+            --artifact-url="${AR_REPO}/${IMAGE}@${digest}" \
+            --format='value(name)' | head -1)
+          if [ -z "${attested}" ]; then
+            echo "::error::${IMAGE}@${digest} carries NO issuance-image attestation; refusing to put a version label on an unattested digest."
+            exit 1
+          fi
+
+          gcloud artifacts docker tags add \
+            "${AR_REPO}/${IMAGE}@${digest}" \
+            "${AR_REPO}/${IMAGE}:${VERSION}"
+          echo "labeled ${IMAGE}@${digest} as ${VERSION}"
