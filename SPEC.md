@@ -4960,9 +4960,9 @@ native balance every 60 seconds:
   and threshold in the chain's native token.
 - Still below the threshold: alert again at most once per hour, so a sustained
   low balance cannot flood the operator channel.
-- Recovers above the threshold: INFO log only, and clears the repeat alert
-  timer; a later drop below the threshold then pages immediately, since the
-  hourly interval only throttles repeated alerts while the balance stays
+- Recovers to at or above the threshold: INFO log only, and clears the repeat
+  alert timer; a later drop below the threshold then pages immediately, since
+  the hourly interval only throttles repeated alerts while the balance stays
   continuously low.
 - Balance read fails: WARN log, alert state unchanged (a transient RPC blip must
   not fire or clear alerts), and the telemetry gas status degrades to
@@ -4987,8 +4987,10 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
 - **Receipt backfill:** the periodic loop records the same shape per pass, with
   the same failure rule (the asset list or head fetch failed, or every vault
   failed) and `lag_blocks` measured against the receipt backfill checkpoints. A
-  pass with no enabled assets records a success with zero lag, matching the
-  transfer poller, so the counter keeps rising to show the loop is alive.
+  vault whose checkpoint read fails also forces the pass to failure, since its
+  backlog cannot be measured and a success would understate the lag. A pass with
+  no enabled assets records a success with zero lag, matching the transfer
+  poller, so the counter keeps rising to show the loop is alive.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 

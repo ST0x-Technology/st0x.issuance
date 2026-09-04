@@ -1706,6 +1706,7 @@ where
             // single WARN summary below if any vault failed.
             let mut failed_vaults: Vec<Address> = Vec::new();
             let mut lag_blocks = 0_u64;
+            let mut checkpoint_read_failed = false;
 
             for asset in &assets {
                 // Read the vault's start block first so its backlog counts
@@ -1729,6 +1730,7 @@ where
                             "Failed to read receipt backfill checkpoint; \
                              skipping vault this pass"
                         );
+                        checkpoint_read_failed = true;
                         failed_vaults.push(asset.vault);
                         continue;
                     }
@@ -1793,10 +1795,13 @@ where
                 );
             }
 
-            // A pass where nothing progressed is a telemetry failure; partial
-            // vault failures keep the pass successful and surface through
-            // `lag_blocks` instead, mirroring the transfer poller.
-            if failed_vaults.len() == assets.len() {
+            // A pass where nothing progressed is a telemetry failure. Partial
+            // vault failures whose start block was read keep the pass
+            // successful and surface through `lag_blocks`, mirroring the
+            // transfer poller. A checkpoint read failure is different: its
+            // backlog is never counted, so it forces the pass to failure rather
+            // than reporting a success whose lag omits that vault.
+            if failed_vaults.len() == assets.len() || checkpoint_read_failed {
                 telemetry.record_receipt_backfill_failure(network);
             } else {
                 telemetry.record_receipt_backfill_success(network, lag_blocks);
@@ -1851,7 +1856,7 @@ where
     }
 
     for (network, runtime) in deps.chain_registry.runtimes() {
-        info!(
+        debug!(
             target: "redemption",
             network = %network,
             "Spawning dynamic transfer poller for network"

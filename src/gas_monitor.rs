@@ -9,10 +9,14 @@
 //! Spam control is time based dedup, not a hysteresis band: the monitor alerts
 //! once when the balance drops below the threshold, alerts again at most once
 //! per [`GAS_REALERT_INTERVAL`] while it stays low, and only logs recovery.
-//! Recovery clears the dedup state, so a later drop below the threshold pages
-//! immediately; the interval only throttles repeated alerts while the balance
-//! stays continuously low. A failed balance read leaves the alert state
-//! unchanged: a transient RPC blip must neither fire nor clear alerts.
+//! A throttled realert requires a delivered alert: if delivery fails the poll
+//! keeps the prior alert state (Normal on the first drop), so the next low
+//! balance poll retries the alert immediately rather than waiting out the
+//! interval. Recovery clears the dedup state, so a later drop below the
+//! threshold pages immediately; the interval only throttles repeated alerts
+//! while the balance stays continuously low. A failed balance read leaves the
+//! alert state unchanged: a transient RPC blip must neither fire nor clear
+//! alerts.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -20,7 +24,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::network_telemetry::NetworkTelemetry;
 use crate::notifications::{LifecycleNotification, LifecycleNotifier};
@@ -50,7 +54,7 @@ impl<P: Provider> GasMonitor<P> {
     /// Runs the polling loop forever. Never returns; the spawn site pairs it
     /// with the shutdown channel in a `select!`, like the transfer poller.
     pub(crate) async fn run(&self) {
-        info!(
+        debug!(
             target: "gas",
             network = %self.network,
             wallet = %self.wallet,
