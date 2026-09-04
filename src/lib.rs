@@ -879,6 +879,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
+                admin::aggregate_snapshot_ops,
             ],
         ),
         None => rocket,

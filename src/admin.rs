@@ -11,7 +11,7 @@ use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -3430,6 +3430,80 @@ pub(crate) async fn unfreeze_underlying_ops(
             UnfreezeOutcome::RemainsFrozen => "remains_frozen",
         },
     }))
+}
+
+/// Cached snapshot state of one aggregate, for the read-tier database
+/// diagnostics. The snapshot is the framework's performance cache at
+/// `last_sequence`; it can lag the event log if events were appended without a
+/// re-snapshot, and is rebuilt from events after a schema change (see SPEC).
+#[derive(Serialize)]
+pub(crate) struct SnapshotResponse {
+    aggregate_type: String,
+    aggregate_id: String,
+    last_sequence: i64,
+    snapshot_version: i64,
+    timestamp: String,
+    payload: serde_json::Value,
+}
+
+/// Read-tier database diagnostic: the cached snapshot for one aggregate. After
+/// SSH removal this is how an operator inspects an aggregate's stored state; a
+/// 404 means no snapshot is cached (not that the aggregate has no events).
+#[get("/ops/read/snapshots/<aggregate_type>/<aggregate_id>")]
+pub(crate) async fn aggregate_snapshot_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    aggregate_type: &str,
+    aggregate_id: &str,
+) -> Result<Json<SnapshotResponse>, Status> {
+    let row = sqlx::query(
+        "
+        SELECT last_sequence, payload, timestamp, snapshot_version
+        FROM snapshots
+        WHERE aggregate_type = ?
+        AND aggregate_id = ?
+        ",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|error| {
+        error!(target: "admin", aggregate_type, aggregate_id, error = %error,
+            "Failed to read aggregate snapshot"
+        );
+        Status::InternalServerError
+    })?
+    .ok_or(Status::NotFound)?;
+
+    let payload_json: String =
+        row.try_get("payload").map_err(|error| snapshot_row_error(&error))?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        error!(target: "admin", aggregate_type, aggregate_id, error = %error,
+            "Snapshot payload is not valid JSON"
+        );
+        Status::InternalServerError
+    })?;
+
+    Ok(Json(SnapshotResponse {
+        aggregate_type: aggregate_type.to_string(),
+        aggregate_id: aggregate_id.to_string(),
+        last_sequence: row
+            .try_get("last_sequence")
+            .map_err(|error| snapshot_row_error(&error))?,
+        snapshot_version: row
+            .try_get("snapshot_version")
+            .map_err(|error| snapshot_row_error(&error))?,
+        timestamp: row
+            .try_get("timestamp")
+            .map_err(|error| snapshot_row_error(&error))?,
+        payload,
+    }))
+}
+
+fn snapshot_row_error(error: &sqlx::Error) -> Status {
+    error!(target: "admin", error = %error, "Failed to decode snapshot row");
+    Status::InternalServerError
 }
 
 #[cfg(test)]
