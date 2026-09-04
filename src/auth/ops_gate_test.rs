@@ -302,7 +302,8 @@ async fn real_ops_routes_require_an_iap_assertion() {
             rocket::routes![
                 crate::admin::list_stuck_ops,
                 crate::admin::reprocess_mint_ops,
-                crate::admin::orchestrator_health_ops
+                crate::admin::orchestrator_health_ops,
+                crate::burn_excess::api::burn_excess_internal_ops
             ],
         );
     let client = Client::tracked(rocket).await.unwrap();
@@ -319,9 +320,55 @@ async fn real_ops_routes_require_an_iap_assertion() {
     let health = client.get("/ops/read/orchestrator-health").dispatch().await;
     assert_eq!(health.status(), Status::Unauthorized);
 
+    let burn = client
+        .post("/ops/breakglass/burn-excess/internal")
+        .header(rocket::http::ContentType::JSON)
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(burn.status(), Status::Unauthorized);
+
     assert!(logs_contain_at!(
         Level::WARN,
         &["Request carries no IAP assertion"]
+    ));
+}
+
+/// The headline breakglass property: a debug-tier operator cannot burn excess.
+/// A debug token is refused on the breakglass burn-excess route before the
+/// handler (and the signer) is ever reached.
+#[traced_test]
+#[tokio::test]
+async fn a_debug_token_cannot_burn_excess() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let rocket = setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_internal_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let response = client
+        .post("/ops/breakglass/burn-excess/internal")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, DEBUG_AUDIENCE),
+        ))
+        .body("{}")
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::Unauthorized);
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
     ));
 }
 
