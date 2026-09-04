@@ -30,6 +30,7 @@ use crate::mint::{
         enqueue_scheduled_mint_recovery, manually_retry_failed_mint,
     },
 };
+use crate::network_telemetry::{NetworkTelemetry, NetworkTelemetrySnapshot};
 use crate::receipt_inventory::ReceiptService;
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -2333,6 +2334,36 @@ pub(crate) async fn orchestrator_health(
     Ok(Json(OrchestratorHealthResponse { orchestrators, assets }))
 }
 
+/// Per network operational telemetry: transfer poller and receipt backfill
+/// pass counters with block lag, and the gas monitor's latest native balance
+/// reading for the issuer wallet.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct NetworkTelemetryResponse {
+    networks: Vec<NetworkTelemetrySnapshot>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/network-telemetry",
+    tag = "admin",
+    responses(
+        (status = 200,
+            description = "Per network poller and backfill pass counters with \
+                block lag, plus the latest gas balance reading; counters live \
+                in process memory and reset on restart",
+            body = NetworkTelemetryResponse)
+    ),
+    security(("internal_api_key" = []))
+)]
+#[tracing::instrument(skip(_auth, telemetry))]
+#[get("/admin/network-telemetry")]
+pub(crate) fn network_telemetry(
+    _auth: InternalAuth,
+    telemetry: &rocket::State<Arc<NetworkTelemetry>>,
+) -> Json<NetworkTelemetryResponse> {
+    Json(NetworkTelemetryResponse { networks: telemetry.snapshot() })
+}
+
 /// Classification of a non-terminal view used to decide whether it counts as
 /// stuck right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4261,6 +4292,7 @@ mod tests {
             signer: SignerConfig::Local(B256::ZERO),
             backfill_start_block: 0,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
@@ -4569,6 +4601,7 @@ mod tests {
             signer: SignerConfig::Local(B256::ZERO),
             backfill_start_block: 0,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
@@ -5766,6 +5799,7 @@ mod tests {
             lifecycle_notifications:
                 crate::LifecycleNotificationsConfig::disabled(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             chains: Vec::new(),
             vault_mode_config: VaultModeConfig::default(),
         };
@@ -6908,6 +6942,7 @@ mod tests {
             signer: SignerConfig::Local(B256::ZERO),
             backfill_start_block: 0,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,

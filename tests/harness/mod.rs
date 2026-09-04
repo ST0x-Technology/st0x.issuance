@@ -597,6 +597,7 @@ pub fn create_config_with_db(
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
         receipt_poll_interval: tokio::time::Duration::from_millis(500),
+        gas_poll_interval: tokio::time::Duration::from_millis(200),
         auth: AuthConfig {
             issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
             alpaca_ip_ranges: IpWhitelist::single(
@@ -629,6 +630,7 @@ pub fn create_config_with_db(
             chain_id: evm.chain_id,
             rpc_url,
             backfill_start_block: 0,
+            low_gas_threshold: None,
         }],
         vault_mode_config: VaultModeConfig::default(),
     })
@@ -650,12 +652,14 @@ pub fn create_multichain_config_with_db(
             chain_id: base_evm.chain_id,
             rpc_url: Url::parse(&base_evm.endpoint)?,
             backfill_start_block: 0,
+            low_gas_threshold: None,
         },
         ChainConfig {
             network: Network::Ethereum,
             chain_id: eth_evm.chain_id,
             rpc_url: Url::parse(&eth_evm.endpoint)?,
             backfill_start_block: 0,
+            low_gas_threshold: None,
         },
     ];
 

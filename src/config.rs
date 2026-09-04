@@ -1,4 +1,7 @@
-use alloy::primitives::Address;
+use alloy::primitives::{
+    Address, U256,
+    utils::{UnitsError, parse_ether},
+};
 use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
@@ -221,6 +224,10 @@ pub struct Config {
     /// `RECEIPT_POLL_INTERVAL` in production; tests lower it so they don't
     /// have to wait a full production interval for a reconciliation pass.
     pub receipt_poll_interval: Duration,
+    /// Interval between gas balance polls. Defaults to
+    /// `gas_monitor::GAS_POLL_INTERVAL` in production; tests lower it so
+    /// they don't have to wait a full production interval for a reading.
+    pub gas_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     /// Console log output format; see [`LogFormat`].
@@ -334,6 +341,15 @@ struct Env {
     )]
     backfill_start_block: u64,
 
+    #[arg(
+        long,
+        env = "LOW_GAS_THRESHOLD",
+        help = "Low gas alert threshold for the legacy flat Base group, in \
+                native token units with 18 decimals (e.g. \"0.05\"); ignored \
+                when CHAIN_BASE_* overrides the flat Base configuration"
+    )]
+    low_gas_threshold: Option<String>,
+
     #[clap(flatten)]
     auth: AuthConfig,
 
@@ -397,6 +413,15 @@ struct Env {
 
     #[arg(
         long,
+        env = "CHAIN_BASE_LOW_GAS_THRESHOLD",
+        requires = "chain_base_rpc_url",
+        help = "Low gas alert threshold for the Base group, in ETH \
+                (e.g. \"0.05\")"
+    )]
+    chain_base_low_gas_threshold: Option<String>,
+
+    #[arg(
+        long,
         env = "CHAIN_ETHEREUM_RPC_URL",
         requires_all = [
             "chain_ethereum_chain_id",
@@ -422,6 +447,15 @@ struct Env {
         help = "Receipt-backfill start block for the Ethereum group"
     )]
     chain_ethereum_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_ETHEREUM_LOW_GAS_THRESHOLD",
+        requires = "chain_ethereum_rpc_url",
+        help = "Low gas alert threshold for the Ethereum group, in ETH \
+                (e.g. \"0.05\")"
+    )]
+    chain_ethereum_low_gas_threshold: Option<String>,
 
     #[arg(
         long,
@@ -451,6 +485,15 @@ struct Env {
         help = "Receipt-backfill start block for the HyperEVM group"
     )]
     chain_hyperevm_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_HYPEREVM_LOW_GAS_THRESHOLD",
+        requires = "chain_hyperevm_rpc_url",
+        help = "Low gas alert threshold for the HyperEVM group, in HYPE \
+                (e.g. \"1.0\")"
+    )]
+    chain_hyperevm_low_gas_threshold: Option<String>,
 
     #[arg(
         long,
@@ -514,6 +557,7 @@ impl Env {
             signer,
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
             log_format: self.log_format,
@@ -542,6 +586,7 @@ impl Env {
                 rpc_url: self.chain_base_rpc_url.as_ref(),
                 chain_id: self.chain_base_chain_id,
                 backfill_start_block: self.chain_base_backfill_start_block,
+                low_gas_threshold: self.chain_base_low_gas_threshold.as_deref(),
             },
         )? {
             // Both forms set is a legitimate state — the legacy flat vars
@@ -556,6 +601,20 @@ impl Env {
                     "Both legacy (RPC_URL) and grouped (CHAIN_BASE_*) Base \
                      configuration are set; the grouped form takes precedence \
                      for the service"
+                );
+            }
+            // The grouped path reads only CHAIN_BASE_LOW_GAS_THRESHOLD, so a
+            // flat LOW_GAS_THRESHOLD is dropped here. Name it rather than let
+            // Base fall through to the generic "monitoring disabled" WARN,
+            // which would read as if no threshold were set at all.
+            if self.low_gas_threshold.is_some()
+                && self.chain_base_low_gas_threshold.is_none()
+            {
+                warn!(
+                    target: "startup",
+                    "Flat LOW_GAS_THRESHOLD is ignored while CHAIN_BASE_* \
+                     configures Base; set CHAIN_BASE_LOW_GAS_THRESHOLD to \
+                     monitor Base gas"
                 );
             }
             base
@@ -573,6 +632,10 @@ impl Env {
                 chain_id: self.chain_id,
                 rpc_url,
                 backfill_start_block: self.backfill_start_block,
+                low_gas_threshold: parse_low_gas_threshold(
+                    Network::Base,
+                    self.low_gas_threshold.as_deref(),
+                )?,
             }
         };
         let ethereum = Self::optional_chain_config(
@@ -581,6 +644,9 @@ impl Env {
                 rpc_url: self.chain_ethereum_rpc_url.as_ref(),
                 chain_id: self.chain_ethereum_chain_id,
                 backfill_start_block: self.chain_ethereum_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_ethereum_low_gas_threshold
+                    .as_deref(),
             },
         )?;
         let hyperevm = Self::optional_chain_config(
@@ -589,6 +655,9 @@ impl Env {
                 rpc_url: self.chain_hyperevm_rpc_url.as_ref(),
                 chain_id: self.chain_hyperevm_chain_id,
                 backfill_start_block: self.chain_hyperevm_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_hyperevm_low_gas_threshold
+                    .as_deref(),
             },
         )?;
         let mut chains = vec![base.clone()];
@@ -602,10 +671,26 @@ impl Env {
         network: Network,
         group: &ChainGroupEnv<'_>,
     ) -> Result<Option<ChainConfig>, ConfigError> {
-        let &ChainGroupEnv { rpc_url, chain_id, backfill_start_block } = group;
+        let &ChainGroupEnv {
+            rpc_url,
+            chain_id,
+            backfill_start_block,
+            low_gas_threshold,
+        } = group;
 
         match (rpc_url, chain_id, backfill_start_block) {
-            (None, None, None) => Ok(None),
+            (None, None, None) => {
+                // Clap's `requires` ties each threshold to its group's RPC
+                // URL, so this is a defensive guard like the legacy-Base
+                // `ok_or` above: a future clap edit degrades to a startup
+                // error instead of a silently dropped threshold.
+                if low_gas_threshold.is_some() {
+                    return Err(ConfigError::ParseError(clap::Error::new(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                    )));
+                }
+                Ok(None)
+            }
             (Some(rpc_url), Some(chain_id), Some(backfill_start_block)) => {
                 // A network label bound to a chain it does not name is not a
                 // recoverable misconfiguration: the receipt inventory is keyed
@@ -632,6 +717,10 @@ impl Env {
                     chain_id,
                     rpc_url: rpc_url.clone(),
                     backfill_start_block,
+                    low_gas_threshold: parse_low_gas_threshold(
+                        network,
+                        low_gas_threshold,
+                    )?,
                 }))
             }
             _ => Err(ConfigError::ParseError(clap::Error::new(
@@ -650,6 +739,63 @@ struct ChainGroupEnv<'env> {
     rpc_url: Option<&'env Url>,
     chain_id: Option<u64>,
     backfill_start_block: Option<u64>,
+    low_gas_threshold: Option<&'env str>,
+}
+
+/// Parses one chain's low gas threshold from its decimal native token string
+/// (e.g. `"0.05"`) into wei. Zero is rejected: a zero threshold never alerts,
+/// which reads as monitored while monitoring nothing. A negative sign is
+/// rejected too, because `parse_ether` would otherwise reinterpret it as a
+/// near-`U256::MAX` two's-complement value (a sign typo silently making every
+/// balance read below threshold) instead of failing. A value carrying a
+/// non-zero digit finer than wei (beyond 18 decimal places) is rejected
+/// rather than silently truncated, so lost precision fails fast; trailing
+/// zeros beyond 18 places carry no value and are kept.
+fn parse_low_gas_threshold(
+    network: Network,
+    value: Option<&str>,
+) -> Result<Option<U256>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    if value.trim_start().starts_with('-') {
+        return Err(ConfigError::NegativeLowGasThreshold {
+            network,
+            value: value.to_string(),
+        });
+    }
+
+    // `parse_ether` truncates decimals beyond 18 (finer than wei) without
+    // error, silently dropping precision from a financial value. Reject a
+    // non-zero digit past the 18th fractional place before parsing;
+    // `chars().skip` avoids byte-boundary indexing panics on non-ASCII input,
+    // and non-digits fall through to `parse_ether`'s own error.
+    if let Some((_, fraction)) = value.split_once('.')
+        && fraction
+            .chars()
+            .skip(18)
+            .any(|digit| digit.is_ascii_digit() && digit != '0')
+    {
+        return Err(ConfigError::ExcessiveLowGasThresholdPrecision {
+            network,
+            value: value.to_string(),
+        });
+    }
+
+    let threshold = parse_ether(value).map_err(|source| {
+        ConfigError::InvalidLowGasThreshold {
+            network,
+            value: value.to_string(),
+            source,
+        }
+    })?;
+
+    if threshold.is_zero() {
+        return Err(ConfigError::ZeroLowGasThreshold { network });
+    }
+
+    Ok(Some(threshold))
 }
 
 #[derive(Args, Clone)]
@@ -778,6 +924,31 @@ pub enum ConfigError {
         network.as_str().to_uppercase()
     )]
     ChainIdNotForNetwork { network: Network, configured: u64, expected: u64 },
+    #[error(
+        "low gas threshold '{value}' for {network} is not a valid \
+         native token amount: {source}"
+    )]
+    InvalidLowGasThreshold {
+        network: Network,
+        value: String,
+        #[source]
+        source: UnitsError,
+    },
+    #[error(
+        "low gas threshold for {network} is zero; a zero threshold never \
+         alerts, so it reads as monitored while monitoring nothing"
+    )]
+    ZeroLowGasThreshold { network: Network },
+    #[error(
+        "low gas threshold '{value}' for {network} is negative; a threshold \
+         must be a positive native token amount"
+    )]
+    NegativeLowGasThreshold { network: Network, value: String },
+    #[error(
+        "low gas threshold '{value}' for {network} has more than 18 decimal \
+         places; a threshold cannot be finer than one wei"
+    )]
+    ExcessiveLowGasThresholdPrecision { network: Network, value: String },
     #[error(
         "no RPC URL configured for {network}; set {hint} in the service \
          environment (deployment secrets / .env)"
@@ -1083,9 +1254,12 @@ mod tests {
     use alloy::primitives::address;
     use ipnetwork::IpNetwork;
     use tempfile::NamedTempFile;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::auth::IpWhitelist;
+    use crate::test_utils::logs_contain_at;
 
     fn minimal_args() -> Vec<&'static str> {
         vec![
@@ -1208,6 +1382,7 @@ mod tests {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
                 chain_id: Some(8453),
                 backfill_start_block: Some(22_000_000),
+                low_gas_threshold: None,
             },
         );
 
@@ -1277,6 +1452,159 @@ mod tests {
         assert_eq!(hyperevm.backfill_start_block, 9_000_000);
     }
 
+    #[test]
+    fn grouped_threshold_parses_to_wei() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--chain-hyperevm-rpc-url",
+            "wss://hyperevm.example",
+            "--chain-hyperevm-chain-id",
+            "999",
+            "--chain-hyperevm-backfill-start-block",
+            "9000000",
+            "--chain-hyperevm-low-gas-threshold",
+            "1.5",
+            "--low-gas-threshold",
+            "0.05",
+        ]);
+
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config().unwrap();
+
+        let base = &config.chains[0];
+        assert_eq!(
+            base.low_gas_threshold,
+            Some(U256::from(50_000_000_000_000_000_u64)),
+            "the flat LOW_GAS_THRESHOLD must apply to the legacy Base entry"
+        );
+        let hyperevm = &config.chains[1];
+        assert_eq!(
+            hyperevm.low_gas_threshold,
+            Some(U256::from(1_500_000_000_000_000_000_u64))
+        );
+    }
+
+    /// A grouped Base config with a flat `LOW_GAS_THRESHOLD` but no
+    /// `CHAIN_BASE_LOW_GAS_THRESHOLD` drops the flat value (Base ends up
+    /// unmonitored) and warns that it was ignored, rather than silently
+    /// applying it.
+    #[traced_test]
+    #[test]
+    fn grouped_base_ignores_flat_threshold_with_warning() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--chain-base-rpc-url",
+            "wss://base.example",
+            "--chain-base-chain-id",
+            "8453",
+            "--chain-base-backfill-start-block",
+            "42000000",
+            "--low-gas-threshold",
+            "0.05",
+        ]);
+
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config().unwrap();
+
+        assert_eq!(
+            config.chains[0].low_gas_threshold, None,
+            "the flat threshold must not leak into the grouped Base entry"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Flat LOW_GAS_THRESHOLD is ignored"]
+        ));
+    }
+
+    /// A threshold supplied without its group's RPC configuration is refused,
+    /// guarding against a future clap change that severs the `requires` tie.
+    #[test]
+    fn threshold_without_group_rpc_is_refused() {
+        let result = Env::optional_chain_config(
+            Network::Ethereum,
+            &ChainGroupEnv {
+                rpc_url: None,
+                chain_id: None,
+                backfill_start_block: None,
+                low_gas_threshold: Some("0.05"),
+            },
+        );
+
+        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+    }
+
+    #[test]
+    fn malformed_threshold_is_refused() {
+        let result =
+            parse_low_gas_threshold(Network::Base, Some("not-a-number"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidLowGasThreshold {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_threshold_is_refused() {
+        let result = parse_low_gas_threshold(Network::Base, Some("0"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ZeroLowGasThreshold { network: Network::Base })
+        ));
+    }
+
+    /// A leading `-` is a sign typo, not a valid threshold. `parse_ether`
+    /// would reinterpret it as a near-`U256::MAX` value that passes the zero
+    /// check and makes every balance read below threshold, so it must be
+    /// rejected at parse time.
+    #[test]
+    fn negative_threshold_is_refused() {
+        let result = parse_low_gas_threshold(Network::Base, Some("-0.05"));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::NegativeLowGasThreshold {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    /// A non-zero digit finer than wei is a precision the threshold cannot
+    /// hold; `parse_ether` would silently truncate it, so it is rejected.
+    #[test]
+    fn subwei_precision_is_refused() {
+        let result = parse_low_gas_threshold(
+            Network::Base,
+            Some("1.0000000000000000005"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ExcessiveLowGasThresholdPrecision {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    /// Trailing zeros beyond 18 decimals carry no value, so a wei-precise
+    /// amount padded with them parses unchanged rather than being refused.
+    #[test]
+    fn trailing_zeros_beyond_wei_precision_are_kept() {
+        let result = parse_low_gas_threshold(
+            Network::Base,
+            Some("0.0500000000000000000"),
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(U256::from(50_000_000_000_000_000_u64)));
+    }
+
     /// HyperEVM's testnet id (998) one keystroke away from mainnet (999) is
     /// exactly the mislabeling the canonical-id check exists to refuse.
     #[test]
@@ -1287,6 +1615,7 @@ mod tests {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
                 chain_id: Some(998),
                 backfill_start_block: Some(9_000_000),
+                low_gas_threshold: None,
             },
         );
 

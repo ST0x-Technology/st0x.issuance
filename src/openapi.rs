@@ -35,6 +35,7 @@ expressed as an OpenAPI scheme."
         crate::admin::list_stuck,
         crate::admin::schedule_freeze_window,
         crate::admin::orchestrator_health,
+        crate::admin::network_telemetry,
     ),
     components(schemas(
         st0x_issuance_dto::TokenizedAssetDetailResponse,
@@ -67,6 +68,10 @@ expressed as an OpenAPI scheme."
         crate::admin::OrchestratorHealth,
         crate::admin::AssetVaultModeStatus,
         crate::admin::OrchestratorHealthResponse,
+        crate::admin::NetworkTelemetryResponse,
+        crate::network_telemetry::NetworkTelemetrySnapshot,
+        crate::network_telemetry::PassStatsSnapshot,
+        crate::network_telemetry::GasStatusSnapshot,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -122,6 +127,7 @@ mod tests {
             "/admin/reprocess/mint/{aggregate_id}",
             "/admin/close/mint/{aggregate_id}",
             "/admin/freeze-schedules",
+            "/admin/network-telemetry",
             "/internal/mints/{tokenization_request_id}/authorization",
         ] {
             assert!(
