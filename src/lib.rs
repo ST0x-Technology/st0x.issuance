@@ -2503,14 +2503,22 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let blocked = tokio::task::spawn_blocking(move || {
             let _ = started_tx.send(());
-            std::thread::sleep(Duration::from_millis(250));
+            // Sleeps well past the outer bound below and ignores abort
+            // (spawn_blocking cannot be cancelled once running), so the only
+            // way `stop_with_grace` returns before this elapses is its own
+            // drain bound.
+            std::thread::sleep(Duration::from_millis(1000));
         });
         started_rx.await.unwrap();
         let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
         let tasks = BackgroundTasks { shutdown, handles: vec![blocked] };
 
+        // Grace is 10ms, so a bounded `stop_with_grace` returns in ~10ms. The
+        // 500ms outer bound leaves wide headroom for scheduler jitter on a
+        // loaded CI runner while staying far below the 1000ms sleep, so an
+        // unbounded drain (waiting on the ignored abort) still trips it.
         tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_millis(500),
             tasks.stop_with_grace(Duration::from_millis(10)),
         )
         .await
