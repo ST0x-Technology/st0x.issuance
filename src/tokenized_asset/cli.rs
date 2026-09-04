@@ -1522,6 +1522,16 @@ impl AssetAdmin {
         Ok(Self { store, pool })
     }
 
+    /// Builds an admin over the running service's already-open store and pool,
+    /// for the HTTP operator routes. The CLI path uses [`connect`], which opens
+    /// its own pool while the service is stopped.
+    pub(crate) const fn from_managed(
+        store: Arc<Store<Underlying>>,
+        pool: Pool<Sqlite>,
+    ) -> Self {
+        Self { store, pool }
+    }
+
     /// Reads the current freeze status, or `None` if the underlying has no
     /// listing on any network.
     pub(crate) async fn status(
