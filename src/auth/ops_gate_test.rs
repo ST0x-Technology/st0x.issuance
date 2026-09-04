@@ -306,7 +306,8 @@ async fn real_ops_routes_require_an_iap_assertion() {
                 crate::burn_excess::api::burn_excess_internal_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
-                crate::tokenized_asset::orchestrator_ops::orchestrator_approve_ops
+                crate::tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
+                crate::admin::aggregate_snapshot_ops
             ],
         );
     let client = Client::tracked(rocket).await.unwrap();
@@ -346,6 +347,10 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .dispatch()
         .await;
     assert_eq!(approve.status(), Status::Unauthorized);
+
+    let snapshot =
+        client.get("/ops/read/snapshots/Mint/some-id").dispatch().await;
+    assert_eq!(snapshot.status(), Status::Unauthorized);
 
     assert!(logs_contain_at!(
         Level::WARN,
