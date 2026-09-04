@@ -143,6 +143,38 @@ nix run .#stagingDeployAll -- -i "$SSH_IDENTITY"
 nix run .#prodDeployAll -- -i "$SSH_IDENTITY"
 ```
 
+**Two prerequisites, both outside the deploy scripts.** nginx requests a
+Let's Encrypt certificate during system activation, so a first deploy fails
+and rolls back unless each is in place. Neither is checked for you:
+
+1. **DNS.** An A record for the environment's FQDN, pointing at its reserved
+   IP, at the s01issuer.com registrar (GoDaddy). The names are in
+   `nix/ingress.nix`: `issuance.s01issuer.com` for prod,
+   `issuance-staging.s01issuer.com` for staging.
+2. **Firewall.** `tfApply` for that environment, opening TCP 80 and 443 on the
+   DigitalOcean firewall. `nix run .#tfPlan`/`.#tfApply` above; the deploy
+   scripts never run Terraform, and CI's deploy workflow does not either.
+
+The http-01 challenge is what needs port 80. If it cannot be reached, the
+`acme-<fqdn>.service` unit fails, `switch-to-configuration` exits non-zero, and
+deploy-rs rolls the generation back. Re-run the deploy once the record and the
+firewall rule exist.
+
+**Flipping `st0x.ingress.behindProxy` needs `DeployAll`, not `DeployNixos`.**
+The system profile carries nginx and the firewall; only the service profile
+restarts the app, and that unit sets `restartIfChanged = false`, so a
+system-only deploy never moves the app into proxy mode. The app binds a
+different port in each mode (8000 direct, 8001 proxied), so a half-applied
+flip shows up as nginx returning 502 rather than as requests reaching the app
+with a spoofable source address. Run `nix run .#<env>DeployAll` and let both
+profiles land.
+
+The flip does not strand plaintext callers. While `st0x.ingress.legacyPlaintext`
+is on (the default), nginx also serves the same route allowlist over plain HTTP
+on 8000, so Alpaca and the liquidity bots keep working on the old URL and can
+move to the HTTPS name one at a time. Retiring plaintext is a separate step:
+set `legacyPlaintext = false`, deploy, then drop the port-8000 rule in `infra/`.
+
 ---
 
 ## Database (one-time, per environment)

@@ -344,33 +344,14 @@ pub async fn initialize_rocket(
         &managers,
     )
     .await?;
-    // FIXME: temporary production gate. Remove once the snapshot-repair
-    // baseline operation ships so production can establish a cursor and run
-    // the feed. See docs/runbooks/corporate-action-feed-boundary.md.
-    // The corporate-action feed fails the whole service closed on first
-    // production start: an authenticated stream with no committed cursor
-    // returns BaselineRequired, and production cannot establish a baseline
-    // until the snapshot-repair operation ships. Skip it in production until
-    // then; development auto-establishes its baseline and keeps running.
-    let corporate_action_feed = if config.environment == Environment::Production
-    {
-        tracing::info!(
-            target: "asset",
-            "Corporate-action feed disabled in production pending the \
-             snapshot-repair baseline operation"
-        );
-        None
-    } else {
-        Some(
-            prepare_corporate_action_feed(
-                &config,
-                pool.clone(),
-                &apalis_pool,
-                lifecycle_notifier.clone(),
-            )
-            .await?,
-        )
-    };
+
+    let corporate_action_feed = prepare_corporate_action_feed_unless_gated(
+        &config,
+        pool.clone(),
+        &apalis_pool,
+        lifecycle_notifier.clone(),
+    )
+    .await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut background_task_handles = Vec::new();
@@ -575,6 +556,48 @@ async fn run_startup_recovery<P: Provider + Clone>(
     Ok(())
 }
 
+/// Prepares the corporate-action feed, except in production.
+///
+/// FIXME: temporary production gate. Remove once the snapshot-repair baseline
+/// operation ships so production can establish a cursor and run the feed. See
+/// docs/runbooks/corporate-action-feed-boundary.md.
+///
+/// The feed fails the whole service closed on first production start: an
+/// authenticated stream with no committed cursor returns `BaselineRequired`,
+/// and production cannot establish a baseline until the snapshot-repair
+/// operation ships. Skip it in production until then; development
+/// auto-establishes its baseline and keeps running.
+///
+/// # Errors
+///
+/// Returns an error if the feed cannot be constructed or its development
+/// baseline cannot be established.
+async fn prepare_corporate_action_feed_unless_gated(
+    config: &Config,
+    pool: Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
+) -> Result<Option<CorporateActionFeed>, anyhow::Error> {
+    if config.environment == Environment::Production {
+        tracing::info!(
+            target: "asset",
+            "Corporate-action feed disabled in production pending the \
+             snapshot-repair baseline operation"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(
+        prepare_corporate_action_feed(
+            config,
+            pool,
+            apalis_pool,
+            lifecycle_notifier,
+        )
+        .await?,
+    ))
+}
+
 async fn prepare_corporate_action_feed(
     config: &Config,
     pool: Pool<Sqlite>,
@@ -775,15 +798,58 @@ fn log_background_task_failure(
     }
 }
 
+/// Port Rocket listens on when it is the public listener itself.
+pub(crate) const DIRECT_PORT: u16 = 8000;
+
+/// Port Rocket listens on behind the nginx TLS proxy. Deliberately not
+/// [`DIRECT_PORT`]: see [`server_figment`].
+pub(crate) const PROXIED_PORT: u16 = 8001;
+
+/// Listening socket and client-IP source, which move together.
+///
+/// Behind the proxy (`nix/ingress.nix`, `st0x.ingress.behindProxy`) Rocket
+/// binds loopback so nginx is the only way in, and the client IP the auth
+/// whitelists check comes from `X-Real-IP`, which nginx overwrites from the
+/// TCP source on every proxied request. Binding a public address while
+/// trusting that header would let any direct caller forge its own source, so
+/// the two settings are chosen here as one pair rather than configured apart.
+///
+/// Without the proxy, header-based detection stays off and the TCP source is
+/// the client IP. Rocket has no PROXY-protocol support, so a proxy that
+/// preserves the source only at the network layer is not an option.
+///
+/// # Why the port differs between the two modes
+///
+/// The unit carrying `BEHIND_PROXY` sets `restartIfChanged = false`
+/// (`nix/upgradeable-services.nix`), so a system-profile activation writes a
+/// new value into the unit file without restarting the running process. On
+/// its own that lets nginx start proxying while the app still reads the TCP
+/// source, and every proxied request then arrives as `127.0.0.1`, which is
+/// inside `INTERNAL_IP_RANGES`. That drops the two proxied `InternalAuth`
+/// routes to a bare check of a key Alpaca also holds.
+///
+/// Giving each mode its own port makes that state fail closed instead: nginx
+/// proxies to [`PROXIED_PORT`], so a process still running in direct mode is
+/// simply not there and nginx answers 502. A missed restart is a loud outage
+/// rather than a silent loss of the IP whitelist.
+fn server_figment(behind_proxy: bool) -> rocket::figment::Figment {
+    let figment = rocket::Config::figment();
+
+    if behind_proxy {
+        figment
+            .merge(("port", PROXIED_PORT))
+            .merge(("address", "127.0.0.1"))
+            .merge(("ip_header", "X-Real-IP"))
+    } else {
+        figment
+            .merge(("port", DIRECT_PORT))
+            .merge(("address", "0.0.0.0"))
+            .merge(("ip_header", false))
+    }
+}
+
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
-    let figment = rocket::Config::figment()
-        .merge(("address", "0.0.0.0"))
-        .merge(("port", 8000))
-        // Disable header-based IP detection (X-Real-IP/X-Forwarded-For) to prevent
-        // IP spoofing. The app relies solely on TCP source address for client IP.
-        // If deployed behind a reverse proxy, the proxy must preserve the original
-        // client IP at the network layer (e.g., PROXY protocol) rather than headers.
-        .merge(("ip_header", false));
+    let figment = server_figment(state.config.behind_proxy);
 
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;
@@ -2360,15 +2426,67 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BURN_RECOVERY_RECONCILE_INTERVAL, BackgroundTasks, Environment,
-        Quantity, QuantityConversionError, ReceiptContractAddress,
-        ReconciliationFailures, VaultAddress, VaultBackfillConfig,
-        cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
-        run_burn_recovery_reconciler, run_startup_reconciliation_for_vaults,
+        BURN_RECOVERY_RECONCILE_INTERVAL, BackgroundTasks, DIRECT_PORT,
+        Environment, PROXIED_PORT, Quantity, QuantityConversionError,
+        ReceiptContractAddress, ReconciliationFailures, VaultAddress,
+        VaultBackfillConfig, cached_receipt_contract, mount_api_docs,
+        next_receipt_backfill_block, run_burn_recovery_reconciler,
+        run_startup_reconciliation_for_vaults, server_figment,
     };
     use crate::chain::{ChainRegistry, ChainRegistryError};
     use crate::receipt_inventory::ReceiptInventory;
     use crate::test_utils::{log_count_at, logs_contain_at};
+
+    /// Without the proxy the TCP source must stay the client IP: a bound
+    /// public address plus a trusted `X-Real-IP` would let any direct caller
+    /// present itself as loopback and pass the internal whitelist.
+    #[test]
+    fn direct_server_reads_the_client_ip_from_the_connection() {
+        let figment = server_figment(false);
+
+        assert_eq!(
+            figment.extract_inner::<String>("address").unwrap(),
+            "0.0.0.0"
+        );
+        assert!(!figment.extract_inner::<bool>("ip_header").unwrap());
+    }
+
+    /// Behind the proxy the header nginx overwrites is the client IP, and the
+    /// listener must be loopback so nothing can reach Rocket without passing
+    /// through nginx and having that header rewritten.
+    #[test]
+    fn proxied_server_binds_loopback_and_reads_the_forwarded_ip() {
+        let figment = server_figment(true);
+
+        assert_eq!(
+            figment.extract_inner::<String>("address").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            figment.extract_inner::<String>("ip_header").unwrap(),
+            "X-Real-IP"
+        );
+    }
+
+    /// The ports must differ. nginx proxies to the proxied port only, so a
+    /// process that missed the restart and is still in direct mode cannot be
+    /// reached through it: nginx 502s instead of handing the app requests it
+    /// would read as coming from 127.0.0.1 and wave past the IP whitelist.
+    #[test]
+    fn each_server_shape_listens_on_its_own_port() {
+        let direct =
+            server_figment(false).extract_inner::<u16>("port").unwrap();
+        let proxied =
+            server_figment(true).extract_inner::<u16>("port").unwrap();
+
+        assert_eq!(direct, DIRECT_PORT);
+        assert_eq!(proxied, PROXIED_PORT);
+        assert_ne!(
+            direct, proxied,
+            "a shared port lets a stale direct-mode process serve proxied \
+             requests as loopback"
+        );
+    }
 
     #[tokio::test]
     #[traced_test]

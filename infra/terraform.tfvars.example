@@ -3,3 +3,11 @@
 # Encrypt it with `nix run .#tfEditVars` after initial setup.
 
 do_token = ""
+
+# Firewall source ranges for the issuance API (RAI-236). Defaults are
+# world-open; tighten these once Alpaca provides its egress CIDRs and the
+# liquidity bots' static egress IPs are known.
+# prod_api_source_addresses      = ["203.0.113.0/24"]
+# prod_https_source_addresses    = ["203.0.113.0/24"]
+# staging_api_source_addresses   = ["203.0.113.0/24"]
+# staging_https_source_addresses = ["203.0.113.0/24"]

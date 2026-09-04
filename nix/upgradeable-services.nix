@@ -10,6 +10,7 @@
 # by a previous deploy so the next switch-to-configuration can
 # complete and let deploy.nix install the fix.
 {
+  config,
   pkgs,
   lib,
   utils,
@@ -42,6 +43,10 @@ let
             throw "Unsupported environment '${environment}'"
         }"
         "LOG_LEVEL=debug"
+        # Paired with the nginx routes in nix/ingress.nix off one option, so
+        # the app cannot trust X-Real-IP while nothing sets it, nor keep
+        # reading the TCP source once nginx is the only caller.
+        "BEHIND_PROXY=${lib.boolToString config.st0x.ingress.behindProxy}"
         # Per-environment orchestrator/vault-mode TOML config; the committed
         # files are dark (no orchestrator entries = every asset vault-direct).
         # Interpolating the path copies the file into the nix store, so the

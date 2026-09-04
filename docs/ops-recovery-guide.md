@@ -13,6 +13,16 @@ export ISSUER_API_KEY=$(grep ISSUER_API_KEY /mnt/volume_nyc3_02/.env | cut -d= -
 
 Every example below assumes this is set.
 
+The examples use port 8000, which is where the app listens while it is its own
+public listener. Once `st0x.ingress.behindProxy` is on (`nix/ingress.nix`) it
+listens on **8001**, bound to loopback. `/admin/*` is never proxied by nginx in
+either mode, so these commands always run on the box; only the port moves.
+Confirm which one is live before you start:
+
+```bash
+ss -tlnp | grep st0x-issuance
+```
+
 ## Step 1: Check what's stuck
 
 ```bash
