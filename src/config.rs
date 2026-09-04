@@ -229,6 +229,9 @@ pub struct Config {
     /// they don't have to wait a full production interval for a reading.
     pub gas_poll_interval: Duration,
     pub auth: AuthConfig,
+    /// IAP audiences for the role-gated operator API, one per tier. `None`
+    /// leaves the role-gated routes unmounted.
+    pub ops_api: Option<OpsApiConfig>,
     pub log_level: LogLevel,
     /// Console log output format; see [`LogFormat`].
     pub log_format: LogFormat,
@@ -294,6 +297,122 @@ impl Config {
     }
 }
 
+/// IAP audiences for the role-gated operator API paths, one per privilege
+/// tier from the role and route matrix (RAI-1914).
+///
+/// Each audience names the load balancer backend service that fronts one tier
+/// prefix. IAP binds the token it mints to the backend that admitted the
+/// caller, so pinning the audience per tier is what makes a lower-tier token
+/// useless against a higher-tier path.
+///
+/// Not a secret: these name IAM-gated backends and are worthless without an
+/// identity Google will sign for. Absent from the environment means the
+/// role-gated routes are not mounted at all, which is the correct posture for
+/// any deployment that has no load balancer in front of it. Existence of this
+/// value proves all four audiences are present, non-blank, unpadded, and
+/// distinct (see [`resolve_ops_api`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpsApiConfig {
+    /// Audience of the backend serving the read tier.
+    pub read: String,
+    /// Audience of the backend serving the debug tier.
+    pub debug: String,
+    /// Audience of the backend serving the capital tier.
+    pub capital: String,
+    /// Audience of the backend serving the breakglass tier.
+    pub breakglass: String,
+}
+
+/// The raw `OPS_API_*_AUDIENCE` environment group. Each is optional at the clap
+/// layer; [`resolve_ops_api`] enforces the all-or-none, non-blank, unpadded,
+/// and distinct rules that [`OpsApiConfig`] then embodies.
+#[derive(Args, Clone)]
+struct OpsApiEnv {
+    #[arg(
+        long = "ops-api-read-audience",
+        env = "OPS_API_READ_AUDIENCE",
+        help = "IAP audience for the read-tier ops API backend"
+    )]
+    read: Option<String>,
+
+    #[arg(
+        long = "ops-api-debug-audience",
+        env = "OPS_API_DEBUG_AUDIENCE",
+        help = "IAP audience for the debug-tier ops API backend"
+    )]
+    debug: Option<String>,
+
+    #[arg(
+        long = "ops-api-capital-audience",
+        env = "OPS_API_CAPITAL_AUDIENCE",
+        help = "IAP audience for the capital-tier ops API backend"
+    )]
+    capital: Option<String>,
+
+    #[arg(
+        long = "ops-api-breakglass-audience",
+        env = "OPS_API_BREAKGLASS_AUDIENCE",
+        help = "IAP audience for the breakglass-tier ops API backend"
+    )]
+    breakglass: Option<String>,
+}
+
+/// Collapses the optional `OPS_API_*_AUDIENCE` group into a validated
+/// [`OpsApiConfig`], or `None` when the whole group is absent.
+///
+/// The audiences are what keep the tiers apart: each tier's verifier pins the
+/// audience IAP mints for that tier's backend. So a partial group (some tiers
+/// gated, others silently unmounted), a blank pin (verifies nothing), a padded
+/// value (jsonwebtoken compares `aud` byte for byte, so a stray space would
+/// 401 every real token at runtime with no startup signal), or two equal
+/// audiences (a token for one tier verifies on another, collapsing them) are
+/// each refused here rather than reaching the verifiers.
+fn resolve_ops_api(
+    env: OpsApiEnv,
+) -> Result<Option<OpsApiConfig>, ConfigError> {
+    let OpsApiEnv { read, debug, capital, breakglass } = env;
+
+    if read.is_none()
+        && debug.is_none()
+        && capital.is_none()
+        && breakglass.is_none()
+    {
+        return Ok(None);
+    }
+
+    let read = validated_audience("read", read)?;
+    let debug = validated_audience("debug", debug)?;
+    let capital = validated_audience("capital", capital)?;
+    let breakglass = validated_audience("breakglass", breakglass)?;
+
+    let all = [&read, &debug, &capital, &breakglass];
+    for (index, first) in all.iter().enumerate() {
+        for second in all.iter().skip(index + 1) {
+            if first == second {
+                return Err(ConfigError::OpsApiAudiencesNotDistinct);
+            }
+        }
+    }
+
+    Ok(Some(OpsApiConfig { read, debug, capital, breakglass }))
+}
+
+/// Validates one tier's audience: present, non-blank, and free of surrounding
+/// whitespace (the verifier pins it byte for byte).
+fn validated_audience(
+    tier: &'static str,
+    value: Option<String>,
+) -> Result<String, ConfigError> {
+    let value = value.ok_or(ConfigError::OpsApiIncomplete { tier })?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::OpsApiAudienceBlank { tier });
+    }
+    if value.trim() != value {
+        return Err(ConfigError::OpsApiAudiencePadded { tier });
+    }
+    Ok(value)
+}
+
 #[derive(Parser, Clone)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
@@ -352,6 +471,9 @@ struct Env {
 
     #[clap(flatten)]
     auth: AuthConfig,
+
+    #[clap(flatten)]
+    ops_api: OpsApiEnv,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -549,6 +671,8 @@ impl Env {
             }
         }
 
+        let ops_api = resolve_ops_api(self.ops_api)?;
+
         Ok(Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
@@ -559,6 +683,7 @@ impl Env {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: self.auth,
+            ops_api,
             log_level: self.log_level,
             log_format: self.log_format,
             environment: self.environment,
@@ -1000,6 +1125,31 @@ pub enum ConfigError {
          entry per asset"
     )]
     DuplicateAssetSymbol { symbol: String },
+    #[error(
+        "OPS_API_{}_AUDIENCE is required once any ops-API audience is set: a \
+         partial group would leave the {tier} tier unmounted while its \
+         siblings are gated",
+        tier.to_uppercase()
+    )]
+    OpsApiIncomplete { tier: &'static str },
+    #[error(
+        "OPS_API_{}_AUDIENCE is blank: a blank audience pins nothing, so the \
+         {tier} verifier would accept a token minted for any backend",
+        tier.to_uppercase()
+    )]
+    OpsApiAudienceBlank { tier: &'static str },
+    #[error(
+        "OPS_API_{}_AUDIENCE has leading or trailing whitespace: the verifier \
+         pins the audience byte for byte, so a padded value 401s every real \
+         IAP token at runtime instead of failing here",
+        tier.to_uppercase()
+    )]
+    OpsApiAudiencePadded { tier: &'static str },
+    #[error(
+        "ops-API audiences must all differ: an equal audience lets a token \
+         minted for one tier verify on another, collapsing the tiers"
+    )]
+    OpsApiAudiencesNotDistinct,
 }
 
 // Sourced from the file given to `--config`.  All structs carry
@@ -2583,6 +2733,106 @@ mod tests {
         assert_eq!(
             config.vault_mode_for(&rklb, Network::Ethereum).unwrap(),
             VaultMode::Orchestrator { address: eth_orch_address() }
+        );
+    }
+
+    fn ops_env(
+        read: Option<&str>,
+        debug: Option<&str>,
+        capital: Option<&str>,
+        breakglass: Option<&str>,
+    ) -> OpsApiEnv {
+        OpsApiEnv {
+            read: read.map(String::from),
+            debug: debug.map(String::from),
+            capital: capital.map(String::from),
+            breakglass: breakglass.map(String::from),
+        }
+    }
+
+    #[test]
+    fn ops_api_absent_group_leaves_routes_unmounted() {
+        assert!(
+            resolve_ops_api(ops_env(None, None, None, None)).unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn ops_api_all_present_resolves_to_config() {
+        let config = resolve_ops_api(ops_env(
+            Some("aud-read"),
+            Some("aud-debug"),
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.read, "aud-read");
+        assert_eq!(config.debug, "aud-debug");
+        assert_eq!(config.capital, "aud-capital");
+        assert_eq!(config.breakglass, "aud-break");
+    }
+
+    #[test]
+    fn ops_api_partial_group_names_the_missing_tier() {
+        let error = resolve_ops_api(ops_env(
+            Some("aud-read"),
+            None,
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::OpsApiIncomplete { tier: "debug" }),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn ops_api_blank_audience_is_rejected() {
+        let error = resolve_ops_api(ops_env(
+            Some("   "),
+            Some("aud-debug"),
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::OpsApiAudienceBlank { tier: "read" }),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn ops_api_padded_audience_is_rejected() {
+        let error = resolve_ops_api(ops_env(
+            Some("aud-read"),
+            Some("aud-debug "),
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::OpsApiAudiencePadded { tier: "debug" }
+            ),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn ops_api_equal_audiences_collapse_tiers_and_are_rejected() {
+        let error = resolve_ops_api(ops_env(
+            Some("same"),
+            Some("same"),
+            Some("aud-capital"),
+            Some("aud-break"),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::OpsApiAudiencesNotDistinct),
+            "got: {error}"
         );
     }
 }

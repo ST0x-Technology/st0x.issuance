@@ -4565,6 +4565,45 @@ fn test_journal_confirmed_for_missing_mint() {
 Internal endpoints for operational management, protected by `InternalAuth`
 (X-API-KEY header + internal IP whitelist).
 
+### Role-gated operator API (IAP)
+
+Alongside the `InternalAuth` `/admin/*` endpoints, the operator capabilities are
+also mounted under role-tiered prefixes verified by Google IAP, so who may run
+what is decided by Workspace group membership rather than one shared API key.
+The load balancer routes each prefix to its own IAP backend; the app re-verifies
+the `x-goog-iap-jwt-assertion` (ES256, signed by Google) and pins the expected
+audience per prefix (`src/auth/iap.rs`), so a token minted for one tier does not
+verify on another.
+
+Tiers and routes:
+
+- **read** (`/ops/read/*`): `stuck`, `orchestrator-health`,
+  `status/<underlying>`, `orchestrator-preflight/<network>`,
+  `snapshots/<aggregate_type>/<aggregate_id>`.
+- **debug** (`/ops/debug/*`): `recover/redemption/<id>`, `reprocess/mint/<id>`,
+  `orchestrator-verify-signing/<network>/<underlying>`.
+- **capital** (`/ops/capital/*`): `freeze/<underlying>`,
+  `unfreeze/<underlying>`, `freeze-schedules`,
+  `orchestrator-approve/<network>/<underlying>`.
+- **breakglass** (`/ops/breakglass/*`): `force-complete/redemption/<id>`,
+  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`.
+
+Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
+debug identity cannot freeze, burn excess, force-complete, or close.
+
+Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
+backend audiences (from the terraform `ops_api_audiences` output; non-secret),
+validated at startup as all-or-none, non-blank, unpadded, and pairwise distinct.
+When absent the `/ops/*` routes are not mounted at all: the correct posture for
+a deployment with no load balancer in front of it (a 404, never a 401 that
+implies the path exists and wants credentials).
+
+The IAP layer is a second gate. It refuses a request that reached the VM from
+inside the VPC without passing IAP, rather than trusting the network; it does
+not itself decide who may do what, which is group membership evaluated by IAP
+against each backend's IAM policy. `burn-excess external`, `move-receipts`, and
+`confirm-custody` stay offline `issuer` CLI verbs.
+
 ### Recover Stuck Aggregates
 
 Recovers a stuck or failed aggregate so existing recovery logic picks it up.

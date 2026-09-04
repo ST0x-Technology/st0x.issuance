@@ -11,7 +11,7 @@ use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -19,7 +19,7 @@ use crate::Quantity;
 use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
-use crate::auth::InternalAuth;
+use crate::auth::{BreakglassOps, CapitalOps, DebugOps, InternalAuth, ReadOps};
 use crate::config::{Config, VaultMode};
 use crate::mint::{
     IssuerMintRequestId, ManualRecoveryDecision, Mint, MintCommand, MintEvent,
@@ -44,10 +44,16 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
+use crate::tokenized_asset::cli::{
+    AssetAdmin, AssetAdminError, AssetStatusReport, FreezeOutcome,
+    UnfreezeOutcome,
+};
 use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
 use crate::tokenized_asset::view::{find_vault, list_enabled_assets};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
-use crate::underlying::{UnderlyingViewError, load_freeze_status};
+use crate::underlying::{
+    AssetStatus, Underlying, UnderlyingViewError, load_freeze_status,
+};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
@@ -377,17 +383,58 @@ async fn load_reprocess_context(
     ),
     security(("internal_api_key" = []))
 )]
+#[post("/admin/recover/redemption/<issuer_request_id>")]
+pub(crate) async fn recover_redemption(
+    _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+) -> Result<Json<ReprocessResponse>, Status> {
+    recover_redemption_logic(
+        store,
+        pool,
+        alpaca_service,
+        vault_services,
+        burn_recovery,
+        issuer_request_id,
+    )
+    .await
+}
+
+/// Debug-tier operator route mirroring [`recover_redemption`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/recover/redemption/<issuer_request_id>")]
+pub(crate) async fn recover_redemption_ops(
+    _auth: DebugOps,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+) -> Result<Json<ReprocessResponse>, Status> {
+    recover_redemption_logic(
+        store,
+        pool,
+        alpaca_service,
+        vault_services,
+        burn_recovery,
+        issuer_request_id,
+    )
+    .await
+}
+
 #[tracing::instrument(skip(
-    _auth,
     store,
     pool,
     alpaca_service,
     vault_services,
     burn_recovery
 ))]
-#[post("/admin/recover/redemption/<issuer_request_id>")]
-pub(crate) async fn recover_redemption(
-    _auth: InternalAuth,
+async fn recover_redemption_logic(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
@@ -1031,7 +1078,6 @@ pub(crate) struct CloseRedemptionRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool))]
 #[post(
     "/admin/close/redemption/<issuer_request_id>",
     format = "json",
@@ -1039,6 +1085,33 @@ pub(crate) struct CloseRedemptionRequest {
 )]
 pub(crate) async fn close_redemption(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<CloseRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    close_redemption_logic(store, pool, issuer_request_id, body).await
+}
+
+/// Breakglass-tier operator route mirroring [`close_redemption`], gated by IAP
+/// (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/close/redemption/<issuer_request_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn close_redemption_ops(
+    _auth: BreakglassOps,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<CloseRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    close_redemption_logic(store, pool, issuer_request_id, body).await
+}
+
+#[tracing::instrument(skip(store, pool))]
+async fn close_redemption_logic(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1133,7 +1206,6 @@ pub(crate) struct ForceCompleteRedemptionRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, burn_recovery))]
 #[post(
     "/admin/force-complete/redemption/<issuer_request_id>",
     format = "json",
@@ -1141,6 +1213,45 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 )]
 pub(crate) async fn force_complete_redemption(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<ForceCompleteRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    force_complete_redemption_logic(
+        pool,
+        burn_recovery,
+        issuer_request_id,
+        body,
+    )
+    .await
+}
+
+/// Breakglass-tier operator route mirroring [`force_complete_redemption`],
+/// gated by IAP (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/force-complete/redemption/<issuer_request_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn force_complete_redemption_ops(
+    _auth: BreakglassOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<ForceCompleteRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    force_complete_redemption_logic(
+        pool,
+        burn_recovery,
+        issuer_request_id,
+        body,
+    )
+    .await
+}
+
+#[tracing::instrument(skip(pool, burn_recovery))]
+async fn force_complete_redemption_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1299,10 +1410,36 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, apalis_pool, store, vault_services))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    aggregate_id: &str,
+) -> Result<Json<ReprocessResponse>, ReprocessMintError> {
+    reprocess_mint_logic(pool, apalis_pool, store, vault_services, aggregate_id)
+        .await
+}
+
+/// Debug-tier operator route mirroring [`reprocess_mint`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/reprocess/mint/<aggregate_id>")]
+pub(crate) async fn reprocess_mint_ops(
+    _auth: DebugOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    aggregate_id: &str,
+) -> Result<Json<ReprocessResponse>, ReprocessMintError> {
+    reprocess_mint_logic(pool, apalis_pool, store, vault_services, aggregate_id)
+        .await
+}
+
+#[tracing::instrument(skip(pool, apalis_pool, store, vault_services))]
+async fn reprocess_mint_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     store: &rocket::State<Arc<Store<Mint>>>,
@@ -1558,10 +1695,42 @@ pub(crate) struct CloseMintRequest {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool, vault_services, receipts))]
 #[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
 pub(crate) async fn close_mint(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    receipts: &rocket::State<Arc<dyn ReceiptService>>,
+    aggregate_id: &str,
+    body: Json<CloseMintRequest>,
+) -> Result<Json<ReprocessResponse>, CloseMintError> {
+    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
+        .await
+}
+
+/// Breakglass-tier operator route mirroring [`close_mint`], gated by IAP
+/// (`BreakglassOps`) instead of the internal API key.
+#[post(
+    "/ops/breakglass/close/mint/<aggregate_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn close_mint_ops(
+    _auth: BreakglassOps,
+    store: &rocket::State<Arc<Store<Mint>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+    receipts: &rocket::State<Arc<dyn ReceiptService>>,
+    aggregate_id: &str,
+    body: Json<CloseMintRequest>,
+) -> Result<Json<ReprocessResponse>, CloseMintError> {
+    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
+        .await
+}
+
+#[tracing::instrument(skip(store, pool, vault_services, receipts))]
+async fn close_mint_logic(
     store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     vault_services: &rocket::State<NetworkVaultServices>,
@@ -2057,12 +2226,28 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, _vault_services))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
     _vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<StuckResponse>, Status> {
+    list_stuck_logic(pool).await
+}
+
+/// Read-tier operator route mirroring [`list_stuck`], gated by IAP (`ReadOps`)
+/// instead of the internal API key.
+#[get("/ops/read/stuck")]
+pub(crate) async fn list_stuck_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<StuckResponse>, Status> {
+    list_stuck_logic(pool).await
+}
+
+#[tracing::instrument(skip(pool))]
+async fn list_stuck_logic(
+    pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
     let mut stuck = Vec::new();
@@ -2213,10 +2398,30 @@ pub(crate) struct OrchestratorHealthResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, config, vault_services))]
 #[get("/admin/orchestrator-health")]
 pub(crate) async fn orchestrator_health(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<OrchestratorHealthResponse>, Status> {
+    orchestrator_health_logic(pool, config, vault_services).await
+}
+
+/// Read-tier operator route mirroring [`orchestrator_health`], gated by IAP
+/// (`ReadOps`) instead of the internal API key.
+#[get("/ops/read/orchestrator-health")]
+pub(crate) async fn orchestrator_health_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    config: &rocket::State<Config>,
+    vault_services: &rocket::State<NetworkVaultServices>,
+) -> Result<Json<OrchestratorHealthResponse>, Status> {
+    orchestrator_health_logic(pool, config, vault_services).await
+}
+
+#[tracing::instrument(skip(pool, config, vault_services))]
+async fn orchestrator_health_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     config: &rocket::State<Config>,
     vault_services: &rocket::State<NetworkVaultServices>,
@@ -3003,10 +3208,29 @@ pub(crate) struct ScheduleFreezeWindowResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, scheduler))]
 #[post("/admin/freeze-schedules", format = "json", data = "<body>")]
 pub(crate) async fn schedule_freeze_window(
     _auth: InternalAuth,
+    scheduler: &rocket::State<FreezeScheduler>,
+    body: Json<ScheduleFreezeWindowRequest>,
+) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
+    schedule_freeze_window_logic(scheduler, body).await
+}
+
+/// Capital-tier operator route mirroring [`schedule_freeze_window`]: arming a
+/// freeze gates token supply, so it sits above debug — the issue requires that
+/// debug cannot freeze. Gated by IAP (`CapitalOps`).
+#[post("/ops/capital/freeze-schedules", format = "json", data = "<body>")]
+pub(crate) async fn schedule_freeze_window_ops(
+    _auth: CapitalOps,
+    scheduler: &rocket::State<FreezeScheduler>,
+    body: Json<ScheduleFreezeWindowRequest>,
+) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
+    schedule_freeze_window_logic(scheduler, body).await
+}
+
+#[tracing::instrument(skip(scheduler))]
+async fn schedule_freeze_window_logic(
     scheduler: &rocket::State<FreezeScheduler>,
     body: Json<ScheduleFreezeWindowRequest>,
 ) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
@@ -3061,6 +3285,225 @@ pub(crate) async fn schedule_freeze_window(
         unfreeze_at,
         message: "Freeze window armed".to_string(),
     }))
+}
+
+/// Current freeze status of an underlying, for the read-tier status route.
+#[derive(Serialize)]
+pub(crate) struct AssetStatusResponse {
+    underlying: String,
+    status: &'static str,
+}
+
+impl From<AssetStatusReport> for AssetStatusResponse {
+    fn from(report: AssetStatusReport) -> Self {
+        Self {
+            underlying: report.underlying.to_string(),
+            status: match report.status {
+                AssetStatus::Frozen => "frozen",
+                AssetStatus::Enabled => "enabled",
+            },
+        }
+    }
+}
+
+/// Outcome of a freeze or unfreeze operator request.
+#[derive(Serialize)]
+pub(crate) struct FreezeOutcomeResponse {
+    underlying: String,
+    outcome: &'static str,
+}
+
+/// Parses the path segment into a validated underlying symbol; a malformed one
+/// is a 422.
+fn parse_underlying(underlying: &str) -> Result<UnderlyingSymbol, Status> {
+    UnderlyingSymbol::new(underlying).map_err(|error| {
+        warn!(target: "admin", underlying, error = %error,
+            "Invalid underlying symbol"
+        );
+        Status::UnprocessableEntity
+    })
+}
+
+/// Maps an asset-admin failure to an HTTP status. An unknown underlying is a
+/// client 404; everything else is an internal failure.
+const fn map_asset_admin_error(error: &AssetAdminError) -> Status {
+    match error {
+        AssetAdminError::NotFound { .. } => Status::NotFound,
+        _ => Status::InternalServerError,
+    }
+}
+
+/// Refuses a mutation on an underlying with no listing on any network before it
+/// is dispatched, mirroring the CLI's up-front rejection: the freeze aggregate
+/// would otherwise create operator-hold state for an unknown symbol.
+async fn ensure_listed(
+    admin: &AssetAdmin,
+    symbol: &UnderlyingSymbol,
+) -> Result<(), Status> {
+    match admin.status(symbol).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Status::NotFound),
+        Err(error) => {
+            error!(target: "admin", underlying = %symbol, error = %error,
+                "Failed to read asset status"
+            );
+            Err(map_asset_admin_error(&error))
+        }
+    }
+}
+
+/// Read-tier freeze status of an underlying. New operator route (the verb was
+/// CLI-only), so there is no `/admin` twin.
+#[get("/ops/read/status/<underlying>")]
+pub(crate) async fn asset_status_ops(
+    _auth: ReadOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<AssetStatusResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    match admin.status(&symbol).await {
+        Ok(Some(report)) => Ok(Json(report.into())),
+        Ok(None) => Err(Status::NotFound),
+        Err(error) => {
+            error!(target: "admin", underlying, error = %error,
+                "Failed to read asset status"
+            );
+            Err(map_asset_admin_error(&error))
+        }
+    }
+}
+
+/// Capital-tier immediate freeze of an underlying on all networks. Above debug
+/// because holding a freeze gates token supply.
+#[post("/ops/capital/freeze/<underlying>")]
+pub(crate) async fn freeze_underlying_ops(
+    _auth: CapitalOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<FreezeOutcomeResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    ensure_listed(&admin, &symbol).await?;
+    let outcome = admin.freeze(&symbol).await.map_err(|error| {
+        error!(target: "admin", underlying, error = %error,
+            "Failed to freeze underlying"
+        );
+        map_asset_admin_error(&error)
+    })?;
+    Ok(Json(FreezeOutcomeResponse {
+        underlying: symbol.to_string(),
+        outcome: match outcome {
+            FreezeOutcome::Froze => "froze",
+            FreezeOutcome::OperatorHoldEnsured => "operator_hold_ensured",
+        },
+    }))
+}
+
+/// Capital-tier release of the operator freeze hold.
+#[post("/ops/capital/unfreeze/<underlying>")]
+pub(crate) async fn unfreeze_underlying_ops(
+    _auth: CapitalOps,
+    store: &rocket::State<Arc<Store<Underlying>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    underlying: &str,
+) -> Result<Json<FreezeOutcomeResponse>, Status> {
+    let symbol = parse_underlying(underlying)?;
+    let admin =
+        AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
+    ensure_listed(&admin, &symbol).await?;
+    let outcome = admin.unfreeze(&symbol).await.map_err(|error| {
+        error!(target: "admin", underlying, error = %error,
+            "Failed to unfreeze underlying"
+        );
+        map_asset_admin_error(&error)
+    })?;
+    Ok(Json(FreezeOutcomeResponse {
+        underlying: symbol.to_string(),
+        outcome: match outcome {
+            UnfreezeOutcome::Unfroze => "unfroze",
+            UnfreezeOutcome::AlreadyEnabled => "already_enabled",
+            UnfreezeOutcome::RemainsFrozen => "remains_frozen",
+        },
+    }))
+}
+
+/// Cached snapshot state of one aggregate, for the read-tier database
+/// diagnostics. The snapshot is the framework's performance cache at
+/// `last_sequence`; it can lag the event log if events were appended without a
+/// re-snapshot, and is rebuilt from events after a schema change (see SPEC).
+#[derive(Serialize)]
+pub(crate) struct SnapshotResponse {
+    aggregate_type: String,
+    aggregate_id: String,
+    last_sequence: i64,
+    snapshot_version: i64,
+    timestamp: String,
+    payload: serde_json::Value,
+}
+
+/// Read-tier database diagnostic: the cached snapshot for one aggregate. After
+/// SSH removal this is how an operator inspects an aggregate's stored state; a
+/// 404 means no snapshot is cached (not that the aggregate has no events).
+#[get("/ops/read/snapshots/<aggregate_type>/<aggregate_id>")]
+pub(crate) async fn aggregate_snapshot_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    aggregate_type: &str,
+    aggregate_id: &str,
+) -> Result<Json<SnapshotResponse>, Status> {
+    let row = sqlx::query(
+        "
+        SELECT last_sequence, payload, timestamp, snapshot_version
+        FROM snapshots
+        WHERE aggregate_type = ?
+        AND aggregate_id = ?
+        ",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|error| {
+        error!(target: "admin", aggregate_type, aggregate_id, error = %error,
+            "Failed to read aggregate snapshot"
+        );
+        Status::InternalServerError
+    })?
+    .ok_or(Status::NotFound)?;
+
+    let payload_json: String =
+        row.try_get("payload").map_err(|error| snapshot_row_error(&error))?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        error!(target: "admin", aggregate_type, aggregate_id, error = %error,
+            "Snapshot payload is not valid JSON"
+        );
+        Status::InternalServerError
+    })?;
+
+    Ok(Json(SnapshotResponse {
+        aggregate_type: aggregate_type.to_string(),
+        aggregate_id: aggregate_id.to_string(),
+        last_sequence: row
+            .try_get("last_sequence")
+            .map_err(|error| snapshot_row_error(&error))?,
+        snapshot_version: row
+            .try_get("snapshot_version")
+            .map_err(|error| snapshot_row_error(&error))?,
+        timestamp: row
+            .try_get("timestamp")
+            .map_err(|error| snapshot_row_error(&error))?,
+        payload,
+    }))
+}
+
+fn snapshot_row_error(error: &sqlx::Error) -> Status {
+    error!(target: "admin", error = %error, "Failed to decode snapshot row");
+    Status::InternalServerError
 }
 
 #[cfg(test)]
@@ -4294,6 +4737,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
+            ops_api: None,
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
             environment: Environment::Development,
@@ -4603,6 +5047,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
+            ops_api: None,
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
             environment: Environment::Development,
@@ -5791,6 +6236,7 @@ mod tests {
             signer: SignerConfig::Local(B256::ZERO),
             backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
+            ops_api: None,
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
             environment: Environment::Development,
@@ -6944,6 +7390,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
+            ops_api: None,
             log_level: LogLevel::Debug,
             log_format: LogFormat::Text,
             environment: Environment::Development,

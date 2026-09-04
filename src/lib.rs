@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
-use crate::auth::FailedAuthRateLimiter;
+use crate::auth::{FailedAuthRateLimiter, OpsApiVerifiers, build_jwks_client};
 use crate::burn_excess::{
     BurnExcess, exclusion::rebuild_funding_exclusion_index,
 };
@@ -443,7 +443,7 @@ pub async fn initialize_rocket(
     ));
     background_task_handles.push(spawn_corporate_action_freeze_worker(
         apalis_pool.clone(),
-        underlying_store,
+        underlying_store.clone(),
         pool.clone(),
         shutdown_rx.clone(),
     ));
@@ -452,11 +452,6 @@ pub async fn initialize_rocket(
         lifecycle_notifier.clone(),
         shutdown_rx.clone(),
     ));
-
-    let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
-        &apalis_pool,
-        pool.clone(),
-    );
 
     if let Some(corporate_action_feed) = corporate_action_feed {
         background_task_handles.push(spawn_corporate_action_feed(
@@ -467,6 +462,12 @@ pub async fn initialize_rocket(
     }
 
     Ok(build_rocket(RocketState {
+        freeze_scheduler: tokenized_asset::schedule::FreezeScheduler::new(
+            &apalis_pool,
+            pool.clone(),
+        ),
+        ops_verifiers: build_ops_verifiers(&config)?,
+        underlying_store,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
@@ -480,7 +481,6 @@ pub async fn initialize_rocket(
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
         configured_networks,
-        freeze_scheduler,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
         network_telemetry,
         background_tasks: BackgroundTasks {
@@ -656,6 +656,12 @@ struct RocketState {
     receipts: Arc<dyn ReceiptService>,
     /// Per network loop and gas balance telemetry for the admin surface.
     network_telemetry: Arc<NetworkTelemetry>,
+    /// Per-tier IAP verifiers for the role-gated operator API. `None` leaves
+    /// the `/ops/*` routes unmounted (no `[ops_api]` audiences configured).
+    ops_verifiers: Option<OpsApiVerifiers>,
+    /// The Underlying aggregate store backing the capital-tier freeze/unfreeze
+    /// and read-tier status ops routes.
+    underlying_store: Arc<Store<Underlying>>,
     background_tasks: BackgroundTasks,
 }
 
@@ -750,6 +756,20 @@ fn log_background_task_failure(
     }
 }
 
+/// Builds the per-tier IAP verifiers when the ops-API audiences are configured.
+/// `None` leaves the role-gated `/ops/*` routes unmounted. The fallible JWKS
+/// client build surfaces here as a startup error.
+fn build_ops_verifiers(
+    config: &Config,
+) -> Result<Option<OpsApiVerifiers>, reqwest::Error> {
+    match config.ops_api.as_ref() {
+        Some(ops_api) => {
+            Ok(Some(OpsApiVerifiers::new(ops_api, &build_jwks_client()?)))
+        }
+        None => Ok(None),
+    }
+}
+
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))
@@ -809,6 +829,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.freeze_scheduler)
         .manage(state.receipts)
         .manage(state.network_telemetry)
+        .manage(state.underlying_store)
         .mount(
             "/",
             routes![
@@ -835,6 +856,34 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
             ],
         )
         .register("/", catchers::json_catchers());
+
+    // The role-gated operator API is mounted only when the deployment
+    // configured its IAP audiences: a host with no load balancer in front of it
+    // must not expose `/ops/*` at all (a stronger guarantee than a 401).
+    let rocket = match state.ops_verifiers {
+        Some(verifiers) => rocket.manage(verifiers).mount(
+            "/",
+            routes![
+                admin::list_stuck_ops,
+                admin::recover_redemption_ops,
+                admin::reprocess_mint_ops,
+                admin::force_complete_redemption_ops,
+                admin::close_redemption_ops,
+                admin::close_mint_ops,
+                admin::schedule_freeze_window_ops,
+                admin::orchestrator_health_ops,
+                admin::asset_status_ops,
+                admin::freeze_underlying_ops,
+                admin::unfreeze_underlying_ops,
+                burn_excess::api::burn_excess_internal_ops,
+                tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
+                tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
+                tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
+                admin::aggregate_snapshot_ops,
+            ],
+        ),
+        None => rocket,
+    };
 
     mount_api_docs(rocket, environment)
 }

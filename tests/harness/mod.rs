@@ -607,6 +607,7 @@ pub fn create_config_with_db(
                 .parse()
                 .expect("Valid IP ranges"),
         },
+        ops_api: None,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,
         environment: Environment::Development,

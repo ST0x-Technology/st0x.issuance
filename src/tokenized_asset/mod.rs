@@ -3,6 +3,7 @@ pub(crate) mod cli;
 mod cmd;
 pub(crate) mod corporate_action_feed;
 mod event;
+pub(crate) mod orchestrator_ops;
 pub(crate) mod schedule;
 pub(crate) mod view;
 

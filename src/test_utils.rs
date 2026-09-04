@@ -165,6 +165,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
         auth: test_auth_config()?,
+        ops_api: None,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,
         environment: Environment::Development,

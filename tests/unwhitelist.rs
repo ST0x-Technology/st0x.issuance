@@ -72,6 +72,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
                 .parse()
                 .expect("Valid IP ranges"),
         },
+        ops_api: None,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,
         environment: Environment::Development,
