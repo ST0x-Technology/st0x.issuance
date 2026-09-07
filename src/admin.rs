@@ -52,7 +52,9 @@ use crate::vault::{
     BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
 };
-use crate::wrapped_transfer::InboundWrappedTransfer;
+use crate::wrapped_transfer::{
+    InboundWrappedTransfer, list_inbound_wrapped_transfers,
+};
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -2429,8 +2431,19 @@ pub(crate) async fn list_wrapped_transfers(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<WrappedTransfersResponse>, Status> {
-    let _ = pool;
-    todo!()
+    let transfers =
+        list_inbound_wrapped_transfers(pool.inner()).await.map_err(|err| {
+            error!(
+                target: "admin",
+                error = %err,
+                "Failed to read recorded inbound wrapped-token transfers"
+            );
+            Status::InternalServerError
+        })?;
+
+    Ok(Json(WrappedTransfersResponse {
+        transfers: transfers.into_iter().map(Into::into).collect(),
+    }))
 }
 
 /// Classification of a non-terminal view used to decide whether it counts as
