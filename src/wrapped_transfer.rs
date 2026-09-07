@@ -138,3 +138,126 @@ impl WrappedTokenConfig {
             .map(|(network, _)| *network)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Address, address};
+
+    use super::{
+        WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
+        WrappedTokenEntry,
+    };
+    use crate::tokenized_asset::{Network, UnderlyingSymbol};
+
+    fn symbol(value: &str) -> UnderlyingSymbol {
+        UnderlyingSymbol::new(value).unwrap()
+    }
+
+    fn entry(
+        network: Network,
+        underlying: &str,
+        token: Address,
+    ) -> WrappedTokenEntry {
+        WrappedTokenEntry { network, underlying: symbol(underlying), token }
+    }
+
+    const TOKEN_A: Address =
+        address!("0x00000000000000000000000000000000000000aa");
+    const TOKEN_B: Address =
+        address!("0x00000000000000000000000000000000000000bb");
+
+    /// The same address may wrap the same underlying on two chains
+    /// (deterministic deploys), and each network's watch list is sorted by
+    /// address regardless of entry order.
+    #[test]
+    fn watched_tokens_are_per_network_and_sorted_by_address() {
+        let config = WrappedTokenConfig::new([
+            entry(Network::Base, "AAPL", TOKEN_B),
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Ethereum, "RKLB", TOKEN_A),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.watched_on(Network::Base),
+            vec![
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("RKLB")
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_B,
+                    underlying: symbol("AAPL")
+                },
+            ]
+        );
+        assert_eq!(
+            config.watched_on(Network::Ethereum),
+            vec![WatchedWrappedToken {
+                token: TOKEN_A,
+                underlying: symbol("RKLB")
+            }]
+        );
+        assert!(config.watched_on(Network::HyperEvm).is_empty());
+
+        let mut networks: Vec<Network> = config.networks().collect();
+        networks.sort_unstable_by_key(Network::as_str);
+        assert_eq!(networks, vec![Network::Base, Network::Ethereum]);
+    }
+
+    #[test]
+    fn zero_address_is_rejected() {
+        let error = WrappedTokenConfig::new([entry(
+            Network::Base,
+            "RKLB",
+            Address::ZERO,
+        )])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::ZeroAddress {
+                network: Network::Base,
+                underlying: symbol("RKLB"),
+            }
+        );
+    }
+
+    /// One address cannot wrap two underlyings on one network: an inbound
+    /// transfer of it could not be attributed to an asset.
+    #[test]
+    fn one_address_for_two_underlyings_on_a_network_is_rejected() {
+        let error = WrappedTokenConfig::new([
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Base, "AAPL", TOKEN_A),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::AddressCollision {
+                network: Network::Base,
+                token: TOKEN_A,
+                first: symbol("RKLB"),
+                second: symbol("AAPL"),
+            }
+        );
+    }
+
+    #[test]
+    fn two_addresses_for_one_underlying_on_a_network_is_rejected() {
+        let error = WrappedTokenConfig::new([
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Base, "RKLB", TOKEN_B),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::DuplicateUnderlying {
+                network: Network::Base,
+                underlying: symbol("RKLB"),
+            }
+        );
+    }
+}

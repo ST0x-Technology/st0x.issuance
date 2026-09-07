@@ -24,7 +24,7 @@ use crate::notifications::{
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig, console_fmt_layer};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
-use crate::wrapped_transfer::WrappedTokenConfig;
+use crate::wrapped_transfer::{WrappedTokenConfig, WrappedTokenConfigError};
 
 /// How a specific tokenized asset's mint/burn is executed on-chain.
 ///
@@ -530,11 +530,14 @@ impl Env {
         let signer = self.signer.into_config()?;
         let hyperdx =
             self.hyperdx.into_config(log_level_tracing, self.log_format);
-        let vault_mode_config = if let Some(config_path) = self.config {
-            load_vault_mode_config(&config_path)?
-        } else {
-            VaultModeConfig::default()
-        };
+        let ConfigFile { vault_modes: vault_mode_config, wrapped_tokens } =
+            match self.config {
+                Some(config_path) => load_config_file(&config_path)?,
+                None => ConfigFile {
+                    vault_modes: VaultModeConfig::default(),
+                    wrapped_tokens: WrappedTokenConfig::default(),
+                },
+            };
 
         // While anything resolves to orchestrator kind, every configured
         // chain must carry an `[orchestrator.addresses]` entry — a missing
@@ -566,8 +569,7 @@ impl Env {
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
-            wrapped_tokens:
-                crate::wrapped_transfer::WrappedTokenConfig::default(),
+            wrapped_tokens,
             wrapped_transfer_poll_interval:
                 crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
             auth: self.auth,
@@ -1008,6 +1010,38 @@ pub enum ConfigError {
         error: UnderlyingSymbolError,
     },
     #[error(
+        "Invalid [wrapped_tokens] table '{key}': not a known network \
+         (expected one of: base, ethereum, hyperevm)"
+    )]
+    UnknownWrappedTokenNetwork { key: String },
+    #[error("Invalid [wrapped_tokens.{network}] key '{symbol}': {error}")]
+    InvalidWrappedTokenSymbol {
+        network: Network,
+        symbol: String,
+        #[source]
+        error: UnderlyingSymbolError,
+    },
+    #[error(
+        "Invalid [wrapped_tokens.{network}] entry for {underlying}: \
+         '{value}' is not a valid EVM address"
+    )]
+    InvalidWrappedTokenAddress {
+        network: Network,
+        underlying: UnderlyingSymbol,
+        value: String,
+    },
+    #[error(transparent)]
+    WrappedTokens(#[from] WrappedTokenConfigError),
+    #[error(
+        "[wrapped_tokens.{network}] is configured but {network} has no chain \
+         configuration; add the CHAIN_{network_upper}_* group or remove the \
+         table"
+    )]
+    WrappedTokensForUnconfiguredNetwork {
+        network: Network,
+        network_upper: String,
+    },
+    #[error(
         "multiple [assets] keys normalize to '{symbol}'; keep exactly one \
          entry per asset"
     )]
@@ -1024,6 +1058,11 @@ struct TomlFile {
     orchestrator: Option<OrchestratorSection>,
     #[serde(default)]
     assets: HashMap<String, AssetSection>,
+    /// `[wrapped_tokens.<network>]` tables: underlying symbol to that chain's
+    /// wrapped-token contract address. Keys and values are validated in
+    /// `resolve_wrapped_tokens`.
+    #[serde(default)]
+    wrapped_tokens: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1051,24 +1090,43 @@ enum VaultModeStr {
     Orchestrator,
 }
 
-/// Reads and validates the TOML config file at `path` into a
-/// [`VaultModeConfig`]. The single loading path shared by server startup
-/// (`Env::into_config`) and the issuer CLI, so both apply identical strict
-/// parsing and validation.
+/// The validated contents of the `--config` TOML file.
+pub(crate) struct ConfigFile {
+    pub(crate) vault_modes: VaultModeConfig,
+    pub(crate) wrapped_tokens: WrappedTokenConfig,
+}
+
+/// Reads and validates the TOML config file at `path`. The single loading
+/// path shared by server startup (`Env::into_config`) and the issuer CLI, so
+/// both apply identical strict parsing and validation.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, is not valid TOML for the
 /// strict schema (unknown keys are rejected), or fails the validation rules
-/// of [`resolve_vault_modes`].
-pub(crate) fn load_vault_mode_config(
-    path: &Path,
-) -> Result<VaultModeConfig, ConfigError> {
+/// of [`resolve_vault_modes`] or [`resolve_wrapped_tokens`].
+pub(crate) fn load_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
     let content = std::fs::read_to_string(path).map_err(|error| {
         ConfigError::ConfigFileRead { path: path.to_path_buf(), error }
     })?;
     let toml_file: TomlFile = toml::from_str(&content)?;
-    resolve_vault_modes(&toml_file)
+
+    Ok(ConfigFile {
+        vault_modes: resolve_vault_modes(&toml_file)?,
+        wrapped_tokens: resolve_wrapped_tokens(&toml_file)?,
+    })
+}
+
+/// Converts the `[wrapped_tokens.<network>]` tables into a validated
+/// [`WrappedTokenConfig`]: network keys must be known wire names, symbol keys
+/// are validated and upper-cased like `[assets]` keys, and addresses must
+/// parse; the zero-address and collision rules live in
+/// [`WrappedTokenConfig::new`].
+fn resolve_wrapped_tokens(
+    toml: &TomlFile,
+) -> Result<WrappedTokenConfig, ConfigError> {
+    let _ = toml;
+    todo!()
 }
 
 /// Converts the raw TOML file into a validated `VaultModeConfig`.
@@ -1972,11 +2030,20 @@ mod tests {
             cfg.orchestrator_address_for(Network::Base),
             Some(orch_address())
         );
+
+        let wrapped = resolve_wrapped_tokens(&toml_file).unwrap();
+        let watched = wrapped.watched_on(Network::Base);
+        assert_eq!(watched.len(), 1, "the example must list one Base wrapper");
+        assert_eq!(
+            watched[0].underlying,
+            UnderlyingSymbol::new("RKLB").unwrap()
+        );
     }
 
     #[test]
     fn per_asset_override_to_orchestrator() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: None,
@@ -1999,6 +2066,7 @@ mod tests {
     #[test]
     fn per_asset_override_to_vault_direct_ignores_default() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
@@ -2021,6 +2089,7 @@ mod tests {
     #[test]
     fn no_per_asset_override_uses_default_vault_mode() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
@@ -2035,7 +2104,11 @@ mod tests {
 
     #[test]
     fn no_orchestrator_section_defaults_to_vault_direct() {
-        let toml = TomlFile { orchestrator: None, assets: HashMap::new() };
+        let toml = TomlFile {
+            orchestrator: None,
+            assets: HashMap::new(),
+            wrapped_tokens: HashMap::new(),
+        };
 
         let cfg = resolve_vault_modes(&toml).unwrap();
 
@@ -2047,6 +2120,7 @@ mod tests {
     #[test]
     fn orchestrator_asset_without_addresses_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: None,
                 default_vault_mode: None,
@@ -2066,6 +2140,7 @@ mod tests {
     #[test]
     fn default_orchestrator_without_addresses_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(HashMap::new()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),
@@ -2082,6 +2157,7 @@ mod tests {
     #[test]
     fn invalid_orchestrator_address_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(HashMap::from([(
                     "base".to_string(),
@@ -2101,6 +2177,7 @@ mod tests {
     #[test]
     fn unknown_orchestrator_network_key_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(HashMap::from([(
                     "solana".to_string(),
@@ -2238,6 +2315,7 @@ mod tests {
     #[test]
     fn orchestrator_addresses_exposed_while_all_assets_vault_direct() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: None,
@@ -2257,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn load_vault_mode_config_reads_and_resolves_file() {
+    fn load_config_file_reads_and_resolves_file() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
@@ -2272,7 +2350,7 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_vault_mode_config(file.path()).unwrap();
+        let cfg = load_config_file(file.path()).unwrap().vault_modes;
 
         assert_eq!(
             cfg.per_asset.get("RKLB").copied(),
@@ -2290,18 +2368,179 @@ mod tests {
     }
 
     #[test]
-    fn load_vault_mode_config_missing_file_is_read_error() {
+    fn load_config_file_missing_file_is_read_error() {
         let missing = PathBuf::from("/nonexistent/issuance-config.toml");
 
         assert!(matches!(
-            load_vault_mode_config(&missing),
+            load_config_file(&missing),
             Err(ConfigError::ConfigFileRead { path, .. }) if path == missing
         ));
+    }
+
+    fn wrapped_token_address() -> Address {
+        address!("0x00000000000000000000000000000000000000ee")
+    }
+
+    /// `[wrapped_tokens.<network>]` tables resolve per network with symbol
+    /// keys normalized the way `[assets]` keys are, so `rklb` on Base
+    /// configures RKLB rather than silently configuring nothing.
+    #[test]
+    fn wrapped_tokens_tables_resolve_per_network_with_normalized_symbols() {
+        let toml: TomlFile = toml::from_str(
+            r#"
+            [wrapped_tokens.base]
+            rklb = "0x00000000000000000000000000000000000000ee"
+            AAPL = "0x00000000000000000000000000000000000000ff"
+
+            [wrapped_tokens.ethereum]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = resolve_wrapped_tokens(&toml).unwrap();
+
+        let base = cfg.watched_on(Network::Base);
+        assert_eq!(base.len(), 2);
+        assert_eq!(base[0].token, wrapped_token_address());
+        assert_eq!(base[0].underlying, UnderlyingSymbol::new("RKLB").unwrap());
+        assert_eq!(base[1].underlying, UnderlyingSymbol::new("AAPL").unwrap());
+        assert_eq!(cfg.watched_on(Network::Ethereum).len(), 1);
+        assert!(cfg.watched_on(Network::HyperEvm).is_empty());
+    }
+
+    #[test]
+    fn wrapped_tokens_unknown_network_table_is_startup_error() {
+        let toml: TomlFile = toml::from_str(
+            r#"
+            [wrapped_tokens.polygon]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolve_wrapped_tokens(&toml),
+            Err(ConfigError::UnknownWrappedTokenNetwork { key }) if key == "polygon"
+        ));
+    }
+
+    #[test]
+    fn wrapped_tokens_malformed_address_is_startup_error() {
+        let toml: TomlFile = toml::from_str(
+            r#"
+            [wrapped_tokens.base]
+            RKLB = "not-an-address"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolve_wrapped_tokens(&toml),
+            Err(ConfigError::InvalidWrappedTokenAddress {
+                network: Network::Base,
+                underlying,
+                value,
+            }) if underlying.as_str() == "RKLB" && value == "not-an-address"
+        ));
+    }
+
+    #[test]
+    fn wrapped_tokens_zero_address_is_startup_error() {
+        let toml: TomlFile = toml::from_str(
+            r#"
+            [wrapped_tokens.base]
+            RKLB = "0x0000000000000000000000000000000000000000"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolve_wrapped_tokens(&toml),
+            Err(ConfigError::WrappedTokens(
+                WrappedTokenConfigError::ZeroAddress {
+                    network: Network::Base,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn wrapped_tokens_blank_symbol_key_is_startup_error() {
+        let toml: TomlFile = toml::from_str(
+            r#"
+            [wrapped_tokens.base]
+            " " = "0x00000000000000000000000000000000000000ee"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolve_wrapped_tokens(&toml),
+            Err(ConfigError::InvalidWrappedTokenSymbol {
+                network: Network::Base,
+                ..
+            })
+        ));
+    }
+
+    /// A wrapped-token table for a chain the deployment does not run would
+    /// be silently unwatched, which is the exact gap this feature closes.
+    #[test]
+    fn wrapped_tokens_for_unconfigured_network_is_startup_error() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [wrapped_tokens.ethereum]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+            "#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let mut args = minimal_args();
+        args.extend(["--config", path]);
+
+        let env = Env::try_parse_from(args).unwrap();
+
+        assert!(matches!(
+            env.into_config(),
+            Err(ConfigError::WrappedTokensForUnconfiguredNetwork {
+                network: Network::Ethereum,
+                ..
+            })
+        ));
+    }
+
+    /// The loaded file's wrapped tokens reach `Config` for the chain that is
+    /// configured, so the watcher spawn site sees them.
+    #[test]
+    fn wrapped_tokens_for_configured_network_reach_config() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            [wrapped_tokens.base]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+            "#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let mut args = minimal_args();
+        args.extend(["--config", path]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        let watched = config.wrapped_tokens.watched_on(Network::Base);
+        assert_eq!(watched.len(), 1);
+        assert_eq!(watched[0].token, wrapped_token_address());
     }
 
     #[test]
     fn zero_orchestrator_address_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(HashMap::from([(
                     "base".to_string(),
@@ -2329,6 +2568,7 @@ mod tests {
     #[test]
     fn lowercase_asset_key_normalizes_to_the_stored_symbol() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: None,
@@ -2351,6 +2591,7 @@ mod tests {
     #[test]
     fn blank_asset_key_is_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: None,
             assets: HashMap::from([(
                 "  ".to_string(),
@@ -2368,6 +2609,7 @@ mod tests {
     #[test]
     fn asset_keys_colliding_after_normalization_are_a_startup_error() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: None,
             assets: HashMap::from([
                 (
@@ -2419,6 +2661,7 @@ mod tests {
     #[test]
     fn vault_mode_for_uses_per_asset_override_then_default() {
         let toml = TomlFile {
+            wrapped_tokens: HashMap::new(),
             orchestrator: Some(OrchestratorSection {
                 addresses: Some(base_addresses()),
                 default_vault_mode: Some(VaultModeStr::Orchestrator),

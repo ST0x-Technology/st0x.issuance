@@ -24,8 +24,7 @@ use crate::burn_excess::cli::{
 };
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
-    LogLevel, VaultModeConfig, VaultModeKind, load_vault_mode_config,
-    setup_tracing,
+    LogLevel, VaultModeConfig, VaultModeKind, load_config_file, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -724,7 +723,7 @@ async fn run_orchestrator_preflight(
         );
     }
 
-    let vault_modes = load_vault_mode_config(&args.config)?;
+    let vault_modes = load_config_file(&args.config)?.vault_modes;
     let orchestrator =
         orchestrator_address_from(&vault_modes, &args.config, args.network)?;
 
@@ -964,7 +963,8 @@ async fn run_move_receipts(
         );
     }
 
-    let configured_orchestrator = load_vault_mode_config(&args.config)?
+    let configured_orchestrator = load_config_file(&args.config)?
+        .vault_modes
         .orchestrator_address_for(args.network);
     let destination = match (
         args.destination.to,
@@ -1212,7 +1212,7 @@ fn required_orchestrator_address(
     config: &Path,
     network: Network,
 ) -> anyhow::Result<Address> {
-    let vault_modes = load_vault_mode_config(config)?;
+    let vault_modes = load_config_file(config)?.vault_modes;
     orchestrator_address_from(&vault_modes, config, network)
 }
 
@@ -1231,7 +1231,7 @@ fn orchestrator_address_from(
         );
     };
 
-    // No zero-address guard here: `load_vault_mode_config` already refuses a
+    // No zero-address guard here: `load_config_file` already refuses a
     // zero `[orchestrator.addresses]` entry at parse time, for the service
     // and these commands alike.
     Ok(orchestrator)
