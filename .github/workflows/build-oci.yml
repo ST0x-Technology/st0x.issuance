@@ -1,0 +1,317 @@
+name: build-oci
+
+# Issuance bot OCI image -> s01-artifacts Artifact Registry (s01-issuance
+# repo): nix build the flake's dockerTools image -> smoke test -> push
+# digest -> sign (GitHub/Sigstore + the s01-artifacts issuance-image KMS
+# attestor) -> roll staging once the GCP staging VM exists.
+#
+# A MERGE TO MAIN DEPLOYS GCP STAGING (roll-staging job at the bottom): the
+# staging plane is a GCE VM that pulls its deploy state, so the job writes
+# the digest into the images.env object the VM's roll timer polls. The VM
+# verifies the issuance-image attestation of everything it adopts, so this
+# job cannot make it run an unsigned image. Whether the roll is ARMED is
+# derived, not configured: the deploy identity's only access to that object
+# is a grant the devops side creates when it flips images.yaml ci_rolls to
+# true, so the job probes the object first and stands down cleanly while the
+# grant does not exist.
+#
+# Auth: GitHub OIDC -> the s01-artifacts WIF provider, bound to
+# issuance-deployer (main only; the WIF binding lives in s01.devops
+# terraform/artifacts/issuance.tf). PRs get nothing. The provider path,
+# deployer SA and attestor are the s01.devops artifacts stack's outputs;
+# they change only if that project is rebuilt.
+#
+# Coexists with deploy-staging.yaml / deploy-prod.yaml (the DigitalOcean
+# deploy-rs path) until the staging cutover retires the staging half.
+#
+# PRODUCTION IS NOT DEPLOYED FROM THIS REPO: promote a staging-proven digest
+# via s01.devops (gated apply). This SA holds nothing in production.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-oci
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  # GitHub/Sigstore provenance attestation on every pushed digest.
+  attestations: write
+
+env:
+  REGION: europe-west3
+  AR_REPO: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+  WIF_PROVIDER: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  DEPLOYER_SA: issuance-deployer@s01-artifacts.iam.gserviceaccount.com
+  ATTESTOR: projects/s01-artifacts/attestors/issuance-image
+  # Local docker name the flake's streamLayeredImage loads as
+  # (nix/oci-image.nix `name`) and the AR image name; the same string on
+  # purpose.
+  IMAGE: s01-issuance
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+
+      # Same pins as rainix.yaml / deploy-*.yaml, for the reason recorded
+      # there (Nix 2.24-2.28 cannot resolve rainix's overridden `foundry`
+      # input; 2.31.5 on v35 works). One toolchain for CI and the release
+      # image.
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
+        with:
+          nix_version: "2.31.5"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      # Restores the deploy/test caches on a key miss (same crane
+      # cargoArtifacts for the same Cargo.lock), saves under its own key,
+      # and stays inside the siblings' 5G cap so a save never evicts them.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-oci-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: |
+            nix-oci-${{ runner.os }}-
+            nix-deploy-${{ runner.os }}-
+            nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+        with:
+          # `container binauthz` lives in the beta component.
+          install_components: beta
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build OCI image from the flake
+        run: |
+          set -euo pipefail
+          nix build .#bot-oci
+          # streamLayeredImage output is a script that streams the tar.
+          ./result | docker load
+          docker tag "${IMAGE}:latest" "${AR_REPO}/${IMAGE}:${GITHUB_SHA}"
+
+      # scripts/smoke-test-image.nu: the binary must reach its own config
+      # parsing; distinguishes a hang from a crash.
+      - name: Smoke-test the image
+        run: nix run .#smoke-test-image -- "${AR_REPO}/${IMAGE}:${GITHUB_SHA}"
+
+      - name: Push image and resolve digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${AR_REPO}/${IMAGE}:${GITHUB_SHA}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${AR_REPO}/${IMAGE}:${GITHUB_SHA}")
+          echo "Pushed: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+
+      # Two independent provenance proofs: the GitHub/Sigstore attestation is
+      # non-blocking (needs a paid plan on private repos); the KMS/BinAuthz
+      # attestation below is the one the VM's roll timer verifies and MUST
+      # succeed.
+      - name: Attest build provenance (GitHub / Sigstore)
+        continue-on-error: true
+        uses: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4  # v4.2.2
+        with:
+          subject-name: ${{ env.AR_REPO }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.sha256 }}
+
+      # Signs with whichever key version the attestor currently lists, so a
+      # key rotation on the devops side needs no change here. Nix image
+      # builds are reproducible, so a push that does not change the image
+      # reproduces its digest, and sign-and-create 409s on the existing
+      # (attestor, digest) occurrence; tolerating that is sound, the
+      # attestation the VM verifies is already in place. Detected from the
+      # error text: the deployer may attach occurrences but cannot list
+      # them, and a denied list would look like an empty one.
+      - name: Sign Binary Authorization attestation
+        run: |
+          set -euo pipefail
+          KEY_VERSION=$(gcloud container binauthz attestors describe issuance-image \
+            --project=s01-artifacts \
+            --format='value(userOwnedGrafeasNote.publicKeys[0].id)')
+          case "$KEY_VERSION" in
+            projects/s01-artifacts/locations/*/cryptoKeyVersions/*) ;;
+            *) echo "::error::could not resolve the attestor's key version (got '${KEY_VERSION}')"; exit 1 ;;
+          esac
+          if ! output=$(gcloud beta container binauthz attestations sign-and-create \
+            --project="s01-artifacts" \
+            --artifact-url="${{ steps.push.outputs.digest }}" \
+            --attestor="${ATTESTOR}" \
+            --keyversion="${KEY_VERSION}" 2>&1); then
+            printf '%s\n' "$output"
+            grep -q "is the subject of a conflict" <<<"$output" || exit 1
+            echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
+          fi
+
+  # STAGING ROLLS ON EVERY MAIN MERGE once armed. What this job may touch is
+  # exactly one object: the IAM grant behind DEPLOYER_SA is objectAdmin
+  # conditioned to gs://s01-issuance-staging-config/images.env (s01.devops
+  # terraform/staging-issuance), created only when images.yaml ci_rolls is
+  # true. It rewrites the BOT_IMAGE line in place and preserves every other
+  # line byte for byte, in particular GATED_SERVICE_REPLICAS, the workload
+  # gate, which must never be settable from this repo. Terraform reads the
+  # digest back on every plan, so an apply recomposes what this job wrote
+  # instead of undoing it.
+  roll-staging:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      CONFIG_BUCKET: s01-issuance-staging-config
+      DIGEST: ${{ needs.build-push.outputs.digest }}
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+
+      # Armed-ness is the grant: no access to images.env means the devops
+      # side has not flipped ci_rolls (or has flipped it back to pin a
+      # digest by manifest), and the right outcome is a clean stand-down,
+      # not a red build. It is a WARNING annotation (yellow on the run and
+      # in the PR checks), with the exact answer quoted, so a grant that
+      # was meant to be there but was misapplied is visible on the very
+      # next merge rather than hiding behind a green tick. Anything other
+      # than a permission or not-found answer is a real failure.
+      - name: Probe the deploy state object
+        id: probe
+        run: |
+          set -euo pipefail
+          if out=$(gcloud storage objects describe "gs://${CONFIG_BUCKET}/images.env" \
+              --format='value(generation)' 2>&1); then
+            echo "generation=${out}" >> "$GITHUB_OUTPUT"
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+          elif grep -qiE "403|permission|denied|404|not found|no such object" <<<"$out"; then
+            echo "::warning title=staging roll not armed::no access to gs://${CONFIG_BUCKET}/images.env; image pushed and attested, nothing deployed. If ci_rolls is meant to be on, the deployer's images.env grant is missing. gcloud said: ${out}"
+            {
+              echo "### staging roll: not armed"
+              echo "Image pushed and attested; no deploy. \`gcloud storage objects describe\` answered:"
+              echo '```'
+              echo "$out"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+      - name: Rewrite images.env with the digest just built
+        if: steps.probe.outputs.armed == 'true'
+        id: roll
+        run: |
+          set -euo pipefail
+          if ! grep -qE "^${AR_REPO}/${IMAGE}@sha256:[0-9a-f]{64}$" <<<"$DIGEST"; then
+            echo "::error::build-push handed over an unexpected digest ('${DIGEST}')"
+            exit 1
+          fi
+
+          # The generation from the probe pins the precondition on the write
+          # across the whole read-modify-write: a concurrent writer (a devops
+          # apply) fails the cp itself instead of being caught only by the
+          # read-back.
+          GENERATION="${{ steps.probe.outputs.generation }}"
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
+          cp current.env next.env
+
+          # Refuse to write a file that is missing anything: a dropped
+          # GATED_SERVICE_REPLICAS takes the whole stack unit down.
+          for key in BOT_IMAGE GATED_SERVICE_REPLICAS; do
+            grep -q "^${key}=" current.env \
+              || { echo "::error::images.env has no ${key}; refusing to write"; exit 1; }
+          done
+
+          sed -i "s|^BOT_IMAGE=.*|BOT_IMAGE=${DIGEST}|" next.env
+
+          echo "--- images.env ---"
+          cat next.env
+
+          echo "gated=$(grep -qx 'GATED_SERVICE_REPLICAS=0' next.env && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "bot=$(grep -m1 '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+
+          if cmp -s current.env next.env; then
+            echo "::notice::images.env already carries this digest; verifying adoption only"
+            exit 0
+          fi
+
+          gcloud storage cp --if-generation-match="$GENERATION" \
+            next.env "gs://${CONFIG_BUCKET}/images.env" || {
+            echo "::error::images.env changed under us (a concurrent devops apply?); re-run this job"
+            exit 1
+          }
+
+          # Read back: Terraform writes this object too; losing that race
+          # must be a red job, not a box that quietly rolls backwards.
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > readback.env
+          cmp -s next.env readback.env || {
+            echo "::error::images.env was overwritten by another writer; re-run this job"
+            diff -u next.env readback.env || true
+            exit 1
+          }
+
+      # The roll is only real once the box has taken it: the timer publishes
+      # deployed.env after a SUCCESSFUL stack restart. Runs whenever the
+      # workload is not gated off, including when the write above was a
+      # no-op: after a failed roll a re-run's write changes nothing and the
+      # verification must still happen.
+      - name: Wait for the VM to adopt it
+        if: steps.probe.outputs.armed == 'true' && steps.roll.outputs.gated == 'false'
+        run: |
+          set -euo pipefail
+          want="${{ steps.roll.outputs.bot }}"
+          for _ in $(seq 1 40); do
+            if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
+              if grep -qxF "$want" <<<"$out"; then
+                echo "::notice::s01-issuance-staging rolled to ${GITHUB_SHA}"
+                exit 0
+              fi
+            elif grep -qiE "403|permission|denied" <<<"$out"; then
+              echo "::error::cannot READ deployed.env; the deployer SA lacks the read grant (s01.devops staging-issuance):"
+              echo "$out"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::the VM has not published this digest after 10 minutes." \
+            "Check the roll timer: gcloud compute ssh s01-issuance-staging --project s01-issuance-staging" \
+            "--zone europe-west3-a --tunnel-through-iap --command 'journalctl -u s01-issuance-staging-roll -n 50'"
+          exit 1
