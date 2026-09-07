@@ -216,6 +216,30 @@ impl RealBlockchainService {
     }
 }
 
+fn classify_burn_broadcast_error(
+    error: VaultError,
+    sendable_tx: &SendableTxWithHash,
+) -> VaultError {
+    if let VaultError::Rpc(alloy::transports::RpcError::ErrorResp(response)) =
+        &error
+        && is_nonce_too_low_message(&response.message)
+    {
+        return VaultError::BurnNonceTooLow {
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+        };
+    }
+
+    error
+}
+
+fn is_nonce_too_low_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["nonce too low", "nonce is too low", "oldnonce", "old nonce"]
+        .iter()
+        .any(|indicator| message.contains(indicator))
+}
+
 #[async_trait]
 impl VaultService for RealBlockchainService {
     async fn prepare_mint_tx(
@@ -513,7 +537,10 @@ impl VaultService for RealBlockchainService {
         sendable_tx.validate_for_owner(params.owner)?;
         if self
             .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
-            .await?
+            .await
+            .map_err(|error| {
+                classify_burn_broadcast_error(error, &sendable_tx)
+            })?
             .is_none()
         {
             debug!(target: "vault", tx_hash = %sendable_tx.hash,
@@ -945,7 +972,8 @@ impl VaultService for RealBlockchainService {
         sendable_tx.validate_for_owner(params.owner)?;
         if self
             .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
-            .await?
+            .await
+            .map_err(|error| classify_burn_broadcast_error(error, sendable_tx))?
             .is_none()
         {
             debug!(target: "vault", tx_hash = %sendable_tx.hash,
@@ -2918,6 +2946,46 @@ mod tests {
             Err(VaultError::BroadcastHashMismatch { expected, returned: actual })
                 if expected == prepared_tx.hash && actual == returned
         ));
+    }
+
+    #[tokio::test]
+    async fn submit_burn_classifies_common_nonce_too_low_phrasings() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        for message in [
+            "nonce too low: next nonce 1860, tx nonce 1858",
+            "nonce is too low",
+            "OldNonce",
+        ] {
+            let asserter = Asserter::new();
+            asserter.push_failure(ErrorPayload {
+                code: -32000,
+                message: message.into(),
+                data: None,
+            });
+            asserter.push_success(&Option::<RpcTransaction>::None);
+            let service = create_service_with_asserter(asserter);
+
+            let result = service
+                .submit_burn(
+                    test_multi_burn_params(prepared_tx.signer_for_test()),
+                    prepared_tx.clone(),
+                )
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(VaultError::BurnNonceTooLow { tx_hash, nonce })
+                        if tx_hash == prepared_tx.hash
+                            && nonce == prepared_tx.nonce
+                ),
+                "RPC message `{message}` should classify as nonce too low"
+            );
+        }
     }
 
     #[tokio::test]

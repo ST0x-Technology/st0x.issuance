@@ -280,6 +280,21 @@ checkpoint out of block order. Redemption transfer backfill runs as background
 startup work. Restarts resume after the last successfully processed block
 instead of rescanning the full configured historical range.
 
+## Per network monitoring
+
+Every configured chain gets a gas balance monitor on the issuer wallet's native
+balance (ETH on Base and Ethereum, HYPE on HyperEVM). Thresholds come from
+`CHAIN_<NETWORK>_LOW_GAS_THRESHOLD` (or the flat `LOW_GAS_THRESHOLD` for the
+legacy Base configuration) as decimal native token amounts; a balance below the
+threshold raises an ERROR log and a Telegram lifecycle notification,
+deduplicated to at most one repeat alert per hour. Thresholds are all or nothing
+across configured chains; with none set, monitoring is disabled with a startup
+WARN.
+
+`GET /admin/network-telemetry` reports per network telemetry: transfer poller
+and receipt backfill pass counters with failure rate and block lag, plus the gas
+monitor's latest reading. See SPEC.md "Per network monitoring".
+
 ## Configuration
 
 Configuration comes from two non-overlapping sources:
@@ -383,3 +398,16 @@ Before submitting changes, always run in order:
 
 For detailed architectural patterns and design decisions, see
 [SPEC.md](SPEC.md).
+
+## GCP release path
+
+Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
+`st0x-issuance` binary (`nix build .#bot-oci`, contract in
+`nix/oci-image.nix`). `.github/workflows/build-oci.yml` pushes it to the
+`s01-issuance` Artifact Registry, signs its attestation, and, once the
+devops side has armed it, writes the digest into the GCP staging VM's
+deploy state (a merge to main is a staging deploy). Pushing a `vX.Y.Z` tag
+labels that commit's attested image (`release-tag.yml`); production is
+promoted from that label on the devops side, never from this repo.
+`nix run .#smoke-test-image -- <image>` runs the same startup check CI
+does.

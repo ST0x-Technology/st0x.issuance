@@ -306,6 +306,14 @@
               issuer
               ;
 
+            inherit
+              (import ./nix/oci-image.nix {
+                inherit pkgs;
+                inherit (rust) st0x-issuance;
+              })
+              bot-oci
+              ;
+
             bootstrap = pkgs.writeShellApplication {
               name = "bootstrap-nixos";
               runtimeInputs =

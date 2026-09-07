@@ -39,7 +39,8 @@ use crate::notifications::{
     SendLifecycleNotification, release_dead_lifecycle_notification_job,
 };
 use crate::underlying::{
-    FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand, UnderlyingEvent,
+    FreezeAdmissionGuard, FreezeHoldId, FreezeWindow, Underlying,
+    UnderlyingCommand, UnderlyingEvent, acquire_freeze_admission,
     persisted_event_changed_freeze_status, with_freeze_admission,
 };
 
@@ -136,12 +137,20 @@ pub(crate) struct RevisionReadTestHook {
 
 static CORPORATE_ACTION_REVISION_GUARD: Mutex<()> = Mutex::const_new(());
 
+/// Proof that a caller owns the single-process corporate-action revision
+/// boundary.
+pub(crate) struct CorporateActionRevisionGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
 /// Serializes projection commits with the action-owned hold effects authorized
 /// by their expected revision. The issuer is a single-writer service, so one
 /// process-wide guard closes this boundary without a distributed lease.
 pub(crate) async fn acquire_corporate_action_revision_guard()
--> MutexGuard<'static, ()> {
-    CORPORATE_ACTION_REVISION_GUARD.lock().await
+-> CorporateActionRevisionGuard {
+    CorporateActionRevisionGuard {
+        _guard: CORPORATE_ACTION_REVISION_GUARD.lock().await,
+    }
 }
 
 const CORPORATE_ACTION_ALIGNMENT_MAX_ATTEMPTS: u32 = 10;
@@ -426,124 +435,137 @@ impl Job<CorporateActionFreezeCtx> for AlignCorporateActionFreeze {
         &self,
         ctx: &CorporateActionFreezeCtx,
     ) -> Result<Self::Output, Self::Error> {
-        let _revision_guard = acquire_corporate_action_revision_guard().await;
-        let Some((event_id, underlying, ex_date, deleted)) =
-            sqlx::query_as::<_, (String, String, String, i64)>(
-                "
-                SELECT event_id, underlying, ex_date, deleted
-                FROM corporate_action_schedule
-                WHERE action_id = ?
-                ",
-            )
-            .bind(self.action_id.as_str())
-            .fetch_optional(&ctx.pool)
-            .await?
-        else {
-            return Ok(());
-        };
+        let revision_guard = acquire_corporate_action_revision_guard().await;
+        // Revision always precedes admission. Feed projection uses this same
+        // ordering, so the two paths cannot deadlock one another.
+        let admission_guard = acquire_freeze_admission().await;
+        align_corporate_action_freeze_under_guards(
+            self,
+            ctx,
+            &revision_guard,
+            &admission_guard,
+        )
+        .await
+    }
+}
 
-        if event_id != self.expected_event_id.as_str() {
-            return Ok(());
-        }
-
-        #[cfg(test)]
-        if let Some(hook) = &ctx.revision_read_test_hook {
-            hook.observed.wait().await;
-            hook.release.wait().await;
-        }
-
-        let underlying_symbol =
-            UnderlyingSymbol::new(&underlying).map_err(|_| {
-                CorporateActionFreezeError::InvalidUnderlying(
-                    underlying.clone(),
-                )
-            })?;
-        let ex_date =
-            NaiveDate::parse_from_str(&ex_date, "%Y-%m-%d").map_err(|_| {
-                CorporateActionFreezeError::InvalidExDate(ex_date.clone())
-            })?;
-        let freeze_at = DateTime::<Utc>::from_naive_utc_and_offset(
-            ex_date.and_time(NaiveTime::MIN),
-            Utc,
-        );
-        let unfreeze_at = ex_date
-            .succ_opt()
-            .map(|value| {
-                DateTime::<Utc>::from_naive_utc_and_offset(
-                    value.and_time(NaiveTime::MIN),
-                    Utc,
-                )
-            })
-            .ok_or(CorporateActionFreezeError::ExDateWithoutFollowingDay(
-                ex_date,
-            ))?;
-        let now = Utc::now();
-        let hold_id =
-            FreezeHoldId::alpaca_corporate_action(self.action_id.clone());
-        let should_hold = deleted == 0
-            && underlying_has_listing(&ctx.pool, &underlying_symbol).await?
-            && now >= freeze_at
-            && now < unfreeze_at;
-        let observed_underlyings: Vec<String> = sqlx::query_scalar(
+/// Aligns one projected revision while the caller owns both ordering guards.
+/// Requiring the guard proofs keeps cursor projection, hold state, and mint
+/// admission in one explicit critical section.
+pub(crate) async fn align_corporate_action_freeze_under_guards(
+    alignment: &AlignCorporateActionFreeze,
+    ctx: &CorporateActionFreezeCtx,
+    _revision_guard: &CorporateActionRevisionGuard,
+    _admission_guard: &FreezeAdmissionGuard,
+) -> Result<(), CorporateActionFreezeError> {
+    let Some((event_id, underlying, ex_date, deleted)) =
+        sqlx::query_as::<_, (String, String, String, i64)>(
             "
-            SELECT DISTINCT underlying
-            FROM corporate_action_mutations
-            WHERE action_id = ? AND underlying IS NOT NULL
+            SELECT event_id, underlying, ex_date, deleted
+            FROM corporate_action_schedule
+            WHERE action_id = ?
             ",
         )
-        .bind(self.action_id.as_str())
-        .fetch_all(&ctx.pool)
-        .await?;
+        .bind(alignment.action_id.as_str())
+        .fetch_optional(&ctx.pool)
+        .await?
+    else {
+        return Ok(());
+    };
 
-        if should_hold {
-            // `perform` holds the revision guard before entering freeze
-            // admission. Every caller that needs both must keep that order;
-            // acquiring them in reverse would deadlock the issuer process.
-            with_freeze_admission(|| async {
-                ctx.underlying_store
-                    .send(
-                        &underlying_symbol,
-                        UnderlyingCommand::AcquireFreezeHold {
-                            underlying: underlying_symbol.clone(),
-                            hold_id: hold_id.clone(),
-                            acquired_at: now,
-                        },
-                    )
-                    .await
-                    .map_err(|source| {
-                        CorporateActionFreezeError::Aggregate(Box::new(source))
-                    })
-            })
-            .await?;
-        }
-
-        for observed_underlying in observed_underlyings {
-            let observed_underlying =
-                UnderlyingSymbol::new(&observed_underlying).map_err(|_| {
-                    CorporateActionFreezeError::InvalidUnderlying(
-                        observed_underlying.clone(),
-                    )
-                })?;
-            if should_hold && observed_underlying == underlying_symbol {
-                continue;
-            }
-            ctx.underlying_store
-                .send(
-                    &observed_underlying,
-                    UnderlyingCommand::ReleaseFreezeHold {
-                        underlying: observed_underlying.clone(),
-                        hold_id: hold_id.clone(),
-                        released_at: now,
-                    },
-                )
-                .await
-                .map_err(|source| {
-                    CorporateActionFreezeError::Aggregate(Box::new(source))
-                })?;
-        }
-
-        Ok(())
+    if event_id != alignment.expected_event_id.as_str() {
+        return Ok(());
     }
+
+    #[cfg(test)]
+    if let Some(hook) = &ctx.revision_read_test_hook {
+        hook.observed.wait().await;
+        hook.release.wait().await;
+    }
+
+    let underlying_symbol =
+        UnderlyingSymbol::new(&underlying).map_err(|_| {
+            CorporateActionFreezeError::InvalidUnderlying(underlying.clone())
+        })?;
+    let ex_date =
+        NaiveDate::parse_from_str(&ex_date, "%Y-%m-%d").map_err(|_| {
+            CorporateActionFreezeError::InvalidExDate(ex_date.clone())
+        })?;
+    let freeze_at = DateTime::<Utc>::from_naive_utc_and_offset(
+        ex_date.and_time(NaiveTime::MIN),
+        Utc,
+    );
+    let unfreeze_at = ex_date
+        .succ_opt()
+        .map(|value| {
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                value.and_time(NaiveTime::MIN),
+                Utc,
+            )
+        })
+        .ok_or(CorporateActionFreezeError::ExDateWithoutFollowingDay(
+            ex_date,
+        ))?;
+    let now = Utc::now();
+    let hold_id =
+        FreezeHoldId::alpaca_corporate_action(alignment.action_id.clone());
+    let should_hold = deleted == 0
+        && underlying_has_listing(&ctx.pool, &underlying_symbol).await?
+        && now >= freeze_at
+        && now < unfreeze_at;
+    let observed_underlyings: Vec<String> = sqlx::query_scalar(
+        "
+        SELECT DISTINCT underlying
+        FROM corporate_action_mutations
+        WHERE action_id = ? AND underlying IS NOT NULL
+        ",
+    )
+    .bind(alignment.action_id.as_str())
+    .fetch_all(&ctx.pool)
+    .await?;
+
+    if should_hold {
+        ctx.underlying_store
+            .send(
+                &underlying_symbol,
+                UnderlyingCommand::AcquireFreezeHold {
+                    underlying: underlying_symbol.clone(),
+                    hold_id: hold_id.clone(),
+                    acquired_at: now,
+                },
+            )
+            .await
+            .map_err(|source| {
+                CorporateActionFreezeError::Aggregate(Box::new(source))
+            })?;
+    }
+
+    for observed_underlying in observed_underlyings {
+        let observed_underlying = UnderlyingSymbol::new(&observed_underlying)
+            .map_err(|_| {
+            CorporateActionFreezeError::InvalidUnderlying(
+                observed_underlying.clone(),
+            )
+        })?;
+        if should_hold && observed_underlying == underlying_symbol {
+            continue;
+        }
+        ctx.underlying_store
+            .send(
+                &observed_underlying,
+                UnderlyingCommand::ReleaseFreezeHold {
+                    underlying: observed_underlying.clone(),
+                    hold_id: hold_id.clone(),
+                    released_at: now,
+                },
+            )
+            .await
+            .map_err(|source| {
+                CorporateActionFreezeError::Aggregate(Box::new(source))
+            })?;
+    }
+
+    Ok(())
 }
 
 /// Error surfaced by a freeze-transition job. Command dispatch is the only

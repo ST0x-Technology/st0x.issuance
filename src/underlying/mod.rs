@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::collections::BTreeSet;
 use std::future::Future;
+use tokio::sync::MutexGuard;
 
 use st0x_issuance_dto::TokenizedAssetStatus;
 pub use st0x_issuance_dto::UnderlyingSymbol;
@@ -27,6 +28,21 @@ use crate::tokenized_asset::CorporateActionId;
 static FREEZE_ADMISSION: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Proof that a caller owns the single-process freeze-admission boundary.
+#[derive(Debug)]
+pub(crate) struct FreezeAdmissionGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Acquires the freeze-admission boundary.
+///
+/// A caller that also needs the corporate-action revision guard must acquire
+/// that guard first. Callers that need only freeze admission may acquire this
+/// guard directly.
+pub(crate) async fn acquire_freeze_admission() -> FreezeAdmissionGuard {
+    FreezeAdmissionGuard { _guard: FREEZE_ADMISSION.lock().await }
+}
+
 pub(crate) async fn with_freeze_admission<Operation, OperationFuture, Output>(
     operation: Operation,
 ) -> Output
@@ -34,7 +50,7 @@ where
     Operation: FnOnce() -> OperationFuture,
     OperationFuture: Future<Output = Output>,
 {
-    let _admission = FREEZE_ADMISSION.lock().await;
+    let _admission = acquire_freeze_admission().await;
     operation().await
 }
 

@@ -1,11 +1,56 @@
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Args;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
 pub(crate) const DEFAULT_CORPORATE_ACTIONS_STREAM_URL: &str = "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us";
+
+/// An operator-approved lower bound for an authenticated corporate-action feed
+/// that has no durable cursor.
+///
+/// Parsing accepts non-future RFC3339 timestamps and normalizes them to UTC for
+/// the Alpaca `since` query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorporateActionBootstrapSince(DateTime<Utc>);
+
+impl CorporateActionBootstrapSince {
+    pub(crate) fn try_from_instant(
+        instant: DateTime<Utc>,
+    ) -> Result<Self, CorporateActionBootstrapSinceError> {
+        if instant > Utc::now() {
+            return Err(CorporateActionBootstrapSinceError::Future(instant));
+        }
+        Ok(Self(instant))
+    }
+
+    pub(crate) fn query_value(&self) -> String {
+        self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    }
+}
+
+/// An error returned when validating a corporate-action bootstrap boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum CorporateActionBootstrapSinceError {
+    /// The configured value is not a valid RFC3339 timestamp.
+    #[error("invalid corporate-action bootstrap timestamp")]
+    Parse(#[from] chrono::ParseError),
+    /// The configured timestamp is later than the current time.
+    #[error("corporate-action bootstrap timestamp {0} is in the future")]
+    Future(DateTime<Utc>),
+}
+
+impl FromStr for CorporateActionBootstrapSince {
+    type Err = CorporateActionBootstrapSinceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let instant = DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc);
+        Self::try_from_instant(instant)
+    }
+}
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -77,6 +122,17 @@ pub struct AlpacaConfig {
         help = "Alpaca corporate-actions SSE stream URL"
     )]
     pub corporate_actions_stream_url: String,
+
+    /// Enables one bounded replay from a validated, non-future RFC3339 instant
+    /// when an authenticated corporate-action stream has no cursor. If absent,
+    /// that first-install stream remains disabled without stopping issuance.
+    #[arg(
+        long = "alpaca-corporate-actions-bootstrap-since",
+        env = "ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE",
+        help = "Explicit bounded-history bootstrap instant for an authenticated corporate-action stream with no cursor"
+    )]
+    pub corporate_actions_bootstrap_since:
+        Option<CorporateActionBootstrapSince>,
 }
 
 impl std::fmt::Debug for AlpacaConfig {
@@ -95,6 +151,10 @@ impl std::fmt::Debug for AlpacaConfig {
             .field(
                 "corporate_actions_stream_url",
                 &self.corporate_actions_stream_url,
+            )
+            .field(
+                "corporate_actions_bootstrap_since",
+                &self.corporate_actions_bootstrap_since,
             )
             .finish()
     }
@@ -126,6 +186,7 @@ impl AlpacaConfig {
             corporate_actions_read_timeout_secs: 90,
             corporate_actions_stream_url: DEFAULT_CORPORATE_ACTIONS_STREAM_URL
                 .to_string(),
+            corporate_actions_bootstrap_since: None,
         }
     }
 }
@@ -400,12 +461,16 @@ impl AlpacaService for RealAlpacaService {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
+    use chrono::Utc;
+    use clap::Parser;
     use httpmock::prelude::*;
     use tracing_test::traced_test;
 
     use super::{
-        AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
-        RedeemRequest, TokenizationRequest,
+        AlpacaConfig, AlpacaError, AlpacaService,
+        CorporateActionBootstrapSince, CorporateActionBootstrapSinceError,
+        MintCallbackRequest, RealAlpacaService, RedeemRequest,
+        TokenizationRequest,
     };
     use crate::alpaca::{
         RedeemRequestStatus, TokenizationRequestType,
@@ -415,6 +480,64 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+
+    #[derive(Debug, Parser)]
+    struct AlpacaConfigTestCli {
+        #[command(flatten)]
+        alpaca: AlpacaConfig,
+    }
+
+    fn parse_config_with_bootstrap(
+        bootstrap_since: &str,
+    ) -> Result<AlpacaConfigTestCli, clap::Error> {
+        AlpacaConfigTestCli::try_parse_from([
+            "test",
+            "--alpaca-account-id",
+            "test-account",
+            "--alpaca-api-key",
+            "test-key",
+            "--alpaca-api-secret",
+            "test-secret",
+            "--alpaca-corporate-actions-bootstrap-since",
+            bootstrap_since,
+        ])
+    }
+
+    #[test]
+    fn accepts_and_normalizes_an_explicit_corporate_action_bootstrap_instant() {
+        let config =
+            parse_config_with_bootstrap("2026-08-30T21:00:00-03:00").unwrap();
+
+        assert_eq!(
+            config
+                .alpaca
+                .corporate_actions_bootstrap_since
+                .unwrap()
+                .query_value(),
+            "2026-08-31T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_corporate_action_bootstrap_instant() {
+        assert!(parse_config_with_bootstrap("yesterday").is_err());
+    }
+
+    #[test]
+    fn rejects_a_future_corporate_action_bootstrap_instant() {
+        assert!(parse_config_with_bootstrap("2999-01-01T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn fallible_bootstrap_constructor_rejects_a_future_instant() {
+        let future = Utc::now() + chrono::Duration::days(1);
+
+        assert!(matches!(
+            CorporateActionBootstrapSince::try_from_instant(future),
+            Err(CorporateActionBootstrapSinceError::Future(rejected))
+                if rejected == future
+        ));
+    }
 
     fn create_test_request() -> MintCallbackRequest {
         let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();

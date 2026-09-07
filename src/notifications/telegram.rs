@@ -167,6 +167,18 @@ fn log_delivery_failure(
             cause = ?cause,
             "notification_delivery_failed"
         ),
+        LifecycleNotification::LowGasBalance { network, wallet, .. } => {
+            tracing::error!(
+                target: "notifications",
+                event = "notification_delivery_failed",
+                notification_kind = notification.kind().as_str(),
+                network = %network,
+                wallet = %wallet,
+                error = %error,
+                cause = ?cause,
+                "notification_delivery_failed"
+            );
+        }
     }
 }
 

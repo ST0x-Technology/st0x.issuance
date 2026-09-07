@@ -60,6 +60,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
         receipt_poll_interval: tokio::time::Duration::from_millis(500),
+        gas_poll_interval: tokio::time::Duration::from_millis(200),
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -87,6 +88,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             corporate_actions_stream_url: setup_corporate_actions_stream_mock(
                 &mock_alpaca,
             ),
+            corporate_actions_bootstrap_since: None,
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),
@@ -94,6 +96,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             rpc_url,
+            low_gas_threshold: None,
             backfill_start_block: 0,
         }],
         vault_mode_config: VaultModeConfig::default(),

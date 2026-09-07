@@ -167,6 +167,18 @@ impl Network {
             Self::HyperEvm => 999,
         }
     }
+
+    /// The symbol of the native token that pays gas on this network.
+    ///
+    /// Used when rendering native balance amounts for operators: Base and
+    /// Ethereum pay gas in ETH, HyperEVM (chain 999) pays gas in HYPE.
+    #[must_use]
+    pub const fn native_currency(&self) -> &'static str {
+        match self {
+            Self::Base | Self::Ethereum => "ETH",
+            Self::HyperEvm => "HYPE",
+        }
+    }
 }
 
 impl std::fmt::Display for Network {

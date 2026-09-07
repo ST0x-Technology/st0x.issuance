@@ -179,6 +179,7 @@ pub fn test_config() -> Config {
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+        gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
         auth: test_auth_config().expect("valid test auth config"),
         behind_proxy: false,
         log_level: LogLevel::Debug,
@@ -1036,6 +1037,13 @@ impl LocalEvm {
 #[cfg(test)]
 pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     let module = module.strip_suffix("::tests").unwrap_or(module);
+
+    if module.contains("::gas_monitor") {
+        return "gas";
+    }
+    if module.contains("::network_telemetry") {
+        return "network_telemetry";
+    }
 
     if module.contains("::mint") {
         "mint"

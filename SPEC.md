@@ -430,14 +430,15 @@ signer intent per nonce domain can be outstanding at a time, regardless of which
 aggregate holds it. This makes the event append itself the durable arbitration
 point: a second instance's competing intent is rejected by SQLite before it can
 commit, rather than relying on an in-memory lock or a fallible read-model
-projection. When the pre-append check finds the network occupied, a mint job
-returns `MintJobError::UnresolvedWalletIntent` and refuses to submit rather than
-risk a nonce collision, leaving the job to retry once the guard clears. When the
-race is lost between that check and the append, the trigger aborts the append
-with an explicit signer-reservation error — worded distinctly from a
-same-aggregate concurrency conflict so an operator reading the failure is
-pointed at the nonce-domain guard, not at a phantom concurrent modification of
-the aggregate.
+projection. Recovery bookkeeping, including `BurnNonceTooLow`, never releases
+this reservation; only a definitively resolved terminal event does. When the
+pre-append check finds the network occupied, a mint job returns
+`MintJobError::UnresolvedWalletIntent` and refuses to submit rather than risk a
+nonce collision, leaving the job to retry once the guard clears. When the race
+is lost between that check and the append, the trigger aborts the append with an
+explicit signer-reservation error — worded distinctly from a same-aggregate
+concurrency conflict so an operator reading the failure is pointed at the
+nonce-domain guard, not at a phantom concurrent modification of the aggregate.
 
 The issuer is a single-writer service: exactly one process may own a given
 SQLite event store and signing wallet at a time. Horizontal replicas sharing a
@@ -682,10 +683,17 @@ on-chain transfer through calling Alpaca to burning tokens.
   stored well before any burn submission), not from the vault
 - `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before its
   external side effect
+- `RecordBurnNonceTooLow` - Persist a deterministic node rejection that proves
+  the exact rebroadcast transaction's nonce is already spent. This observation
+  consumes no additional recovery action.
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
   resuming a failed redemption that has no signed burn transaction
 - `ReplaceDeadBurn` - Re-check that the persisted transaction is provably dead,
   then sign and persist a replacement at a fresh nonce
+- `ReplaceNonceTooLowBurn` - Sign and persist a fresh-nonce replacement after
+  the recovery manager matches a durable `BurnNonceTooLow` observation to this
+  redemption's current transaction and supplies a proof marker. The command
+  handler re-verifies the marker's request id, hash, and nonce before signing.
 - `RecordBurnRecoveryExhausted` - Persist that the redemption-wide automatic
   recovery budget is spent
 - `RecordBurnPreparationRecoveryExhausted` - Persist exhaustion when repeated
@@ -834,14 +842,20 @@ raw redemption amounts are emitted in the admission log.
   the persisted transaction, including its hash, nonce, action, and timestamp.
   These events form the durable redemption-wide recovery budget across process
   restarts.
+- `BurnNonceTooLow` - Records that rebroadcasting the exact persisted hash and
+  nonce received a deterministic `nonce too low` response. Later passes still
+  check the exact hash receipt first, then may use this durable observation as
+  proof that a replacement decision is required without spending more
+  rebroadcast actions.
 - `BurnPreparationRecoveryAttempted` - Records an automatic retry before a
   failed redemption without a signed burn transaction resumes preparation. These
   attempts share the same redemption-wide budget.
 - `BurnRecoveryExhausted` - Records that the automatic recovery budget is spent,
   including the latest hash, nonce, attempt count, and timestamp. It leaves the
   aggregate unresolved and the receipt reservation held for operator recovery.
-  Its first persistence emits the single actionable operator error; later
-  periodic passes observe the marker and perform no RPC or signing side effects.
+  Its first persistence emits the single actionable operator error. Later
+  periodic passes continue read-only exact-hash classification and may record a
+  mined transaction, but perform no signing or broadcast side effects.
 - `BurnPreparationRecoveryExhausted` - Records the same durable stop when
   repeated preparation failures never produced a burn hash and nonce.
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
@@ -934,8 +948,10 @@ raw redemption amounts are emitted in the admission log.
 | `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                  | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                      |
 | `RecordBurnConfirmed`                    | `TokensBurned`                     | Pure: records the confirmation `ConfirmBurnJob` performed via `BurnManager::confirm_submitted_burn`; terminal success                                                                                                                              |
 | `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                                                                                                                                                                      |
+| `RecordBurnNonceTooLow`                  | `BurnNonceTooLow`                  | Persist deterministic proof that the current transaction's nonce is spent without consuming another action                                                                                                                                         |
 | `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                                                                                                                                                                            |
 | `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
+| `ReplaceNonceTooLowBurn`                 | `BurnIntended`                     | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable nonce-too-low observation, then persist a replacement                                                      |
 | `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                                                                                                                                                                    |
 | `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                                                                                                                                                                                   |
 | `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                                                                                                                                                                     |
@@ -972,11 +988,14 @@ the latest persisted signed transaction `(H, N)` for wallet `W` in this order:
 Equivalently, the exact replacement predicate is
 `receipt(H) = None AND finalized_nonce(W) > N`. Receipt lookup is evaluated
 before the nonce comparison. A latest-but-unfinalized nonce advance is not proof
-of death because a reorganization can remove it. A missing block number,
-mismatched receipt hash, provider error, timeout, signer that differs from `W`,
-or any other identity/RPC uncertainty is unclassified and fails closed: the old
-transaction remains live, no replacement is signed, and its reservation remains
-held. Same-nonce fee replacement is not supported.
+of death because a reorganization can remove it. A deterministic `nonce too low`
+response to rebroadcasting the exact persisted bytes is the additional death
+proof: recovery durably records it against `(H, N)`, and every later pass still
+checks `receipt(H)` before using that observation to select replacement. A
+missing block number, mismatched receipt hash, provider error, timeout, signer
+that differs from `W`, or any other identity/RPC uncertainty is unclassified and
+fails closed: the old transaction remains live, no replacement is signed, and
+its reservation remains held. Same-nonce fee replacement is not supported.
 
 Automatic recovery is capped at five accepted recovery actions across the
 redemption's complete event history, including preparation retries,
@@ -1686,29 +1705,31 @@ source. Production and staging accept only HTTPS on
 `stream.data.alpaca.markets`; development may use plain HTTP only when the URL
 targets a loopback IP and the request carries no Alpaca credential headers. The
 credential-free development transport may establish its initial cursor from the
-first validated mock frame through the ordinary decoder and projection path;
-authenticated environments still require the fail-closed snapshot-repair
-baseline described below. The accepted contract is exactly US-region
-`cash_dividend_corporateaction_event` and `stock_dividend_corporateaction_event`
-frames with `insert`, `update`, or `delete`. Any other mutation kind or
-discriminator, another region, malformed identity, or invalid date is a typed
-poison boundary and cannot advance the cursor. A valid accepted event for an
-underlying that issuance does not list is instead an explicit no-op: the
-projection transaction records the event with a typed
-`no_op_unlisted_underlying` outcome and advances the cursor without creating an
-action projection, schedule, transition job, or hold, while retaining the
-canonical mutation payload. After an asset listing commits, a service-owned
-reactor selects the latest retained mutation per action for that underlying. It
-atomically creates pending revisions for the latest non-delete mutations and
-records their source event IDs without changing the stream cursor or rewriting
-the historical no-op outcomes. The ordinary alignment path then applies future
-windows and immediately acquires holds for windows already active; tests cover
-both cases. A latest retained delete creates no revision because no source hold
-was acquired. Listed events record a `schedule_revision` outcome with the
-resulting revision in that same transaction. Each listed action's stable Alpaca
-ID owns one source hold and one current schedule revision, so updates replace
-that action's prior window and deletes release only that action's hold. An
-operator hold or another action on the same underlying is never affected.
+first validated mock frame through the ordinary decoder and projection path. An
+authenticated first install has no provider-certified complete baseline, so it
+remains disabled unless an operator explicitly configures one bounded-history
+bootstrap timestamp as described below. The accepted contract is exactly
+US-region `cash_dividend_corporateaction_event` and
+`stock_dividend_corporateaction_event` frames with `insert`, `update`, or
+`delete`. Any other mutation kind or discriminator, another region, malformed
+identity, or invalid date is a typed poison boundary and cannot advance the
+cursor. A valid accepted event for an underlying that issuance does not list is
+instead an explicit no-op: the projection transaction records the event with a
+typed `no_op_unlisted_underlying` outcome and advances the cursor without
+creating an action projection, schedule, transition job, or hold, while
+retaining the canonical mutation payload. After an asset listing commits, a
+service-owned reactor selects the latest retained mutation per action for that
+underlying. It atomically creates pending revisions for the latest non-delete
+mutations and records their source event IDs without changing the stream cursor
+or rewriting the historical no-op outcomes. The ordinary alignment path then
+applies future windows and immediately acquires holds for windows already
+active; tests cover both cases. A latest retained delete creates no revision
+because no source hold was acquired. Listed events record a `schedule_revision`
+outcome with the resulting revision in that same transaction. Each listed
+action's stable Alpaca ID owns one source hold and one current schedule
+revision, so updates replace that action's prior window and deletes release only
+that action's hold. An operator hold or another action on the same underlying is
+never affected.
 
 Unlisted canonical state is bounded: one latest row is upserted per
 `(region, underlying, action_id)`, while a separate audit row keeps only the
@@ -1781,26 +1802,56 @@ boundary remains. Operators follow
 @docs/runbooks/corporate-action-feed-boundary.md to inspect the exact stored
 boundary and cursor, preserve incident evidence, and invoke no unsafe SQL
 override. Restart tests cover malformed and oversized frames without an event
-ID. The first install has no cursor and cannot establish a production baseline
-from the documented Alpaca contracts: neither an unbounded `since` replay nor
-the paginated GET endpoint proves a complete state at an SSE event ID. Minting
-and normal consumption remain gated until an operator restores a full issuance
-database backup with a cursor that inclusive replay still accepts. A controlled
-mock stream may establish a development fixture cursor only. Subsequent
-production connections use inclusive `since_id=<committed-event-id>` replay, and
-the first data frame must echo that cursor. `Last-Event-Id` is never sent,
-because Alpaca gives that header precedence over `since_id`. A rejected anchor
-or non-echoing first frame is a replay gap: no later or live event is accepted.
+ID.
 
-A replay-retention gap is not repaired by resetting the cursor or combining an
-uncertified GET page set with a live buffer. Alpaca documents neither a REST
-snapshot watermark nor a consistency relationship between GET pagination and an
-SSE event ID, so an empty buffer, a first live frame, and `since_id` cannot
-prove a safe cutover. Issuance remains gated at the durable replay-gap boundary
-until an operator restores a full database backup whose cursor can be
-echo-verified by inclusive replay, or Alpaca adds a documented atomic
-snapshot/replay boundary. Without either input, recovery is intentionally
-unavailable.
+**First-install bootstrap.** Alpaca documents `since=<RFC3339>` but does not
+certify complete retention back to an arbitrary timestamp or expose an atomic
+snapshot/SSE watermark. Production and staging therefore default to disabled
+when no cursor exists. To accept that bounded-history risk explicitly, an
+operator may configure `ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE` with a
+non-future RFC3339 instant selected from independently verified operational
+history. Before the HTTP service accepts traffic, issuance captures one UTC
+cutoff and adds exactly `since=<configured instant>` and `until=<cutoff>` as
+replay-boundary parameters (never `since_id` or `Last-Event-Id`). It waits for
+Alpaca's documented bounded stream to close after its last inclusive event. EOF
+with a buffered partial SSE frame is not successful completion. Every replayed
+revision must durably project, enqueue its retry jobs, and synchronously align
+its current source-owned hold before startup can continue; any failure aborts
+startup. The live connection then uses a committed cursor, or continues from
+`since=<cutoff>` after an empty replay until the first validated mutation
+establishes one. Projection and hold alignment share the corporate-action
+revision guard and freeze-admission guard in that order; mint initiation holds
+the same admission guard from freeze-status validation through its event-store
+commit. If scheduling or alignment fails after projection commits, the fatal
+error retains admission until service shutdown. Issuance logs one structured
+WARN with the non-secret boundary and `bounded_history` mode. A malformed or
+future instant fails startup. Omitting the setting leaves the feed disabled
+without stopping issuance. The operator removes the setting immediately after
+verifying the first committed cursor. While it remains configured, the issuer
+cannot distinguish an intended first install from a lost, empty, or unmounted
+database; an established deployment with a missing cursor is a storage incident
+and must not reuse the old lower bound.
+
+Once any cursor exists, the bootstrap setting is ignored: every subsequent
+production connection uses inclusive `since_id=<committed-event-id>` replay, and
+the first data frame must echo that cursor. A response that ends before echoing
+the anchor persists a replay-gap boundary and fails closed rather than being
+treated as an ordinary disconnect. `Last-Event-Id` is never sent because Alpaca
+gives that header precedence over `since_id`. A rejected anchor or non-echoing
+first frame is a replay gap: no later or live event is accepted. A persisted
+poison, regression, or replay-gap boundary is never cleared or bypassed by the
+bootstrap setting; `load_cursor` rejects that boundary before request
+construction.
+
+A replay-retention gap is not repaired by resetting the cursor, reusing the
+first-install timestamp, or combining an uncertified GET page set with a live
+buffer. Alpaca documents neither a REST snapshot watermark nor a consistency
+relationship between GET pagination and an SSE event ID, so an empty buffer, a
+first live frame, and `since_id` cannot prove a safe cutover. Issuance remains
+gated at the durable replay-gap boundary until an operator restores a full
+database backup whose cursor can be echo-verified by inclusive replay, or Alpaca
+adds a documented atomic snapshot/replay boundary. Without either input,
+recovery is intentionally unavailable.
 
 Every durable ingestion boundary that gates consumption — poison (including
 replay-evidence-unavailable), cursor regression, rejected anchor, or replay-
@@ -4705,6 +4756,31 @@ and all mints in recoverable states (`JournalConfirmed`, `Minting`,
 persisted signed transactions so operators can discover wallet-nonce holders via
 the stuck list.
 
+### Network Telemetry
+
+Reports per network operational health so a degraded chain is visible without
+log access.
+
+**Endpoint:** `GET /admin/network-telemetry`
+
+Returns one row per configured network, sorted by network wire name:
+
+- `transfer_poller`: pass counters for that network's `TransferPoller`
+  (`passes`, `failures`, `consecutive_failures`, `failure_rate`,
+  `last_success_at`, `last_failure_at`) plus `lag_blocks`, the worst per vault
+  distance between the chain head and the vault's transfer checkpoint measured
+  at the start of the most recent successful pass.
+- `receipt_backfill`: the same counter shape for the periodic receipt backfill
+  loop, with `lag_blocks` measured against the receipt backfill checkpoints.
+- `gas`: the gas monitor's latest reading for the issuer wallet:
+  `{"status": "ok" | "low", "balance_wei", "threshold_wei", "checked_at"}`,
+  `{"status": "unavailable", "error"}` when the last balance read failed, or
+  `{"status": "unmonitored"}` when no low gas threshold is configured.
+
+Counters live in process memory and reset on restart; `failure_rate` is
+`failures / passes` and is absent until the first pass completes. See "Per
+network monitoring" for what counts as a failed pass.
+
 ## Configuration
 
 ### Environment Variables
@@ -4723,6 +4799,8 @@ ALPACA_API_KEY=<api_key>
 ALPACA_API_SECRET=<api_secret>
 ALPACA_BASE_URL=https://broker-api.alpaca.markets
 ALPACA_TOKENIZATION_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
+# Optional first-install boundary; omission keeps production bootstrap disabled.
+ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE=<non_future_RFC3339_timestamp>
 
 # Blockchain Configuration
 RPC_WS_URL=<ethereum_websocket_url>
@@ -4903,3 +4981,81 @@ rekey change itself.
 | Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
 | Shared `VaultService` with runtime chain_id switch        | Signing backends bind `chain_id` at construction; a runtime switch is error-prone                       |
 | Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |
+
+## Per network monitoring
+
+Every configured chain gets per network telemetry for the long running loops,
+and a low gas monitor on the issuer wallet's native balance whenever a gas
+threshold is configured for it. Both are keyed by `Network`, so a chain added to
+the `ChainRegistry` is covered without further wiring.
+
+### Gas balance monitoring
+
+Signed transactions (mints, burns, receipt moves) spend the chain's native token
+from the single issuer wallet: ETH on Base and Ethereum, HYPE on HyperEVM. An
+empty wallet halts issuance on that chain, so the bot polls `eth_getBalance` for
+the issuer wallet on every configured chain and alerts before the wallet runs
+dry. This complements the move receipts CLI's transfer gas ceiling check, which
+gates one CLI invocation rather than watching the running service.
+
+**Configuration:** each chain group takes a low gas threshold denominated in the
+chain's native token with 18 decimals (`"0.05"` = 0.05 ETH):
+
+- `CHAIN_BASE_LOW_GAS_THRESHOLD`, `CHAIN_ETHEREUM_LOW_GAS_THRESHOLD`,
+  `CHAIN_HYPEREVM_LOW_GAS_THRESHOLD` for the grouped chain config, each
+  requiring its group's `CHAIN_<NETWORK>_RPC_URL`.
+- `LOW_GAS_THRESHOLD` for the legacy flat Base group, mirroring how the flat
+  `CHAIN_ID` and `BACKFILL_START_BLOCK` map to the single Base entry.
+
+A zero or malformed threshold is a startup error. Thresholds are all or nothing
+across configured chains: setting a threshold for one chain while another
+configured chain has none is a startup error naming the missing network, because
+a partially monitored deployment is exactly the gap this feature closes (HYPE on
+chain 999 going unwatched while Base is covered). With no thresholds at all the
+monitor is disabled and startup logs a WARN, so local development needs no extra
+variables.
+
+**Behavior:** one monitor task per configured chain polls the issuer wallet's
+native balance every 60 seconds:
+
+- Balance drops below the threshold: ERROR log plus a `LowGasBalance` lifecycle
+  notification (Telegram when configured) carrying the network, wallet, balance,
+  and threshold in the chain's native token.
+- Still below the threshold: alert again at most once per hour, so a sustained
+  low balance cannot flood the operator channel.
+- Recovers to at or above the threshold: INFO log only, and clears the repeat
+  alert timer; a later drop below the threshold then pages immediately, since
+  the hourly interval only throttles repeated alerts while the balance stays
+  continuously low.
+- Balance read fails: WARN log, alert state unchanged (a transient RPC blip must
+  not fire or clear alerts), and the telemetry gas status degrades to
+  `unavailable`.
+
+Alert state lives in process memory; a restart alerts once more for a wallet
+still below the threshold, which is the desired behavior for an unresolved
+condition.
+
+### Per network telemetry
+
+An in memory registry, created at startup for the configured networks,
+aggregates what each per network loop reports; `GET /admin/network-telemetry`
+(see Admin API) is its read surface.
+
+- **Transfer poller:** each pass records success or failure and, on success,
+  `lag_blocks` -- the worst per vault distance between the chain head and the
+  vault's cursor at the start of the pass. A pass counts as failed when nothing
+  progressed: the asset view read or head fetch failed, or every vault failed.
+  Partial vault failures keep the pass successful and surface as growing
+  `lag_blocks` instead, matching the poller's WARN/ERROR escalation semantics.
+- **Receipt backfill:** the periodic loop records the same shape per pass, with
+  the same failure rule (the asset list or head fetch failed, or every vault
+  failed) and `lag_blocks` measured against the receipt backfill checkpoints. A
+  vault whose checkpoint read fails also forces the pass to failure, since its
+  backlog cannot be measured and a success would understate the lag. A pass with
+  no enabled assets records a success with zero lag, matching the transfer
+  poller, so the counter keeps rising to show the loop is alive.
+- **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
+  `unavailable` with the read error); unconfigured chains report `unmonitored`.
+
+The registry is deliberately not persisted: it describes the running process,
+and the durable signals (checkpoints, event store) already survive restarts.
