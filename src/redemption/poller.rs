@@ -40,7 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum number of blocks to query in a single `eth_getLogs` call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
-const BLOCK_CHUNK_SIZE: u64 = 2000;
+pub(crate) const BLOCK_CHUNK_SIZE: u64 = 2000;
 
 /// Interval between retries when a polling pass fails (e.g., RPC error).
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -643,7 +643,7 @@ fn log_poll_failure(error: &TransferPollError, consecutive_failures: usize) {
 // ---------------------------------------------------------------------------
 
 /// Generates inclusive block ranges of at most `chunk_size` blocks.
-fn block_ranges(
+pub(crate) fn block_ranges(
     from: u64,
     to: u64,
     chunk_size: u64,

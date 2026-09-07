@@ -1030,6 +1030,9 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     if module.contains("::network_telemetry") {
         return "network_telemetry";
     }
+    if module.contains("::wrapped_transfer") {
+        return "wrapped_transfer";
+    }
 
     if module.contains("::mint") {
         "mint"

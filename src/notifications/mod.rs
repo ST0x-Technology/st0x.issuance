@@ -2,7 +2,7 @@
 
 mod telegram;
 
-use alloy::primitives::{Address, U256, utils::format_ether};
+use alloy::primitives::{Address, TxHash, U256, utils::format_ether};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ pub(crate) enum NotificationKind {
     RedemptionResumed,
     RedemptionResumeFailed,
     LowGasBalance,
+    InboundWrappedTransfer,
 }
 
 impl NotificationKind {
@@ -43,6 +44,7 @@ impl NotificationKind {
             Self::RedemptionResumed => "redemption_resumed",
             Self::RedemptionResumeFailed => "redemption_resume_failed",
             Self::LowGasBalance => "low_gas_balance",
+            Self::InboundWrappedTransfer => "inbound_wrapped_transfer",
         }
     }
 }
@@ -85,6 +87,16 @@ pub(crate) enum LifecycleNotification {
         balance: U256,
         threshold: U256,
     },
+    /// A transfer of a configured wrapped token into the issuer wallet; not
+    /// redeemable automatically, so the operator must recover it by hand.
+    InboundWrappedTransfer {
+        network: Network,
+        underlying: UnderlyingSymbol,
+        token: Address,
+        from: Address,
+        amount: U256,
+        tx_hash: TxHash,
+    },
 }
 
 impl LifecycleNotification {
@@ -110,6 +122,9 @@ impl LifecycleNotification {
                 NotificationKind::RedemptionResumeFailed
             }
             Self::LowGasBalance { .. } => NotificationKind::LowGasBalance,
+            Self::InboundWrappedTransfer { .. } => {
+                NotificationKind::InboundWrappedTransfer
+            }
         }
     }
 
@@ -165,6 +180,7 @@ impl LifecycleNotification {
                     format_ether(*threshold)
                 )
             }
+            Self::InboundWrappedTransfer { .. } => todo!(),
         }
     }
 }
@@ -670,6 +686,33 @@ mod tests {
             "Low gas on hyperevm: issuer wallet \
              0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
              1.000000000000000000 HYPE (threshold 2.000000000000000000 HYPE)"
+        );
+    }
+
+    /// The alert names everything an operator needs to act: chain, asset,
+    /// wrapped token, sender, amount (18-decimal wrapped shares), and tx.
+    #[test]
+    fn inbound_wrapped_transfer_message_names_chain_asset_amount_and_tx() {
+        let notification = LifecycleNotification::InboundWrappedTransfer {
+            network: Network::Ethereum,
+            underlying: underlying(),
+            token: address!("0x00000000000000000000000000000000000000aa"),
+            from: address!("0x9999999999999999999999999999999999999999"),
+            amount: parse_ether("7.5").unwrap(),
+            tx_hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+        };
+
+        assert_eq!(notification.kind().as_str(), "inbound_wrapped_transfer");
+        assert_eq!(
+            notification.message(),
+            "Inbound wrapped-token transfer on ethereum: 7.500000000000000000 \
+             wrapped AAPL (0x00000000000000000000000000000000000000aa) from \
+             0x9999999999999999999999999999999999999999 to the issuer wallet \
+             in tx \
+             0x1111111111111111111111111111111111111111111111111111111111111111; \
+             not redeemable automatically, manual recovery required"
         );
     }
 
