@@ -313,6 +313,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             corporate_actions_read_timeout_secs: 90,
             corporate_actions_stream_url:
                 harness::setup_corporate_actions_stream_mock(&mock_alpaca),
+            corporate_actions_bootstrap_since: None,
         },
         lifecycle_notifications:
             st0x_issuance::LifecycleNotificationsConfig::disabled(),

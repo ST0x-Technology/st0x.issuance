@@ -578,20 +578,22 @@ pub(crate) async fn vacuum_terminal_recovery_jobs(
     Ok(())
 }
 
-/// Flips mint recovery and side-effect jobs left `Running` by a dead process
-/// back to `Pending`, clearing their lock columns (`lock_at`, `lock_by`).
+/// Flips mint recovery and side-effect jobs left `Running` or `Queued` by a
+/// dead process back to `Pending`, clearing their lock columns (`lock_at`,
+/// `lock_by`).
 ///
-/// At startup no worker from this process is running yet, so any `Running` row
-/// is an orphan from the previous process. Without this reset a job crashed
-/// during submit, confirmation, callback, or recovery blocks the same
-/// idempotency key until apalis's orphan re-enqueue timeout. The query is scoped
-/// to the four mint job types so unrelated apalis jobs sharing the table are
-/// left for their own recovery. Runs on the event-store pool because both pools
-/// address the same SQLite file (see [`vacuum_terminal_recovery_jobs`]).
+/// At startup no worker from this process is running yet, so any in-flight row
+/// is an orphan from the previous process. `Queued` is included because apalis
+/// can persist that locked state after fetching a pending job but before the
+/// worker starts it. Without this reset such a job blocks the same idempotency
+/// key until apalis's orphan re-enqueue timeout. The query is scoped to the four
+/// mint job types so unrelated apalis jobs sharing the table are left for their
+/// own recovery. Runs on the event-store pool because both pools address the
+/// same SQLite file (see [`vacuum_terminal_recovery_jobs`]).
 pub(crate) async fn reset_orphaned_mint_jobs(
     pool: &Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let affected_rows = sqlx::query(
         "
         UPDATE Jobs
         SET
@@ -600,7 +602,7 @@ pub(crate) async fn reset_orphaned_mint_jobs(
             lock_by = NULL
         WHERE
             job_type IN (?, ?, ?, ?)
-            AND status = 'Running'
+            AND status IN ('Running', 'Queued')
         ",
     )
     .bind(mint_recovery_job_type())
@@ -608,8 +610,10 @@ pub(crate) async fn reset_orphaned_mint_jobs(
     .bind(job_type::<ConfirmMintJob>())
     .bind(job_type::<SendCallbackJob>())
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
 
+    info!(target: "mint", affected_rows, "Reset orphaned mint jobs");
     Ok(())
 }
 
@@ -2940,11 +2944,13 @@ mod tests {
         );
     }
 
-    /// The startup reset must flip every `Running` mint job orphaned by a dead
-    /// process back to `Pending` with its lock columns cleared, so the fresh
-    /// workers pick them up without waiting out apalis's orphan timeout.
+    /// The startup reset must flip every locked `Running` or `Queued` mint job
+    /// orphaned by a dead process back to `Pending` with its lock columns
+    /// cleared, so fresh workers pick them up without waiting out apalis's
+    /// orphan timeout.
+    #[traced_test]
     #[tokio::test]
-    async fn reset_orphaned_mint_jobs_flips_every_running_job_to_pending() {
+    async fn reset_orphaned_mint_jobs_flips_every_in_flight_job_to_pending() {
         let harness = TestHarness::new().await;
         let issuer_request_id = test_issuer_request_id();
         let idempotency_key = issuer_request_id.to_string();
@@ -3002,12 +3008,17 @@ mod tests {
             "
             UPDATE Jobs
             SET
-                status = 'Running',
+                status = CASE
+                    WHEN job_type IN (?, ?) THEN 'Running'
+                    ELSE 'Queued'
+                END,
                 lock_at = strftime('%s', 'now'),
                 lock_by = 'dead-worker'
             WHERE idempotency_key = ?
             ",
         )
+        .bind(mint_recovery_job_type())
+        .bind(job_type::<SubmitMintJob>())
         .bind(&idempotency_key)
         .execute(&harness.pool)
         .await
@@ -3045,14 +3056,21 @@ mod tests {
             4,
             "the fixture must cover the recovery and three side-effect jobs"
         );
-        assert!(
-            jobs.iter()
-                .all(|(_, status, lock_at, lock_by)| status == "Pending"
-                    && lock_at.is_none()
-                    && lock_by.is_none()),
-            "the reset must make every orphaned mint job pending and unlocked; \
-             got {jobs:?}"
+        assert_eq!(
+            jobs.iter().filter(|(_, status, ..)| status == "Pending").count(),
+            4,
+            "the reset must make every Running and Queued orphan pending; got \
+             {jobs:?}"
         );
+        assert!(
+            jobs.iter().all(|(_, _, lock_at, lock_by)| lock_at.is_none()
+                && lock_by.is_none()),
+            "the reset must unlock every orphaned mint job; got {jobs:?}"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Reset orphaned mint jobs", "affected_rows=4"]
+        ));
     }
 
     /// A prepare-stage failure (no transaction ever signed or broadcast) is

@@ -16,6 +16,7 @@ use crate::config::{Config, Environment, LogFormat, LogLevel};
 use crate::mint::{Mint, Network, TokenSymbol, UnderlyingSymbol};
 use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
+use crate::underlying::Underlying;
 use crate::vault::mock::MockVaultService;
 use crate::vault::{NetworkVaultServices, VaultService};
 use crate::wallet::SignerConfig;
@@ -64,6 +65,7 @@ pub(crate) struct TestHarness {
     pub(crate) account_store: Arc<Store<Account>>,
     pub(crate) asset_store: Arc<Store<TokenizedAsset>>,
     pub(crate) mint_store: Arc<Store<Mint>>,
+    pub(crate) underlying_store: Arc<Store<Underlying>>,
     pub(crate) vault: Arc<dyn VaultService>,
 }
 
@@ -124,6 +126,12 @@ impl TestHarness {
                 .await
                 .expect("Failed to build mint store");
 
+        let (underlying_store, _underlying_projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build underlying store");
+
         let apalis_options =
             apalis_sqlite::SqliteConnectOptions::from_str(&db_url)
                 .expect("valid sqlite url")
@@ -140,6 +148,7 @@ impl TestHarness {
             account_store,
             asset_store,
             mint_store,
+            underlying_store,
             vault,
         }
     }

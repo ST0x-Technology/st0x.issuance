@@ -1,7 +1,8 @@
 //! Durable projection of Alpaca corporate-action stream mutations.
 
 use backon::{BackoffBuilder, ExponentialBuilder};
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use event_sorcery::Store;
 use futures::StreamExt;
 use serde::Deserialize;
 use sqlx::{Pool, Sqlite};
@@ -12,14 +13,25 @@ use tracing::{debug, error, info, warn};
 use url::{Host, Url};
 
 use super::schedule::{
-    CorporateActionFreezeScheduler, CorporateActionScheduleError,
+    AlignCorporateActionFreeze, CorporateActionFreezeCtx,
+    CorporateActionFreezeError, CorporateActionFreezeScheduler,
+    CorporateActionRevisionGuard, CorporateActionScheduleError,
     CorporateActionScheduleState, acquire_corporate_action_revision_guard,
+    align_corporate_action_freeze_under_guards,
 };
 use super::view::{TokenizedAssetViewError, underlying_has_listing};
 use super::{CorporateActionEventId, CorporateActionId, UnderlyingSymbol};
-use crate::alpaca::AlpacaConfig;
+use crate::alpaca::{
+    AlpacaConfig,
+    service::{
+        CorporateActionBootstrapSince, CorporateActionBootstrapSinceError,
+    },
+};
 use crate::config::Environment;
 use crate::notifications::{LifecycleNotification, LifecycleNotifier};
+use crate::underlying::{
+    FreezeAdmissionGuard, Underlying, acquire_freeze_admission,
+};
 
 const BLOCKED_REASON_CURSOR_REGRESSION: &str = "cursor_regression";
 const BLOCKED_REASON_POISON: &str = "poison";
@@ -37,6 +49,19 @@ enum ConnectionProgress {
 struct ConnectionConsumption {
     progress: ConnectionProgress,
     result: Result<(), CorporateActionFeedError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CorporateActionReplayUntil(DateTime<Utc>);
+
+impl CorporateActionReplayUntil {
+    const fn at(instant: DateTime<Utc>) -> Self {
+        Self(instant)
+    }
+
+    fn query_value(&self) -> String {
+        self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +290,10 @@ pub(crate) struct CorporateActionSseDecoder {
 }
 
 impl CorporateActionSseDecoder {
+    const fn has_pending_frame(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// Incrementally decodes bounded SSE frames without retaining poisoned
     /// input. Complete frames preceding a poison boundary are returned so the
     /// caller can commit them before stopping at the rejected event.
@@ -365,8 +394,10 @@ pub(crate) struct CorporateActionFeed {
     api_key: String,
     api_secret: String,
     stream_transport: CorporateActionStreamTransport,
+    bootstrap_since: Option<CorporateActionBootstrapSince>,
     pool: Pool<Sqlite>,
     scheduler: CorporateActionFreezeScheduler,
+    underlying_store: Arc<Store<Underlying>>,
     notifier: Arc<dyn LifecycleNotifier>,
 }
 
@@ -386,8 +417,20 @@ pub(crate) enum CorporateActionFeedBuildError {
         "corporate-action stream URL must target stream.data.alpaca.markets"
     )]
     UnexpectedEndpointHost,
+    #[error(
+        "corporate-action stream URL contains reserved replay query parameter {0}"
+    )]
+    ReservedReplayQueryParameter(String),
     #[error("failed to build corporate-action HTTP client")]
     Client(#[from] reqwest::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CorporateActionPostProjectionError {
+    #[error(transparent)]
+    Reconciliation(#[from] CorporateActionReconciliationError),
+    #[error(transparent)]
+    Alignment(#[from] CorporateActionFreezeError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -399,15 +442,29 @@ pub(crate) enum CorporateActionFeedError {
     #[error("corporate-action stream returned content type {0}")]
     InvalidContentType(String),
     #[error(
-        "corporate-action projection has no baseline; snapshot repair is required"
+        "corporate-action projection has no cursor or explicit bootstrap boundary"
     )]
     BaselineRequired,
+    #[error("bounded corporate-action replay ended inside an SSE frame")]
+    BoundedReplayEndedMidFrame,
+    #[error(transparent)]
+    BootstrapSince(#[from] CorporateActionBootstrapSinceError),
     #[error(transparent)]
     Decode(#[from] CorporateActionStreamDecodeError),
     #[error(transparent)]
     Projection(#[from] CorporateActionProjectionError),
     #[error(transparent)]
     Reconciliation(#[from] CorporateActionReconciliationError),
+    #[error(transparent)]
+    Alignment(#[from] CorporateActionFreezeError),
+    #[error(
+        "corporate-action projection committed before a required effect failed: {source}"
+    )]
+    PostProjection {
+        #[source]
+        source: CorporateActionPostProjectionError,
+        _admission_guard: FreezeAdmissionGuard,
+    },
 }
 
 impl CorporateActionFeedError {
@@ -417,9 +474,13 @@ impl CorporateActionFeedError {
             Self::HttpStatus(_) => "http_status",
             Self::InvalidContentType(_) => "content_type",
             Self::BaselineRequired => "baseline_required",
+            Self::BoundedReplayEndedMidFrame => "bounded_replay_eof",
+            Self::BootstrapSince(_) => "bootstrap_since",
             Self::Decode(_) => "decode",
             Self::Projection(_) => "projection",
             Self::Reconciliation(_) => "reconciliation",
+            Self::Alignment(_) => "alignment",
+            Self::PostProjection { .. } => "post_projection",
         }
     }
 
@@ -434,6 +495,9 @@ impl CorporateActionFeedError {
                     observed: next,
                     ..
                 }
+                | CorporateActionProjectionError::ReplayEndedBeforeAnchor {
+                    expected: next,
+                }
                 | CorporateActionProjectionError::BlockedCursorRegression {
                     event_id: next,
                 }
@@ -444,7 +508,16 @@ impl CorporateActionFeedError {
             Self::Projection(
                 CorporateActionProjectionError::BlockedPoison { event_id },
             ) => event_id.as_ref(),
-            _ => None,
+            Self::Http(_)
+            | Self::HttpStatus(_)
+            | Self::InvalidContentType(_)
+            | Self::Projection(_)
+            | Self::BaselineRequired
+            | Self::BoundedReplayEndedMidFrame
+            | Self::BootstrapSince(_)
+            | Self::Reconciliation(_)
+            | Self::Alignment(_)
+            | Self::PostProjection { .. } => None,
         }
     }
 }
@@ -455,6 +528,7 @@ impl CorporateActionFeed {
         environment: Environment,
         pool: Pool<Sqlite>,
         apalis_pool: &apalis_sqlite::SqlitePool,
+        underlying_store: Arc<Store<Underlying>>,
         notifier: Arc<dyn LifecycleNotifier>,
     ) -> Result<Self, CorporateActionFeedBuildError> {
         let stream_transport = validate_corporate_action_endpoint(
@@ -475,19 +549,37 @@ impl CorporateActionFeed {
             api_key: config.api_key.clone(),
             api_secret: config.api_secret.clone(),
             stream_transport,
+            bootstrap_since: config.corporate_actions_bootstrap_since.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 apalis_pool,
                 pool.clone(),
             ),
+            underlying_store,
             pool,
             notifier,
         })
     }
 
+    /// Aligns every durable revision, then establishes any required replay
+    /// baseline before the HTTP service can accept traffic.
+    pub(crate) async fn establish_startup_baseline_at(
+        &mut self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<(), CorporateActionFeedError> {
+        self.align_all_current_revisions().await?;
+        match self.stream_transport {
+            CorporateActionStreamTransport::AuthenticatedAlpaca => {
+                self.establish_authenticated_baseline_at(cutoff).await
+            }
+            CorporateActionStreamTransport::CredentialFreeDevelopment => {
+                self.establish_development_baseline().await
+            }
+        }
+    }
+
     /// Lets a credential-free development stream establish its cursor through
-    /// the normal decoder and projection path before the development service starts.
-    /// Authenticated environments remain fail-closed until snapshot repair has
-    /// established their production baseline.
+    /// the normal decoder and projection path before the development service
+    /// starts.
     pub(crate) async fn establish_development_baseline(
         &mut self,
     ) -> Result<(), CorporateActionFeedError> {
@@ -501,11 +593,152 @@ impl CorporateActionFeed {
         self.consume_connection(None).await.result
     }
 
-    /// Reconciles every durably projected revision before connecting, then
-    /// retries transport failures with backoff. Contract, projection, and
-    /// reconciliation failures stop the feed so the service fails closed.
-    pub(crate) async fn run(mut self) -> Result<(), CorporateActionFeedError> {
+    /// Replays one finite operator-authorized history window before service
+    /// readiness. Alpaca closes a `since` + `until` stream after the inclusive
+    /// upper bound, so successful EOF proves the bounded replay completed.
+    pub(crate) async fn establish_authenticated_baseline_at(
+        &mut self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<(), CorporateActionFeedError> {
+        if self.stream_transport
+            != CorporateActionStreamTransport::AuthenticatedAlpaca
+            || load_cursor(&self.pool).await?.is_some()
+        {
+            return Ok(());
+        }
+        let Some(since) = self.bootstrap_since.clone() else {
+            return Ok(());
+        };
+        let until = CorporateActionReplayUntil::at(cutoff);
+        warn!(
+            target: "asset",
+            state = "bootstrapping",
+            mode = "bounded_history",
+            since = %since.query_value(),
+            until = %until.query_value(),
+            "Replaying a bounded Alpaca corporate-action window before service readiness"
+        );
+        self.consume_bootstrap_window(&since, &until).await.result?;
+        if load_cursor(&self.pool).await?.is_none() {
+            self.bootstrap_since =
+                Some(CorporateActionBootstrapSince::try_from_instant(cutoff)?);
+        }
+        Ok(())
+    }
+
+    async fn align_all_current_revisions(
+        &mut self,
+    ) -> Result<(), CorporateActionFeedError> {
+        let revision_guard = acquire_corporate_action_revision_guard().await;
+        let admission_guard = acquire_freeze_admission().await;
         reconcile_pending_schedules(&self.pool, &mut self.scheduler).await?;
+        let revisions: Vec<(String, String)> = sqlx::query_as(
+            "
+            SELECT action_id, event_id
+            FROM corporate_action_schedule
+            ORDER BY event_id
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(CorporateActionReconciliationError::from)?;
+        let ctx = CorporateActionFreezeCtx {
+            underlying_store: self.underlying_store.clone(),
+            pool: self.pool.clone(),
+            #[cfg(test)]
+            revision_read_test_hook: None,
+        };
+        for (action_id, event_id) in revisions {
+            let action_id =
+                CorporateActionId::new(&action_id).ok_or_else(|| {
+                    CorporateActionReconciliationError::InvalidActionId(
+                        action_id,
+                    )
+                })?;
+            let event_id =
+                CorporateActionEventId::new(&event_id).ok_or_else(|| {
+                    CorporateActionReconciliationError::InvalidEventId(event_id)
+                })?;
+            align_corporate_action_freeze_under_guards(
+                &AlignCorporateActionFreeze {
+                    action_id,
+                    expected_event_id: event_id,
+                },
+                &ctx,
+                &revision_guard,
+                &admission_guard,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_and_align_stream_mutation(
+        &mut self,
+        mutation: &CorporateActionMutation,
+    ) -> Result<ApplyMutationOutcome, CorporateActionFeedError> {
+        let revision_guard = acquire_corporate_action_revision_guard().await;
+        // Revision always precedes admission; scheduled jobs use the same
+        // ordering. Keep admission through projection and the hold commit so a
+        // mint cannot validate inside the boundary.
+        let admission_guard = acquire_freeze_admission().await;
+        let outcome = apply_stream_mutation_under_guards(
+            &self.pool,
+            mutation,
+            &revision_guard,
+            &admission_guard,
+        )
+        .await?;
+        if let Err(source) =
+            reconcile_pending_schedules(&self.pool, &mut self.scheduler).await
+        {
+            return Err(CorporateActionFeedError::PostProjection {
+                source: source.into(),
+                _admission_guard: admission_guard,
+            });
+        }
+        let ctx = CorporateActionFreezeCtx {
+            underlying_store: self.underlying_store.clone(),
+            pool: self.pool.clone(),
+            #[cfg(test)]
+            revision_read_test_hook: None,
+        };
+        let alignment = align_corporate_action_freeze_under_guards(
+            &AlignCorporateActionFreeze {
+                action_id: mutation.action.id.clone(),
+                expected_event_id: mutation.event_id.clone(),
+            },
+            &ctx,
+            &revision_guard,
+            &admission_guard,
+        )
+        .await;
+        if let Err(source) = alignment {
+            return Err(CorporateActionFeedError::PostProjection {
+                source: source.into(),
+                _admission_guard: admission_guard,
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// Connects after startup alignment, then retries transport failures with
+    /// backoff. Contract, projection, and reconciliation failures stop the
+    /// feed so the service fails closed.
+    pub(crate) async fn run(mut self) -> Result<(), CorporateActionFeedError> {
+        if load_cursor(&self.pool).await?.is_none()
+            && self.stream_transport
+                == CorporateActionStreamTransport::AuthenticatedAlpaca
+            && self.bootstrap_since.is_none()
+        {
+            info!(
+                target: "asset",
+                state = "disabled",
+                reason = "baseline_required",
+                "Corporate-action feed remains disabled without a cursor or explicit bootstrap boundary"
+            );
+            return Ok(());
+        }
         let reconnect_builder = reconnect_backoff_builder();
         let mut reconnect_backoff = reconnect_builder.build();
         let mut reconnect_failures = ReconnectFailures::default();
@@ -534,8 +767,11 @@ impl CorporateActionFeed {
                     error @ (CorporateActionFeedError::Decode(_)
                     | CorporateActionFeedError::Projection(_)
                     | CorporateActionFeedError::Reconciliation(_)
+                    | CorporateActionFeedError::Alignment(_)
+                    | CorporateActionFeedError::PostProjection { .. }
                     | CorporateActionFeedError::InvalidContentType(_)
-                    | CorporateActionFeedError::BaselineRequired),
+                    | CorporateActionFeedError::BaselineRequired
+                    | CorporateActionFeedError::BoundedReplayEndedMidFrame),
                 ) => {
                     self.notifier
                         .notify(
@@ -594,9 +830,29 @@ impl CorporateActionFeed {
         &mut self,
         cursor: Option<&CorporateActionEventId>,
     ) -> ConnectionConsumption {
+        self.consume_connection_with_window(cursor, None).await
+    }
+
+    async fn consume_bootstrap_window(
+        &mut self,
+        since: &CorporateActionBootstrapSince,
+        until: &CorporateActionReplayUntil,
+    ) -> ConnectionConsumption {
+        self.consume_connection_with_window(None, Some((since, until))).await
+    }
+
+    async fn consume_connection_with_window(
+        &mut self,
+        cursor: Option<&CorporateActionEventId>,
+        bootstrap_window: Option<(
+            &CorporateActionBootstrapSince,
+            &CorporateActionReplayUntil,
+        )>,
+    ) -> ConnectionConsumption {
         let mut progress = ConnectionProgress::Idle;
-        let result =
-            self.consume_connection_result(cursor, &mut progress).await;
+        let result = self
+            .consume_connection_result(cursor, bootstrap_window, &mut progress)
+            .await;
 
         ConnectionConsumption { progress, result }
     }
@@ -604,11 +860,18 @@ impl CorporateActionFeed {
     async fn consume_connection_result(
         &mut self,
         cursor: Option<&CorporateActionEventId>,
+        bootstrap_window: Option<(
+            &CorporateActionBootstrapSince,
+            &CorporateActionReplayUntil,
+        )>,
         progress: &mut ConnectionProgress,
     ) -> Result<(), CorporateActionFeedError> {
+        let bounded_replay = bootstrap_window.is_some();
         if cursor.is_none()
+            && !bounded_replay
             && self.stream_transport
                 == CorporateActionStreamTransport::AuthenticatedAlpaca
+            && self.bootstrap_since.is_none()
         {
             return Err(CorporateActionFeedError::BaselineRequired);
         }
@@ -624,6 +887,16 @@ impl CorporateActionFeed {
         };
         let request = if let Some(cursor) = cursor {
             request.query(&[("since_id", cursor.as_str())])
+        } else if let Some((since, until)) = bootstrap_window {
+            request.query(&[
+                ("since", since.query_value()),
+                ("until", until.query_value()),
+            ])
+        } else if let Some(bootstrap_since) = self.bootstrap_since.as_ref()
+            && self.stream_transport
+                == CorporateActionStreamTransport::AuthenticatedAlpaca
+        {
+            request.query(&[("since", bootstrap_since.query_value())])
         } else {
             request
         };
@@ -655,7 +928,8 @@ impl CorporateActionFeed {
         let mut applied_mutations = 0_usize;
         let mut last_accepted_event_id = None;
         while let Some(chunk) = chunks.next().await {
-            let (mutations, decode_error) = match decoder.push(&chunk?) {
+            let chunk = chunk?;
+            let (mutations, decode_error) = match decoder.push(&chunk) {
                 CorporateActionDecodeBatch::Complete(mutations) => {
                     (mutations, None)
                 }
@@ -680,9 +954,7 @@ impl CorporateActionFeed {
                 let action_id = mutation.action.id.clone();
                 let mutation_kind = mutation.kind;
                 let outcome =
-                    apply_stream_mutation(&self.pool, &mutation).await?;
-                reconcile_pending_schedules(&self.pool, &mut self.scheduler)
-                    .await?;
+                    self.apply_and_align_stream_mutation(&mutation).await?;
                 *progress = ConnectionProgress::AcceptedMutation;
                 applied_mutations = applied_mutations.saturating_add(1);
                 last_accepted_event_id = Some(event_id.clone());
@@ -699,6 +971,18 @@ impl CorporateActionFeed {
                 persist_poison_boundary(&self.pool, error.event_id()).await?;
                 return Err(error.into());
             }
+        }
+        if bounded_replay && decoder.has_pending_frame() {
+            return Err(CorporateActionFeedError::BoundedReplayEndedMidFrame);
+        }
+        if let Some(expected) = replay_anchor {
+            persist_replay_gap(&self.pool, &expected).await?;
+            return Err(
+                CorporateActionProjectionError::ReplayEndedBeforeAnchor {
+                    expected,
+                }
+                .into(),
+            );
         }
         if applied_mutations > 0 {
             info!(
@@ -719,6 +1003,17 @@ fn validate_corporate_action_endpoint(
     environment: Environment,
 ) -> Result<CorporateActionStreamTransport, CorporateActionFeedBuildError> {
     let endpoint = Url::parse(endpoint)?;
+    if let Some((parameter, _)) =
+        endpoint.query_pairs().find(|(parameter, _)| {
+            matches!(parameter.as_ref(), "since" | "since_id" | "until")
+        })
+    {
+        return Err(
+            CorporateActionFeedBuildError::ReservedReplayQueryParameter(
+                parameter.into_owned(),
+            ),
+        );
+    }
     if is_development_loopback_endpoint(&endpoint, environment) {
         return Ok(CorporateActionStreamTransport::CredentialFreeDevelopment);
     }
@@ -755,8 +1050,20 @@ pub(crate) fn spawn_corporate_action_feed(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = run_until_shutdown(feed, shutdown).await {
+            let retain_admission = matches!(
+                &error,
+                CorporateActionFeedError::PostProjection { .. }
+            );
             log_corporate_action_feed_failure(&error);
             let _ = service_shutdown.send(true);
+            if retain_admission {
+                // Projection committed before its required hold effect. Keep
+                // mint admission closed until Rocket aborts this background
+                // task during shutdown; dropping the error earlier would let
+                // a request race the shutdown notification.
+                let _retained_error = error;
+                std::future::pending::<()>().await;
+            }
         }
     })
 }
@@ -778,7 +1085,8 @@ fn log_corporate_action_feed_failure(error: &CorporateActionFeedError) {
         failure_kind = error.kind(),
         event_id = error.event_id().map(CorporateActionEventId::as_str),
         error = %error,
-        "Alpaca corporate-action stream stopped on poison input; terminating service to fail closed"
+        "Alpaca corporate-action stream stopped after a fatal consistency \
+         failure; terminating service to fail closed"
     );
 }
 
@@ -1034,6 +1342,10 @@ pub(crate) enum CorporateActionProjectionError {
         observed: CorporateActionEventId,
     },
     #[error(
+        "corporate-action replay ended before committed cursor {expected} was returned"
+    )]
+    ReplayEndedBeforeAnchor { expected: CorporateActionEventId },
+    #[error(
         "corporate-action event processing is blocked at {event_id}: replay gap"
     )]
     BlockedReplayGap { event_id: CorporateActionEventId },
@@ -1168,11 +1480,28 @@ async fn mark_reconciled(
 /// Atomically persists one accepted mutation, its latest schedule revision,
 /// and the monotonic replay cursor. Duplicate event IDs are no-ops; an unseen
 /// lower ID records a durable blocked boundary before returning an error.
+#[cfg(test)]
 pub(crate) async fn apply_mutation(
     pool: &Pool<Sqlite>,
     mutation: &CorporateActionMutation,
 ) -> Result<ApplyMutationOutcome, CorporateActionProjectionError> {
-    let _revision_guard = acquire_corporate_action_revision_guard().await;
+    let revision_guard = acquire_corporate_action_revision_guard().await;
+    let admission_guard = acquire_freeze_admission().await;
+    apply_mutation_under_guards(
+        pool,
+        mutation,
+        &revision_guard,
+        &admission_guard,
+    )
+    .await
+}
+
+async fn apply_mutation_under_guards(
+    pool: &Pool<Sqlite>,
+    mutation: &CorporateActionMutation,
+    _revision_guard: &CorporateActionRevisionGuard,
+    _admission_guard: &FreezeAdmissionGuard,
+) -> Result<ApplyMutationOutcome, CorporateActionProjectionError> {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(error) =
         projection_boundary(&mut transaction, &mutation.event_id).await?
@@ -1263,15 +1592,38 @@ pub(crate) async fn apply_mutation(
     Ok(ApplyMutationOutcome::Applied)
 }
 
+#[cfg(test)]
 async fn apply_stream_mutation(
     pool: &Pool<Sqlite>,
     mutation: &CorporateActionMutation,
 ) -> Result<ApplyMutationOutcome, CorporateActionProjectionError> {
+    let revision_guard = acquire_corporate_action_revision_guard().await;
+    let admission_guard = acquire_freeze_admission().await;
+    apply_stream_mutation_under_guards(
+        pool,
+        mutation,
+        &revision_guard,
+        &admission_guard,
+    )
+    .await
+}
+
+async fn apply_stream_mutation_under_guards(
+    pool: &Pool<Sqlite>,
+    mutation: &CorporateActionMutation,
+    revision_guard: &CorporateActionRevisionGuard,
+    admission_guard: &FreezeAdmissionGuard,
+) -> Result<ApplyMutationOutcome, CorporateActionProjectionError> {
     if underlying_has_listing(pool, &mutation.action.underlying).await? {
-        return apply_mutation(pool, mutation).await;
+        return apply_mutation_under_guards(
+            pool,
+            mutation,
+            revision_guard,
+            admission_guard,
+        )
+        .await;
     }
 
-    let _revision_guard = acquire_corporate_action_revision_guard().await;
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(error) =
         projection_boundary(&mut transaction, &mutation.event_id).await?
@@ -1466,15 +1818,17 @@ fn parse_stored_cursor(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration as ChronoDuration, NaiveDate};
+    use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
     use event_sorcery::StoreBuilder;
     use httpmock::prelude::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::alpaca::service::CorporateActionBootstrapSince;
     use crate::jobs::{Job, job_type};
     use crate::mint::test_utils::TestHarness;
     use crate::notifications::{
@@ -1536,6 +1890,22 @@ mod tests {
             ),
             Err(CorporateActionFeedBuildError::InsecureEndpointScheme(_))
         ));
+        for parameter in ["since", "since_id", "until"] {
+            let endpoint = format!(
+                "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?{parameter}=reserved"
+            );
+            assert!(matches!(
+                validate_corporate_action_endpoint(
+                    &endpoint,
+                    Environment::Production,
+                ),
+                Err(
+                    CorporateActionFeedBuildError::ReservedReplayQueryParameter(
+                        value
+                    )
+                ) if value == parameter
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1745,11 +2115,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -1954,6 +2326,7 @@ mod tests {
         let feed_error = CorporateActionFeedError::Decode(error);
 
         assert!(feed_error.event_id().is_none());
+        drop(feed_error);
     }
 
     #[test]
@@ -2060,6 +2433,7 @@ mod tests {
                 &format!("event_id=\"{event_id}\"")
             ]
         ));
+        drop(feed_error);
     }
 
     #[test]
@@ -2108,6 +2482,7 @@ mod tests {
             Some(event_id),
             "invalid UTF-8 telemetry must retain a validated ASCII SSE identity"
         );
+        drop(feed_error);
     }
 
     #[test]
@@ -2125,6 +2500,7 @@ mod tests {
             Some(event_id),
             "semantic poison telemetry must retain the validated SSE identity"
         );
+        drop(feed_error);
     }
 
     #[test]
@@ -2142,6 +2518,7 @@ mod tests {
             Some(event_id),
             "payload-only poison telemetry must retain its validated replay identity"
         );
+        drop(feed_error);
     }
 
     #[tokio::test]
@@ -2177,11 +2554,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool,
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
         let (service_shutdown, feed_shutdown) = watch::channel(false);
@@ -2228,11 +2607,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -2246,6 +2627,7 @@ mod tests {
             error.event_id().map(CorporateActionEventId::as_str),
             Some(poison_event_id)
         );
+        drop(error);
         let restart_error = load_cursor(&harness.pool).await.unwrap_err();
         assert!(matches!(
             restart_error,
@@ -2287,11 +2669,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -2307,6 +2691,7 @@ mod tests {
                 CorporateActionStreamDecodeError::FrameTooLarge
             )
         ));
+        drop(error);
         assert!(matches!(
             load_cursor(&harness.pool).await.unwrap_err(),
             CorporateActionProjectionError::BlockedPoison { event_id: None }
@@ -2318,6 +2703,64 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(blocked, (None, BLOCKED_REASON_POISON.to_string()));
+    }
+
+    #[tokio::test]
+    async fn replay_connection_refuses_eof_before_anchor() {
+        let harness = TestHarness::new().await;
+        let cursor_mutation = event(
+            "01J9RPMV5TKB8WX3M4F1KZ7QH2",
+            CorporateActionMutationKind::Insert,
+            "ca-1",
+            "2026-08-14",
+        );
+        apply_mutation(&harness.pool, &cursor_mutation).await.unwrap();
+        let server = MockServer::start();
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .query_param("since_id", cursor_mutation.event_id.as_str());
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("");
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        let consumption =
+            feed.consume_connection(Some(&cursor_mutation.event_id)).await;
+
+        stream.assert();
+        assert_eq!(consumption.progress, ConnectionProgress::Idle);
+        assert!(consumption.result.is_err());
+        drop(consumption);
+        let blocked: (String, String) = sqlx::query_as(
+            "SELECT event_id, reason FROM corporate_action_blocked_event WHERE singleton = 1",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+        assert_eq!(blocked.0, cursor_mutation.event_id.as_str());
+        assert_eq!(blocked.1, BLOCKED_REASON_REPLAY_GAP);
+        assert!(matches!(
+            load_cursor(&harness.pool).await.unwrap_err(),
+            CorporateActionProjectionError::BlockedReplayGap { event_id }
+                if event_id == cursor_mutation.event_id
+        ));
     }
 
     #[tokio::test]
@@ -2350,11 +2793,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -2369,6 +2814,7 @@ mod tests {
             error.event_id().map(CorporateActionEventId::as_str),
             Some(observed_event_id)
         );
+        drop(error);
         let persisted: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM corporate_action_mutations WHERE event_id = ?",
         )
@@ -2395,6 +2841,9 @@ mod tests {
     #[traced_test]
     async fn replay_connection_accepts_the_anchor_before_new_events() {
         let harness = TestHarness::new().await;
+        let bootstrap_since = "2026-08-01T00:00:00Z"
+            .parse::<CorporateActionBootstrapSince>()
+            .unwrap();
         let cursor_mutation = event(
             "01J9RPMV5TKB8WX3M4F1KZ7QH2",
             CorporateActionMutationKind::Insert,
@@ -2411,7 +2860,11 @@ mod tests {
         let stream = server.mock(|when, then| {
             when.method(GET)
                 .path("/corporate-actions")
-                .query_param("since_id", cursor_mutation.event_id.as_str());
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret")
+                .query_param("since_id", cursor_mutation.event_id.as_str())
+                .query_param_missing("since")
+                .query_param_missing("until");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(body);
@@ -2422,12 +2875,14 @@ mod tests {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             stream_transport:
-                CorporateActionStreamTransport::CredentialFreeDevelopment,
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(bootstrap_since),
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -2498,11 +2953,13 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool,
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
@@ -2515,6 +2972,7 @@ mod tests {
             consumption.result,
             Err(CorporateActionFeedError::Http(_))
         ));
+        drop(consumption);
     }
 
     #[tokio::test]
@@ -2542,17 +3000,478 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool.clone(),
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
         feed.establish_development_baseline().await.unwrap();
 
         assert_eq!(load_cursor(&harness.pool).await.unwrap(), Some(event_id));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn authenticated_first_install_replays_from_explicit_timestamp() {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let event_id =
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").unwrap();
+        let bootstrap_since = "2026-08-31T00:00:00Z"
+            .parse::<CorporateActionBootstrapSince>()
+            .unwrap();
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret")
+                .query_param("since", "2026-08-31T00:00:00Z")
+                .query_param_missing("since_id")
+                .query_param_missing("until");
+            then.status(200).header("content-type", "text/event-stream").body(
+                sse_frame(
+                    event_id.as_str(),
+                    CorporateActionMutationKind::Insert,
+                    "ca-bootstrap",
+                    &UnderlyingSymbol::new("UNLISTED").unwrap(),
+                    Utc::now().date_naive(),
+                ),
+            );
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(bootstrap_since),
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        let consumption = feed.consume_connection(None).await;
+
+        stream.assert();
+        consumption.result.unwrap();
+        assert_eq!(load_cursor(&harness.pool).await.unwrap(), Some(event_id));
+        assert!(!logs_contain("test-key"));
+        assert!(!logs_contain("test-secret"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn authenticated_startup_replay_is_bounded_before_service_readiness()
+    {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let bootstrap_since = "2026-08-31T00:00:00Z"
+            .parse::<CorporateActionBootstrapSince>()
+            .unwrap();
+        let startup_cutoff =
+            DateTime::parse_from_rfc3339("2026-09-01T23:59:59Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret")
+                .query_param("since", "2026-08-31T00:00:00Z")
+                .query_param("until", "2026-09-01T23:59:59Z")
+                .query_param_missing("since_id");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("");
+        });
+        let live_event_id =
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").unwrap();
+        let live = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .query_param("since", "2026-09-01T23:59:59Z")
+                .query_param_missing("since_id")
+                .query_param_missing("until");
+            then.status(200).header("content-type", "text/event-stream").body(
+                sse_frame(
+                    live_event_id.as_str(),
+                    CorporateActionMutationKind::Insert,
+                    "ca-after-empty-bootstrap",
+                    &UnderlyingSymbol::new("UNLISTED").unwrap(),
+                    Utc::now().date_naive(),
+                ),
+            );
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(bootstrap_since),
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        feed.establish_authenticated_baseline_at(startup_cutoff).await.unwrap();
+
+        stream.assert();
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Replaying a bounded Alpaca corporate-action window before service readiness",
+                "mode=\"bounded_history\"",
+                "since=2026-08-31T00:00:00Z",
+                "until=2026-09-01T23:59:59Z"
+            ]
+        ));
+        assert!(!logs_contain("test-key"));
+        assert!(!logs_contain("test-secret"));
+        assert_eq!(load_cursor(&harness.pool).await.unwrap(), None);
+        feed.consume_connection(None).await.result.unwrap();
+        live.assert();
+        assert_eq!(
+            load_cursor(&harness.pool).await.unwrap(),
+            Some(live_event_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_startup_replay_keeps_original_bound_after_committing_cursor()
+     {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let event_id =
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").unwrap();
+        let bootstrap_since = "2026-08-31T00:00:00Z"
+            .parse::<CorporateActionBootstrapSince>()
+            .unwrap();
+        let startup_cutoff =
+            DateTime::parse_from_rfc3339("2026-09-01T23:59:59Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .query_param("since", "2026-08-31T00:00:00Z")
+                .query_param("until", "2026-09-01T23:59:59Z")
+                .query_param_missing("since_id");
+            then.status(200).header("content-type", "text/event-stream").body(
+                sse_frame(
+                    event_id.as_str(),
+                    CorporateActionMutationKind::Insert,
+                    "ca-bootstrap",
+                    &UnderlyingSymbol::new("UNLISTED").unwrap(),
+                    Utc::now().date_naive(),
+                ),
+            );
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(bootstrap_since.clone()),
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        feed.establish_authenticated_baseline_at(startup_cutoff).await.unwrap();
+
+        stream.assert();
+        assert_eq!(load_cursor(&harness.pool).await.unwrap(), Some(event_id));
+        assert_eq!(feed.bootstrap_since, Some(bootstrap_since));
+    }
+
+    #[tokio::test]
+    async fn authenticated_startup_refuses_eof_inside_an_sse_frame() {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .query_param("since", "2026-08-31T00:00:00Z")
+                .query_param("until", "2026-09-01T23:59:59Z")
+                .query_param_missing("since_id");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("id: 01J9RPMV5TKB8WX3M4F1KZ7QH2\nevent: insert\ndata: {");
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(
+                "2026-08-31T00:00:00Z"
+                    .parse::<CorporateActionBootstrapSince>()
+                    .unwrap(),
+            ),
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+        let cutoff = DateTime::parse_from_rfc3339("2026-09-01T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let error =
+            feed.establish_authenticated_baseline_at(cutoff).await.unwrap_err();
+
+        stream.assert();
+        assert!(matches!(
+            error,
+            CorporateActionFeedError::BoundedReplayEndedMidFrame
+        ));
+        drop(error);
+    }
+
+    #[tokio::test]
+    async fn authenticated_startup_refuses_a_durable_blocked_boundary() {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let blocked_event_id = "01J9RPMV5TKB8WX3M4F1KZ7QH2";
+        sqlx::query(
+            "
+            INSERT INTO corporate_action_blocked_event (
+                singleton,
+                event_id,
+                reason
+            )
+            VALUES (1, ?, ?)
+            ",
+        )
+        .bind(blocked_event_id)
+        .bind(BLOCKED_REASON_POISON)
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        let unexpected_request = server.mock(|when, then| {
+            when.method(GET).path("/corporate-actions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("");
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: Some(
+                "2026-08-31T00:00:00Z"
+                    .parse::<CorporateActionBootstrapSince>()
+                    .unwrap(),
+            ),
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        let error =
+            feed.establish_startup_baseline_at(Utc::now()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            CorporateActionFeedError::Projection(
+                CorporateActionProjectionError::BlockedPoison {
+                    event_id: Some(ref event_id)
+                }
+            ) if event_id.as_str() == blocked_event_id
+        ));
+        drop(error);
+        assert_eq!(unexpected_request.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_active_mutation_is_aligned_before_connection_returns() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(harness.pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let server = MockServer::start();
+        let event_id =
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").unwrap();
+        let stream = server.mock(|when, then| {
+            when.method(GET).path("/corporate-actions");
+            then.status(200).header("content-type", "text/event-stream").body(
+                sse_frame(
+                    event_id.as_str(),
+                    CorporateActionMutationKind::Insert,
+                    "ca-bootstrap-active",
+                    &underlying,
+                    Utc::now().date_naive(),
+                ),
+            );
+        });
+        let mut feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store,
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        feed.consume_connection(None).await.result.unwrap();
+
+        stream.assert();
+        assert_eq!(
+            load_freeze_status(&harness.pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen,
+            "connection completion must mean its active hold is aligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_post_projection_failure_keeps_mint_admission_closed() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        sqlx::query("DROP TABLE Jobs").execute(&harness.pool).await.unwrap();
+        let server = MockServer::start();
+        let event_id =
+            CorporateActionEventId::new("01J9RPMV5TKB8WX3M4F1KZ7QH2").unwrap();
+        let stream = server.mock(|when, then| {
+            when.method(GET).path("/corporate-actions");
+            then.status(200).header("content-type", "text/event-stream").body(
+                sse_frame(
+                    event_id.as_str(),
+                    CorporateActionMutationKind::Insert,
+                    "ca-schedule-failure",
+                    &underlying,
+                    Utc::now().date_naive(),
+                ),
+            );
+        });
+        let feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            bootstrap_since: None,
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool.clone(),
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+        let (service_shutdown, feed_shutdown) = watch::channel(false);
+        let mut observed_shutdown = service_shutdown.subscribe();
+        let task =
+            spawn_corporate_action_feed(feed, feed_shutdown, service_shutdown);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            observed_shutdown.changed(),
+        )
+        .await
+        .expect("post-projection failure must request shutdown promptly")
+        .expect("service shutdown sender must remain live");
+
+        stream.assert();
+        assert!(*observed_shutdown.borrow());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                acquire_freeze_admission(),
+            )
+            .await
+            .is_err(),
+            "production failure handling must keep mint admission closed"
+        );
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_freeze_admission(),
+        )
+        .await
+        .expect(
+            "aborting the failed feed during shutdown must release admission",
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn authenticated_feed_without_cursor_or_bootstrap_stays_disabled() {
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let feed = CorporateActionFeed {
+            client: reqwest::Client::new(),
+            endpoint: format!("{}/corporate-actions", server.base_url()),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            stream_transport:
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: None,
+            pool: harness.pool.clone(),
+            scheduler: CorporateActionFreezeScheduler::new(
+                &harness.apalis_pool,
+                harness.pool,
+            ),
+            underlying_store: harness.underlying_store.clone(),
+            notifier: Arc::new(NoopLifecycleNotifier),
+        };
+
+        feed.run().await.unwrap();
+
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Corporate-action feed remains disabled without a cursor or explicit bootstrap boundary",
+                "state=\"disabled\"",
+                "reason=\"baseline_required\""
+            ]
+        ));
     }
 
     #[tokio::test]
@@ -2566,17 +3485,20 @@ mod tests {
             api_secret: "test-secret".to_string(),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
+            bootstrap_since: None,
             pool: harness.pool.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
                 &harness.apalis_pool,
                 harness.pool,
             ),
+            underlying_store: harness.underlying_store.clone(),
             notifier: Arc::new(NoopLifecycleNotifier),
         };
 
         let error = feed.consume_connection(None).await.result.unwrap_err();
 
         assert!(matches!(error, CorporateActionFeedError::BaselineRequired));
+        drop(error);
     }
 
     #[tokio::test]
