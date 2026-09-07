@@ -49,9 +49,11 @@ pub(crate) const WRAPPED_TRANSFER_POLL_INTERVAL: Duration =
 /// Interval between retries when a polling pass fails (e.g. RPC error).
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Wrapped-token contract addresses to watch, per network, each mapped to the
-/// underlying it wraps. Built from the `[wrapped_tokens.<network>]` tables of
-/// the TOML config file; existence implies the entries passed validation.
+/// Wrapped-token contract addresses to watch, per network.
+///
+/// Each address maps to the underlying it wraps. Built from the
+/// `[wrapped_tokens.<network>]` tables of the TOML config file; existence
+/// implies the entries passed validation.
 #[derive(Debug, Clone, Default)]
 pub struct WrappedTokenConfig {
     per_network: HashMap<Network, HashMap<Address, UnderlyingSymbol>>,
@@ -348,10 +350,9 @@ impl<P: Provider> WrappedTransferMonitor<P> {
 
             let mut dropped = 0_usize;
             for log in &logs {
-                if let HandledLog::Dropped =
-                    self.handle_log(watched, log).await?
-                {
-                    dropped += 1;
+                match self.handle_log(watched, log).await? {
+                    HandledLog::Dropped => dropped += 1,
+                    HandledLog::Recorded => {}
                 }
             }
 
