@@ -327,6 +327,7 @@ mod tests {
     use rocket::local::asynchronous::Client;
 
     use super::*;
+    use crate::test_utils::test_config;
 
     #[rocket::get("/issuer-test")]
     fn issuer_endpoint(_auth: IssuerAuth) -> &'static str {
@@ -337,8 +338,6 @@ mod tests {
     fn internal_endpoint(_auth: InternalAuth) -> &'static str {
         "internal authenticated"
     }
-
-    use crate::test_utils::test_config;
 
     #[tokio::test]
     async fn test_missing_api_key_header_returns_401() {

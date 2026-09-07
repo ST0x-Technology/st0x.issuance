@@ -3084,9 +3084,6 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
-    use crate::auth::FailedAuthRateLimiter;
-    use crate::config::Config;
-
     use super::{
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
     };
@@ -3099,7 +3096,8 @@ mod tests {
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
-    use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
+    use crate::auth::FailedAuthRateLimiter;
+    use crate::config::{Config, VaultMode, VaultModeConfig, VaultModeKind};
     use crate::mint::test_utils::{
         TestHarness, network_vault_services, test_config,
     };

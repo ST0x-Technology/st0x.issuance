@@ -326,9 +326,7 @@ mod tests {
     use super::*;
     use crate::account::Account;
     use crate::auth::FailedAuthRateLimiter;
-    use crate::test_utils::logs_contain_at;
-
-    use crate::test_utils::test_config;
+    use crate::test_utils::{logs_contain_at, test_config};
 
     async fn register_account(
         store: &Arc<Store<Account>>,

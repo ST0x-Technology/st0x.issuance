@@ -351,13 +351,11 @@ mod tests {
     use super::*;
     use crate::auth::FailedAuthRateLimiter;
     use crate::config::{Config, VaultModeConfig};
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{logs_contain_at, test_config};
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
     use crate::underlying::{Underlying, UnderlyingCommand};
-
-    use crate::test_utils::test_config;
 
     fn base_view(underlying: &str, token: &str) -> TokenizedAssetView {
         TokenizedAssetView {
