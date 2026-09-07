@@ -248,8 +248,260 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     /// where every token failed propagates, since that is indistinguishable
     /// from the watcher being offline.
     async fn poll_once(&self) -> Result<(), WrappedTransferPollError> {
-        todo!()
+        if self.watched.is_empty() {
+            return Ok(());
+        }
+
+        // One head for the whole pass so every token scans to a consistent
+        // block.
+        let head = self.provider.get_block_number().await?;
+
+        // A per token failure must not starve the others: each token owns
+        // its checkpoint and resumes next pass. A pass where EVERY token
+        // failed is indistinguishable from the watcher being offline, so it
+        // propagates and `run` backs off.
+        let mut failed_tokens: Vec<Address> = Vec::new();
+        for watched in &self.watched {
+            if let Err(error) = self.poll_token(watched, head).await {
+                debug!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    error = %error,
+                    "Failed to poll wrapped token; will retry next pass from \
+                     its checkpoint"
+                );
+                failed_tokens.push(watched.token);
+            }
+        }
+
+        if !failed_tokens.is_empty() {
+            warn!(
+                target: "wrapped_transfer",
+                network = %self.network,
+                failed_token_count = failed_tokens.len(),
+                failed_tokens = ?failed_tokens,
+                total_tokens = self.watched.len(),
+                "Wrapped-token transfer poll pass completed with token \
+                 failures; each resumes from its checkpoint next pass"
+            );
+
+            if failed_tokens.len() == self.watched.len() {
+                return Err(WrappedTransferPollError::AllTokensFailed {
+                    total: self.watched.len(),
+                });
+            }
+        }
+
+        Ok(())
     }
+
+    /// Scans one token from its checkpoint (or `backfill_start_block` when
+    /// it has none) up to `head`, handling each log and advancing the
+    /// checkpoint per chunk.
+    async fn poll_token(
+        &self,
+        watched: &WatchedWrappedToken,
+        head: u64,
+    ) -> Result<(), WrappedTransferPollError> {
+        let name = checkpoint_name(self.network, watched.token);
+
+        let cursor = match load_checkpoint_block(&self.pool, &name).await? {
+            None => self.backfill_start_block,
+            Some(last_processed) => {
+                let next = last_processed.checked_add(1).ok_or(
+                    WrappedTransferPollError::CheckpointOverflow {
+                        last_processed_block: last_processed,
+                    },
+                )?;
+                next.max(self.backfill_start_block)
+            }
+        };
+
+        if cursor > head {
+            trace!(
+                target: "wrapped_transfer",
+                network = %self.network,
+                token = %watched.token,
+                cursor,
+                head,
+                "Wrapped token caught up; skipping"
+            );
+            return Ok(());
+        }
+
+        debug!(
+            target: "wrapped_transfer",
+            network = %self.network,
+            token = %watched.token,
+            from_block = cursor,
+            to_block = head,
+            "Polling wrapped token for inbound transfers"
+        );
+
+        for (chunk_from, chunk_to) in
+            block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
+        {
+            let logs = self
+                .fetch_transfer_logs(watched.token, chunk_from, chunk_to)
+                .await?;
+
+            let mut dropped = 0_usize;
+            for log in &logs {
+                if let HandledLog::Dropped =
+                    self.handle_log(watched, log).await?
+                {
+                    dropped += 1;
+                }
+            }
+
+            advance_checkpoint_block(&self.pool, &name, chunk_to).await?;
+
+            // The advance above makes the drop permanent, and the per log
+            // detail is DEBUG (loop-body rule), so this per chunk summary is
+            // the operator's only signal.
+            if dropped > 0 {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    count = dropped,
+                    chunk_from,
+                    chunk_to,
+                    "Dropped unidentifiable wrapped-token transfer logs; they \
+                     cannot be recorded or alerted"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetches `Transfer` logs of `token` whose `to` is the issuer wallet.
+    /// Every ERC-20 emits the same `Transfer(address,address,uint256)`, so
+    /// the vault binding's event matches and decodes the wrapper's logs too.
+    async fn fetch_transfer_logs(
+        &self,
+        token: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>, WrappedTransferPollError> {
+        let filter = Filter::new()
+            .address(token)
+            .event_signature(
+                bindings::OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
+            )
+            .topic2(self.bot_wallet.into_word())
+            .from_block(from_block)
+            .to_block(to_block);
+
+        Ok(self.provider.get_logs(&filter).await?)
+    }
+
+    /// Records the log and queues its alert. Both steps are idempotent on the
+    /// log identity, so a chunk retried after a partial failure can neither
+    /// double-record nor double-alert. A log that cannot be identified (no tx
+    /// hash, block number, or log index, or an undecodable payload) is
+    /// `Dropped`: retrying it would freeze the checkpoint forever.
+    async fn handle_log(
+        &self,
+        watched: &WatchedWrappedToken,
+        log: &Log,
+    ) -> Result<HandledLog, WrappedTransferPollError> {
+        let Some(transfer) = identify_transfer(self.network, watched, log)
+        else {
+            debug!(
+                target: "wrapped_transfer",
+                network = %self.network,
+                token = %watched.token,
+                tx_hash = ?log.transaction_hash,
+                log_index = ?log.log_index,
+                "Skipping unidentifiable wrapped-token transfer log"
+            );
+            return Ok(HandledLog::Dropped);
+        };
+
+        if record_inbound_wrapped_transfer(&self.pool, &transfer).await? {
+            error!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                underlying = %transfer.underlying,
+                token = %transfer.token,
+                from = %transfer.from,
+                amount = %transfer.amount,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                block_number = transfer.block_number,
+                "Inbound wrapped-token transfer to the issuer wallet; it \
+                 cannot be redeemed automatically and needs manual recovery"
+            );
+        } else {
+            debug!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                "Inbound wrapped-token transfer already recorded; re-queueing \
+                 its alert is a no-op"
+            );
+        }
+
+        let key = alert_idempotency_key(
+            transfer.network,
+            transfer.tx_hash,
+            transfer.log_index,
+        );
+        release_dead_lifecycle_notification_job(&self.pool, &key).await?;
+        JobQueue::<SendLifecycleNotification>::new(&self.apalis_pool)
+            .push_with_idempotency_key(
+                SendLifecycleNotification {
+                    notification:
+                        LifecycleNotification::InboundWrappedTransfer {
+                            network: transfer.network,
+                            underlying: transfer.underlying,
+                            token: transfer.token,
+                            from: transfer.from,
+                            amount: transfer.amount,
+                            tx_hash: transfer.tx_hash,
+                        },
+                },
+                key,
+            )
+            .await?;
+
+        Ok(HandledLog::Recorded)
+    }
+}
+
+/// Outcome of handling one log: recorded (and its alert queued), or dropped
+/// because the log cannot be identified.
+enum HandledLog {
+    Recorded,
+    Dropped,
+}
+
+/// Decodes one `Transfer` log into a record, or `None` when the log lacks
+/// the fields that make up its identity or does not decode as a `Transfer`.
+fn identify_transfer(
+    network: Network,
+    watched: &WatchedWrappedToken,
+    log: &Log,
+) -> Option<InboundWrappedTransfer> {
+    let event =
+        bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)
+            .ok()?;
+
+    Some(InboundWrappedTransfer {
+        network,
+        underlying: watched.underlying.clone(),
+        token: watched.token,
+        from: event.from,
+        amount: event.value,
+        tx_hash: log.transaction_hash?,
+        log_index: log.log_index?,
+        block_number: log.block_number?,
+        detected_at: Utc::now(),
+    })
 }
 
 /// Records `transfer` unless its `(network, tx_hash, log_index)` identity is
@@ -258,16 +510,104 @@ pub(crate) async fn record_inbound_wrapped_transfer(
     pool: &Pool<Sqlite>,
     transfer: &InboundWrappedTransfer,
 ) -> Result<bool, sqlx::Error> {
-    let _ = (pool, transfer);
-    todo!()
+    let result = sqlx::query(
+        "
+        INSERT INTO inbound_wrapped_transfers (
+            network,
+            tx_hash,
+            log_index,
+            token,
+            underlying,
+            from_address,
+            amount,
+            block_number,
+            detected_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(network, tx_hash, log_index) DO NOTHING
+        ",
+    )
+    .bind(transfer.network.as_str())
+    .bind(format!("{:#x}", transfer.tx_hash))
+    .bind(integer_column(transfer.log_index)?)
+    .bind(format!("{:#x}", transfer.token))
+    .bind(transfer.underlying.as_str())
+    .bind(format!("{:#x}", transfer.from))
+    .bind(transfer.amount.to_string())
+    .bind(integer_column(transfer.block_number)?)
+    .bind(transfer.detected_at.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// Converts a block number or log index into a SQLite INTEGER bind. Reported
+/// as an encode error: the value is on its way into a bind parameter, so a
+/// decode error would point an operator at the read path.
+fn integer_column(value: u64) -> Result<i64, sqlx::Error> {
+    i64::try_from(value).map_err(|error| {
+        sqlx::Error::Encode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )))
+    })
 }
 
 /// Every recorded inbound wrapped-token transfer, highest block first.
 pub(crate) async fn list_inbound_wrapped_transfers(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<InboundWrappedTransfer>, InboundWrappedTransferReadError> {
-    let _ = pool;
-    todo!()
+    let rows = sqlx::query_as::<
+        _,
+        (String, String, i64, String, String, String, String, i64, String),
+    >(
+        "
+        SELECT
+            network,
+            tx_hash,
+            log_index,
+            token,
+            underlying,
+            from_address,
+            amount,
+            block_number,
+            detected_at
+        FROM inbound_wrapped_transfers
+        ORDER BY block_number DESC, log_index DESC
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(
+            |(
+                network,
+                tx_hash,
+                log_index,
+                token,
+                underlying,
+                from_address,
+                amount,
+                block_number,
+                detected_at,
+            )| {
+                Ok(InboundWrappedTransfer {
+                    network: network.parse()?,
+                    underlying: UnderlyingSymbol::new(underlying)?,
+                    token: token.parse()?,
+                    from: from_address.parse()?,
+                    amount: amount.parse()?,
+                    tx_hash: tx_hash.parse()?,
+                    log_index: u64::try_from(log_index)?,
+                    block_number: u64::try_from(block_number)?,
+                    detected_at: DateTime::parse_from_rfc3339(&detected_at)?
+                        .with_timezone(&Utc),
+                })
+            },
+        )
+        .collect()
 }
 
 /// A stored row failed to parse back into its typed form.

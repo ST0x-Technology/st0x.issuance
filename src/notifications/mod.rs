@@ -180,7 +180,20 @@ impl LifecycleNotification {
                     format_ether(*threshold)
                 )
             }
-            Self::InboundWrappedTransfer { .. } => todo!(),
+            Self::InboundWrappedTransfer {
+                network,
+                underlying,
+                token,
+                from,
+                amount,
+                tx_hash,
+            } => format!(
+                "Inbound wrapped-token transfer on {network}: {} wrapped \
+                 {underlying} ({token}) from {from} to the issuer wallet in tx \
+                 {tx_hash}; not redeemable automatically, manual recovery \
+                 required",
+                format_ether(*amount)
+            ),
         }
     }
 }
@@ -696,7 +709,7 @@ mod tests {
         let notification = LifecycleNotification::InboundWrappedTransfer {
             network: Network::Ethereum,
             underlying: underlying(),
-            token: address!("0x00000000000000000000000000000000000000aa"),
+            token: address!("0x0000000000000000000000000000000000001010"),
             from: address!("0x9999999999999999999999999999999999999999"),
             amount: parse_ether("7.5").unwrap(),
             tx_hash: b256!(
@@ -708,7 +721,7 @@ mod tests {
         assert_eq!(
             notification.message(),
             "Inbound wrapped-token transfer on ethereum: 7.500000000000000000 \
-             wrapped AAPL (0x00000000000000000000000000000000000000aa) from \
+             wrapped AAPL (0x0000000000000000000000000000000000001010) from \
              0x9999999999999999999999999999999999999999 to the issuer wallet \
              in tx \
              0x1111111111111111111111111111111111111111111111111111111111111111; \
