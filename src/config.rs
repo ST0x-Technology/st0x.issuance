@@ -24,7 +24,9 @@ use crate::notifications::{
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig, console_fmt_layer};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
-use crate::wrapped_transfer::{WrappedTokenConfig, WrappedTokenConfigError};
+use crate::wrapped_transfer::{
+    WrappedTokenConfig, WrappedTokenConfigError, WrappedTokenEntry,
+};
 
 /// How a specific tokenized asset's mint/burn is executed on-chain.
 ///
@@ -558,6 +560,18 @@ impl Env {
                     .into());
                 }
             }
+        }
+
+        // A wrapped-token table for a chain this deployment does not run
+        // would be silently unwatched — the exact gap the watcher closes —
+        // so it is a deploy error here rather than a missing alert later.
+        if let Some(network) = wrapped_tokens.networks().find(|network| {
+            chains.iter().all(|chain| chain.network != *network)
+        }) {
+            return Err(ConfigError::WrappedTokensForUnconfiguredNetwork {
+                network,
+                network_upper: network.as_str().to_ascii_uppercase(),
+            });
         }
 
         Ok(Config {
@@ -1125,8 +1139,33 @@ pub(crate) fn load_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
 fn resolve_wrapped_tokens(
     toml: &TomlFile,
 ) -> Result<WrappedTokenConfig, ConfigError> {
-    let _ = toml;
-    todo!()
+    let mut entries = Vec::new();
+
+    for (network_key, tokens) in &toml.wrapped_tokens {
+        let network = network_key.parse::<Network>().map_err(|_| {
+            ConfigError::UnknownWrappedTokenNetwork { key: network_key.clone() }
+        })?;
+
+        for (symbol, value) in tokens {
+            let underlying = UnderlyingSymbol::new(symbol.to_ascii_uppercase())
+                .map_err(|error| ConfigError::InvalidWrappedTokenSymbol {
+                    network,
+                    symbol: symbol.clone(),
+                    error,
+                })?;
+            let token = value.parse::<Address>().map_err(|_| {
+                ConfigError::InvalidWrappedTokenAddress {
+                    network,
+                    underlying: underlying.clone(),
+                    value: value.clone(),
+                }
+            })?;
+
+            entries.push(WrappedTokenEntry { network, underlying, token });
+        }
+    }
+
+    Ok(WrappedTokenConfig::new(entries)?)
 }
 
 /// Converts the raw TOML file into a validated `VaultModeConfig`.

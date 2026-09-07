@@ -29,3 +29,15 @@ base = "0x1234567890abcdef1234567890abcdef12345678"
 # every other asset stays on the default.
 [assets.RKLB]
 vault_mode = "orchestrator"
+
+# Wrapped-token (ERC-4626 wrapper) contract addresses, one table per network
+# (base | ethereum | hyperevm), keyed by underlying symbol. Inbound transfers
+# of these tokens to the issuer wallet cannot be redeemed, so the per network
+# watcher records them and alerts the operator (see SPEC.md "Per network
+# monitoring"). Every listed network must have a chain configuration; a
+# configured chain with no table here has wrapped-token watching disabled
+# (startup WARN). Unknown networks, invalid symbols, malformed or zero
+# addresses, and one address bound to two symbols on a chain are startup
+# errors.
+[wrapped_tokens.base]
+RKLB = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
