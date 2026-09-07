@@ -43,10 +43,6 @@ let
             throw "Unsupported environment '${environment}'"
         }"
         "LOG_LEVEL=debug"
-        # Paired with the nginx routes in nix/ingress.nix off one option, so
-        # the app cannot trust X-Real-IP while nothing sets it, nor keep
-        # reading the TCP source once nginx is the only caller.
-        "BEHIND_PROXY=${lib.boolToString config.st0x.ingress.behindProxy}"
         # Per-environment orchestrator/vault-mode TOML config; the committed
         # files are dark (no orchestrator entries = every asset vault-direct).
         # Interpolating the path copies the file into the nix store, so the
@@ -63,38 +59,55 @@ let
     else
       [ ];
 
-  mkService = name: cfg: {
-    description = cfg.description or "st0x ${name}";
+  mkService =
+    name: cfg:
+    let
+      # BEHIND_PROXY rides on the command line rather than in Environment=.
+      # systemd applies EnvironmentFile= after Environment=, so a stray
+      # BEHIND_PROXY in the agenix env file would otherwise win and let the
+      # app disagree with the nginx routes that nix/ingress.nix opens off the
+      # same option: the app would read the TCP source while nginx proxies,
+      # and every request would look like 127.0.0.1 to the IP whitelists.
+      # `env` runs after systemd has assembled the environment, so this value
+      # is the last word whatever the secrets file says.
+      behindProxy = lib.optionals (cfg.kind == "st0x") [
+        "BEHIND_PROXY=${lib.boolToString config.st0x.ingress.behindProxy}"
+      ];
+    in
+    {
+      description = cfg.description or "st0x ${name}";
 
-    # Service is started by deploy.nix profile, not by systemd on boot.
-    # This avoids coordination issues during deployments.
-    wantedBy = [ ];
+      # Service is started by deploy.nix profile, not by systemd on boot.
+      # This avoids coordination issues during deployments.
+      wantedBy = [ ];
 
-    restartIfChanged = false;
-    stopIfChanged = false;
+      restartIfChanged = false;
+      stopIfChanged = false;
 
-    unitConfig = {
-      "X-OnlyManualStart" = true;
-      StartLimitBurst = 10;
-      StartLimitIntervalSec = 300;
+      unitConfig = {
+        "X-OnlyManualStart" = true;
+        StartLimitBurst = 10;
+        StartLimitIntervalSec = 300;
 
-      # Marker file created ONLY by service profile activation.
-      # Guarantees service is SKIPPED (not failed) during system activation.
-      ConditionPathExists = cfg.markerFile;
+        # Marker file created ONLY by service profile activation.
+        # Guarantees service is SKIPPED (not failed) during system activation.
+        ConditionPathExists = cfg.markerFile;
+      };
+
+      serviceConfig = {
+        User = "st0x";
+        Group = "st0x";
+        ExecStart = utils.escapeSystemdExecArgs (
+          [ "${pkgs.coreutils}/bin/env" ] ++ behindProxy ++ [ "${cfg.profilePath}/bin/${cfg.bin}" ]
+        );
+        Environment = staticEnvironment name cfg;
+        Restart = "always";
+        RestartSec = 30;
+      }
+      // lib.optionalAttrs (cfg.kind == "st0x") {
+        EnvironmentFile = cfg.decryptedEnvPath;
+      };
     };
-
-    serviceConfig = {
-      User = "st0x";
-      Group = "st0x";
-      ExecStart = utils.escapeSystemdExecArgs [ "${cfg.profilePath}/bin/${cfg.bin}" ];
-      Environment = staticEnvironment name cfg;
-      Restart = "always";
-      RestartSec = 30;
-    }
-    // lib.optionalAttrs (cfg.kind == "st0x") {
-      EnvironmentFile = cfg.decryptedEnvPath;
-    };
-  };
 in
 {
   systemd.services = lib.mapAttrs mkService unitServices;

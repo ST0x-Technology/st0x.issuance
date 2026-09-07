@@ -4,7 +4,8 @@
 # Whether it forwards anything is controlled by the single option below.
 #
 # `st0x.ingress.behindProxy` is the one switch for the whole cutover. It sets
-# `BEHIND_PROXY` on the service unit (see nix/upgradeable-services.nix) and
+# `BEHIND_PROXY` on the service unit's command line (see
+# nix/upgradeable-services.nix; the agenix env file cannot override it) and
 # opens the proxied routes here, so the app and nginx cannot disagree:
 #
 #   false  Rocket listens on 0.0.0.0:8000 and takes the client IP from the TCP
@@ -106,6 +107,12 @@ let
     "~ ^/tokenized-assets/.+/status$" = proxied;
     "~ ^/internal/mints/.+/authorization$" = proxied;
 
+    # Deliberately NOT forwarded: GET /tokenized-assets/<underlying>, the
+    # InternalAuth asset read. No automated caller uses it (liquidity builds
+    # only the two routes above), so it stays off the public listener with the
+    # rest of the internal surface; the allowlist is what callers need, not
+    # what the guard would permit. Add a location here if a consumer appears.
+    #
     # Everything else (admin, provisioning, docs) is not served here.
     "/".return = "403";
   };
