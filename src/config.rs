@@ -1370,6 +1370,27 @@ mod tests {
         assert_eq!(config.log_format, LogFormat::Json);
     }
 
+    /// `behind_proxy` picks the listener (loopback vs all interfaces) and
+    /// whether `X-Real-IP` is trusted, so the default must stay off and an
+    /// explicit value must survive the conversion into [`Config`].
+    #[test]
+    fn behind_proxy_defaults_off_and_explicit_value_reaches_config() {
+        let env = Env::try_parse_from(minimal_args()).unwrap();
+        assert!(!env.behind_proxy);
+        assert!(!env.into_config().unwrap().behind_proxy);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--behind-proxy", "true"]);
+        let env = Env::try_parse_from(args).unwrap();
+        assert!(env.behind_proxy);
+        assert!(env.into_config().unwrap().behind_proxy);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--behind-proxy", "false"]);
+        let env = Env::try_parse_from(args).unwrap();
+        assert!(!env.into_config().unwrap().behind_proxy);
+    }
+
     #[test]
     fn into_config_keeps_additional_chains_disabled_with_explicit_base_config()
     {
