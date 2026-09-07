@@ -160,9 +160,13 @@ jobs:
       - name: Sign Binary Authorization attestation
         run: |
           set -euo pipefail
+          # The attestor reports the key as a full resource URL
+          # (//cloudkms.googleapis.com/v1/projects/...); --keyversion wants
+          # the bare resource name.
           KEY_VERSION=$(gcloud container binauthz attestors describe issuance-image \
             --project=s01-artifacts \
             --format='value(userOwnedGrafeasNote.publicKeys[0].id)')
+          KEY_VERSION="${KEY_VERSION#//cloudkms.googleapis.com/v1/}"
           case "$KEY_VERSION" in
             projects/s01-artifacts/locations/*/cryptoKeyVersions/*) ;;
             *) echo "::error::could not resolve the attestor's key version (got '${KEY_VERSION}')"; exit 1 ;;
