@@ -65,14 +65,27 @@ variable "volume_description" {
   default     = null
 }
 
+# Both lists mirror the root-level validation: an empty list would make
+# Terraform drop the firewall rule rather than restrict it, so a caller that
+# passes [] must fail at plan time here too, not only through infra/main.tf.
 variable "api_source_addresses" {
   description = "Source ranges allowed to reach the legacy plaintext API on port 8000. Tighten to Alpaca ranges + the old liquidity droplet, then remove the rule after the HTTPS cutover (RAI-236)."
   type        = list(string)
   default     = ["0.0.0.0/0", "::/0"]
+
+  validation {
+    condition     = length(var.api_source_addresses) > 0
+    error_message = "api_source_addresses must not be empty; an empty list silently drops the rule instead of restricting it"
+  }
 }
 
 variable "https_source_addresses" {
   description = "Source ranges allowed to reach the HTTPS API on port 443. World until Alpaca provides egress CIDRs."
   type        = list(string)
   default     = ["0.0.0.0/0", "::/0"]
+
+  validation {
+    condition     = length(var.https_source_addresses) > 0
+    error_message = "https_source_addresses must not be empty; an empty list silently drops the rule instead of restricting it"
+  }
 }
