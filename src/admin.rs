@@ -52,6 +52,7 @@ use crate::vault::{
     BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
 };
+use crate::wrapped_transfer::InboundWrappedTransfer;
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -2364,6 +2365,74 @@ pub(crate) fn network_telemetry(
     Json(NetworkTelemetryResponse { networks: telemetry.snapshot() })
 }
 
+/// One recorded inbound wrapped-token transfer as the admin API reports it.
+/// `amount` is the raw ERC-20 value in 18-decimal base units, as a decimal
+/// string.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct WrappedTransferEntry {
+    network: Network,
+    #[schema(value_type = String)]
+    underlying: UnderlyingSymbol,
+    #[schema(value_type = String)]
+    token: Address,
+    #[schema(value_type = String)]
+    from: Address,
+    amount: String,
+    #[schema(value_type = String)]
+    tx_hash: B256,
+    log_index: u64,
+    block_number: u64,
+    #[schema(value_type = String)]
+    detected_at: DateTime<Utc>,
+}
+
+impl From<InboundWrappedTransfer> for WrappedTransferEntry {
+    fn from(transfer: InboundWrappedTransfer) -> Self {
+        Self {
+            network: transfer.network,
+            underlying: transfer.underlying,
+            token: transfer.token,
+            from: transfer.from,
+            amount: transfer.amount.to_string(),
+            tx_hash: transfer.tx_hash,
+            log_index: transfer.log_index,
+            block_number: transfer.block_number,
+            detected_at: transfer.detected_at,
+        }
+    }
+}
+
+/// Every inbound wrapped-token transfer the per network watchers recorded,
+/// highest block first.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct WrappedTransfersResponse {
+    transfers: Vec<WrappedTransferEntry>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/wrapped-transfers",
+    tag = "admin",
+    responses(
+        (status = 200,
+            description = "Inbound wrapped-token transfers to the issuer \
+                wallet recorded by the per network watchers, highest block \
+                first; each needs manual recovery",
+            body = WrappedTransfersResponse),
+        (status = 500, description = "Failed to read the recorded transfers")
+    ),
+    security(("internal_api_key" = []))
+)]
+#[tracing::instrument(skip(_auth, pool))]
+#[get("/admin/wrapped-transfers")]
+pub(crate) async fn list_wrapped_transfers(
+    _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<WrappedTransfersResponse>, Status> {
+    let _ = pool;
+    todo!()
+}
+
 /// Classification of a non-terminal view used to decide whether it counts as
 /// stuck right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3077,6 +3146,7 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
+    use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3138,6 +3208,9 @@ mod tests {
         VaultService,
     };
     use crate::vault::{MintAuthorization, OrchestratorMintedLog};
+    use crate::wrapped_transfer::{
+        InboundWrappedTransfer, record_inbound_wrapped_transfer,
+    };
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -8446,5 +8519,111 @@ mod tests {
             Level::INFO,
             &["Mint reprocess enqueued a manual re-drive"]
         ));
+    }
+
+    fn wrapped_transfers_rocket(
+        pool: sqlx::Pool<sqlx::Sqlite>,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .manage(health_config(VaultModeConfig::default()))
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", rocket::routes![super::list_wrapped_transfers])
+    }
+
+    async fn dispatch_wrapped_transfers(
+        rocket: rocket::Rocket<rocket::Build>,
+        with_key: bool,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let mut request = client
+            .get("/admin/wrapped-transfers")
+            .remote("127.0.0.1:8000".parse().unwrap());
+        if with_key {
+            request = request.header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ));
+        }
+        let response = request.dispatch().await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        (status, body)
+    }
+
+    fn recorded_wrapped_transfer(
+        block_number: u64,
+        tx_hash: B256,
+    ) -> InboundWrappedTransfer {
+        InboundWrappedTransfer {
+            network: Network::Base,
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: address!("0x00000000000000000000000000000000000000aa"),
+            from: address!("0x9999999999999999999999999999999999999999"),
+            amount: U256::from(5_000_000_000_000_000_000_u128),
+            tx_hash,
+            log_index: 3,
+            block_number,
+            detected_at: Utc::now(),
+        }
+    }
+
+    /// The operator's view of what the watchers caught: every recorded
+    /// transfer, newest block first, with the chain, asset, wrapped token,
+    /// sender, raw amount, and transaction identity.
+    #[tokio::test]
+    async fn wrapped_transfers_lists_recorded_rows_newest_block_first() {
+        let pool = setup_pool().await;
+        let older = recorded_wrapped_transfer(
+            100,
+            b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+        );
+        let newer = recorded_wrapped_transfer(
+            200,
+            b256!(
+                "0x2222222222222222222222222222222222222222222222222222222222222222"
+            ),
+        );
+        record_inbound_wrapped_transfer(&pool, &older).await.unwrap();
+        record_inbound_wrapped_transfer(&pool, &newer).await.unwrap();
+
+        let (status, body) =
+            dispatch_wrapped_transfers(wrapped_transfers_rocket(pool), true)
+                .await;
+
+        assert_eq!(status, Status::Ok, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let transfers = body["transfers"].as_array().unwrap();
+        assert_eq!(transfers.len(), 2, "{transfers:?}");
+        assert_eq!(transfers[0]["block_number"], json!(200));
+        assert_eq!(transfers[0]["tx_hash"], json!(newer.tx_hash));
+        let entry = &transfers[1];
+        assert_eq!(entry["network"], json!("base"));
+        assert_eq!(entry["underlying"], json!("AAPL"));
+        assert_eq!(entry["token"], json!(older.token));
+        assert_eq!(entry["from"], json!(older.from));
+        assert_eq!(entry["amount"], json!("5000000000000000000"));
+        assert_eq!(entry["tx_hash"], json!(older.tx_hash));
+        assert_eq!(entry["log_index"], json!(3));
+        assert_eq!(entry["block_number"], json!(100));
+        let detected_at = DateTime::parse_from_rfc3339(
+            entry["detected_at"].as_str().expect("detected_at is a string"),
+        )
+        .unwrap();
+        assert_eq!(detected_at, older.detected_at);
+    }
+
+    #[tokio::test]
+    async fn wrapped_transfers_requires_internal_auth() {
+        let pool = setup_pool().await;
+
+        let (status, _) =
+            dispatch_wrapped_transfers(wrapped_transfers_rocket(pool), false)
+                .await;
+
+        assert_eq!(status, Status::Unauthorized);
     }
 }
