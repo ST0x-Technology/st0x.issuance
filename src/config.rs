@@ -24,6 +24,7 @@ use crate::notifications::{
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig, console_fmt_layer};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
+use crate::wrapped_transfer::WrappedTokenConfig;
 
 /// How a specific tokenized asset's mint/burn is executed on-chain.
 ///
@@ -228,6 +229,13 @@ pub struct Config {
     /// `gas_monitor::GAS_POLL_INTERVAL` in production; tests lower it so
     /// they don't have to wait a full production interval for a reading.
     pub gas_poll_interval: Duration,
+    /// Wrapped-token contracts to watch per network for inbound transfers to
+    /// the issuer wallet; see [`crate::wrapped_transfer`].
+    pub wrapped_tokens: WrappedTokenConfig,
+    /// Interval between inbound wrapped-token transfer polls. Defaults to
+    /// `wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL` in production;
+    /// tests lower it so a transfer surfaces within the test's timeout.
+    pub wrapped_transfer_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     /// Console log output format; see [`LogFormat`].
@@ -558,6 +566,10 @@ impl Env {
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
+            wrapped_tokens:
+                crate::wrapped_transfer::WrappedTokenConfig::default(),
+            wrapped_transfer_poll_interval:
+                crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
             log_format: self.log_format,

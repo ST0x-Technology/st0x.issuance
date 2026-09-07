@@ -61,6 +61,8 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         backfill_start_block: 0,
         receipt_poll_interval: tokio::time::Duration::from_millis(500),
         gas_poll_interval: tokio::time::Duration::from_millis(200),
+        wrapped_tokens: st0x_issuance::WrappedTokenConfig::default(),
+        wrapped_transfer_poll_interval: tokio::time::Duration::from_millis(200),
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()

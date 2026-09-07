@@ -102,6 +102,7 @@ pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 pub(crate) mod wallet;
+pub(crate) mod wrapped_transfer;
 
 pub mod bindings;
 
@@ -122,6 +123,9 @@ pub use test_utils::{
 };
 pub use tokenized_asset::cli::run_issuer_cli;
 pub use wallet::SignerConfig;
+pub use wrapped_transfer::{
+    WrappedTokenConfig, WrappedTokenConfigError, WrappedTokenEntry,
+};
 
 struct AggregateCqrsSetup {
     mint_store: Arc<Store<Mint>>,

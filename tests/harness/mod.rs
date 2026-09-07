@@ -598,6 +598,8 @@ pub fn create_config_with_db(
         backfill_start_block: 0,
         receipt_poll_interval: tokio::time::Duration::from_millis(500),
         gas_poll_interval: tokio::time::Duration::from_millis(200),
+        wrapped_tokens: st0x_issuance::WrappedTokenConfig::default(),
+        wrapped_transfer_poll_interval: tokio::time::Duration::from_millis(200),
         auth: AuthConfig {
             issuer_api_key: TEST_API_KEY.parse().expect("Valid API key"),
             alpaca_ip_ranges: IpWhitelist::single(
