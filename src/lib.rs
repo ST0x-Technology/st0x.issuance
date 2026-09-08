@@ -1936,7 +1936,8 @@ where
 
 /// Spawns one inbound wrapped-token transfer watcher per configured chain
 /// that has `[wrapped_tokens.<network>]` entries. A chain without entries is
-/// unwatched, so the WARN makes that operator visible; a table for a chain
+/// unwatched, so the WARN makes that state operator visible; a table for a
+/// chain
 /// with no configuration was already rejected at config load.
 fn spawn_wrapped_transfer_monitors<P>(
     deps: &PerNetworkTaskDeps<'_, P>,

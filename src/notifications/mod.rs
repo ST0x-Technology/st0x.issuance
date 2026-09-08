@@ -702,8 +702,8 @@ mod tests {
         );
     }
 
-    /// The alert names everything an operator needs to act: chain, asset,
-    /// wrapped token, sender, amount (18-decimal wrapped shares), and tx.
+    /// The amount is rendered as 18-decimal wrapped shares; the raw value is
+    /// what the admin listing carries.
     #[test]
     fn inbound_wrapped_transfer_message_names_chain_asset_amount_and_tx() {
         let notification = LifecycleNotification::InboundWrappedTransfer {

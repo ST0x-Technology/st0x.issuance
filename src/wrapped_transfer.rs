@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{NetworkParseError, UnderlyingSymbolError};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::num::TryFromIntError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,13 +142,18 @@ impl WrappedTokenConfig {
                 });
             }
 
-            if let Some(first) = tokens.insert(token, underlying.clone()) {
-                return Err(WrappedTokenConfigError::AddressCollision {
-                    network,
-                    token,
-                    first,
-                    second: underlying,
-                });
+            match tokens.entry(token) {
+                Entry::Occupied(occupied) => {
+                    return Err(WrappedTokenConfigError::AddressCollision {
+                        network,
+                        token,
+                        first: occupied.get().clone(),
+                        second: underlying,
+                    });
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(underlying);
+                }
             }
         }
 
@@ -177,10 +183,7 @@ impl WrappedTokenConfig {
     /// Every network that has at least one entry, so startup can reject a
     /// table for a chain that has no configuration.
     pub(crate) fn networks(&self) -> impl Iterator<Item = Network> + '_ {
-        self.per_network
-            .iter()
-            .filter(|(_, tokens)| !tokens.is_empty())
-            .map(|(network, _)| *network)
+        self.per_network.keys().copied()
     }
 }
 
@@ -208,6 +211,7 @@ pub(crate) struct WrappedTransferMonitor<P> {
     pub(crate) provider: P,
     pub(crate) bot_wallet: Address,
     pub(crate) backfill_start_block: u64,
+    /// Never empty: a chain with nothing left to watch runs no monitor.
     pub(crate) watched: Vec<WatchedWrappedToken>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) apalis_pool: ApalisSqlitePool,
@@ -273,26 +277,19 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     }
 
     /// One pass: scan every watched token from its checkpoint to one shared
-    /// chain head. A per token failure does not starve the others; a pass
-    /// where every token failed propagates, since that is indistinguishable
-    /// from the watcher being offline.
+    /// chain head. A per token failure does not starve the others, since each
+    /// token owns its checkpoint and resumes next pass; a pass where every
+    /// token failed propagates, since that is indistinguishable from the
+    /// watcher being offline.
     ///
     /// Returns the worst per token distance between the head and the token's
     /// checkpoint at the start of the pass, which telemetry reports as the
     /// watcher's block lag.
     async fn poll_once(&self) -> Result<u64, WrappedTransferPollError> {
-        if self.watched.is_empty() {
-            return Ok(0);
-        }
-
         // One head for the whole pass so every token scans to a consistent
         // block.
         let head = self.provider.get_block_number().await?;
 
-        // A per token failure must not starve the others: each token owns
-        // its checkpoint and resumes next pass. A pass where EVERY token
-        // failed is indistinguishable from the watcher being offline, so it
-        // propagates and `run` backs off.
         let mut failed_tokens: Vec<Address> = Vec::new();
         let mut lag_blocks = 0_u64;
         for watched in &self.watched {
@@ -737,7 +734,7 @@ pub(crate) enum InboundWrappedTransferReadError {
 
 /// Checkpoint name for one network's scan of one wrapped token, in the same
 /// per-(network, address) shape as the transfer poller's.
-pub(crate) fn checkpoint_name(network: Network, token: Address) -> String {
+fn checkpoint_name(network: Network, token: Address) -> String {
     format!("wrapped_transfer_poll:{network}:{token:#x}")
 }
 
@@ -849,8 +846,8 @@ fn alert_idempotency_key(
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::primitives::{Address, TxHash, U256, address, b256};
-    use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
@@ -1006,7 +1003,7 @@ mod tests {
         harness: &TestHarness,
         asserter: &Asserter,
         watched: Vec<WatchedWrappedToken>,
-    ) -> WrappedTransferMonitor<impl alloy::providers::Provider> {
+    ) -> WrappedTransferMonitor<impl Provider> {
         WrappedTransferMonitor {
             network: Network::Base,
             provider: ProviderBuilder::new()
@@ -1064,9 +1061,9 @@ mod tests {
         .unwrap()
     }
 
-    /// The core guarantee: a wrapped-token transfer into the issuer wallet is
-    /// recorded, logged at ERROR with chain, asset, amount and tx, queued as
-    /// a durable alert, and the token's checkpoint moves to the head.
+    /// The checkpoint moves to the pass head rather than the log's block:
+    /// every log in the chunk was handled, so re-scanning the gap could only
+    /// re-derive rows the identity key already holds.
     #[traced_test]
     #[tokio::test]
     async fn poll_records_alerts_and_checkpoints_an_inbound_transfer() {
@@ -1536,17 +1533,6 @@ mod tests {
                 "total_tokens=2",
             ]
         ));
-    }
-
-    /// With nothing configured for the network the pass makes no RPC call at
-    /// all: the asserter has no queued responses, so any call would fail.
-    #[tokio::test]
-    async fn nothing_watched_makes_no_rpc_calls() {
-        let harness = TestHarness::new().await;
-        let asserter = Asserter::new();
-        let monitor = monitor(&harness, &asserter, Vec::new());
-
-        monitor.poll_once().await.unwrap();
     }
 
     #[tokio::test]

@@ -93,7 +93,6 @@ async fn inbound_wrapped_token_transfer_is_listed_for_the_operator()
     let rocket = initialize_rocket(config).await?;
     let client = Client::tracked(rocket).await?;
 
-    // The service is up with nothing detected yet.
     let body =
         authenticated_get_json(&client, "/admin/wrapped-transfers").await;
     assert_eq!(body["transfers"], json!([]));

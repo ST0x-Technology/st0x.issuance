@@ -8582,9 +8582,7 @@ mod tests {
         }
     }
 
-    /// The operator's view of what the watchers caught: every recorded
-    /// transfer, newest block first, with the chain, asset, wrapped token,
-    /// sender, raw amount, and transaction identity.
+    /// The operator's view of what the watchers caught, newest block first.
     #[tokio::test]
     async fn wrapped_transfers_lists_recorded_rows_newest_block_first() {
         let pool = setup_pool().await;
