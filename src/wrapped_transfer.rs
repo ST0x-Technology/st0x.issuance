@@ -859,6 +859,7 @@ mod tests {
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::transports::{RpcError, TransportErrorKind};
     use chrono::Utc;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1309,6 +1310,29 @@ mod tests {
             Level::DEBUG,
             &["reason=", "recipient is not the issuer wallet"]
         ));
+    }
+
+    /// The configured RPC URL carries the provider API key, and a transport
+    /// error's display can quote the URL it failed to reach, so the poll
+    /// failure log must name the failure category only.
+    #[traced_test]
+    #[test]
+    fn a_transport_failure_is_logged_without_the_rpc_url() {
+        let error = WrappedTransferPollError::Rpc(RpcError::Transport(
+            TransportErrorKind::Custom(Box::new(std::io::Error::other(
+                "error sending request for url \
+                 (https://base-mainnet.example.com/v2/SECRET_API_KEY)",
+            ))),
+        ));
+
+        super::log_poll_failure(Network::Base, &error, 1);
+
+        assert!(logs_contain_at!(Level::WARN, &["transport error"]));
+        assert_eq!(
+            log_count_at!(Level::WARN, &["SECRET_API_KEY"]),
+            0,
+            "the provider API key must never reach the log"
+        );
     }
 
     /// The escalation policy for consecutive pass failures: WARN below
