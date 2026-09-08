@@ -900,7 +900,9 @@ mod tests {
     use crate::mint::test_utils::TestHarness;
     use crate::network_telemetry::NetworkTelemetry;
     use crate::notifications::SendLifecycleNotification;
-    use crate::poll_checkpoint::load_checkpoint_block;
+    use crate::poll_checkpoint::{
+        advance_checkpoint_block, load_checkpoint_block,
+    };
     use crate::redemption::test_utils::create_transfer_log_with_index;
     use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{Network, UnderlyingSymbol};
@@ -1616,8 +1618,30 @@ mod tests {
             ],
         );
 
-        monitor.poll_once().await.unwrap();
+        // Checkpoints far apart, so the reported lag says which token it
+        // came from: the failing one is the further behind.
+        advance_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, TOKEN_A),
+            190,
+        )
+        .await
+        .unwrap();
+        advance_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, TOKEN_B),
+            100,
+        )
+        .await
+        .unwrap();
 
+        let lag_blocks = monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            lag_blocks, 99,
+            "a failing token's backlog must reach the lag gauge, not just \
+             the healthy token's"
+        );
         assert_eq!(
             list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
             1,
@@ -1626,7 +1650,7 @@ mod tests {
         assert_eq!(token_checkpoint(&harness, TOKEN_A).await, Some(200));
         assert_eq!(
             token_checkpoint(&harness, TOKEN_B).await,
-            None,
+            Some(100),
             "the failing token holds its checkpoint for a retry"
         );
         assert!(logs_contain_at!(
