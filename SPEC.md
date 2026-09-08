@@ -5120,7 +5120,11 @@ issuer wallet, in block chunks from a per-(network, token) checkpoint
 (`wrapped_transfer_poll:{network}:{token_address_lowercase}` in
 `poll_checkpoints`, starting at `backfill_start_block` when the token has none)
 up to the chain head. Every sender counts, including the zero address (a wrapper
-deposit made straight to the issuer wallet). For each matching log the watcher:
+deposit made straight to the issuer wallet). A zero-value transfer is ignored at
+DEBUG, neither recorded nor alerted: ERC-20 emits `Transfer` for it like any
+other, so an unauthenticated sender could otherwise page the operator for the
+price of gas, and nothing moved that could need recovery. For each remaining
+matching log the watcher:
 
 - records the transfer durably in `inbound_wrapped_transfers`, keyed by
   `(network, tx_hash, log_index)` so a re-scan cannot record it twice;

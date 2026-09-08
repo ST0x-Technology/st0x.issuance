@@ -352,7 +352,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             for log in &logs {
                 match self.handle_log(watched, log).await? {
                     HandledLog::Dropped => dropped += 1,
-                    HandledLog::Recorded => {}
+                    HandledLog::Recorded | HandledLog::Ignored => {}
                 }
             }
 
@@ -422,6 +422,24 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             return Ok(HandledLog::Dropped);
         };
 
+        // ERC-20 requires a zero-value transfer to emit `Transfer` like any
+        // other (EIP-20, "Transfer event"), so an unauthenticated sender can
+        // emit one to the issuer wallet for the price of gas. Nothing moved,
+        // so there is nothing to recover and nothing to page about.
+        if transfer.amount.is_zero() {
+            debug!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                token = %transfer.token,
+                from = %transfer.from,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                "Ignoring zero-value wrapped-token transfer to the issuer \
+                 wallet; it moves nothing and needs no recovery"
+            );
+            return Ok(HandledLog::Ignored);
+        }
+
         if record_inbound_wrapped_transfer(&self.pool, &transfer).await? {
             error!(
                 target: "wrapped_transfer",
@@ -474,10 +492,11 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     }
 }
 
-/// Outcome of handling one log: recorded (and its alert queued), or dropped
-/// because the log cannot be identified.
+/// Outcome of handling one log: recorded (and its alert queued), ignored
+/// because it moves nothing, or dropped because the log cannot be identified.
 enum HandledLog {
     Recorded,
+    Ignored,
     Dropped,
 }
 
