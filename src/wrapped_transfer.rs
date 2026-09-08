@@ -220,6 +220,8 @@ pub(crate) enum WrappedTransferPollError {
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("Failed to record the inbound wrapped-token transfer: {0}")]
+    Record(#[from] RecordInboundWrappedTransferError),
     #[error("Checkpoint error: {0}")]
     Checkpoint(#[from] CheckpointError),
     #[error("Checkpoint overflow: last_processed_block={last_processed_block}")]
@@ -380,10 +382,12 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                 .fetch_transfer_logs(watched.token, chunk_from, chunk_to)
                 .await?;
 
-            let mut dropped = 0_usize;
+            let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
             for log in &logs {
                 match self.handle_log(watched, log).await? {
-                    HandledLog::Dropped => dropped += 1,
+                    HandledLog::Dropped { tx_hash } => {
+                        dropped_tx_hashes.push(tx_hash);
+                    }
                     HandledLog::Recorded | HandledLog::Ignored => {}
                 }
             }
@@ -393,12 +397,13 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             // The advance above makes the drop permanent, and the per log
             // detail is DEBUG (loop-body rule), so this per chunk summary is
             // the operator's only signal.
-            if dropped > 0 {
+            if !dropped_tx_hashes.is_empty() {
                 warn!(
                     target: "wrapped_transfer",
                     network = %self.network,
                     token = %watched.token,
-                    count = dropped,
+                    count = dropped_tx_hashes.len(),
+                    tx_hashes = ?dropped_tx_hashes,
                     chunk_from,
                     chunk_to,
                     "Dropped unidentifiable wrapped-token transfer logs; they \
@@ -441,18 +446,27 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         watched: &WatchedWrappedToken,
         log: &Log,
     ) -> Result<HandledLog, WrappedTransferPollError> {
-        let Some(transfer) =
-            identify_transfer(self.network, self.bot_wallet, watched, log)
-        else {
-            debug!(
-                target: "wrapped_transfer",
-                network = %self.network,
-                token = %watched.token,
-                tx_hash = ?log.transaction_hash,
-                log_index = ?log.log_index,
-                "Skipping unidentifiable wrapped-token transfer log"
-            );
-            return Ok(HandledLog::Dropped);
+        let transfer = match identify_transfer(
+            self.network,
+            self.bot_wallet,
+            watched,
+            log,
+        ) {
+            Ok(transfer) => transfer,
+            Err(reason) => {
+                debug!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    tx_hash = ?log.transaction_hash,
+                    log_index = ?log.log_index,
+                    reason = %reason,
+                    "Skipping unidentifiable wrapped-token transfer log"
+                );
+                return Ok(HandledLog::Dropped {
+                    tx_hash: log.transaction_hash,
+                });
+            }
         };
 
         // ERC-20 requires a zero-value transfer to emit `Transfer` like any
@@ -530,10 +544,13 @@ impl<P: Provider> WrappedTransferMonitor<P> {
 
 /// Outcome of handling one log: recorded (and its alert queued), ignored
 /// because it moves nothing, or dropped because the log cannot be identified.
+/// A dropped log carries what identity it had, since the drop is permanent
+/// once the chunk is checkpointed and the summary WARN is all the operator
+/// gets.
 enum HandledLog {
     Recorded,
     Ignored,
-    Dropped,
+    Dropped { tx_hash: Option<TxHash> },
 }
 
 /// Decodes one `Transfer` log into a record, or `None` when the log lacks
@@ -549,30 +566,50 @@ fn identify_transfer(
     bot_wallet: Address,
     watched: &WatchedWrappedToken,
     log: &Log,
-) -> Option<InboundWrappedTransfer> {
+) -> Result<InboundWrappedTransfer, UnidentifiableLog> {
     if log.address() != watched.token {
-        return None;
+        return Err(UnidentifiableLog::OtherEmitter { emitter: log.address() });
     }
 
     let event =
-        bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)
-            .ok()?;
+        bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
 
     if event.to != bot_wallet {
-        return None;
+        return Err(UnidentifiableLog::OtherRecipient { recipient: event.to });
     }
 
-    Some(InboundWrappedTransfer {
+    Ok(InboundWrappedTransfer {
         network,
         underlying: watched.underlying.clone(),
         token: watched.token,
         from: event.from,
         amount: event.value,
-        tx_hash: log.transaction_hash?,
-        log_index: log.log_index?,
-        block_number: log.block_number?,
+        tx_hash: log.transaction_hash.ok_or(UnidentifiableLog::NoTxHash)?,
+        log_index: log.log_index.ok_or(UnidentifiableLog::NoLogIndex)?,
+        block_number: log
+            .block_number
+            .ok_or(UnidentifiableLog::NoBlockNumber)?,
         detected_at: Utc::now(),
     })
+}
+
+/// Why a log cannot become an [`InboundWrappedTransfer`]. Each one is
+/// permanent for that log, so the reason is what the operator gets instead of
+/// a retry.
+#[derive(Debug, thiserror::Error)]
+enum UnidentifiableLog {
+    #[error("log was not emitted by the watched token but by {emitter}")]
+    OtherEmitter { emitter: Address },
+    #[error("recipient is not the issuer wallet but {recipient}")]
+    OtherRecipient { recipient: Address },
+    #[error("log does not decode as an ERC-20 Transfer: {0}")]
+    Undecodable(#[from] alloy::sol_types::Error),
+    #[error("log has no transaction hash")]
+    NoTxHash,
+    #[error("log has no log index")]
+    NoLogIndex,
+    #[error("log has no block number")]
+    NoBlockNumber,
 }
 
 /// Records `transfer` unless its `(network, tx_hash, log_index)` identity is
@@ -580,7 +617,7 @@ fn identify_transfer(
 pub(crate) async fn record_inbound_wrapped_transfer(
     pool: &Pool<Sqlite>,
     transfer: &InboundWrappedTransfer,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, RecordInboundWrappedTransferError> {
     let result = sqlx::query(
         "
         INSERT INTO inbound_wrapped_transfers (
@@ -600,12 +637,12 @@ pub(crate) async fn record_inbound_wrapped_transfer(
     )
     .bind(transfer.network.as_str())
     .bind(format!("{:#x}", transfer.tx_hash))
-    .bind(integer_column(transfer.log_index)?)
+    .bind(i64::try_from(transfer.log_index)?)
     .bind(format!("{:#x}", transfer.token))
     .bind(transfer.underlying.as_str())
     .bind(format!("{:#x}", transfer.from))
     .bind(transfer.amount.to_string())
-    .bind(integer_column(transfer.block_number)?)
+    .bind(i64::try_from(transfer.block_number)?)
     .bind(transfer.detected_at.to_rfc3339())
     .execute(pool)
     .await?;
@@ -613,16 +650,13 @@ pub(crate) async fn record_inbound_wrapped_transfer(
     Ok(result.rows_affected() == 1)
 }
 
-/// Converts a block number or log index into a SQLite INTEGER bind. Reported
-/// as an encode error: the value is on its way into a bind parameter, so a
-/// decode error would point an operator at the read path.
-fn integer_column(value: u64) -> Result<i64, sqlx::Error> {
-    i64::try_from(value).map_err(|error| {
-        sqlx::Error::Encode(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error.to_string(),
-        )))
-    })
+/// A transfer could not be written to `inbound_wrapped_transfers`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecordInboundWrappedTransferError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error("block number or log index exceeds SQLite INTEGER range: {0}")]
+    Int(#[from] TryFromIntError),
 }
 
 /// Every recorded inbound wrapped-token transfer, highest block first.
