@@ -242,6 +242,11 @@ plus enqueue of the next job), not a wallet-locked aggregate command.
   records a successful broadcast (`MintTxSubmitted`). Accepts `Minting` and
   legacy `MintIntended`. Uncertain broadcast with a live prepared identity
   leaves `MintIntended` (no event) so the same bytes are rebroadcast
+- `RecordSubmitRejected { issuer_request_id, tx_hash, nonce, error }` - Pure:
+  records that the node rejected the persisted raw transaction before acceptance
+  and holds no transaction for its hash (`MintSubmitRejected`). Valid from
+  `MintIntended`; an idempotent no-op once the mint has advanced. Rejects a
+  payload whose hash or nonce differs from the persisted transaction
 - `RecordTokensMinted { issuer_request_id, tx_id, ... }` - Pure: records
   on-chain success (`TokensMinted`) from `ConfirmMintJob`. Requires
   `TxSubmitted` and a matching stored `tx_id` (stale confirm jobs are rejected)
@@ -324,6 +329,12 @@ authoritative statement of what each observation records.
 - `MintingStarted` - Mint intent recorded (aggregate moves to `Minting`)
 - `MintTxIntended` - Exact signed mint transaction persisted before broadcast
   (carries raw bytes, hash, nonce, signing time, and external transaction ID)
+- `MintSubmitRejected` - The node rejected the persisted raw transaction before
+  acceptance and holds no transaction for its hash, so that transaction cannot
+  land. Carries the rejected `tx_hash`, `nonce`, and the node's error. The
+  aggregate moves to `MintingFailed` with a `Minting` predecessor carrying no
+  transaction provenance, so a budgeted retry may prepare a fresh transaction;
+  the release trigger frees the network's signer reservation
 - `MintTxSubmitted` - Persisted signed mint transaction broadcast (carries
   `external_tx_id` and `tx_id` — the on-chain tx hash — for crash recovery)
 - `TokensMinted` - On-chain mint succeeded (carries tx details)
@@ -381,20 +392,21 @@ dual-format reader or restore the pre-cutover backup.
 
 **Command -> Event Mappings:**
 
-| Command              | Events                  | Notes                                                     |
-| -------------------- | ----------------------- | --------------------------------------------------------- |
-| `Initiate`           | `Initiated`             | Mint request created                                      |
-| `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                                         |
-| `RejectJournal`      | `JournalRejected`       | Terminal failure                                          |
-| `Deposit`            | `MintingStarted`        | Records intent (no network call)                          |
-| `RecordTxIntended`   | `MintTxIntended`        | Pure; `SubmitMintJob` signed first                        |
-| `RecordTxSubmitted`  | `MintTxSubmitted`       | Pure; job already broadcast                               |
-| `RecordTokensMinted` | `TokensMinted`          | Pure; requires matching `tx_id`                           |
-| `RecordMintFailed`   | `MintingFailed`         | Pure; job-side observation gates                          |
-| `RecordCallbackSent` | `MintCompleted`         | Pure; `SendCallbackJob` already called Alpaca             |
-| `RetryMint`          | `MintRetryStarted`      | Pure; recovery before re-enqueue submit                   |
-| `RecordExistingMint` | `ExistingMintRecovered` | Pure; `Minting` / `MintIntended` / `TxSubmitted` / failed |
-| `CloseMint`          | (closed)                | Admin terminal                                            |
+| Command                | Events                  | Notes                                                     |
+| ---------------------- | ----------------------- | --------------------------------------------------------- |
+| `Initiate`             | `Initiated`             | Mint request created                                      |
+| `ConfirmJournal`       | `JournalConfirmed`      | Journal confirmed                                         |
+| `RejectJournal`        | `JournalRejected`       | Terminal failure                                          |
+| `Deposit`              | `MintingStarted`        | Records intent (no network call)                          |
+| `RecordTxIntended`     | `MintTxIntended`        | Pure; `SubmitMintJob` signed first                        |
+| `RecordTxSubmitted`    | `MintTxSubmitted`       | Pure; job already broadcast                               |
+| `RecordSubmitRejected` | `MintSubmitRejected`    | Pure; node rejected the raw transaction and holds no hash |
+| `RecordTokensMinted`   | `TokensMinted`          | Pure; requires matching `tx_id`                           |
+| `RecordMintFailed`     | `MintingFailed`         | Pure; job-side observation gates                          |
+| `RecordCallbackSent`   | `MintCompleted`         | Pure; `SendCallbackJob` already called Alpaca             |
+| `RetryMint`            | `MintRetryStarted`      | Pure; recovery before re-enqueue submit                   |
+| `RecordExistingMint`   | `ExistingMintRecovered` | Pure; `Minting` / `MintIntended` / `TxSubmitted` / failed |
+| `CloseMint`            | (closed)                | Admin terminal                                            |
 
 `Deposit` emits only `MintingStarted` (business intent). `SubmitMintJob` builds
 and signs the transaction, persists exact bytes via `RecordTxIntended`, then
@@ -424,15 +436,18 @@ process terminating and its replacement starting. `active_signer_intents` is the
 durable, cross-process backstop for that window: one row per network (a signer's
 nonce domain), reserved by a trigger in the same transaction that appends
 `MintTxIntended` or `BurnIntended`, and released by a trigger on that
-aggregate's own definitively-resolved terminal event. The reservation key is
-`network` alone, so it is shared between `Mint` and `Redemption` — only one
-signer intent per nonce domain can be outstanding at a time, regardless of which
-aggregate holds it. This makes the event append itself the durable arbitration
-point: a second instance's competing intent is rejected by SQLite before it can
-commit, rather than relying on an in-memory lock or a fallible read-model
-projection. Recovery bookkeeping, including `BurnNonceTooLow`, never releases
-this reservation; only a definitively resolved terminal event does. When the
-pre-append check finds the network occupied, a mint job returns
+aggregate's own definitively-resolved terminal event or recorded submit
+rejection. The reservation key is `network` alone, so it is shared between
+`Mint` and `Redemption` — only one signer intent per nonce domain can be
+outstanding at a time, regardless of which aggregate holds it. This makes the
+event append itself the durable arbitration point: a second instance's competing
+intent is rejected by SQLite before it can commit, rather than relying on an
+in-memory lock or a fallible read-model projection. Recovery bookkeeping,
+including `BurnNonceTooLow`, never releases this reservation; only a
+definitively resolved terminal event or a recorded submit rejection
+(`MintSubmitRejected` / `BurnSubmitRejected`: the node rejected the persisted
+raw transaction and holds no transaction for its hash, so it cannot land) does.
+When the pre-append check finds the network occupied, a mint job returns
 `MintJobError::UnresolvedWalletIntent` and refuses to submit rather than risk a
 nonce collision, leaving the job to retry once the guard clears. When the race
 is lost between that check and the append, the trigger aborts the append with an
@@ -686,6 +701,10 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RecordBurnNonceTooLow` - Persist a deterministic node rejection that proves
   the exact rebroadcast transaction's nonce is already spent. This observation
   consumes no additional recovery action.
+- `RecordBurnSubmitRejected` - Persist a node rejection of the exact persisted
+  raw transaction before acceptance, observed while the node holds no
+  transaction for its hash. The handler checks the hash and nonce against the
+  current transaction before recording.
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
   resuming a failed redemption that has no signed burn transaction
 - `ReplaceDeadBurn` - Re-check that the persisted transaction is provably dead,
@@ -694,6 +713,10 @@ on-chain transfer through calling Alpaca to burning tokens.
   the recovery manager matches a durable `BurnNonceTooLow` observation to this
   redemption's current transaction and supplies a proof marker. The command
   handler re-verifies the marker's request id, hash, and nonce before signing.
+- `ReplaceRejectedBurn` - Sign and persist a replacement at a fresh nonce after
+  the recovery manager matches a durable `BurnSubmitRejected` observation to
+  this redemption's current transaction and supplies a proof marker. The command
+  handler checks the marker's request id, hash, and nonce before signing.
 - `RecordBurnRecoveryExhausted` - Persist that the redemption-wide automatic
   recovery budget is spent
 - `RecordBurnPreparationRecoveryExhausted` - Persist exhaustion when repeated
@@ -847,6 +870,12 @@ raw redemption amounts are emitted in the admission log.
   check the exact hash receipt first, then may use this durable observation as
   proof that a replacement decision is required without spending more
   rebroadcast actions.
+- `BurnSubmitRejected` - Records that broadcasting the exact persisted hash and
+  nonce received a rejection while the node holds no transaction for that hash,
+  so the persisted transaction never entered the pool. Later passes still check
+  the exact hash receipt first, then may use this durable observation as proof
+  that a replacement decision is required. The release trigger frees the
+  network's signer reservation.
 - `BurnPreparationRecoveryAttempted` - Records an automatic retry before a
   failed redemption without a signed burn transaction resumes preparation. These
   attempts share the same redemption-wide budget.
@@ -952,6 +981,8 @@ raw redemption amounts are emitted in the admission log.
 | `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                                                                                                                                                                            |
 | `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
 | `ReplaceNonceTooLowBurn`                 | `BurnIntended`                     | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable nonce-too-low observation, then persist a replacement                                                      |
+| `RecordBurnSubmitRejected`               | `BurnSubmitRejected`               | Persist proof that the node rejected the current transaction before acceptance and holds no transaction for its hash                                                                                                                               |
+| `ReplaceRejectedBurn`                    | `BurnIntended`                     | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable submit rejection observation, then persist a replacement                                                   |
 | `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                                                                                                                                                                    |
 | `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                                                                                                                                                                                   |
 | `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                                                                                                                                                                     |
@@ -992,10 +1023,14 @@ of death because a reorganization can remove it. A deterministic `nonce too low`
 response to rebroadcasting the exact persisted bytes is the additional death
 proof: recovery durably records it against `(H, N)`, and every later pass still
 checks `receipt(H)` before using that observation to select replacement. A
-missing block number, mismatched receipt hash, provider error, timeout, signer
-that differs from `W`, or any other identity/RPC uncertainty is unclassified and
-fails closed: the old transaction remains live, no replacement is signed, and
-its reservation remains held. Same-nonce fee replacement is not supported.
+rejection of the exact persisted bytes that the node does not hold is the same
+kind of death proof: the transaction never entered the pool, recovery durably
+records it against `(H, N)`, and every later pass still checks `receipt(H)`
+before using that observation to select replacement. A missing block number,
+mismatched receipt hash, provider error, timeout, signer that differs from `W`,
+or any other identity/RPC uncertainty is unclassified and fails closed: the old
+transaction remains live, no replacement is signed, and its reservation remains
+held. Same-nonce fee replacement is not supported.
 
 Automatic recovery is capped at five accepted recovery actions across the
 redemption's complete event history, including preparation retries,
