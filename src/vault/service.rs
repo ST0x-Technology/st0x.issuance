@@ -54,18 +54,18 @@ pub type RealBlockchainServiceProvider = FillProvider<
     RootProvider,
 >;
 
-/// Nonce manager that serves nonces from a local counter for each signer, like
-/// alloy's `CachedNonceManager`, and can restore one failed fill without
-/// dropping other nonce values already given to prepared transactions. The
-/// filler consumes a nonce when the request is filled; an error after that
-/// point (fee lookup, signing, definitive broadcast rejection) would otherwise
-/// leave the counter ahead of the chain, and every later transaction would
-/// queue unmineable behind the unused nonce.
+/// Nonce manager that serves nonces from a local counter for each signer and
+/// reconciles the counter with the node's `pending` nonce before every new
+/// assignment. The filler consumes a nonce when the request is filled; an
+/// error after that point (fee lookup, signing, definitive broadcast
+/// rejection) would otherwise leave the counter ahead of the chain, and every
+/// later transaction would queue unmineable behind the unused nonce.
 ///
-/// Counters initialize from the `pending` transaction count so transactions
-/// already accepted by the node are counted. Failed nonce values are kept as
-/// reusable holes rather than resetting the whole counter, preserving unique
-/// assignment for prepared transactions that are not visible in `pending` yet.
+/// Failed nonce values are kept as reusable holes rather than resetting the
+/// whole counter, preserving unique assignment for prepared transactions that
+/// are not visible in `pending` yet. A later `pending` value discards any
+/// reusable hole below it, because the node has already accepted a transaction
+/// at that nonce.
 #[derive(Clone, Debug, Default)]
 pub struct ResyncNonceManager {
     nonces: Arc<StdMutex<HashMap<Address, NonceState>>>,
@@ -105,6 +105,11 @@ impl NonceState {
         } else if nonce < self.next {
             self.reusable.insert(nonce);
         }
+    }
+
+    fn observe_pending(&mut self, pending: u64) {
+        self.reusable.retain(|nonce| *nonce >= pending);
+        self.next = self.next.max(pending);
     }
 }
 
@@ -152,21 +157,13 @@ impl NonceManager for ResyncNonceManager {
         P: Provider<N>,
         N: Network,
     {
-        {
-            let mut nonces =
-                self.nonces.lock().expect("nonce cache lock poisoned");
-            if let Some(state) = nonces.get_mut(&address) {
-                return Ok(state.take_next());
-            }
-        }
-
         let fetched = provider.get_transaction_count(address).pending().await?;
-
         let nonce = self
             .nonces
             .lock()
             .expect("nonce cache lock poisoned")
             .entry(address)
+            .and_modify(|state| state.observe_pending(fetched))
             .or_insert_with(|| NonceState::new(fetched))
             .take_next();
         Ok(nonce)
@@ -1680,6 +1677,29 @@ mod tests {
 
         assert_eq!(state.take_next(), 11);
         assert_eq!(state.take_next(), 12);
+    }
+
+    #[test]
+    fn nonce_state_advances_cached_next_to_pending() {
+        let mut state = NonceState::new(10);
+        assert_eq!(state.take_next(), 10);
+
+        state.observe_pending(12);
+
+        assert_eq!(state.take_next(), 12);
+    }
+
+    #[test]
+    fn nonce_state_drops_reusable_nonce_behind_pending() {
+        let mut state = NonceState::new(10);
+        assert_eq!(state.take_next(), 10);
+        assert_eq!(state.take_next(), 11);
+        assert_eq!(state.take_next(), 12);
+        state.release(10);
+
+        state.observe_pending(11);
+
+        assert_eq!(state.take_next(), 13);
     }
 
     fn test_receipt_info() -> ReceiptInformation {
