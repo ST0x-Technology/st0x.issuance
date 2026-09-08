@@ -1435,6 +1435,50 @@ mod tests {
         ));
     }
 
+    /// Assets are enabled at runtime, so a vault that collides with a
+    /// configured wrapped token can appear after the watcher started. The
+    /// check has to run every pass, or the watcher keeps paging the operator
+    /// for genuine redemptions it can never clear.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_vault_enabled_after_startup_is_refused_on_the_next_pass() {
+        let harness = TestHarness::new().await;
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&Vec::<Log>::new());
+        // Sorted by address, so an unfiltered pass would spend the single
+        // queued `eth_getLogs` response on the vault and fail on TOKEN_A.
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![
+                WatchedWrappedToken {
+                    token: vault,
+                    underlying: symbol("AAPL"),
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("RKLB"),
+                },
+            ],
+        );
+
+        harness.setup_account_and_asset().await;
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(token_checkpoint(&harness, TOKEN_A).await, Some(200));
+        assert_eq!(
+            token_checkpoint(&harness, vault).await,
+            None,
+            "the vault must never be scanned"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["is an enabled asset's vault", &format!("token={vault}")]
+        ));
+    }
+
     /// A log without a transaction hash cannot be identified, so it cannot be
     /// recorded or deduplicated; it is dropped with a WARN summary and the
     /// checkpoint still advances rather than freezing on it forever.
