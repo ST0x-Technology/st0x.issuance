@@ -555,6 +555,7 @@ impl RedemptionView {
             | RedemptionEvent::BurnSubmitRejected { .. }
             | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
             | RedemptionEvent::BurnRecoveryExhausted { .. }
+            | RedemptionEvent::ManualBurnReplacementAuthorized { .. }
             | RedemptionEvent::BurnPreparationRecoveryExhausted { .. } => self,
             RedemptionEvent::RedemptionClosed {
                 issuer_request_id,

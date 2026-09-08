@@ -167,6 +167,22 @@ mod tests {
         assert_eq!(scheme["type"], "apiKey");
         assert_eq!(scheme["in"], "header");
         assert_eq!(scheme["name"], "X-API-KEY");
+
+        let recovery_ok = &paths["/admin/recover/redemption/{issuer_request_id}"]
+            ["post"]["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            recovery_ok["$ref"],
+            "#/components/schemas/RecoverRedemptionResponseBody"
+        );
+        let recovery_variants = &spec["components"]["schemas"]["RecoverRedemptionResponseBody"]
+            ["oneOf"];
+        assert_eq!(
+            recovery_variants,
+            &serde_json::json!([
+                { "$ref": "#/components/schemas/ReprocessResponse" },
+                { "$ref": "#/components/schemas/RecoverRedemptionErrorBody" }
+            ])
+        );
     }
 
     // The DTO `ToSchema` derives and `schema(value_type = String)` overrides are

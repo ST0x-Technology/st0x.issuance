@@ -58,7 +58,9 @@ confirms mined transactions, re-broadcasts the exact signed bytes while a
 transaction can still land, and signs a fresh-nonce replacement only after the
 old hash is provably dead. After five durable automatic actions across the
 redemption's lifetime, it logs `Automatic burn recovery exhausted` once with the
-request ID, transaction hash, nonce, and required operator action.
+request ID, transaction hash, nonce, and required operator action. Automatic
+recovery does not sign again after exhaustion; the admin recovery endpoint can
+authorize one replacement after independently proving the persisted hash dead.
 
 - If recovery completes within 30 seconds, everything is handled automatically.
 - If recovery times out (e.g., the RPC is slow or unavailable), the remaining
@@ -188,24 +190,68 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
   http://localhost:8000/admin/recover/redemption/<issuer_request_id> | python3 -m json.tool
 ```
 
-This **executes the burn inline** — no restart needed. The endpoint first
-re-verifies the journal status with Alpaca (to avoid burning without backing),
-then resumes the redemption to `Burning` and submits the burn, waiting for
-on-chain confirmation before responding.
+For failures before Alpaca was called, the endpoint returns the redemption to
+`Detected` so `RedeemCallManager` can call Alpaca. It does not re-verify a
+journal or submit a burn.
 
-Possible responses:
+For post-Alpaca, pre-burn failures, this **executes the burn inline** — no
+restart needed. The endpoint first re-verifies the journal status with Alpaca
+(to avoid burning without backing), then resumes the redemption to `Burning` and
+submits the burn, waiting for on-chain confirmation before responding.
 
-| Response message                                                           | Meaning                                                                                                                      |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                                             |
-| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                                                       |
-| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold enough vault shares — manual intervention (see "Insufficient on-chain share balance").                  |
-| `409 Conflict`                                                             | Already recovered/completed — no action needed.                                                                              |
-| `422 Unprocessable`                                                        | Recovery refused: Alpaca is pending/rejected, prior burn is ambiguous/legacy, or automatic recovery is exhausted. See below. |
-| `404 Not Found`                                                            | The tokenization request is genuinely absent from Alpaca — see "Alpaca request not found" below.                             |
-| `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited or network error). See below.                              |
+For an exhausted `BurnIntended` or `BurnSubmitted` redemption, the endpoint
+reloads the aggregate while holding the network wallet lock and verifies the
+exact persisted signed transaction. It signs a fresh-nonce replacement only when
+that transaction is `ProvablyDead`; pending, mined, unknown, invalid, and
+RPC-failure results fail closed without signing. The authorization and
+replacement intent commit atomically before queue dispatch. A successful JSON
+response includes `manual_replacement` with stable `code`, `recovery_id`, old
+and new transaction hashes and nonces, and `queue_dispatch`. A deferred dispatch
+is safe: the reconciler reconstructs the job from the committed replacement
+intent after restart without signing another transaction.
 
-Then check `/admin/stuck` again to confirm it cleared.
+Successful response messages:
+
+| Response message                                                           | Meaning                                                                                                     |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                            |
+| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                                      |
+| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold enough vault shares — manual intervention (see "Insufficient on-chain share balance"). |
+
+Error and manual-replacement responses use the exact code and action below:
+
+| Code                                             | Status | Meaning and action                                                                                                                                               |
+| ------------------------------------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `burn_replacement_queued`                        | 200    | The replacement is authorized and its submit job is queued.                                                                                                      |
+| `burn_replacement_reenqueued`                    | 200    | An authorized replacement was re-enqueued. Do not request another signature.                                                                                     |
+| `burn_replacement_confirmation_queued`           | 200    | The replacement landed and its confirmation job is queued.                                                                                                       |
+| `burn_replacement_dispatch_deferred`             | 200    | The queue write failed after authorization. Leave the service running or restart it so the reconciler repairs dispatch.                                          |
+| `burn_replacement_committed_inspection_required` | 200    | Inspect events using `recovery_id` and the old transaction identity, then repair dispatch without another signature.                                             |
+| `redemption_not_found`                           | 404    | No aggregate history exists. Verify the ID against `/admin/stuck`.                                                                                               |
+| `alpaca_request_not_found`                       | 404    | The request is absent from Alpaca. Follow “Alpaca request not found” below.                                                                                      |
+| `burn_replacement_already_queued`                | 409    | An authorized replacement has an active submit job. Wait, then inspect `/admin/stuck`.                                                                           |
+| `redemption_terminal`                            | 409    | The redemption is complete or closed. Do not retry.                                                                                                              |
+| `recovery_refused`                               | 422    | The Alpaca journal is pending or rejected, or the redemption network is not a published Alpaca `TokenizationNetwork`. Re-check the journal and network mapping.  |
+| `prior_burn_unverifiable`                        | 422    | The prior burn outcome is ambiguous or its legacy ID cannot be verified. Reconcile it manually before recovery.                                                  |
+| `redemption_command_rejected`                    | 422    | The aggregate rejected `ResumeBurn`. Inspect its event history and state before retrying.                                                                        |
+| `burn_recovery_not_exhausted`                    | 422    | Automatic attempts remain. Wait for the five-attempt budget to finish, then retry. No replacement was signed.                                                    |
+| `burn_not_provably_dead`                         | 422    | The persisted transaction is not provably dead. No replacement was signed.                                                                                       |
+| `invalid_burn_identity`                          | 422    | The transaction is malformed, belongs to another wallet, or has a chain-ID mismatch. Check the network configuration before retrying. No replacement was signed. |
+| `competing_signer_intent`                        | 422    | Another prepared transaction owns the wallet's next nonce. Let it submit or reconcile, then retry.                                                               |
+| `invalid_recovery_state`                         | 422    | The aggregate cannot enter manual replacement. Inspect its events before retrying.                                                                               |
+| `network_not_configured`                         | 422    | No vault service is active for the redemption's network. Restore its configuration before retrying.                                                              |
+| `burn_classification_unavailable`                | 502    | Classification failed or returned an unusable receipt. No replacement was signed.                                                                                |
+| `burn_replacement_preparation_unavailable`       | 502    | Preparation failed before authorization. No replacement was signed.                                                                                              |
+| `upstream_unavailable`                           | 502    | Alpaca was unavailable or returned inconsistent data. Retry after it recovers.                                                                                   |
+| `internal_error`                                 | 500    | Recovery failed before a decision. Collect request logs and escalate.                                                                                            |
+| `burn_replacement_internal_error`                | 500    | Replacement recovery failed before a decision. Collect request logs and investigate before retrying.                                                             |
+
+Never force-complete a burn that did not land.
+
+Then check `/admin/stuck` again to verify the expected progress. Queued or
+deferred replacements can remain until dispatch and confirmation complete, and
+insufficient-balance recovery remains until funding or manual intervention.
+Confirm the entry clears after its required follow-up completes.
 
 ### Closing an unresolved redemption
 

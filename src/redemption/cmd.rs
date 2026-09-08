@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     BurnExternalTxId, BurnNonceTooLowProof, BurnSubmitRejectedProof,
@@ -113,6 +114,7 @@ pub(crate) enum RedemptionCommand {
     /// `BurnIntended`, so an at least once job rerun is safe.
     RecordBurnTxSubmitted {
         issuer_request_id: IssuerRedemptionRequestId,
+        expected_tx_hash: B256,
         external_tx_id: BurnExternalTxId,
         tx_id: TxId,
         planned_burns: Vec<super::BurnRecord>,
@@ -123,6 +125,7 @@ pub(crate) enum RedemptionCommand {
     /// the redemption advanced past `BurnIntended`.
     RecordOrchestratorBurnSubmitted {
         issuer_request_id: IssuerRedemptionRequestId,
+        expected_tx_hash: B256,
         external_tx_id: BurnExternalTxId,
         tx_id: TxId,
     },
@@ -153,6 +156,11 @@ pub(crate) enum RedemptionCommand {
     },
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
+        /// When present, records the failure only while this exact signed burn
+        /// is still current. Jobs created before a replacement use this bind
+        /// so their late result cannot fail the replacement.
+        #[serde(default)]
+        expected_tx_hash: Option<B256>,
         error: String,
         tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
@@ -270,6 +278,17 @@ pub(crate) enum RedemptionCommand {
     },
     ReplaceDeadBurn {
         issuer_request_id: IssuerRedemptionRequestId,
+        owner: Address,
+    },
+    /// Operator-authorized replacement after the automatic recovery budget is
+    /// exhausted. The exact persisted identity is bound into the command so a
+    /// concurrent state change is refused before another transaction is
+    /// signed.
+    ReplaceExhaustedDeadBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        recovery_id: Uuid,
+        previous_tx_hash: B256,
+        previous_nonce: u64,
         owner: Address,
     },
     ReplaceNonceTooLowBurn {

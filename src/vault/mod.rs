@@ -446,8 +446,18 @@ impl SendableTxWithHash {
         destination: Address,
         input: Bytes,
     ) -> Self {
+        Self::valid_for_test_with_chain_id(nonce, destination, input, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test_with_chain_id(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+        chain_id: u64,
+    ) -> Self {
         let transaction = TxLegacy {
-            chain_id: Some(1),
+            chain_id: Some(chain_id),
             nonce,
             gas_price: 1,
             gas_limit: 100_000,
