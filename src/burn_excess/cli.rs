@@ -175,7 +175,7 @@ pub(crate) async fn run_burn_excess_cli(
         .disable_recommended_fillers()
         .with_gas_estimation()
         .filler(BlobGasFiller)
-        .with_simple_nonce_management()
+        .with_cached_nonce_management()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
         .connect_http(http_url.clone());

@@ -1731,7 +1731,7 @@ mod tests {
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_simple_nonce_management()
+            .with_cached_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer.clone()))
             .connect(&evm.endpoint)

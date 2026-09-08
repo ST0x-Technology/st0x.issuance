@@ -4,8 +4,8 @@ use alloy::eips::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionResponse};
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill,
-    NonceFiller, SimpleNonceManager, WalletFiller,
+    BlobGasFiller, CachedNonceManager, ChainIdFiller, FillProvider, GasFiller,
+    JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{
     Identity, PendingTransactionBuilder, Provider, RootProvider,
@@ -43,7 +43,7 @@ pub type RealBlockchainServiceProvider = FillProvider<
         JoinFill<
             JoinFill<
                 JoinFill<JoinFill<Identity, GasFiller>, BlobGasFiller>,
-                NonceFiller<SimpleNonceManager>,
+                NonceFiller<CachedNonceManager>,
             >,
             ChainIdFiller,
         >,
@@ -74,6 +74,15 @@ const MINTED_LOG_CHUNK_BLOCKS: u64 = 2_000;
 /// recovery pass for a landing younger than the window (the lookup's `None`
 /// is retryable).
 const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
+
+/// Fixed gas limit for the vault-direct mint multicall, set instead of
+/// estimating. The provider's default estimate runs `eth_estimateGas` against
+/// `pending` state, which under mempool load intermittently reverts with empty
+/// returndata (the vault multicall's `FailedCall`) and fails an otherwise valid
+/// mint. A deliberately high fixed limit (far above the observed ~250k gas,
+/// still well under Base's block gas limit) keeps the mint deterministic;
+/// unused gas is not charged.
+const MINT_GAS_LIMIT: u64 = 3_000_000;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -275,9 +284,15 @@ impl VaultService for RealBlockchainService {
         let transfer_call =
             vault_contract.transfer(user, shares).calldata().clone();
 
-        let transaction = vault_contract
+        let mut transaction = vault_contract
             .multicall(vec![deposit_call, transfer_call])
             .into_transaction_request();
+        // Skip gas estimation: the provider default estimates against
+        // `pending` state, which under mempool load intermittently reverts with
+        // empty returndata (the vault multicall's `FailedCall`) and fails an
+        // otherwise valid mint. A fixed, generous limit avoids that call
+        // entirely; the wallet filler still assigns `from`.
+        transaction.gas = Some(MINT_GAS_LIMIT);
         let envelope = self
             .provider
             .fill(transaction)
@@ -1573,7 +1588,7 @@ mod tests {
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_simple_nonce_management()
+            .with_cached_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
@@ -1610,7 +1625,7 @@ mod tests {
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_simple_nonce_management()
+            .with_cached_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect(&evm.endpoint)
@@ -1803,7 +1818,7 @@ mod tests {
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_simple_nonce_management()
+            .with_cached_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter.clone());
@@ -1931,7 +1946,7 @@ mod tests {
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_simple_nonce_management()
+            .with_cached_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter.clone());
