@@ -227,20 +227,16 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             "Starting inbound wrapped-token transfer watcher"
         );
 
+        let mut consecutive_failures = 0_usize;
         loop {
             if let Err(error) = self.poll_once().await {
-                warn!(
-                    target: "wrapped_transfer",
-                    network = %self.network,
-                    error = %error,
-                    retry_after_secs = RETRY_INTERVAL.as_secs(),
-                    "Wrapped-token transfer poll pass failed; will retry from \
-                     the last checkpoint"
-                );
+                consecutive_failures += 1;
+                log_poll_failure(self.network, &error, consecutive_failures);
                 tokio::time::sleep(RETRY_INTERVAL).await;
                 continue;
             }
 
+            consecutive_failures = 0;
             tokio::time::sleep(self.poll_interval).await;
         }
     }
@@ -669,6 +665,23 @@ pub(crate) enum InboundWrappedTransferReadError {
 /// per-(network, address) shape as the transfer poller's.
 pub(crate) fn checkpoint_name(network: Network, token: Address) -> String {
     format!("wrapped_transfer_poll:{network}:{token:#x}")
+}
+
+/// Emits the log for a failed poll pass.
+fn log_poll_failure(
+    network: Network,
+    error: &WrappedTransferPollError,
+    consecutive_failures: usize,
+) {
+    warn!(
+        target: "wrapped_transfer",
+        %network,
+        error = %error,
+        consecutive_failures,
+        retry_after_secs = RETRY_INTERVAL.as_secs(),
+        "Wrapped-token transfer poll pass failed; will retry from the last \
+         checkpoint"
+    );
 }
 
 /// Durable idempotency key of the alert for one transfer log.
@@ -1113,6 +1126,42 @@ mod tests {
             Level::WARN,
             &["Dropped unidentifiable wrapped-token transfer logs", "count=2"]
         ));
+    }
+
+    /// The escalation policy for consecutive pass failures: WARN below
+    /// `MAX_POLL_FAILURES_BEFORE_ALARM` (the loop retries quietly), ERROR at
+    /// the threshold, where the backstop is offline and every inbound
+    /// wrapped-token transfer in the gap goes unseen until it recovers.
+    #[traced_test]
+    #[test]
+    fn log_poll_failure_escalates_from_warn_to_error_at_the_alarm_threshold() {
+        let error = WrappedTransferPollError::AllTokensFailed { total: 1 };
+
+        super::log_poll_failure(Network::Base, &error, 1);
+        super::log_poll_failure(Network::Base, &error, 2);
+
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &["will retry from the last checkpoint"]
+            ),
+            2,
+            "each below-threshold failure must WARN"
+        );
+        assert!(
+            !logs_contain_at!(Level::ERROR, &["failed repeatedly"]),
+            "no ERROR before the alarm threshold is reached"
+        );
+
+        super::log_poll_failure(Network::Base, &error, 3);
+
+        assert!(
+            logs_contain_at!(
+                Level::ERROR,
+                &["failed repeatedly", "consecutive_failures=3"]
+            ),
+            "the third consecutive failure must escalate to ERROR"
+        );
     }
 
     /// A log without a transaction hash cannot be identified, so it cannot be

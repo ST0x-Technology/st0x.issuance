@@ -315,6 +315,7 @@ mod tests {
         assert_eq!(snapshot[0]["transfer_poller"].get("failure_rate"), None);
         assert_eq!(snapshot[0]["transfer_poller"].get("lag_blocks"), None);
         assert_eq!(snapshot[0]["receipt_backfill"]["passes"], 0);
+        assert_eq!(snapshot[0]["wrapped_transfer"]["passes"], 0);
         assert_eq!(snapshot[0]["gas"]["status"], "unmonitored");
     }
 
