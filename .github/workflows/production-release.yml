@@ -1,0 +1,51 @@
+name: production-release
+
+# Config-only production release and rollback, behind the production
+# project's app-deploy PAM grant (same shared workflow as release-tag.yml):
+#   - a merge to main touching config.prod.toml deploys that config against
+#     the digest live in production (a config must never run ahead of its
+#     binary; the workflow redeploys the running digest);
+#   - workflow_dispatch with a version rolls production back (or forward) to
+#     that tag: images and config both from the tag.
+# Off until the production stack exists on the devops side
+# (PRODUCTION_RELEASES_ENABLED repository variable).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - config.prod.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to deploy (vX.Y.Z), images and config both from that tag"
+        required: true
+        type: string
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: vars.PRODUCTION_RELEASES_ENABLED == 'true'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # app-release @ .github main
+    with:
+      environment: production
+      runtime: bot-vm
+      project: s01-issuance
+      config_bucket: s01-issuance-config
+      ar_repo: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+      images: s01-issuance=BOT_IMAGE
+      attestor: projects/s01-artifacts/attestors/issuance-image
+      service_account: issuance-releaser@s01-artifacts.iam.gserviceaccount.com
+      wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+      pam_entitlement: app-deploy
+      image_tag: ${{ inputs.version || '' }}
+      ref: ${{ inputs.version || '' }}
+      config_file: config.prod.toml
+      config_secret: issuance-runtime-config
