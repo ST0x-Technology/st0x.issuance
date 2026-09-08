@@ -1604,11 +1604,11 @@ mod tests {
 
         let listed =
             list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
-        let order: Vec<(u64, u64)> = listed
+        let block_and_log_index: Vec<(u64, u64)> = listed
             .iter()
             .map(|transfer| (transfer.block_number, transfer.log_index))
             .collect();
-        assert_eq!(order, vec![(200, 1), (200, 0), (100, 0)]);
+        assert_eq!(block_and_log_index, vec![(200, 1), (200, 0), (100, 0)]);
         assert_eq!(listed[0].amount, U256::MAX, "amount round-trips exactly");
     }
 
@@ -1635,7 +1635,7 @@ mod tests {
             VALUES ('mars', ?, 0, ?, 'AAPL', ?, '1', 100, ?)
             ",
         )
-        .bind(format!("{:#x}", TX_HASH))
+        .bind(format!("{TX_HASH:#x}"))
         .bind(format!("{TOKEN_A:#x}"))
         .bind(format!("{SENDER:#x}"))
         .bind(Utc::now().to_rfc3339())
