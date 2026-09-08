@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::num::TryFromIntError;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::bindings;
 use crate::jobs::{JobQueue, QueuePushError};
@@ -740,6 +740,30 @@ pub(crate) fn checkpoint_name(network: Network, token: Address) -> String {
     format!("wrapped_transfer_poll:{network}:{token:#x}")
 }
 
+/// The tokens a network's watcher may actually scan, announced at INFO so an
+/// operator can see what is watched without reading the config file.
+///
+/// A wrapped-token address that is also an enabled asset's vault on this
+/// network would make every genuine redemption transfer look like an
+/// un-redeemable inbound one, so it is refused rather than watched. A failed
+/// asset read leaves the list alone: an unverified watch still detects real
+/// transfers, while dropping the list would disable the backstop over a
+/// database blip.
+pub(crate) async fn watchable_tokens(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    watched: Vec<WatchedWrappedToken>,
+) -> Vec<WatchedWrappedToken> {
+    info!(
+        target: "wrapped_transfer",
+        %network,
+        tokens = ?watched,
+        "Watching wrapped tokens for inbound transfers to the issuer wallet"
+    );
+
+    watched
+}
+
 /// Emits the log for a failed poll pass: WARN while the failure may still be
 /// a blip, escalating to ERROR once `consecutive_failures` reaches
 /// [`MAX_POLL_FAILURES_BEFORE_ALARM`], where the backstop is offline and an
@@ -800,7 +824,7 @@ mod tests {
         WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
         WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPollError,
         alert_idempotency_key, checkpoint_name, list_inbound_wrapped_transfers,
-        record_inbound_wrapped_transfer,
+        record_inbound_wrapped_transfer, watchable_tokens,
     };
     use crate::jobs::job_type;
     use crate::mint::test_utils::TestHarness;
@@ -809,6 +833,7 @@ mod tests {
     use crate::poll_checkpoint::load_checkpoint_block;
     use crate::redemption::test_utils::create_transfer_log_with_index;
     use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
     fn symbol(value: &str) -> UnderlyingSymbol {
@@ -1274,6 +1299,46 @@ mod tests {
             ),
             "the third consecutive failure must escalate to ERROR"
         );
+    }
+
+    /// A vault address configured as a wrapped token would turn every genuine
+    /// redemption transfer into an un-redeemable inbound one: recorded, paged,
+    /// and impossible to clear. The watcher refuses to watch it.
+    #[traced_test]
+    #[tokio::test]
+    async fn an_enabled_vault_is_refused_as_a_wrapped_token() {
+        let harness = TestHarness::new().await;
+        harness.setup_account_and_asset().await;
+        let vault = list_enabled_assets(&harness.pool).await.unwrap()[0].vault;
+
+        let watchable = watchable_tokens(
+            &harness.pool,
+            Network::Base,
+            vec![
+                WatchedWrappedToken {
+                    token: vault,
+                    underlying: symbol("AAPL"),
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("RKLB"),
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            watchable,
+            vec![WatchedWrappedToken {
+                token: TOKEN_A,
+                underlying: symbol("RKLB")
+            }],
+            "the vault must not be watched"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["is an enabled asset's vault", &format!("token={vault}")]
+        ));
     }
 
     /// A log without a transaction hash cannot be identified, so it cannot be
