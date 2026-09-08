@@ -4140,6 +4140,72 @@ mod tests {
         ));
     }
 
+    /// A rejected submission is a recorded outcome, not an apalis redrive:
+    /// the job records `MintSubmitRejected` against the persisted transaction,
+    /// returns Ok, and kicks recovery to prepare a replacement.
+    #[tokio::test]
+    async fn submit_mint_job_submit_rejected_records_and_kicks_recovery() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared = crate::vault::PreparedMintTx::valid_for_test(
+            1,
+            format!("mint-{issuer_request_id}"),
+        );
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+
+        let vault =
+            Arc::new(MockVaultService::new_success().with_submit_mint_error(
+                VaultError::SubmitRejected {
+                    tx_hash: prepared.hash,
+                    nonce: prepared.nonce,
+                    source: alloy::transports::RpcError::ErrorResp(
+                        alloy::rpc::json_rpc::ErrorPayload {
+                            code: -32000,
+                            message: "txpool is full".into(),
+                            data: None,
+                        },
+                    ),
+                },
+            ));
+        let ctx = submit_ctx(&harness, vault);
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await
+        .expect("a recorded submit rejection must not redrive the job");
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "a submit rejection must record MintingFailed, got: {mint:?}"
+        );
+        assert!(
+            mint.pending_prepared_tx().is_none(),
+            "the rejected transaction must not stay live on the aggregate"
+        );
+
+        let recovery_jobs = count_jobs(
+            &harness.pool,
+            type_name::<MintRecoveryJob>(),
+            &issuer_request_id.to_string(),
+        )
+        .await;
+        assert!(
+            recovery_jobs >= 1,
+            "a submit rejection must kick mint recovery immediately"
+        );
+    }
+
     /// ConfirmationPending + StillMineable with prepared bytes: rebroadcast
     /// the same hash under the wallet lock (never prepare a replacement).
     #[traced_test]

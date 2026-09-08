@@ -3421,6 +3421,7 @@ mod tests {
     };
     use crate::burn_excess::BurnExcessEvent;
     use crate::config::{VaultMode, VaultModeKind};
+    use crate::jobs::Job;
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
@@ -3432,6 +3433,7 @@ mod tests {
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::RedemptionServices;
+    use crate::redemption::job::{SubmitBurnContext, SubmitBurnJob};
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
@@ -9071,6 +9073,89 @@ mod tests {
             tracing::Level::WARN,
             &["rebroadcast was rejected as nonce too low"]
         ));
+    }
+
+    /// A submit rejection is a recorded outcome, not an apalis redrive: the
+    /// manager records `BurnSubmitRejected` and `SubmitBurnJob::perform`
+    /// returns Ok instead of re-driving the dead broadcast.
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_rejected_broadcast_records_without_job_redrive() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_submit_rejected()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("burn intent should persist");
+        let execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+
+        SubmitBurnJob {
+            issuer_request_id: issuer_request_id.clone(),
+            execution,
+        }
+        .perform(&SubmitBurnContext { burn_manager: Arc::new(manager) })
+        .await
+        .expect("a recorded submit rejection must not redrive the job");
+
+        let rejected_events = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::BurnSubmitRejected'
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("rejected event count should load");
+        assert_eq!(
+            rejected_events, 1,
+            "the rejection must be recorded exactly once"
+        );
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::BurnIntended { .. }),
+            "recovery bookkeeping must keep BurnIntended, got: {aggregate:?}"
+        );
     }
 
     #[traced_test]

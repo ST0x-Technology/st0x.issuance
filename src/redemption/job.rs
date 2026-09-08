@@ -66,7 +66,8 @@ impl Job<SubmitBurnContext> for SubmitBurnJob {
             // for the burn recovery reconciler; this is not an apalis redrive.
             Err(BurnManagerError::Redemption(
                 RedemptionError::Vault { .. }
-                | RedemptionError::BurnNonceTooLow { .. },
+                | RedemptionError::BurnNonceTooLow { .. }
+                | RedemptionError::BurnSubmitRejected { .. },
             )) => Ok(()),
             Err(other) => Err(BurnJobError::Manager(Box::new(other))),
         }
