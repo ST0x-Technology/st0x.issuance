@@ -1511,11 +1511,24 @@ mod tests {
     #[tokio::test]
     async fn a_failed_alert_enqueue_holds_the_checkpoint_for_a_retry() {
         let harness = TestHarness::new().await;
-        sqlx::query("DROP TABLE Jobs").execute(&harness.pool).await.unwrap();
+        let tx = tx_hash(0xa5);
+        // Hidden rather than dropped, so the recovery leg below can put the
+        // queue back exactly as apalis created it.
+        sqlx::query("ALTER TABLE Jobs RENAME TO JobsHidden")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
         asserter.push_success(&vec![inbound_log(
-            tx_hash(0xa5),
+            tx,
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
             SENDER,
             U256::from(1u64),
             0,
@@ -1543,6 +1556,32 @@ mod tests {
                 "failed_token_count=1",
             ]
         ));
+
+        // The checkpoint held, so the next pass re-reads the same log: the
+        // row is already there, and this is the one path that re-derives the
+        // alert key, so the alert it could not queue is queued now.
+        sqlx::query("ALTER TABLE JobsHidden RENAME TO Jobs")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            1,
+            "the re-read must not duplicate the row"
+        );
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            1,
+            "exactly one alert, queued on the recovery pass"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
     }
 
     /// One token's `eth_getLogs` failing must not starve its siblings: the
