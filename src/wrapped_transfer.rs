@@ -1181,7 +1181,20 @@ mod tests {
         assert_eq!(checkpoint(&harness).await, Some(200));
         assert!(logs_contain_at!(
             Level::WARN,
-            &["Dropped unidentifiable wrapped-token transfer logs", "count=2"]
+            &[
+                "Dropped unidentifiable wrapped-token transfer logs",
+                "count=2",
+                &format!("{:?}", tx_hash(0xa7)),
+                &format!("{:?}", tx_hash(0xa8)),
+            ]
+        ));
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["reason=", "log was not emitted by the watched token"]
+        ));
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["reason=", "recipient is not the issuer wallet"]
         ));
     }
 
