@@ -5121,9 +5121,11 @@ announces the tokens it watches at INFO. Every pass then refuses any configured
 address that is an enabled asset's vault on that chain, logged at ERROR the
 first time each address is refused: scanning a vault would record and page every
 genuine redemption transfer as an un-redeemable inbound one. The check runs per
-pass rather than once, because assets are enabled at runtime; a pass whose every
-configured address is refused scans nothing. A failed asset read leaves the list
-unchecked for that pass rather than disabling the backstop.
+pass rather than once, because assets are enabled at runtime. A pass whose every
+configured address is refused scans nothing, so it counts as a failed pass: the
+backstop is offline, and telemetry and the WARN/ERROR escalation say so rather
+than reporting a healthy watcher with zero lag. A failed asset read leaves the
+list unchecked for that pass rather than disabling the backstop.
 
 **Behavior:** one watcher per configured chain with entries polls `eth_getLogs`
 for ERC-20 `Transfer` events on every configured wrapped token where `to` is the
@@ -5196,11 +5198,12 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
 - **Inbound wrapped-token transfer watcher:** each pass records success or
   failure in the same shape, with `lag_blocks` the worst per token distance
   between the chain head and the token's checkpoint at the start of the pass. A
-  pass counts as failed when the head fetch failed or every watched token
-  failed; a partial token failure keeps the pass successful and surfaces as
-  growing `lag_blocks`, matching the transfer poller. A failed token's own
-  backlog is measured into `lag_blocks` too, so the gauge cannot read healthy
-  while one token stops advancing.
+  pass counts as failed when the head fetch failed, every watched token failed,
+  or every configured token was refused as an enabled vault; a partial token
+  failure keeps the pass successful and surfaces as growing `lag_blocks`,
+  matching the transfer poller. A failed token's own backlog is measured into
+  `lag_blocks` too, so the gauge cannot read healthy while one token stops
+  advancing.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 

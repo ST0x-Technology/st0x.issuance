@@ -369,6 +369,15 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     async fn poll_once(&self) -> Result<u64, WrappedTransferPollError> {
         let watchable = self.watchable().await;
 
+        // Refusing every configured token leaves the backstop scanning
+        // nothing, which telemetry must read as a failed pass rather than a
+        // healthy one with zero lag.
+        if watchable.is_empty() {
+            return Err(WrappedTransferPollError::AllTokensRefused {
+                total: self.watched.len(),
+            });
+        }
+
         // One head for the whole pass so every token scans to a consistent
         // block.
         let head = self.provider.get_block_number().await?;
@@ -1435,8 +1444,9 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
         asserter.push_success(&Vec::<Log>::new());
-        // Sorted by address, so an unfiltered pass would spend the single
-        // queued `eth_getLogs` response on the vault and fail on TOKEN_A.
+        // `watchable` keeps the configured order, and this vec puts the
+        // vault first, so an unfiltered pass would spend the single queued
+        // `eth_getLogs` response on the vault and fail on TOKEN_A.
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let monitor = monitor(
             &harness,
