@@ -5,7 +5,7 @@
 //! configuration groups.
 
 use alloy::primitives::U256;
-use alloy::providers::fillers::BlobGasFiller;
+use alloy::providers::fillers::{BlobGasFiller, NonceFiller};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -23,7 +23,7 @@ use crate::tokenized_asset::view::{
 };
 use crate::vault::{
     NetworkVault, NetworkVaultServices, VaultService,
-    service::RealBlockchainService,
+    service::{RealBlockchainService, ResyncNonceManager},
 };
 use crate::wallet::{
     SignerConfig, SignerResolveError, local::resolve_local_signer,
@@ -306,17 +306,18 @@ async fn build_chain_runtime(
         "Signer backend resolved"
     );
 
+    let nonce_manager = ResyncNonceManager::default();
     let signing_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .with_gas_estimation()
         .filler(BlobGasFiller)
-        .with_cached_nonce_management()
+        .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
         .connect_http(wss_to_http(&rpc_url)?);
 
     let vault_service: Arc<dyn VaultService> =
-        Arc::new(RealBlockchainService::new(signing_provider));
+        Arc::new(RealBlockchainService::new(signing_provider, nonce_manager));
 
     Ok(ChainRuntime {
         network,

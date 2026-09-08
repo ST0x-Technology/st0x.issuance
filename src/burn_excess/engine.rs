@@ -1588,7 +1588,9 @@ async fn receipt_balance_of<P: Provider>(
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::primitives::{Bytes, U256, address, b256};
-    use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, NonceFiller,
+    };
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
@@ -1614,7 +1616,7 @@ mod tests {
     };
     use crate::vault::ReceiptInformation;
     use crate::vault::mock::MockVaultService;
-    use crate::vault::service::RealBlockchainService;
+    use crate::vault::service::{RealBlockchainService, ResyncNonceManager};
     use crate::vault::{
         BurnTxStatus, MultiBurnResult, MultiBurnResultEntry, SendableTxWithHash,
     };
@@ -1727,17 +1729,19 @@ mod tests {
         evm.certify_vault(U256::MAX).await.unwrap();
 
         let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let nonce_manager = ResyncNonceManager::default();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .with_gas_estimation()
             .filler(BlobGasFiller)
-            .with_cached_nonce_management()
+            .filler(NonceFiller::new(nonce_manager.clone()))
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer.clone()))
             .connect(&evm.endpoint)
             .await
             .unwrap();
-        let service = RealBlockchainService::new(provider.clone());
+        let service =
+            RealBlockchainService::new(provider.clone(), nonce_manager);
         (evm, service, provider, signer)
     }
 

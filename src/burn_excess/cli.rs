@@ -1,7 +1,7 @@
 //! Clap surface for `issuer burn-excess internal|external`.
 
 use alloy::primitives::{B256, U256};
-use alloy::providers::fillers::BlobGasFiller;
+use alloy::providers::fillers::{BlobGasFiller, NonceFiller};
 use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Subcommand};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -19,7 +19,7 @@ use crate::config::{
 };
 use crate::mint::IssuerMintRequestId;
 use crate::tokenized_asset::Network;
-use crate::vault::service::RealBlockchainService;
+use crate::vault::service::{RealBlockchainService, ResyncNonceManager};
 use crate::wallet::local::resolve_local_signer;
 use crate::wallet::turnkey::resolve_turnkey_signer;
 use crate::wallet::{SignerConfig, SignerEnv};
@@ -171,16 +171,18 @@ pub(crate) async fn run_burn_excess_cli(
     };
 
     let http_url = wss_to_http(&rpc_url)?;
+    let nonce_manager = ResyncNonceManager::default();
     let signing_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .with_gas_estimation()
         .filler(BlobGasFiller)
-        .with_cached_nonce_management()
+        .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
         .connect_http(http_url.clone());
 
-    let vault_service = RealBlockchainService::new(signing_provider);
+    let vault_service =
+        RealBlockchainService::new(signing_provider, nonce_manager);
 
     let read_provider = ProviderBuilder::new().connect_http(http_url);
 
