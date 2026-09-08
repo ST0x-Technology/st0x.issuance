@@ -252,6 +252,11 @@ pub(crate) enum WrappedTransferPollError {
     QueuePush(#[from] QueuePushError),
     #[error("all {total} wrapped tokens failed the poll pass")]
     AllTokensFailed { total: usize },
+    #[error(
+        "all {total} configured wrapped tokens are enabled asset vaults; \
+         nothing is being scanned"
+    )]
+    AllTokensRefused { total: usize },
 }
 
 impl<P: Provider> WrappedTransferMonitor<P> {
@@ -1461,6 +1466,39 @@ mod tests {
             Level::ERROR,
             &["is an enabled asset's vault", &format!("token={vault}")]
         ));
+    }
+
+    /// A pass that refused every configured token scans nothing, which is the
+    /// backstop being offline. It must read as a failed pass rather than a
+    /// healthy one, or telemetry says the watcher is fine while nothing is
+    /// watched.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_pass_that_refuses_every_token_fails() {
+        let harness = TestHarness::new().await;
+        harness.setup_account_and_asset().await;
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        // No queued responses: a pass that scans nothing must not reach the
+        // chain at all.
+        let asserter = Asserter::new();
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![WatchedWrappedToken {
+                token: vault,
+                underlying: symbol("AAPL"),
+            }],
+        );
+
+        let result = monitor.poll_once().await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WrappedTransferPollError::AllTokensRefused { total: 1 })
+            ),
+            "got: {result:?}"
+        );
     }
 
     /// A log without a transaction hash cannot be identified, so it cannot be
