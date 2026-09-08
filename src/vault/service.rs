@@ -84,6 +84,14 @@ const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 /// unused gas is not charged.
 const MINT_GAS_LIMIT: u64 = 3_000_000;
 
+/// Fixed gas limit for burn multicalls, set instead of estimating (same reason
+/// as `MINT_GAS_LIMIT`: the provider default estimates against `pending` state,
+/// which under mempool load intermittently reverts with empty returndata and
+/// fails an otherwise valid burn). Burns are heavier and scale with
+/// receipt-leg count (~421k observed on a 4-leg burn); this limit sits well
+/// above that and well under Base's block gas limit. Unused gas is not charged.
+const BURN_GAS_LIMIT: u64 = 3_000_000;
+
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
 ///
@@ -727,7 +735,11 @@ impl VaultService for RealBlockchainService {
             redeem_calls
         };
 
-        let tx = vault_contract.multicall(calls).into_transaction_request();
+        let mut tx = vault_contract.multicall(calls).into_transaction_request();
+        // Skip gas estimation (see `BURN_GAS_LIMIT`): a fixed limit avoids the
+        // provider's `pending`-state `eth_estimateGas`, which reverts with empty
+        // returndata under load and fails an otherwise valid burn.
+        tx.gas = Some(BURN_GAS_LIMIT);
 
         // Fill nonce, gas price, gas limit, chain_id from the provider
         let envelop = self
@@ -828,7 +840,10 @@ impl VaultService for RealBlockchainService {
         transaction.from = Some(owner);
         transaction.nonce =
             Some(self.provider.get_transaction_count(owner).pending().await?);
-        transaction.gas = None;
+        // Fixed limit instead of re-estimating against `pending` (see
+        // `BURN_GAS_LIMIT`); fee fields stay `None` so the replacement still
+        // re-prices for the fee bump.
+        transaction.gas = Some(BURN_GAS_LIMIT);
         transaction.gas_price = None;
         transaction.max_fee_per_gas = None;
         transaction.max_priority_fee_per_gas = None;
