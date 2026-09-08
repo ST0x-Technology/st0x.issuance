@@ -1986,7 +1986,7 @@ impl Mint {
             underlying: underlying.clone(),
             token: token.clone(),
             network,
-            client_id: client_id.clone(),
+            client_id,
             wallet,
             initiated_at,
             mint_mode,
