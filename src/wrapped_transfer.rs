@@ -796,10 +796,11 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        InboundWrappedTransfer, WatchedWrappedToken, WrappedTokenConfig,
-        WrappedTokenConfigError, WrappedTokenEntry, WrappedTransferMonitor,
-        WrappedTransferPollError, alert_idempotency_key, checkpoint_name,
-        list_inbound_wrapped_transfers, record_inbound_wrapped_transfer,
+        InboundWrappedTransfer, InboundWrappedTransferReadError,
+        WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
+        WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPollError,
+        alert_idempotency_key, checkpoint_name, list_inbound_wrapped_transfers,
+        record_inbound_wrapped_transfer,
     };
     use crate::jobs::job_type;
     use crate::mint::test_utils::TestHarness;
@@ -983,9 +984,16 @@ mod tests {
     }
 
     async fn checkpoint(harness: &TestHarness) -> Option<u64> {
+        token_checkpoint(harness, TOKEN_A).await
+    }
+
+    async fn token_checkpoint(
+        harness: &TestHarness,
+        token: Address,
+    ) -> Option<u64> {
         load_checkpoint_block(
             &harness.pool,
-            &checkpoint_name(Network::Base, TOKEN_A),
+            &checkpoint_name(Network::Base, token),
         )
         .await
         .unwrap()
@@ -1300,6 +1308,7 @@ mod tests {
 
     /// A failed `eth_getLogs` must leave the token's checkpoint alone so the
     /// range is retried, and a pass where every token failed fails the pass.
+    #[traced_test]
     #[tokio::test]
     async fn a_failed_log_fetch_fails_the_pass_and_holds_the_checkpoint() {
         let harness = TestHarness::new().await;
@@ -1318,11 +1327,20 @@ mod tests {
             "got: {result:?}"
         );
         assert_eq!(checkpoint(&harness).await, None);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+                "total_tokens=1",
+            ]
+        ));
     }
 
     /// If the alert cannot be queued, the transfer is still recorded (that
     /// insert happens first) but the checkpoint must not advance: the next
     /// pass re-scans the range and queues the alert, so it is never lost.
+    #[traced_test]
     #[tokio::test]
     async fn a_failed_alert_enqueue_holds_the_checkpoint_for_a_retry() {
         let harness = TestHarness::new().await;
@@ -1351,6 +1369,68 @@ mod tests {
             1
         );
         assert_eq!(checkpoint(&harness).await, None);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+            ]
+        ));
+    }
+
+    /// One token's `eth_getLogs` failing must not starve its siblings: the
+    /// healthy token still records and checkpoints, the pass stays `Ok`, and
+    /// only the failing token resumes from its own checkpoint next pass.
+    #[traced_test]
+    #[tokio::test]
+    async fn one_failing_token_leaves_the_others_polling() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa9);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(3u64),
+            0,
+        )]);
+        asserter.push_failure_msg("simulated eth_getLogs failure");
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("AAPL"),
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_B,
+                    underlying: symbol("RKLB"),
+                },
+            ],
+        );
+
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            1,
+            "the healthy token still records its transfer"
+        );
+        assert_eq!(token_checkpoint(&harness, TOKEN_A).await, Some(200));
+        assert_eq!(
+            token_checkpoint(&harness, TOKEN_B).await,
+            None,
+            "the failing token holds its checkpoint for a retry"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+                "total_tokens=2",
+            ]
+        ));
     }
 
     /// With nothing configured for the network the pass makes no RPC call at
@@ -1365,7 +1445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_orders_newest_block_first() {
+    async fn listing_orders_by_block_then_log_index_and_repeats_are_no_ops() {
         let harness = TestHarness::new().await;
         let older = InboundWrappedTransfer {
             network: Network::Base,
@@ -1380,8 +1460,22 @@ mod tests {
         };
         let newer = InboundWrappedTransfer {
             block_number: 200,
+            log_index: 1,
+            // The largest value an ERC-20 can move, to prove the decimal
+            // string in the TEXT column round-trips without loss.
+            amount: U256::MAX,
             tx_hash: b256!(
                 "0x2222222222222222222222222222222222222222222222222222222222222222"
+            ),
+            ..older.clone()
+        };
+        // Same block as `newer`, lower log index: several inbound transfers
+        // in one block is exactly what the tie-break orders.
+        let same_block = InboundWrappedTransfer {
+            block_number: 200,
+            log_index: 0,
+            tx_hash: b256!(
+                "0x3333333333333333333333333333333333333333333333333333333333333333"
             ),
             ..older.clone()
         };
@@ -1397,6 +1491,11 @@ mod tests {
                 .unwrap()
         );
         assert!(
+            record_inbound_wrapped_transfer(&harness.pool, &same_block)
+                .await
+                .unwrap()
+        );
+        assert!(
             !record_inbound_wrapped_transfer(&harness.pool, &older)
                 .await
                 .unwrap(),
@@ -1405,8 +1504,51 @@ mod tests {
 
         let listed =
             list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
-        let blocks: Vec<u64> =
-            listed.iter().map(|transfer| transfer.block_number).collect();
-        assert_eq!(blocks, vec![200, 100]);
+        let order: Vec<(u64, u64)> = listed
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(order, vec![(200, 1), (200, 0), (100, 0)]);
+        assert_eq!(listed[0].amount, U256::MAX, "amount round-trips exactly");
+    }
+
+    /// A row that cannot be parsed back fails the whole listing rather than
+    /// being skipped: the endpoint exists to show an operator every transfer
+    /// awaiting manual recovery, and a listing silently missing one is worse
+    /// than a listing that reports it is broken.
+    #[tokio::test]
+    async fn one_unparsable_row_fails_the_whole_listing() {
+        let harness = TestHarness::new().await;
+        sqlx::query(
+            "
+            INSERT INTO inbound_wrapped_transfers (
+                network,
+                tx_hash,
+                log_index,
+                token,
+                underlying,
+                from_address,
+                amount,
+                block_number,
+                detected_at
+            )
+            VALUES ('mars', ?, 0, ?, 'AAPL', ?, '1', 100, ?)
+            ",
+        )
+        .bind(format!("{:#x}", TX_HASH))
+        .bind(format!("{TOKEN_A:#x}"))
+        .bind(format!("{SENDER:#x}"))
+        .bind(Utc::now().to_rfc3339())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        let error =
+            list_inbound_wrapped_transfers(&harness.pool).await.unwrap_err();
+
+        assert!(
+            matches!(error, InboundWrappedTransferReadError::Network(_)),
+            "got: {error:?}"
+        );
     }
 }
