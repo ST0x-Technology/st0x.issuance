@@ -1038,7 +1038,7 @@ pub(crate) enum VaultError {
     #[error("Persisted burn transaction {tx_hash:?} has a spent nonce {nonce}")]
     BurnNonceTooLow { tx_hash: B256, nonce: u64 },
     #[error(
-        "Node rejected persisted transaction {tx_hash:?} before acceptance at nonce {nonce}"
+        "Node rejected persisted transaction {tx_hash:?} before acceptance at nonce {nonce}: {source}"
     )]
     SubmitRejected {
         tx_hash: B256,

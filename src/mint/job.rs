@@ -1258,6 +1258,14 @@ impl SubmitMintJob {
         }
 
         if let VaultError::SubmitRejected { tx_hash, nonce, .. } = &error {
+            warn!(
+                target: "mint",
+                issuer_request_id = %self.issuer_request_id,
+                tx_hash = %tx_hash,
+                nonce = nonce,
+                error = %error,
+                "Mint submission rejected by the node before acceptance"
+            );
             ctx.mint_store
                 .send(
                     &self.issuer_request_id,

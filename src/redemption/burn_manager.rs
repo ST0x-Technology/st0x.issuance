@@ -9077,7 +9077,9 @@ mod tests {
 
     /// A submit rejection is a recorded outcome, not an apalis redrive: the
     /// manager records `BurnSubmitRejected` and `SubmitBurnJob::perform`
-    /// returns Ok instead of re-driving the dead broadcast.
+    /// returns Ok instead of re-driving the dead broadcast. Recovery then
+    /// matches the durable observation and replaces the rejected transaction
+    /// at a fresh nonce.
     #[traced_test]
     #[tokio::test]
     async fn submit_rejected_broadcast_records_without_job_redrive() {
@@ -9090,12 +9092,13 @@ mod tests {
         let owner = persisted_tx.signer_for_test();
         let vault_mock = Arc::new(
             MockVaultService::new_submit_rejected()
+                .with_burn_tx_status(BurnTxStatus::StillMineable)
                 .with_prepared_tx(persisted_tx.clone()),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let manager = BurnManager::new_for_tests(
+        let manager = Arc::new(BurnManager::new_for_tests(
             vault_mock.clone(),
             pool.clone(),
             store.clone(),
@@ -9103,7 +9106,7 @@ mod tests {
             owner,
             ANVIL_CHAIN_ID,
             harness.apalis_pool.clone(),
-        );
+        ));
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -9130,7 +9133,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             execution,
         }
-        .perform(&SubmitBurnContext { burn_manager: Arc::new(manager) })
+        .perform(&SubmitBurnContext { burn_manager: manager.clone() })
         .await
         .expect("a recorded submit rejection must not redrive the job");
 
@@ -9156,6 +9159,38 @@ mod tests {
             matches!(aggregate, Redemption::BurnIntended { .. }),
             "recovery bookkeeping must keep BurnIntended, got: {aggregate:?}"
         );
+
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            1860,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+        assert!(matches!(
+            manager.recover_single_burning(&issuer_request_id).await,
+            Ok(RecoveryOutcome::EnqueuedBurnJob)
+        ));
+        let replacement_execution =
+            intended_execution(store, &issuer_request_id, vault).await;
+        manager
+            .submit_intended_burn(&issuer_request_id, &replacement_execution)
+            .await
+            .expect("the replacement submit should broadcast");
+        assert_eq!(
+            vault_mock.submitted_burn_txs(),
+            vec![replacement_tx.clone()],
+            "only the replacement bytes may reach the node"
+        );
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(matches!(
+            aggregate,
+            Redemption::BurnSubmitted { sendable_tx, .. }
+                if sendable_tx == replacement_tx
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Automatic burn recovery action accepted", "Replace"]
+        ));
     }
 
     #[traced_test]

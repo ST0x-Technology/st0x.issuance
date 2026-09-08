@@ -1206,7 +1206,8 @@ impl Mint {
             return match self {
                 Self::TxSubmitted { .. }
                 | Self::CallbackPending { .. }
-                | Self::Completed { .. } => Ok(vec![]),
+                | Self::Completed { .. }
+                | Self::MintingFailed { .. } => Ok(vec![]),
                 _ => Err(MintError::NotInMintIntendedState {
                     current_state: self.state_name().to_string(),
                 }),
@@ -4943,6 +4944,44 @@ pub(crate) mod tests {
             error,
             LifecycleError::Apply(MintError::SubmitRejectedTransactionMismatch)
         ));
+    }
+
+    #[tokio::test]
+    async fn record_submit_rejected_replay_after_commit_is_a_noop() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            1,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: prepared_tx.clone(),
+            intended_at: Utc::now(),
+        });
+        events.push(MintEvent::MintSubmitRejected {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: prepared_tx.hash,
+            nonce: prepared_tx.nonce,
+            error: "replacement transaction underpriced".to_string(),
+            rejected_at: Utc::now(),
+        });
+
+        let recorded = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::RecordSubmitRejected {
+                issuer_request_id,
+                tx_hash: prepared_tx.hash,
+                nonce: prepared_tx.nonce,
+                error: "replacement transaction underpriced".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(
+            recorded.is_empty(),
+            "a job rerun after the rejection committed must be a no-op"
+        );
     }
 
     #[test]
