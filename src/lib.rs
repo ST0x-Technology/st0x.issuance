@@ -7,6 +7,7 @@ use event_sorcery::{
     EventSourced, ReconcileError, Reconciler, Store, StoreBuilder,
 };
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
+use parking_lot::Mutex;
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,7 @@ use crate::tokenized_asset::{
 };
 use crate::underlying::Underlying;
 use crate::vault::NetworkVaultServices;
-use crate::wrapped_transfer::{WrappedTransferMonitor, watchable_tokens};
+use crate::wrapped_transfer::WrappedTransferMonitor;
 use poll_checkpoint::load_receipt_backfill;
 
 pub mod account;
@@ -1970,20 +1971,13 @@ where
 
             let mut monitor_shutdown = deps.shutdown.clone();
             Some(tokio::spawn(async move {
-                // Vault addresses are only knowable once the asset view is
-                // readable, so the configured list is checked here rather
-                // than at config load.
-                let watched = watchable_tokens(&pool, network, watched).await;
-                if watched.is_empty() {
-                    return;
-                }
-
                 let monitor = WrappedTransferMonitor {
                     network,
                     provider,
                     bot_wallet,
                     backfill_start_block,
                     watched,
+                    refused: Mutex::default(),
                     pool,
                     apalis_pool,
                     telemetry,

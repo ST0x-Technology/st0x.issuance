@@ -5117,10 +5117,13 @@ network, an invalid symbol, a malformed or zero address, one address bound to
 two underlyings on the same chain, or a network with no chain configuration is a
 startup error. A configured chain with no entries logs a startup WARN that
 wrapped-token watching is disabled for it. When a chain's watcher starts it
-announces the tokens it watches at INFO, and refuses any configured address that
-is an enabled asset's vault on that chain (logged at ERROR): watching a vault
-would record and page every genuine redemption transfer as an un-redeemable
-inbound one. A chain whose every configured address is refused runs no watcher.
+announces the tokens it watches at INFO. Every pass then refuses any configured
+address that is an enabled asset's vault on that chain, logged at ERROR the
+first time each address is refused: scanning a vault would record and page every
+genuine redemption transfer as an un-redeemable inbound one. The check runs per
+pass rather than once, because assets are enabled at runtime; a pass whose every
+configured address is refused scans nothing. A failed asset read leaves the list
+unchecked for that pass rather than disabling the backstop.
 
 **Behavior:** one watcher per configured chain with entries polls `eth_getLogs`
 for ERC-20 `Transfer` events on every configured wrapped token where `to` is the

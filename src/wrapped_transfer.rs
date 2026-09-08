@@ -35,10 +35,11 @@ use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{NetworkParseError, UnderlyingSymbolError};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::num::TryFromIntError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,8 +221,12 @@ pub(crate) struct WrappedTransferMonitor<P> {
     pub(crate) provider: P,
     pub(crate) bot_wallet: Address,
     pub(crate) backfill_start_block: u64,
-    /// Never empty: a chain with nothing left to watch runs no monitor.
+    /// The configured tokens, never empty: a chain with none runs no
+    /// monitor. Each pass scans the subset that is not an enabled vault.
     pub(crate) watched: Vec<WatchedWrappedToken>,
+    /// Tokens already refused as vaults, so the ERROR is raised once per
+    /// token rather than every pass.
+    pub(crate) refused: Mutex<HashSet<Address>>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) apalis_pool: ApalisSqlitePool,
     pub(crate) telemetry: Arc<NetworkTelemetry>,
@@ -253,11 +258,12 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     /// Runs the polling loop forever. Never returns; the spawn site pairs it
     /// with the shutdown channel in a `select!`, like the transfer poller.
     pub(crate) async fn run(&self) {
-        debug!(
+        info!(
             target: "wrapped_transfer",
             network = %self.network,
             watched = ?self.watched,
-            "Starting inbound wrapped-token transfer watcher"
+            "Watching wrapped tokens for inbound transfers to the issuer \
+             wallet"
         );
 
         let mut consecutive_failures = 0_usize;
@@ -288,6 +294,64 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         }
     }
 
+    /// The configured tokens this pass may scan.
+    ///
+    /// A wrapped-token address that is also an enabled asset's vault on this
+    /// network would make every genuine redemption transfer look like an
+    /// un-redeemable inbound one, so it is refused rather than scanned.
+    /// Assets are enabled at runtime, so this runs per pass, as the receipt
+    /// backfill re-reads its asset set. A failed asset read leaves the list
+    /// alone: an unverified scan still detects real transfers, while dropping
+    /// the list would disable the backstop over a database blip.
+    async fn watchable(&self) -> Vec<WatchedWrappedToken> {
+        let vaults: Vec<Address> = match list_enabled_assets(&self.pool).await {
+            Ok(assets) => assets
+                .into_iter()
+                .filter(|asset| asset.network == self.network)
+                .map(|asset| asset.vault)
+                .collect(),
+            Err(error) => {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    error = %error,
+                    "Could not read the enabled assets to check the \
+                     configured wrapped tokens against their vaults; \
+                     scanning them unchecked"
+                );
+                Vec::new()
+            }
+        };
+
+        self.watched
+            .iter()
+            .filter(|candidate| {
+                if !vaults.contains(&candidate.token) {
+                    return true;
+                }
+
+                // Once per token per process: the misconfiguration is
+                // permanent until an operator changes the config, and a pass
+                // runs every minute.
+                if self.refused.lock().insert(candidate.token) {
+                    error!(
+                        target: "wrapped_transfer",
+                        network = %self.network,
+                        token = %candidate.token,
+                        underlying = %candidate.underlying,
+                        "Configured wrapped token is an enabled asset's vault \
+                         on this network; refusing to scan it, since every \
+                         redemption transfer would be recorded and paged as \
+                         an un-redeemable inbound transfer"
+                    );
+                }
+
+                false
+            })
+            .cloned()
+            .collect()
+    }
+
     /// One pass: scan every watched token from its checkpoint to one shared
     /// chain head. A per token failure does not starve the others, since each
     /// token owns its checkpoint and resumes next pass; a pass where every
@@ -298,13 +362,15 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     /// checkpoint at the start of the pass, which telemetry reports as the
     /// watcher's block lag.
     async fn poll_once(&self) -> Result<u64, WrappedTransferPollError> {
+        let watchable = self.watchable().await;
+
         // One head for the whole pass so every token scans to a consistent
         // block.
         let head = self.provider.get_block_number().await?;
 
         let mut failed_tokens: Vec<Address> = Vec::new();
         let mut lag_blocks = 0_u64;
-        for watched in &self.watched {
+        for watched in &watchable {
             match self.poll_token(watched, head).await {
                 Ok(token_lag) => lag_blocks = lag_blocks.max(token_lag),
                 Err(error) => {
@@ -327,14 +393,14 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                 network = %self.network,
                 failed_token_count = failed_tokens.len(),
                 failed_tokens = ?failed_tokens,
-                total_tokens = self.watched.len(),
+                total_tokens = watchable.len(),
                 "Wrapped-token transfer poll pass completed with token \
                  failures; each resumes from its checkpoint next pass"
             );
 
-            if failed_tokens.len() == self.watched.len() {
+            if failed_tokens.len() == watchable.len() {
                 return Err(WrappedTransferPollError::AllTokensFailed {
-                    total: self.watched.len(),
+                    total: watchable.len(),
                 });
             }
         }
@@ -750,69 +816,6 @@ fn checkpoint_name(network: Network, token: Address) -> String {
     format!("wrapped_transfer_poll:{network}:{token:#x}")
 }
 
-/// The tokens a network's watcher may actually scan, announced at INFO so an
-/// operator can see what is watched without reading the config file.
-///
-/// A wrapped-token address that is also an enabled asset's vault on this
-/// network would make every genuine redemption transfer look like an
-/// un-redeemable inbound one, so it is refused rather than watched. A failed
-/// asset read leaves the list alone: an unverified watch still detects real
-/// transfers, while dropping the list would disable the backstop over a
-/// database blip.
-pub(crate) async fn watchable_tokens(
-    pool: &Pool<Sqlite>,
-    network: Network,
-    watched: Vec<WatchedWrappedToken>,
-) -> Vec<WatchedWrappedToken> {
-    let vaults = match list_enabled_assets(pool).await {
-        Ok(assets) => assets
-            .into_iter()
-            .filter(|asset| asset.network == network)
-            .map(|asset| asset.vault)
-            .collect(),
-        Err(error) => {
-            warn!(
-                target: "wrapped_transfer",
-                %network,
-                error = %error,
-                "Could not read the enabled assets to check the configured \
-                 wrapped tokens against their vaults; watching them unchecked"
-            );
-            Vec::new()
-        }
-    };
-
-    let watchable: Vec<WatchedWrappedToken> = watched
-        .into_iter()
-        .filter(|candidate| {
-            if vaults.contains(&candidate.token) {
-                error!(
-                    target: "wrapped_transfer",
-                    %network,
-                    token = %candidate.token,
-                    underlying = %candidate.underlying,
-                    "Configured wrapped token is an enabled asset's vault on \
-                     this network; refusing to watch it, since every \
-                     redemption transfer would be recorded and paged as an \
-                     un-redeemable inbound transfer"
-                );
-                return false;
-            }
-
-            true
-        })
-        .collect();
-
-    info!(
-        target: "wrapped_transfer",
-        %network,
-        tokens = ?watchable,
-        "Watching wrapped tokens for inbound transfers to the issuer wallet"
-    );
-
-    watchable
-}
-
 /// The category of an RPC failure, with no transport detail: the display of
 /// the wrapped error can quote the configured URL, API key and all.
 const fn classify_rpc_error(
@@ -880,6 +883,7 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::{RpcError, TransportErrorKind};
     use chrono::Utc;
+    use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Duration;
     use tracing::Level;
@@ -890,7 +894,7 @@ mod tests {
         WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
         WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPollError,
         alert_idempotency_key, checkpoint_name, list_inbound_wrapped_transfers,
-        record_inbound_wrapped_transfer, watchable_tokens,
+        record_inbound_wrapped_transfer,
     };
     use crate::jobs::job_type;
     use crate::mint::test_utils::TestHarness;
@@ -899,7 +903,6 @@ mod tests {
     use crate::poll_checkpoint::load_checkpoint_block;
     use crate::redemption::test_utils::create_transfer_log_with_index;
     use crate::test_utils::{log_count_at, logs_contain_at};
-    use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
     fn symbol(value: &str) -> UnderlyingSymbol {
@@ -1041,6 +1044,7 @@ mod tests {
             bot_wallet: BOT_WALLET,
             backfill_start_block: 0,
             watched,
+            refused: Mutex::default(),
             pool: harness.pool.clone(),
             apalis_pool: harness.apalis_pool.clone(),
             telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
@@ -1393,46 +1397,6 @@ mod tests {
             ),
             "the third consecutive failure must escalate to ERROR"
         );
-    }
-
-    /// A vault address configured as a wrapped token would turn every genuine
-    /// redemption transfer into an un-redeemable inbound one: recorded, paged,
-    /// and impossible to clear. The watcher refuses to watch it.
-    #[traced_test]
-    #[tokio::test]
-    async fn an_enabled_vault_is_refused_as_a_wrapped_token() {
-        let harness = TestHarness::new().await;
-        harness.setup_account_and_asset().await;
-        let vault = list_enabled_assets(&harness.pool).await.unwrap()[0].vault;
-
-        let watchable = watchable_tokens(
-            &harness.pool,
-            Network::Base,
-            vec![
-                WatchedWrappedToken {
-                    token: vault,
-                    underlying: symbol("AAPL"),
-                },
-                WatchedWrappedToken {
-                    token: TOKEN_A,
-                    underlying: symbol("RKLB"),
-                },
-            ],
-        )
-        .await;
-
-        assert_eq!(
-            watchable,
-            vec![WatchedWrappedToken {
-                token: TOKEN_A,
-                underlying: symbol("RKLB")
-            }],
-            "the vault must not be watched"
-        );
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &["is an enabled asset's vault", &format!("token={vault}")]
-        ));
     }
 
     /// Assets are enabled at runtime, so a vault that collides with a
