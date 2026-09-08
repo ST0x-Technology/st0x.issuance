@@ -4832,7 +4832,7 @@ operator can see what needs manual recovery without log access.
 
 Returns `{"transfers": [...]}`, highest block first, each row carrying
 `network`, `underlying`, `token` (the wrapped-token contract), `from`, `amount`
-(the raw ERC-20 amount as a decimal string, in 18-decimal base units),
+(the raw ERC-20 amount as a decimal string, in the wrapper's own base units),
 `tx_hash`, `log_index`, `block_number`, and `detected_at`. Rows are durable:
 they survive restarts and the service never removes them.
 
@@ -5140,7 +5140,9 @@ matching log the watcher:
 - records the transfer durably in `inbound_wrapped_transfers`, keyed by
   `(network, tx_hash, log_index)` so a re-scan cannot record it twice;
 - emits an ERROR log naming the network, underlying, wrapped token, sender,
-  amount, and transaction hash when the transfer is first recorded;
+  amount, and transaction hash when the transfer is first recorded; the amount
+  is the raw on-chain value, since ERC-4626 does not fix a share token at 18
+  decimals and the service never reads the wrapper's `decimals()`;
 - queues an `InboundWrappedTransfer` lifecycle notification (Telegram when
   configured) carrying the same fields under the durable idempotency key
   `notify:wrapped-transfer:{network}:{tx_hash}:{log_index}` — the dedup the
