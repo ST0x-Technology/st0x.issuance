@@ -2368,8 +2368,9 @@ pub(crate) fn network_telemetry(
 }
 
 /// One recorded inbound wrapped-token transfer as the admin API reports it.
-/// `amount` is the raw ERC-20 value in 18-decimal base units, as a decimal
-/// string.
+/// `amount` is the raw ERC-20 value in the wrapper's own base units, as a
+/// decimal string: ERC-4626 does not fix a share token at 18 decimals and the
+/// service never reads the wrapper's `decimals()`, so it must not be scaled.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct WrappedTransferEntry {
     network: Network,
