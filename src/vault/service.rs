@@ -380,7 +380,11 @@ impl RealBlockchainService {
                     // reusable; later prepared transactions keep their values.
                     self.nonce_manager
                         .release(self.provider.default_signer_address(), nonce);
-                    return Err(error.into());
+                    return Err(VaultError::SubmitRejected {
+                        tx_hash: hash,
+                        nonce,
+                        source: error,
+                    });
                 }
                 Ok(None)
             }

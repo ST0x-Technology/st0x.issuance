@@ -1038,6 +1038,16 @@ pub(crate) enum VaultError {
     #[error("Persisted burn transaction {tx_hash:?} has a spent nonce {nonce}")]
     BurnNonceTooLow { tx_hash: B256, nonce: u64 },
     #[error(
+        "Node rejected persisted transaction {tx_hash:?} before acceptance at nonce {nonce}"
+    )]
+    SubmitRejected {
+        tx_hash: B256,
+        nonce: u64,
+        #[source]
+        source:
+            alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+    },
+    #[error(
         "Persisted mint transaction hash {expected:?} does not match decoded hash {decoded:?}"
     )]
     PreparedMintHashMismatch { expected: B256, decoded: B256 },

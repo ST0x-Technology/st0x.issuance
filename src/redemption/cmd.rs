@@ -2,7 +2,8 @@ use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BurnExternalTxId, BurnNonceTooLowProof, IssuerRedemptionRequestId,
+    BurnExternalTxId, BurnNonceTooLowProof, BurnSubmitRejectedProof,
+    IssuerRedemptionRequestId,
 };
 use crate::Quantity;
 use crate::config::VaultMode;
@@ -247,6 +248,12 @@ pub(crate) enum RedemptionCommand {
         tx_hash: B256,
         nonce: u64,
     },
+    RecordBurnSubmitRejected {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        error: String,
+    },
     RecordBurnPreparationRecoveryAttempt {
         issuer_request_id: IssuerRedemptionRequestId,
         attempt: u32,
@@ -269,5 +276,10 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         owner: Address,
         proof: BurnNonceTooLowProof,
+    },
+    ReplaceRejectedBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        owner: Address,
+        proof: BurnSubmitRejectedProof,
     },
 }

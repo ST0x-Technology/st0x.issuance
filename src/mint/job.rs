@@ -1257,6 +1257,29 @@ impl SubmitMintJob {
             return Ok(());
         }
 
+        if let VaultError::SubmitRejected { tx_hash, nonce, .. } = &error {
+            ctx.mint_store
+                .send(
+                    &self.issuer_request_id,
+                    MintCommand::RecordSubmitRejected {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                        tx_hash: *tx_hash,
+                        nonce: *nonce,
+                        error: error.to_string(),
+                    },
+                )
+                .await?;
+
+            kick_mint_recovery(
+                &ctx.pool,
+                &ctx.apalis_pool,
+                &self.issuer_request_id,
+            )
+            .await;
+
+            return Ok(());
+        }
+
         warn!(
             target: "mint",
             issuer_request_id = %self.issuer_request_id,
@@ -1511,6 +1534,7 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::NotABurn { .. }
         | VaultError::BurnedEventMismatch { .. }
         | VaultError::BurnNonceTooLow { .. }
+        | VaultError::SubmitRejected { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
         | VaultError::PreparedMintSignerMismatch { .. }
@@ -1556,6 +1580,7 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         // integrity anomaly.
         | VaultError::BurnedEventMismatch { .. }
         | VaultError::BurnNonceTooLow { .. }
+        | VaultError::SubmitRejected { .. }
         | VaultError::BroadcastHashMismatch { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }

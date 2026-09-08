@@ -1190,6 +1190,43 @@ impl Mint {
         }
     }
 
+    fn handle_record_submit_rejected(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        error: String,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let Self::TxIntended {
+            issuer_request_id: expected_id,
+            prepared_tx,
+            ..
+        } = self
+        else {
+            return match self {
+                Self::TxSubmitted { .. }
+                | Self::CallbackPending { .. }
+                | Self::Completed { .. } => Ok(vec![]),
+                _ => Err(MintError::NotInMintIntendedState {
+                    current_state: self.state_name().to_string(),
+                }),
+            };
+        };
+
+        Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
+        if prepared_tx.hash != tx_hash || prepared_tx.nonce != nonce {
+            return Err(MintError::SubmitRejectedTransactionMismatch);
+        }
+
+        Ok(vec![MintEvent::MintSubmitRejected {
+            issuer_request_id,
+            tx_hash,
+            nonce,
+            error,
+            rejected_at: Utc::now(),
+        }])
+    }
+
     /// Records a confirmed on-chain mint reported by a durable `ConfirmMintJob`.
     /// Pure — emits `TokensMinted` from the payload. Idempotent: a no-op once
     /// the mint has advanced past `TxSubmitted`. Rejects a report
@@ -1909,6 +1946,74 @@ impl Mint {
             journal_confirmed_at,
             minting_started_at,
             prepared_tx,
+        };
+    }
+
+    fn apply_submit_rejected(
+        &mut self,
+        error: String,
+        failed_at: DateTime<Utc>,
+    ) {
+        let Self::TxIntended {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            mint_mode,
+            mint_authorization,
+            journal_confirmed_at,
+            minting_started_at,
+            prepared_tx,
+        } = self.clone()
+        else {
+            return;
+        };
+
+        let attempts = Self::retry_attempt_from_external_tx_id(
+            &prepared_tx.external_tx_id,
+        )
+        .unwrap_or(0)
+            + 1;
+        let failed_from = Self::Minting {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network,
+            client_id: client_id.clone(),
+            wallet,
+            initiated_at,
+            mint_mode,
+            mint_authorization: mint_authorization.clone(),
+            journal_confirmed_at,
+            minting_started_at,
+            retry: None,
+        };
+
+        *self = Self::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            mint_mode,
+            mint_authorization,
+            journal_confirmed_at,
+            error,
+            failed_at,
+            classification: MintFailureClassification::Unclassified,
+            attempts,
+            failed_from: Box::new(failed_from),
         };
     }
 
@@ -2688,6 +2793,7 @@ impl EventSourced for Mint {
             }
             MintCommand::RecordTxIntended { .. }
             | MintCommand::RecordTxSubmitted { .. }
+            | MintCommand::RecordSubmitRejected { .. }
             | MintCommand::RecordExistingMint { .. } => {
                 Err(MintError::NotInMintingState {
                     current_state: "Uninitialized".to_string(),
@@ -2776,6 +2882,17 @@ impl EventSourced for Mint {
                 issuer_request_id,
                 external_tx_id,
                 tx_id,
+            ),
+            MintCommand::RecordSubmitRejected {
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                error,
+            } => self.handle_record_submit_rejected(
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                error,
             ),
             MintCommand::RecordTokensMinted {
                 issuer_request_id,
@@ -2929,6 +3046,13 @@ impl Mint {
                 prepared_tx,
                 intended_at: _,
             } => self.apply_mint_intended(prepared_tx),
+            MintEvent::MintSubmitRejected {
+                issuer_request_id: _,
+                tx_hash: _,
+                nonce: _,
+                error,
+                rejected_at,
+            } => self.apply_submit_rejected(error, rejected_at),
             MintEvent::TokensMinted {
                 issuer_request_id: _,
                 tx_hash,
@@ -3150,6 +3274,10 @@ pub(crate) enum MintError {
     )]
     SubmittedTransactionMismatch,
     #[error(
+        "Vault rejected transaction metadata that differs from mint intent"
+    )]
+    SubmitRejectedTransactionMismatch,
+    #[error(
         "Asset not found for underlying: {underlying} on network: {network}"
     )]
     AssetNotFound { underlying: UnderlyingSymbol, network: Network },
@@ -3319,6 +3447,23 @@ pub(crate) mod tests {
                 .await
                 .expect("intent query should succeed"),
             "a Base intent must not block an independent Ethereum signer"
+        );
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            &aggregate_id,
+            3,
+            "MintEvent::MintSubmitRejected",
+            "{}",
+        )
+        .await
+        .expect("submit rejection should insert");
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "a submit rejection must release the signer reservation"
         );
 
         let orphaned = sqlx::query(
@@ -4667,6 +4812,86 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn record_submit_rejected_from_tx_intended_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            1,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: prepared_tx.clone(),
+            intended_at: Utc::now(),
+        });
+
+        let recorded = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::RecordSubmitRejected {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: prepared_tx.hash,
+                nonce: prepared_tx.nonce,
+                error: "replacement transaction underpriced".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            recorded.as_slice(),
+            [MintEvent::MintSubmitRejected {
+                issuer_request_id: event_request_id,
+                tx_hash,
+                nonce,
+                error,
+                ..
+            }] if event_request_id == &issuer_request_id
+                && *tx_hash == prepared_tx.hash
+                && *nonce == prepared_tx.nonce
+                && error == "replacement transaction underpriced"
+        ));
+        let mint = replay::<Mint>(
+            events_through_tx_intended(&issuer_request_id)
+                .into_iter()
+                .chain(recorded)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mint.pending_prepared_tx().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_submit_rejected_rejects_a_different_transaction() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = PreparedMintTx::valid_for_test(
+            1,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mut events = events_through_minting(&issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: prepared_tx.clone(),
+            intended_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Mint>::with(())
+            .given(events)
+            .when(MintCommand::RecordSubmitRejected {
+                issuer_request_id,
+                tx_hash: B256::random(),
+                nonce: prepared_tx.nonce,
+                error: "replacement transaction underpriced".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(MintError::SubmitRejectedTransactionMismatch)
+        ));
+    }
+
     #[test]
     fn minting_failed_from_tx_intended_replays_to_failed() {
         let issuer_request_id = IssuerMintRequestId::random();
@@ -5137,6 +5362,7 @@ pub(crate) mod tests {
             | MintEvent::JournalRejected { .. }
             | MintEvent::MintingStarted { .. }
             | MintEvent::MintTxIntended { .. }
+            | MintEvent::MintSubmitRejected { .. }
             | MintEvent::MintTxSubmitted { .. }
             | MintEvent::TokensMinted { .. }
             | MintEvent::MintingFailed { .. }
