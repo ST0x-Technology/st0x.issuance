@@ -696,6 +696,13 @@ mod tests {
         "0x1111111111111111111111111111111111111111111111111111111111111111"
     );
 
+    /// Every test in this module logs into one process-wide buffer that the
+    /// log assertions scan, so a test asserting on its own lines needs a
+    /// transaction hash that no sibling test emits.
+    fn tx_hash(seed: u8) -> TxHash {
+        TxHash::repeat_byte(seed)
+    }
+
     /// The same address may wrap the same underlying on two chains
     /// (deterministic deploys), and each network's watch list is sorted by
     /// address regardless of entry order.
@@ -814,9 +821,14 @@ mod tests {
         vec![WatchedWrappedToken { token: TOKEN_A, underlying: symbol("AAPL") }]
     }
 
-    fn inbound_log(from: Address, amount: U256, log_index: u64) -> Log {
+    fn inbound_log(
+        tx_hash: TxHash,
+        from: Address,
+        amount: U256,
+        log_index: u64,
+    ) -> Log {
         create_transfer_log_with_index(
-            TOKEN_A, from, BOT_WALLET, amount, TX_HASH, 120, log_index,
+            TOKEN_A, from, BOT_WALLET, amount, tx_hash, 120, log_index,
         )
     }
 
@@ -847,10 +859,11 @@ mod tests {
     #[tokio::test]
     async fn poll_records_alerts_and_checkpoints_an_inbound_transfer() {
         let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa1);
         let amount = U256::from(5_000_000_000_000_000_000_u128);
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
-        asserter.push_success(&vec![inbound_log(SENDER, amount, 3)]);
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 3)]);
         let monitor = monitor(&harness, &asserter, watch_aapl());
 
         monitor.poll_once().await.unwrap();
@@ -871,7 +884,7 @@ mod tests {
                 token: TOKEN_A,
                 from: SENDER,
                 amount,
-                tx_hash: TX_HASH,
+                tx_hash: tx,
                 log_index: 3,
                 block_number: 120,
                 detected_at,
@@ -881,7 +894,7 @@ mod tests {
         assert_eq!(
             alert_job_count(
                 &harness,
-                &alert_idempotency_key(Network::Base, TX_HASH, 3)
+                &alert_idempotency_key(Network::Base, tx, 3)
             )
             .await,
             1,
@@ -896,7 +909,7 @@ mod tests {
                 &format!("token={TOKEN_A}"),
                 &format!("from={SENDER}"),
                 "amount=5000000000000000000",
-                &format!("tx_hash={TX_HASH}"),
+                &format!("tx_hash={tx}"),
             ]
         ));
     }
@@ -908,12 +921,13 @@ mod tests {
     #[tokio::test]
     async fn rescanning_a_recorded_transfer_duplicates_neither_row_nor_alert() {
         let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa2);
         let amount = U256::from(1u64);
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
-        asserter.push_success(&vec![inbound_log(SENDER, amount, 0)]);
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 0)]);
         asserter.push_success(&U256::from(300u64));
-        asserter.push_success(&vec![inbound_log(SENDER, amount, 0)]);
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 0)]);
         let monitor = monitor(&harness, &asserter, watch_aapl());
 
         monitor.poll_once().await.unwrap();
@@ -925,7 +939,7 @@ mod tests {
         assert_eq!(
             alert_job_count(
                 &harness,
-                &alert_idempotency_key(Network::Base, TX_HASH, 0)
+                &alert_idempotency_key(Network::Base, tx, 0)
             )
             .await,
             1
@@ -934,17 +948,14 @@ mod tests {
         assert_eq!(
             log_count_at!(
                 Level::ERROR,
-                &[
-                    "Inbound wrapped-token transfer",
-                    &format!("tx_hash={TX_HASH}")
-                ]
+                &["Inbound wrapped-token transfer", &format!("tx_hash={tx}")]
             ),
             1,
             "the operator is paged once per transfer"
         );
         assert!(logs_contain_at!(
             Level::DEBUG,
-            &["already recorded", &format!("tx_hash={TX_HASH}")]
+            &["already recorded", &format!("tx_hash={tx}")]
         ));
     }
 
@@ -957,6 +968,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
         asserter.push_success(&vec![inbound_log(
+            tx_hash(0xa3),
             Address::ZERO,
             U256::from(2u64),
             0,
@@ -979,7 +991,7 @@ mod tests {
     async fn an_unidentifiable_log_is_dropped_with_a_warn_and_the_checkpoint_advances()
      {
         let harness = TestHarness::new().await;
-        let mut log = inbound_log(SENDER, U256::from(1u64), 0);
+        let mut log = inbound_log(tx_hash(0xa4), SENDER, U256::from(1u64), 0);
         log.transaction_hash = None;
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
@@ -1032,7 +1044,12 @@ mod tests {
         sqlx::query("DROP TABLE Jobs").execute(&harness.pool).await.unwrap();
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
-        asserter.push_success(&vec![inbound_log(SENDER, U256::from(1u64), 0)]);
+        asserter.push_success(&vec![inbound_log(
+            tx_hash(0xa5),
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
         let monitor = monitor(&harness, &asserter, watch_aapl());
 
         let result = monitor.poll_once().await;
