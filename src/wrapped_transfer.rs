@@ -983,6 +983,52 @@ mod tests {
         assert_eq!(recorded[0].from, Address::ZERO);
     }
 
+    /// ERC-20 mandates that a zero-value transfer emits `Transfer` like any
+    /// other, so anyone can emit one to the issuer wallet for the price of
+    /// gas. Nothing moved and nothing needs recovery, so it must not reach
+    /// the operator or the table.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_zero_value_transfer_is_ignored() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa6);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(tx, SENDER, U256::ZERO, 0)]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert!(
+            list_inbound_wrapped_transfers(&harness.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a zero-value transfer must not be recorded"
+        );
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            0,
+            "a zero-value transfer must not page the operator"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        assert_eq!(
+            log_count_at!(
+                Level::ERROR,
+                &["Inbound wrapped-token transfer", &format!("tx_hash={tx}")]
+            ),
+            0
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["zero-value", &format!("tx_hash={tx}")]
+        ));
+    }
+
     /// A log without a transaction hash cannot be identified, so it cannot be
     /// recorded or deduplicated; it is dropped with a WARN summary and the
     /// checkpoint still advances rather than freezing on it forever.
