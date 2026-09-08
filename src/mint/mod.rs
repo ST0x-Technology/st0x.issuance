@@ -3504,6 +3504,59 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn submit_rejection_releases_mint_signer_intent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+        let aggregate_id = IssuerMintRequestId::random().to_string();
+
+        for (sequence, event_type, payload) in [
+            (1, "MintEvent::Initiated", r#"{"Initiated":{"network":"base"}}"#),
+            (2, "MintEvent::MintTxIntended", "{}"),
+        ] {
+            insert_raw_event(
+                &pool,
+                "Mint",
+                &aggregate_id,
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test history should insert");
+        }
+        assert!(
+            has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "the mint intent must reserve the signer"
+        );
+
+        insert_raw_event(
+            &pool,
+            "Mint",
+            &aggregate_id,
+            3,
+            "MintEvent::MintSubmitRejected",
+            "{}",
+        )
+        .await
+        .expect("submit rejection should insert");
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "a submit rejection must release the signer reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn signer_intent_migration_backfills_and_rejects_ambiguous_history() {
         const INIT: &str =
             include_str!("../../migrations/20251016210348_init.sql");

@@ -3235,6 +3235,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_burn_stays_ambiguous_when_the_node_holds_the_hash() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = prepared_tx.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Some(rpc_transaction(&prepared_tx.tx, owner)));
+        let service = create_service_with_asserter(asserter);
+
+        let submitted = service
+            .submit_burn(test_multi_burn_params(owner), prepared_tx.clone())
+            .await
+            .expect("a held hash must keep the broadcast ambiguous");
+
+        assert_eq!(submitted.tx_id, TxId::from(prepared_tx.hash));
+    }
+
+    #[tokio::test]
+    async fn submit_burn_returns_submit_rejected_when_the_node_holds_nothing() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Option::<RpcTransaction>::None);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .submit_burn(
+                test_multi_burn_params(prepared_tx.signer_for_test()),
+                prepared_tx.clone(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::SubmitRejected { tx_hash, nonce, .. })
+                if tx_hash == prepared_tx.hash && nonce == prepared_tx.nonce
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_mint_stays_ambiguous_when_the_node_holds_the_hash() {
+        let prepared = persisted_mint_tx(7);
+        let owner = prepared.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Some(rpc_transaction(&prepared.tx, owner)));
+        let service = create_service_with_asserter(asserter);
+
+        let submitted = service
+            .submit_mint(&prepared)
+            .await
+            .expect("a held hash must keep the broadcast ambiguous");
+
+        assert_eq!(submitted.tx_id, TxId::from(prepared.hash));
+    }
+
+    #[tokio::test]
     async fn test_submit_burn_returns_error_on_missing_events() {
         let vault_address = test_vault_address();
         let user = address!("0x6666666666666666666666666666666666666666");
