@@ -291,18 +291,21 @@ deduplicated to at most one repeat alert per hour. Thresholds are all or nothing
 across configured chains; with none set, monitoring is disabled with a startup
 WARN.
 
-`GET /admin/network-telemetry` reports per network telemetry: transfer poller
-and receipt backfill pass counters with failure rate and block lag, plus the gas
-monitor's latest reading. See SPEC.md "Per network monitoring".
+`GET /admin/network-telemetry` reports per network telemetry: transfer poller,
+receipt backfill, and inbound wrapped-token transfer pass counters with failure
+rate and block lag, plus the gas monitor's latest reading. See SPEC.md "Per
+network monitoring".
 
 Every configured chain with `[wrapped_tokens.<network>]` entries in the TOML
 config file also gets an inbound wrapped-token transfer watcher: a transfer of a
 wrapped (ERC-4626) token into the issuer wallet can never be redeemed
 automatically, so the watcher records it, logs an ERROR, and sends a Telegram
 lifecycle notification naming the chain, asset, amount, and transaction,
-deduplicated durably per transfer log. `GET /admin/wrapped-transfers` lists
-every recorded transfer for manual recovery. See SPEC.md "Per network
-monitoring" -> "Inbound wrapped-token transfer alerts".
+deduplicated durably per transfer log. A zero-value transfer is ignored, and a
+configured address that is an enabled asset's vault is refused rather than
+watched. `GET /admin/wrapped-transfers` lists every recorded transfer for manual
+recovery. See SPEC.md "Per network monitoring" -> "Inbound wrapped-token
+transfer alerts".
 
 ## Configuration
 
