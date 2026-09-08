@@ -570,7 +570,6 @@ impl Env {
         }) {
             return Err(ConfigError::WrappedTokensForUnconfiguredNetwork {
                 network,
-                network_upper: network.as_str().to_ascii_uppercase(),
             });
         }
 
@@ -1048,13 +1047,10 @@ pub enum ConfigError {
     WrappedTokens(#[from] WrappedTokenConfigError),
     #[error(
         "[wrapped_tokens.{network}] is configured but {network} has no chain \
-         configuration; add the CHAIN_{network_upper}_* group or remove the \
-         table"
+         configuration; add the CHAIN_{}_* group or remove the table",
+        network.as_str().to_ascii_uppercase()
     )]
-    WrappedTokensForUnconfiguredNetwork {
-        network: Network,
-        network_upper: String,
-    },
+    WrappedTokensForUnconfiguredNetwork { network: Network },
     #[error(
         "multiple [assets] keys normalize to '{symbol}'; keep exactly one \
          entry per asset"
