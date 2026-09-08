@@ -128,8 +128,11 @@ async fn inbound_wrapped_token_transfer_is_listed_for_the_operator()
     assert!(row["log_index"].is_u64(), "log_index missing: {row}");
     assert!(row["detected_at"].is_string(), "detected_at missing: {row}");
 
-    // Later passes re-read the chain past the checkpoint; the transfer must
-    // not be recorded twice.
+    // Mine past the checkpoint so the later passes scan a real range rather
+    // than returning early: this mint emits a `Transfer` on the watched token
+    // to the user, which the watcher must read and ignore while the recorded
+    // transfer stays a single row.
+    evm.mint_directly_on_vault(wrapped_token, amount, user_wallet).await?;
     tokio::time::sleep(Duration::from_millis(700)).await;
     let transfers = wait_for_wrapped_transfers(&client, 1).await;
     assert_eq!(transfers.len(), 1, "duplicate rows: {transfers:?}");
