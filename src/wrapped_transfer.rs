@@ -230,7 +230,10 @@ pub(crate) struct WrappedTransferMonitor<P> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WrappedTransferPollError {
-    #[error("RPC error: {0}")]
+    // The configured RPC URL carries the provider API key and a transport
+    // error's display can quote the URL it failed to reach, so only the
+    // failure category is rendered, as the gas monitor does.
+    #[error("RPC error: {}", classify_rpc_error(.0))]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -810,6 +813,22 @@ pub(crate) async fn watchable_tokens(
     watchable
 }
 
+/// The category of an RPC failure, with no transport detail: the display of
+/// the wrapped error can quote the configured URL, API key and all.
+const fn classify_rpc_error(
+    error: &RpcError<TransportErrorKind>,
+) -> &'static str {
+    match error {
+        RpcError::ErrorResp(_) => "rpc error response",
+        RpcError::NullResp => "null response",
+        RpcError::UnsupportedFeature(_) => "unsupported feature",
+        RpcError::LocalUsageError(_) => "local usage error",
+        RpcError::SerError(_) => "serialization error",
+        RpcError::DeserError { .. } => "deserialization error",
+        RpcError::Transport(_) => "transport error",
+    }
+}
+
 /// Emits the log for a failed poll pass: WARN while the failure may still be
 /// a blip, escalating to ERROR once `consecutive_failures` reaches
 /// [`MAX_POLL_FAILURES_BEFORE_ALARM`], where the backstop is offline and an
@@ -1347,10 +1366,15 @@ mod tests {
         super::log_poll_failure(Network::Base, &error, 1);
         super::log_poll_failure(Network::Base, &error, 2);
 
+        // The count is filtered by this error's own text: the log buffer the
+        // macro scans is shared by every test in the module.
         assert_eq!(
             log_count_at!(
                 Level::WARN,
-                &["will retry from the last checkpoint"]
+                &[
+                    "will retry from the last checkpoint",
+                    "all 1 wrapped tokens failed",
+                ]
             ),
             2,
             "each below-threshold failure must WARN"
