@@ -409,7 +409,8 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         watched: &WatchedWrappedToken,
         log: &Log,
     ) -> Result<HandledLog, WrappedTransferPollError> {
-        let Some(transfer) = identify_transfer(self.network, watched, log)
+        let Some(transfer) =
+            identify_transfer(self.network, self.bot_wallet, watched, log)
         else {
             debug!(
                 target: "wrapped_transfer",
@@ -501,15 +502,30 @@ enum HandledLog {
 }
 
 /// Decodes one `Transfer` log into a record, or `None` when the log lacks
-/// the fields that make up its identity or does not decode as a `Transfer`.
+/// the fields that make up its identity, does not decode as a `Transfer`, or
+/// is not a transfer of `watched.token` to the issuer wallet.
+///
+/// The emitter and recipient are constrained by the `eth_getLogs` filter
+/// already, so re-checking them here is defense in depth: the row is labelled
+/// with `watched.underlying`, which is only true of a log this token emitted,
+/// and `detect_transfer` re-derives `log.address()` the same way.
 fn identify_transfer(
     network: Network,
+    bot_wallet: Address,
     watched: &WatchedWrappedToken,
     log: &Log,
 ) -> Option<InboundWrappedTransfer> {
+    if log.address() != watched.token {
+        return None;
+    }
+
     let event =
         bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)
             .ok()?;
+
+    if event.to != bot_wallet {
+        return None;
+    }
 
     Some(InboundWrappedTransfer {
         network,
