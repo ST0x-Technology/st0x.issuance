@@ -16,8 +16,7 @@ use alloy::sol_types::{SolCall, SolInterface};
 use alloy::transports::TransportResult;
 use async_trait::async_trait;
 use chrono::Utc;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -55,28 +54,90 @@ pub type RealBlockchainServiceProvider = FillProvider<
     RootProvider,
 >;
 
-/// Nonce manager that serves nonces from a local per-signer counter, like
-/// alloy's `CachedNonceManager`, and can additionally drop a signer's counter
-/// when a filled transaction fails before reaching the node. The filler
-/// consumes a nonce when the request is filled; an error after that point
-/// (fee lookup, signing, definitive broadcast rejection) would otherwise
+/// Nonce manager that serves nonces from a local counter for each signer, like
+/// alloy's `CachedNonceManager`, and can restore one failed fill without
+/// dropping other nonce values already given to prepared transactions. The
+/// filler consumes a nonce when the request is filled; an error after that
+/// point (fee lookup, signing, definitive broadcast rejection) would otherwise
 /// leave the counter ahead of the chain, and every later transaction would
-/// queue unmineable behind the unused nonce — a gap the burn classifier can
-/// never prove dead, because the gap nonce is never consumed.
+/// queue unmineable behind the unused nonce.
 ///
-/// Counters initialize (and re-initialize after a reset) from the `pending`
-/// transaction count so already-broadcast, not-yet-mined transactions are
-/// counted.
+/// Counters initialize from the `pending` transaction count so transactions
+/// already accepted by the node are counted. Failed nonce values are kept as
+/// reusable holes rather than resetting the whole counter, preserving unique
+/// assignment for prepared transactions that are not visible in `pending` yet.
 #[derive(Clone, Debug, Default)]
 pub struct ResyncNonceManager {
-    nonces: Arc<StdMutex<HashMap<Address, u64>>>,
+    nonces: Arc<StdMutex<HashMap<Address, NonceState>>>,
+}
+
+#[derive(Clone, Debug)]
+struct NonceState {
+    next: u64,
+    reusable: BTreeSet<u64>,
+}
+
+impl NonceState {
+    const fn new(next: u64) -> Self {
+        Self { next, reusable: BTreeSet::new() }
+    }
+
+    fn take_next(&mut self) -> u64 {
+        if let Some(nonce) = self.reusable.iter().next().copied() {
+            self.reusable.remove(&nonce);
+            return nonce;
+        }
+
+        let nonce = self.next;
+        self.next += 1;
+        nonce
+    }
+
+    fn release(&mut self, nonce: u64) {
+        if nonce.checked_add(1) == Some(self.next) {
+            self.next = nonce;
+            while let Some(previous) = self.next.checked_sub(1) {
+                if !self.reusable.remove(&previous) {
+                    break;
+                }
+                self.next = previous;
+            }
+        } else if nonce < self.next {
+            self.reusable.insert(nonce);
+        }
+    }
 }
 
 impl ResyncNonceManager {
-    /// Drops the cached counter for `address`; the next fill refetches the
-    /// pending transaction count from the RPC.
-    fn reset(&self, address: Address) {
-        self.nonces.lock().expect("nonce cache lock poisoned").remove(&address);
+    fn snapshot(&self, address: Address) -> Option<NonceState> {
+        self.nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .get(&address)
+            .cloned()
+    }
+
+    fn restore(&self, address: Address, snapshot: Option<NonceState>) {
+        let mut nonces = self.nonces.lock().expect("nonce cache lock poisoned");
+        match snapshot {
+            Some(state) => {
+                nonces.insert(address, state);
+            }
+            None => {
+                nonces.remove(&address);
+            }
+        }
+    }
+
+    fn release(&self, address: Address, nonce: u64) {
+        if let Some(state) = self
+            .nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .get_mut(&address)
+        {
+            state.release(nonce);
+        }
     }
 }
 
@@ -94,26 +155,20 @@ impl NonceManager for ResyncNonceManager {
         {
             let mut nonces =
                 self.nonces.lock().expect("nonce cache lock poisoned");
-            if let Some(nonce) = nonces.get_mut(&address) {
-                *nonce += 1;
-                return Ok(*nonce);
+            if let Some(state) = nonces.get_mut(&address) {
+                return Ok(state.take_next());
             }
         }
 
         let fetched = provider.get_transaction_count(address).pending().await?;
 
-        let nonce = {
-            let mut nonces =
-                self.nonces.lock().expect("nonce cache lock poisoned");
-            match nonces.entry(address) {
-                Entry::Occupied(mut entry) => {
-                    let nonce = entry.get_mut();
-                    *nonce += 1;
-                    *nonce
-                }
-                Entry::Vacant(entry) => *entry.insert(fetched),
-            }
-        };
+        let nonce = self
+            .nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .entry(address)
+            .or_insert_with(|| NonceState::new(fetched))
+            .take_next();
         Ok(nonce)
     }
 }
@@ -145,18 +200,17 @@ const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 /// estimating. The provider's default estimate runs `eth_estimateGas` against
 /// `pending` state, which under mempool load intermittently reverts with empty
 /// returndata (the vault multicall's `FailedCall`) and fails an otherwise valid
-/// mint. A deliberately high fixed limit (far above the observed ~250k gas,
-/// still well under Base's block gas limit) keeps the mint deterministic;
-/// unused gas is not charged.
-const MINT_GAS_LIMIT: u64 = 3_000_000;
+/// mint. A fixed limit above the observed ~250k gas keeps the mint
+/// deterministic without looking like an overlarge transaction.
+const MINT_GAS_LIMIT: u64 = 500_000;
 
 /// Fixed gas limit for burn multicalls, set instead of estimating (same reason
 /// as `MINT_GAS_LIMIT`: the provider default estimates against `pending` state,
 /// which under mempool load intermittently reverts with empty returndata and
-/// fails an otherwise valid burn). Burns are heavier and scale with
-/// receipt-leg count (~421k observed on a 4-leg burn); this limit sits well
-/// above that and well under Base's block gas limit. Unused gas is not charged.
-const BURN_GAS_LIMIT: u64 = 3_000_000;
+/// fails an otherwise valid burn). Burns are heavier and scale with receipt
+/// count (~421k observed on a 4-receipt burn); this limit keeps headroom
+/// without looking like an overlarge transaction.
+const BURN_GAS_LIMIT: u64 = 1_000_000;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -188,7 +242,7 @@ impl RealBlockchainService {
     ///
     /// * `provider` - Alloy provider for blockchain communication
     /// * `nonce_manager` - the nonce manager backing `provider`'s nonce
-    ///   filler, held so failed fills can drop the signer's cached counter
+    ///   filler, held so failed fills can restore only the changed state
     pub(crate) fn new(
         provider: RealBlockchainServiceProvider,
         nonce_manager: ResyncNonceManager,
@@ -200,15 +254,16 @@ impl RealBlockchainService {
         }
     }
 
-    /// Fills and signs `transaction`, dropping the signer's cached nonce on
-    /// failure. The nonce filler consumes a nonce when the request is filled;
-    /// an error after that point (fee lookup, signing) would otherwise leave
-    /// the counter ahead of the chain, and every later transaction would
-    /// queue unmineable behind the unused nonce.
+    /// Fills and signs `transaction`, restoring only this fill's nonce state on
+    /// failure. Other prepared transactions may already hold nonce values that
+    /// are not visible in `pending` yet, so failure recovery must not drop the
+    /// whole signer cache.
     async fn fill_envelope(
         &self,
         transaction: TransactionRequest,
     ) -> Result<TxEnvelope, VaultError> {
+        let signer = self.provider.default_signer_address();
+        let nonce_snapshot = self.nonce_manager.snapshot(signer);
         let envelope = match self.provider.fill(transaction).await {
             Ok(sendable) => sendable
                 .try_into_envelope()
@@ -216,7 +271,7 @@ impl RealBlockchainService {
             Err(error) => Err(error.into()),
         };
         if envelope.is_err() {
-            self.nonce_manager.reset(self.provider.default_signer_address());
+            self.nonce_manager.restore(signer, nonce_snapshot);
         }
         envelope
     }
@@ -307,6 +362,7 @@ impl RealBlockchainService {
         &self,
         tx: &[u8],
         hash: B256,
+        nonce: u64,
     ) -> Result<Option<()>, VaultError> {
         match self.provider.send_raw_transaction(tx).await {
             Ok(pending_tx) => {
@@ -323,10 +379,10 @@ impl RealBlockchainService {
                 if self.provider.get_transaction_by_hash(hash).await?.is_none()
                 {
                     // The transaction never entered the pool, so its nonce is
-                    // an unfilled gap ahead of the chain; drop the cached
-                    // counter so the next fill reuses it.
+                    // an unfilled gap ahead of the chain. Mark only this nonce
+                    // reusable; later prepared transactions keep their values.
                     self.nonce_manager
-                        .reset(self.provider.default_signer_address());
+                        .release(self.provider.default_signer_address(), nonce);
                     return Err(error.into());
                 }
                 Ok(None)
@@ -422,7 +478,11 @@ impl VaultService for RealBlockchainService {
     ) -> Result<SubmittedTx, VaultError> {
         prepared_tx.validate()?;
         if self
-            .try_broadcast_tx(&prepared_tx.tx, prepared_tx.hash)
+            .try_broadcast_tx(
+                &prepared_tx.tx,
+                prepared_tx.hash,
+                prepared_tx.nonce,
+            )
             .await?
             .is_none()
         {
@@ -656,7 +716,11 @@ impl VaultService for RealBlockchainService {
     ) -> Result<SubmittedTx, VaultError> {
         sendable_tx.validate_for_owner(params.owner)?;
         if self
-            .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
+            .try_broadcast_tx(
+                &sendable_tx.tx,
+                sendable_tx.hash,
+                sendable_tx.nonce,
+            )
             .await
             .map_err(|error| {
                 classify_burn_broadcast_error(error, &sendable_tx)
@@ -1083,7 +1147,11 @@ impl VaultService for RealBlockchainService {
     ) -> Result<SubmittedTx, VaultError> {
         sendable_tx.validate_for_owner(params.owner)?;
         if self
-            .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
+            .try_broadcast_tx(
+                &sendable_tx.tx,
+                sendable_tx.hash,
+                sendable_tx.nonce,
+            )
             .await
             .map_err(|error| classify_burn_broadcast_error(error, sendable_tx))?
             .is_none()
@@ -1568,9 +1636,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnRange, MintAuthorization, MintedLogQuery, OrchestratorBurnParams,
-        OrchestratorBurnReadiness, OrchestratorMintParams,
-        OrchestratorMintedLog, OrchestratorRevertReason, RealBlockchainService,
+        BurnRange, MintAuthorization, MintedLogQuery, NonceState,
+        OrchestratorBurnParams, OrchestratorBurnReadiness,
+        OrchestratorMintParams, OrchestratorMintedLog,
+        OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider, ResyncNonceManager,
     };
     use crate::bindings::{
@@ -1587,6 +1656,31 @@ mod tests {
         MultiBurnEntry, MultiBurnParams, PreparedMintTx, ReceiptInformation,
         SendableTxWithHash, TxId, VaultError, VaultService,
     };
+
+    #[test]
+    fn nonce_state_reuses_failed_middle_nonce_before_new_nonce() {
+        let mut state = NonceState::new(10);
+        assert_eq!(state.take_next(), 10);
+        assert_eq!(state.take_next(), 11);
+        assert_eq!(state.take_next(), 12);
+
+        state.release(11);
+
+        assert_eq!(state.take_next(), 11);
+        assert_eq!(state.take_next(), 13);
+    }
+
+    #[test]
+    fn nonce_state_reuses_failed_tail_nonce_without_resetting_state() {
+        let mut state = NonceState::new(10);
+        assert_eq!(state.take_next(), 10);
+        assert_eq!(state.take_next(), 11);
+
+        state.release(11);
+
+        assert_eq!(state.take_next(), 11);
+        assert_eq!(state.take_next(), 12);
+    }
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
@@ -1654,17 +1748,26 @@ mod tests {
         asserter.push_success(receipt); // eth_getTransactionReceipt (polling)
     }
 
-    /// Sets up mock responses for `provider.fill(tx)`:
-    /// ChainIdFiller → eth_chainId,
-    /// GasFiller → eth_feeHistory / eth_getBlockByNumber / eth_estimateGas / eth_maxPriorityFeePerGas,
-    /// NonceFiller → eth_getTransactionCount,
-    /// WalletFiller → eth_chainId (signing uses chain_id for replay protection).
+    /// Sets up mock responses for `provider.fill(tx)` when gas is not set:
+    /// ChainIdFiller -> eth_chainId,
+    /// GasFiller -> eth_feeHistory / eth_getBlockByNumber / eth_estimateGas / eth_maxPriorityFeePerGas,
+    /// NonceFiller -> eth_getTransactionCount,
+    /// WalletFiller -> eth_chainId (signing uses chain_id for replay protection).
     fn setup_asserter_for_fill(asserter: &Asserter, nonce: u64) {
         let block: Block<alloy::rpc::types::Transaction> = Block::default();
         asserter.push_success(&1u64); // eth_chainId (ChainIdFiller)
         asserter.push_success(&test_fee_history()); // eth_feeHistory (GasFiller)
         asserter.push_success(&block); // eth_getBlockByNumber (GasFiller)
         asserter.push_success(&100_000_u64); // eth_estimateGas (GasFiller)
+        asserter.push_success(&1_000_000_000_u64); // eth_maxPriorityFeePerGas (GasFiller)
+        asserter.push_success(&nonce); // eth_getTransactionCount (NonceFiller)
+        asserter.push_success(&1u64); // eth_chainId (WalletFiller, for EIP-155 signing)
+    }
+
+    fn setup_asserter_for_fill_with_gas(asserter: &Asserter, nonce: u64) {
+        let block: Block<alloy::rpc::types::Transaction> = Block::default();
+        asserter.push_success(&test_fee_history()); // eth_feeHistory (GasFiller)
+        asserter.push_success(&block); // eth_getBlockByNumber (GasFiller)
         asserter.push_success(&1_000_000_000_u64); // eth_maxPriorityFeePerGas (GasFiller)
         asserter.push_success(&nonce); // eth_getTransactionCount (NonceFiller)
         asserter.push_success(&1u64); // eth_chainId (WalletFiller, for EIP-155 signing)
@@ -1728,7 +1831,7 @@ mod tests {
             .await
             .expect("provider should connect");
         let service =
-            RealBlockchainService::new(provider.clone(), nonce_manager);
+            RealBlockchainService::new(provider.clone(), nonce_manager.clone());
         let recipient = address!("0x3333333333333333333333333333333333333333");
 
         let mineable = sign_test_transaction(
@@ -1779,6 +1882,7 @@ mod tests {
                 .await
                 .expect("competing transaction should mine");
         }
+        nonce_manager.restore(owner, None);
         assert_eq!(
             service.classify_burn_tx(owner, &dead).await.unwrap(),
             BurnTxStatus::StillMineable,
@@ -1903,13 +2007,11 @@ mod tests {
         let asserter = Asserter::new();
 
         asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
-        asserter.push_success(&0u64);
         asserter.push_success(&fee_history);
         asserter.push_success(&block);
-        asserter.push_success(&1u64);
-        asserter.push_success(&100_000_u64);
         asserter.push_success(&1_000_000_000_u64);
         asserter.push_success(&0u64);
+        asserter.push_success(&1u64);
         let signer = PrivateKeySigner::random();
         let nonce_manager = ResyncNonceManager::default();
         let provider = ProviderBuilder::new()
@@ -2032,13 +2134,11 @@ mod tests {
         let asserter = Asserter::new();
 
         asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
-        asserter.push_success(&0u64);
         asserter.push_success(&fee_history);
         asserter.push_success(&block);
-        asserter.push_success(&1u64);
-        asserter.push_success(&100_000_u64);
         asserter.push_success(&1_000_000_000_u64);
         asserter.push_success(&0u64);
+        asserter.push_success(&1u64);
         let signer = PrivateKeySigner::random();
         let nonce_manager = ResyncNonceManager::default();
         let provider = ProviderBuilder::new()
@@ -2615,12 +2715,11 @@ mod tests {
         let pending_nonce = 11u64;
         let asserter = Asserter::new();
         asserter.push_success(&pending_nonce);
-        asserter.push_success(&100_000u64);
         asserter.push_success(&test_fee_history());
         asserter
             .push_success(&Block::<alloy::rpc::types::Transaction>::default());
         asserter.push_success(&1_000_000_000u64);
-        asserter.push_success(&100_000u64);
+        asserter.push_success(&1u64);
         let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
             .expect("test private key should be valid");
         let service = create_service_with_signer(asserter, signer);
@@ -3164,7 +3263,7 @@ mod tests {
         let dust_shares = U256::from(500);
 
         let asserter = Asserter::new();
-        setup_asserter_for_fill(&asserter, expected_nonce);
+        setup_asserter_for_fill_with_gas(&asserter, expected_nonce);
 
         let service = create_service_with_asserter(asserter);
 
@@ -3209,7 +3308,7 @@ mod tests {
         );
 
         let asserter = Asserter::new();
-        setup_asserter_for_fill(&asserter, 0);
+        setup_asserter_for_fill_with_gas(&asserter, 0);
 
         let service = create_service_with_asserter(asserter);
 
