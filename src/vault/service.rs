@@ -396,17 +396,26 @@ fn classify_burn_broadcast_error(
     error: VaultError,
     sendable_tx: &SendableTxWithHash,
 ) -> VaultError {
-    if let VaultError::Rpc(alloy::transports::RpcError::ErrorResp(response)) =
-        &error
-        && is_nonce_too_low_message(&response.message)
-    {
-        return VaultError::BurnNonceTooLow {
-            tx_hash: sendable_tx.hash,
-            nonce: sendable_tx.nonce,
-        };
+    match error {
+        VaultError::Rpc(alloy::transports::RpcError::ErrorResp(response))
+            if is_nonce_too_low_message(&response.message) =>
+        {
+            VaultError::BurnNonceTooLow {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            }
+        }
+        VaultError::SubmitRejected {
+            source: alloy::transports::RpcError::ErrorResp(response),
+            ..
+        } if is_nonce_too_low_message(&response.message) => {
+            VaultError::BurnNonceTooLow {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            }
+        }
+        error => error,
     }
-
-    error
 }
 
 fn is_nonce_too_low_message(message: &str) -> bool {

@@ -10,6 +10,8 @@ WHEN NEW.aggregate_type = 'Mint'
      'MintEvent::MintSubmitRejected',
      'MintEvent::TokensMinted',
      'MintEvent::ExistingMintRecovered',
+     'MintEvent::OrchestratorTokensMinted',
+     'MintEvent::OrchestratorMintRecovered',
      'MintEvent::MintClosed'
  )
 BEGIN
