@@ -1966,6 +1966,7 @@ where
                 watched,
                 pool: deps.pool.clone(),
                 apalis_pool: deps.apalis_pool.clone(),
+                telemetry: Arc::clone(deps.network_telemetry),
                 poll_interval: deps.config.wrapped_transfer_poll_interval,
             };
 

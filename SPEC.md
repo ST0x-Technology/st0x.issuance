@@ -4809,6 +4809,10 @@ Returns one row per configured network, sorted by network wire name:
   at the start of the most recent successful pass.
 - `receipt_backfill`: the same counter shape for the periodic receipt backfill
   loop, with `lag_blocks` measured against the receipt backfill checkpoints.
+- `wrapped_transfer`: the same counter shape for the inbound wrapped-token
+  transfer watcher, with `lag_blocks` measured against the per-(network, token)
+  wrapped-transfer checkpoints. A chain with no `[wrapped_tokens]` entries runs
+  no watcher, so its counters stay at zero.
 - `gas`: the gas monitor's latest reading for the issuer wallet:
   `{"status": "ok" | "low", "balance_wei", "threshold_wei", "checked_at"}`,
   `{"status": "unavailable", "error"}` when the last balance read failed, or
@@ -5141,7 +5145,11 @@ queued; a failed RPC read, database write, or enqueue leaves the chunk to be
 retried next pass, so no inbound transfer is skipped. A log missing its
 transaction hash, block number, or log index cannot be identified and is dropped
 with a WARN summary rather than freezing the checkpoint. A failed pass is logged
-at WARN and retried; the watcher never exits.
+at WARN and retried, escalating to ERROR after three consecutive failures, where
+the backstop is offline and an inbound transfer can land unseen; the watcher
+never exits. Each pass reports success or failure to the per network telemetry
+registry, so a watcher that is failing every pass is visible on
+`GET /admin/network-telemetry` as well as in the log.
 
 Operators list what was detected via `GET /admin/wrapped-transfers` (see Admin
 API). Recovery — unwrapping and returning or redeeming the tokens — is a manual
@@ -5166,6 +5174,12 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
   backlog cannot be measured and a success would understate the lag. A pass with
   no enabled assets records a success with zero lag, matching the transfer
   poller, so the counter keeps rising to show the loop is alive.
+- **Inbound wrapped-token transfer watcher:** each pass records success or
+  failure in the same shape, with `lag_blocks` the worst per token distance
+  between the chain head and the token's checkpoint at the start of the pass. A
+  pass counts as failed when the head fetch failed or every watched token
+  failed; a partial token failure keeps the pass successful and surfaces as
+  growing `lag_blocks`, matching the transfer poller.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 

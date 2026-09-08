@@ -25,11 +25,13 @@ use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{NetworkParseError, UnderlyingSymbolError};
 use std::collections::HashMap;
 use std::num::TryFromIntError;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, trace, warn};
 
 use crate::bindings;
 use crate::jobs::{JobQueue, QueuePushError};
+use crate::network_telemetry::NetworkTelemetry;
 use crate::notifications::{
     LifecycleNotification, SendLifecycleNotification,
     release_dead_lifecycle_notification_job,
@@ -48,6 +50,12 @@ pub(crate) const WRAPPED_TRANSFER_POLL_INTERVAL: Duration =
 
 /// Interval between retries when a polling pass fails (e.g. RPC error).
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Consecutive failed poll passes before the per-pass WARN escalates to an
+/// ERROR alarm, matching the transfer poller. A blip retries quietly; a
+/// sustained failure means the backstop is offline and every inbound
+/// wrapped-token transfer in the gap goes unseen until it recovers.
+const MAX_POLL_FAILURES_BEFORE_ALARM: usize = 3;
 
 /// Wrapped-token contract addresses to watch, per network.
 ///
@@ -197,6 +205,7 @@ pub(crate) struct WrappedTransferMonitor<P> {
     pub(crate) watched: Vec<WatchedWrappedToken>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) apalis_pool: ApalisSqlitePool,
+    pub(crate) telemetry: Arc<NetworkTelemetry>,
     pub(crate) poll_interval: Duration,
 }
 
@@ -229,11 +238,25 @@ impl<P: Provider> WrappedTransferMonitor<P> {
 
         let mut consecutive_failures = 0_usize;
         loop {
-            if let Err(error) = self.poll_once().await {
-                consecutive_failures += 1;
-                log_poll_failure(self.network, &error, consecutive_failures);
-                tokio::time::sleep(RETRY_INTERVAL).await;
-                continue;
+            match self.poll_once().await {
+                Err(error) => {
+                    consecutive_failures += 1;
+                    log_poll_failure(
+                        self.network,
+                        &error,
+                        consecutive_failures,
+                    );
+                    self.telemetry
+                        .record_wrapped_transfer_poll_failure(self.network);
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    continue;
+                }
+                Ok(lag_blocks) => {
+                    self.telemetry.record_wrapped_transfer_poll_success(
+                        self.network,
+                        lag_blocks,
+                    );
+                }
             }
 
             consecutive_failures = 0;
@@ -245,9 +268,13 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     /// chain head. A per token failure does not starve the others; a pass
     /// where every token failed propagates, since that is indistinguishable
     /// from the watcher being offline.
-    async fn poll_once(&self) -> Result<(), WrappedTransferPollError> {
+    ///
+    /// Returns the worst per token distance between the head and the token's
+    /// checkpoint at the start of the pass, which telemetry reports as the
+    /// watcher's block lag.
+    async fn poll_once(&self) -> Result<u64, WrappedTransferPollError> {
         if self.watched.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // One head for the whole pass so every token scans to a consistent
@@ -259,17 +286,21 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         // failed is indistinguishable from the watcher being offline, so it
         // propagates and `run` backs off.
         let mut failed_tokens: Vec<Address> = Vec::new();
+        let mut lag_blocks = 0_u64;
         for watched in &self.watched {
-            if let Err(error) = self.poll_token(watched, head).await {
-                debug!(
-                    target: "wrapped_transfer",
-                    network = %self.network,
-                    token = %watched.token,
-                    error = %error,
-                    "Failed to poll wrapped token; will retry next pass from \
-                     its checkpoint"
-                );
-                failed_tokens.push(watched.token);
+            match self.poll_token(watched, head).await {
+                Ok(token_lag) => lag_blocks = lag_blocks.max(token_lag),
+                Err(error) => {
+                    debug!(
+                        target: "wrapped_transfer",
+                        network = %self.network,
+                        token = %watched.token,
+                        error = %error,
+                        "Failed to poll wrapped token; will retry next pass \
+                         from its checkpoint"
+                    );
+                    failed_tokens.push(watched.token);
+                }
             }
         }
 
@@ -291,7 +322,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             }
         }
 
-        Ok(())
+        Ok(lag_blocks)
     }
 
     /// Scans one token from its checkpoint (or `backfill_start_block` when
@@ -301,7 +332,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         &self,
         watched: &WatchedWrappedToken,
         head: u64,
-    ) -> Result<(), WrappedTransferPollError> {
+    ) -> Result<u64, WrappedTransferPollError> {
         let name = checkpoint_name(self.network, watched.token);
 
         let cursor = match load_checkpoint_block(&self.pool, &name).await? {
@@ -325,7 +356,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                 head,
                 "Wrapped token caught up; skipping"
             );
-            return Ok(());
+            return Ok(0);
         }
 
         debug!(
@@ -371,7 +402,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             }
         }
 
-        Ok(())
+        Ok(head.saturating_sub(cursor))
     }
 
     /// Fetches `Transfer` logs of `token` whose `to` is the issuer wallet.
@@ -667,21 +698,36 @@ pub(crate) fn checkpoint_name(network: Network, token: Address) -> String {
     format!("wrapped_transfer_poll:{network}:{token:#x}")
 }
 
-/// Emits the log for a failed poll pass.
+/// Emits the log for a failed poll pass: WARN while the failure may still be
+/// a blip, escalating to ERROR once `consecutive_failures` reaches
+/// [`MAX_POLL_FAILURES_BEFORE_ALARM`], where the backstop is offline and an
+/// inbound wrapped-token transfer can land unseen.
 fn log_poll_failure(
     network: Network,
     error: &WrappedTransferPollError,
     consecutive_failures: usize,
 ) {
-    warn!(
-        target: "wrapped_transfer",
-        %network,
-        error = %error,
-        consecutive_failures,
-        retry_after_secs = RETRY_INTERVAL.as_secs(),
-        "Wrapped-token transfer poll pass failed; will retry from the last \
-         checkpoint"
-    );
+    if consecutive_failures >= MAX_POLL_FAILURES_BEFORE_ALARM {
+        error!(
+            target: "wrapped_transfer",
+            %network,
+            error = %error,
+            consecutive_failures,
+            retry_after_secs = RETRY_INTERVAL.as_secs(),
+            "Wrapped-token transfer poll pass has failed repeatedly; inbound \
+             wrapped-token transfers are undetected until it recovers"
+        );
+    } else {
+        warn!(
+            target: "wrapped_transfer",
+            %network,
+            error = %error,
+            consecutive_failures,
+            retry_after_secs = RETRY_INTERVAL.as_secs(),
+            "Wrapped-token transfer poll pass failed; will retry from the \
+             last checkpoint"
+        );
+    }
 }
 
 /// Durable idempotency key of the alert for one transfer log.
@@ -702,6 +748,7 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
+    use std::sync::Arc;
     use std::time::Duration;
     use tracing::Level;
     use tracing_test::traced_test;
@@ -714,6 +761,7 @@ mod tests {
     };
     use crate::jobs::job_type;
     use crate::mint::test_utils::TestHarness;
+    use crate::network_telemetry::NetworkTelemetry;
     use crate::notifications::SendLifecycleNotification;
     use crate::poll_checkpoint::load_checkpoint_block;
     use crate::redemption::test_utils::create_transfer_log_with_index;
@@ -861,6 +909,7 @@ mod tests {
             watched,
             pool: harness.pool.clone(),
             apalis_pool: harness.apalis_pool.clone(),
+            telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
             poll_interval: Duration::from_secs(60),
         }
     }
