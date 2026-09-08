@@ -8,6 +8,15 @@
 //! each one durably, raises an operator alert, and exposes the recorded
 //! transfers to the admin API. Recovery itself is a manual operation.
 //!
+//! The scan follows the chain head with no confirmation depth, like the
+//! redemption transfer poller: a log read from a block that is later reorged
+//! out leaves a recorded row and a delivered page for a transfer that no
+//! longer exists, and a transaction re-mined above the advanced checkpoint
+//! with a different log index is recorded again under its new identity. Both
+//! are false positives an operator resolves by looking at the chain, which is
+//! the right way round for a backstop whose failure mode must not be a missed
+//! transfer.
+//!
 //! Alert dedup is durable: the lifecycle notification is queued under an
 //! idempotency key derived from the log identity, exactly as the
 //! corporate-action notifications are, so a restart or a re-scan never

@@ -5148,6 +5148,12 @@ matching log the watcher:
   not re-queued, and the recorded row, the ERROR log, and
   `GET /admin/wrapped-transfers` are the durable record of the transfer.
 
+The scan follows the chain head with no confirmation depth, as the transfer
+poller does: a log from a block later reorged out stays recorded and paged, and
+a transaction re-mined above the checkpoint with a different log index is
+recorded again under its new identity. Both are false positives, which is the
+right way round for a backstop whose failure mode must not be a missed transfer.
+
 A token's checkpoint advances only after every log in the chunk is recorded and
 queued; a failed RPC read, database write, or enqueue leaves the chunk to be
 retried next pass, so no inbound transfer is skipped. A log missing its

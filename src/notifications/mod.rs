@@ -188,6 +188,10 @@ impl LifecycleNotification {
                 amount,
                 tx_hash,
             } => format!(
+                // `format_ether` assumes the wrapper is 18-decimal. This repo
+                // does not own the wrapper contract and never reads its
+                // `decimals()`, so the exact figure to act on is the raw
+                // value on `GET /admin/wrapped-transfers`.
                 "Inbound wrapped-token transfer on {network}: {} wrapped \
                  {underlying} ({token}) from {from} to the issuer wallet in tx \
                  {tx_hash}; not redeemable automatically, manual recovery \
