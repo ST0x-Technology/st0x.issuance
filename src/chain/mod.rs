@@ -319,6 +319,19 @@ async fn build_chain_runtime(
     let vault_service: Arc<dyn VaultService> =
         Arc::new(RealBlockchainService::new(signing_provider, nonce_manager));
 
+    // The signing provider built above is the single endpoint every on-chain
+    // mint and redemption (burn) transaction for this network is signed and
+    // broadcast through. Log host and scheme only; the RPC URL carries the
+    // provider API key in its path, which must never reach the logs.
+    info!(
+        target: "startup",
+        %network,
+        chain_id,
+        rpc_scheme = rpc_url.scheme(),
+        rpc_host = rpc_url.host_str().unwrap_or("(none)"),
+        "RPC endpoint for on-chain mint and redemption transactions"
+    );
+
     Ok(ChainRuntime {
         network,
         chain_id,
