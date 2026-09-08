@@ -1048,6 +1048,57 @@ mod tests {
         ));
     }
 
+    /// The `to` and emitter constraints live in the `eth_getLogs` filter, so
+    /// a filter the provider ignores, a wrong topic index, or a stale RPC
+    /// would hand back logs that belong to nobody here. Re-checking both
+    /// against the log itself keeps such a log out of the table, the way the
+    /// redemption poller re-derives `log.address()` before it acts.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_log_from_another_token_or_to_another_wallet_is_dropped() {
+        let harness = TestHarness::new().await;
+        let other_wallet =
+            address!("0x1234123412341234123412341234123412341234");
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![
+            create_transfer_log_with_index(
+                TOKEN_B,
+                SENDER,
+                BOT_WALLET,
+                U256::from(1u64),
+                tx_hash(0xa7),
+                120,
+                0,
+            ),
+            create_transfer_log_with_index(
+                TOKEN_A,
+                SENDER,
+                other_wallet,
+                U256::from(1u64),
+                tx_hash(0xa8),
+                120,
+                1,
+            ),
+        ]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert!(
+            list_inbound_wrapped_transfers(&harness.pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "neither log belongs to the watched token and wallet"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Dropped unidentifiable wrapped-token transfer logs", "count=2"]
+        ));
+    }
+
     /// A log without a transaction hash cannot be identified, so it cannot be
     /// recorded or deduplicated; it is dropped with a WARN summary and the
     /// checkpoint still advances rather than freezing on it forever.
