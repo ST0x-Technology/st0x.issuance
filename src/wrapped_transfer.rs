@@ -11,8 +11,13 @@
 //! Alert dedup is durable: the lifecycle notification is queued under an
 //! idempotency key derived from the log identity, exactly as the
 //! corporate-action notifications are, so a restart or a re-scan never
-//! re-alerts a transfer whose alert was delivered, while a dead delivery is
-//! released and retried.
+//! re-alerts a transfer whose alert was delivered. Unlike the recurring
+//! producers that pattern comes from, this one derives each key once: the
+//! dead-job release before the push only covers a chunk retried because it
+//! failed before its checkpoint advanced. Past that point the log is never
+//! handled again, so a delivery that exhausts its retries is not re-queued
+//! and the recorded row, the ERROR log, and `GET /admin/wrapped-transfers`
+//! are what remains of it.
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
@@ -498,6 +503,9 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             transfer.tx_hash,
             transfer.log_index,
         );
+        // Only a chunk that failed before its checkpoint advanced brings the
+        // same key back here; releasing a dead delivery lets that retry queue
+        // the alert instead of colliding with the corpse of the first one.
         release_dead_lifecycle_notification_job(&self.pool, &key).await?;
         JobQueue::<SendLifecycleNotification>::new(&self.apalis_pool)
             .push_with_idempotency_key(

@@ -5138,7 +5138,11 @@ matching log the watcher:
   configured) carrying the same fields under the durable idempotency key
   `notify:wrapped-transfer:{network}:{tx_hash}:{log_index}` — the dedup the
   corporate-action notifications use, so a restart or re-scan never re-alerts a
-  transfer already delivered, while a dead delivery is released and retried.
+  transfer already delivered. The key is derived once per log rather than every
+  pass, so releasing a dead delivery only helps a chunk retried before its
+  checkpoint advanced: a notification that exhausts its retries after that is
+  not re-queued, and the recorded row, the ERROR log, and
+  `GET /admin/wrapped-transfers` are the durable record of the transfer.
 
 A token's checkpoint advances only after every log in the chunk is recorded and
 queued; a failed RPC read, database write, or enqueue leaves the chunk to be
