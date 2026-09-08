@@ -706,8 +706,11 @@ mod tests {
         );
     }
 
-    /// The amount is rendered as 18-decimal wrapped shares; the raw value is
-    /// what the admin listing carries.
+    /// The amount is the raw on-chain value. ERC-4626 does not fix a share
+    /// token at 18 decimals (EIP-4626 only recommends mirroring the asset,
+    /// and OpenZeppelin's implementation adds a decimals offset), and this
+    /// repo never reads the wrapper's `decimals()`, so scaling it here would
+    /// state a precision nobody verified.
     #[test]
     fn inbound_wrapped_transfer_message_names_chain_asset_amount_and_tx() {
         let notification = LifecycleNotification::InboundWrappedTransfer {
@@ -724,8 +727,9 @@ mod tests {
         assert_eq!(notification.kind().as_str(), "inbound_wrapped_transfer");
         assert_eq!(
             notification.message(),
-            "Inbound wrapped-token transfer on ethereum: 7.500000000000000000 \
-             wrapped AAPL (0x0000000000000000000000000000000000001010) from \
+            "Inbound wrapped-token transfer on ethereum: 7500000000000000000 \
+             base units of wrapped AAPL \
+             (0x0000000000000000000000000000000000001010) from \
              0x9999999999999999999999999999999999999999 to the issuer wallet \
              in tx \
              0x1111111111111111111111111111111111111111111111111111111111111111; \
