@@ -383,6 +383,14 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                          from its checkpoint"
                     );
                     failed_tokens.push(watched.token);
+                    // A failed token is the one furthest behind, so its
+                    // backlog is exactly what the gauge must not hide. An
+                    // unreadable checkpoint adds nothing: the token is
+                    // already counted as failed.
+                    if let Ok(cursor) = self.token_cursor(watched).await {
+                        lag_blocks =
+                            lag_blocks.max(head.saturating_sub(cursor));
+                    }
                 }
             }
         }
@@ -408,6 +416,27 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         Ok(lag_blocks)
     }
 
+    /// The block this token resumes from: its checkpoint plus one, floored
+    /// at `backfill_start_block`, or that start block when it has none.
+    async fn token_cursor(
+        &self,
+        watched: &WatchedWrappedToken,
+    ) -> Result<u64, WrappedTransferPollError> {
+        let name = checkpoint_name(self.network, watched.token);
+
+        match load_checkpoint_block(&self.pool, &name).await? {
+            None => Ok(self.backfill_start_block),
+            Some(last_processed) => {
+                let next = last_processed.checked_add(1).ok_or(
+                    WrappedTransferPollError::CheckpointOverflow {
+                        last_processed_block: last_processed,
+                    },
+                )?;
+                Ok(next.max(self.backfill_start_block))
+            }
+        }
+    }
+
     /// Scans one token from its checkpoint (or `backfill_start_block` when
     /// it has none) up to `head`, handling each log and advancing the
     /// checkpoint per chunk.
@@ -417,18 +446,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         head: u64,
     ) -> Result<u64, WrappedTransferPollError> {
         let name = checkpoint_name(self.network, watched.token);
-
-        let cursor = match load_checkpoint_block(&self.pool, &name).await? {
-            None => self.backfill_start_block,
-            Some(last_processed) => {
-                let next = last_processed.checked_add(1).ok_or(
-                    WrappedTransferPollError::CheckpointOverflow {
-                        last_processed_block: last_processed,
-                    },
-                )?;
-                next.max(self.backfill_start_block)
-            }
-        };
+        let cursor = self.token_cursor(watched).await?;
 
         if cursor > head {
             trace!(

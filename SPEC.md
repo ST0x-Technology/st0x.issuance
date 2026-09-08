@@ -5198,7 +5198,9 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
   between the chain head and the token's checkpoint at the start of the pass. A
   pass counts as failed when the head fetch failed or every watched token
   failed; a partial token failure keeps the pass successful and surfaces as
-  growing `lag_blocks`, matching the transfer poller.
+  growing `lag_blocks`, matching the transfer poller. A failed token's own
+  backlog is measured into `lag_blocks` too, so the gauge cannot read healthy
+  while one token stops advancing.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 
