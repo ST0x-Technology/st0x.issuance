@@ -45,6 +45,7 @@ use crate::poll_checkpoint::{
     CheckpointError, advance_checkpoint_block, load_checkpoint_block,
 };
 use crate::redemption::poller::{BLOCK_CHUNK_SIZE, block_ranges};
+use crate::tokenized_asset::view::list_enabled_assets;
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
 /// Interval between polling passes once a watcher is caught up. Inbound
@@ -754,14 +755,53 @@ pub(crate) async fn watchable_tokens(
     network: Network,
     watched: Vec<WatchedWrappedToken>,
 ) -> Vec<WatchedWrappedToken> {
+    let vaults = match list_enabled_assets(pool).await {
+        Ok(assets) => assets
+            .into_iter()
+            .filter(|asset| asset.network == network)
+            .map(|asset| asset.vault)
+            .collect(),
+        Err(error) => {
+            warn!(
+                target: "wrapped_transfer",
+                %network,
+                error = %error,
+                "Could not read the enabled assets to check the configured \
+                 wrapped tokens against their vaults; watching them unchecked"
+            );
+            Vec::new()
+        }
+    };
+
+    let watchable: Vec<WatchedWrappedToken> = watched
+        .into_iter()
+        .filter(|candidate| {
+            if vaults.contains(&candidate.token) {
+                error!(
+                    target: "wrapped_transfer",
+                    %network,
+                    token = %candidate.token,
+                    underlying = %candidate.underlying,
+                    "Configured wrapped token is an enabled asset's vault on \
+                     this network; refusing to watch it, since every \
+                     redemption transfer would be recorded and paged as an \
+                     un-redeemable inbound transfer"
+                );
+                return false;
+            }
+
+            true
+        })
+        .collect();
+
     info!(
         target: "wrapped_transfer",
         %network,
-        tokens = ?watched,
+        tokens = ?watchable,
         "Watching wrapped tokens for inbound transfers to the issuer wallet"
     );
 
-    watched
+    watchable
 }
 
 /// Emits the log for a failed poll pass: WARN while the failure may still be
