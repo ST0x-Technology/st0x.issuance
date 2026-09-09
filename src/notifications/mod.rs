@@ -732,7 +732,10 @@ mod tests {
              0x9999999999999999999999999999999999999999 to the issuer wallet \
              in tx \
              0x1111111111111111111111111111111111111111111111111111111111111111; \
-             not redeemable automatically, manual recovery required"
+             not redeemable automatically. Verify the transaction and the \
+             wallet balance on chain before returning or redeeming anything: \
+             the watcher follows the chain head, so a reorg can leave a page \
+             for tokens that never arrived"
         );
     }
 

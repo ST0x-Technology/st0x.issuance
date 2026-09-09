@@ -5177,7 +5177,11 @@ registry, so a watcher that is failing every pass is visible on
 
 Operators list what was detected via `GET /admin/wrapped-transfers` (see Admin
 API). Recovery — unwrapping and returning or redeeming the tokens — is a manual
-operation.
+operation, and it starts with verifying the transaction and the issuer wallet's
+balance on chain: the watcher follows the chain head, so a reorged-out log
+leaves a row and a page for tokens that never arrived, and returning tokens
+against such a page would send the wallet's own holdings out. The alert text
+says so.
 
 ### Per network telemetry
 
