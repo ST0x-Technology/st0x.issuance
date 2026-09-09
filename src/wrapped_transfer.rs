@@ -824,7 +824,8 @@ pub(crate) const MAX_WRAPPED_TRANSFER_PAGE: u32 = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WrappedTransferPage {
     limit: u32,
-    before: Option<(u64, u64, Network)>,
+    /// Already narrowed to SQLite's INTEGER range, so binding cannot fail.
+    before: Option<(i64, i64, Network)>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -838,6 +839,8 @@ pub(crate) enum WrappedTransferPageError {
          together"
     )]
     PartialCursor,
+    #[error("{field} exceeds the stored range: {value}")]
+    CursorOutOfRange { field: &'static str, value: u64 },
 }
 
 /// The first page at the default size.
@@ -849,8 +852,10 @@ impl Default for WrappedTransferPage {
 
 impl WrappedTransferPage {
     /// Builds a page from the query parameters a caller supplied, refusing a
-    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE` and a cursor missing any
-    /// of its three parts.
+    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE`, a cursor missing any of
+    /// its three parts, and a cursor value the stored INTEGER columns cannot
+    /// hold, so every bad parameter is the caller's error rather than a 500
+    /// at query time.
     pub(crate) fn new(
         limit: Option<u32>,
         before_block: Option<u64>,
@@ -864,14 +869,26 @@ impl WrappedTransferPage {
 
         let before = match (before_block, before_log_index, before_network) {
             (None, None, None) => None,
-            (Some(block), Some(log_index), Some(network)) => {
-                Some((block, log_index, network))
-            }
+            (Some(block), Some(log_index), Some(network)) => Some((
+                cursor_column("before_block", block)?,
+                cursor_column("before_log_index", log_index)?,
+                network,
+            )),
             _ => return Err(WrappedTransferPageError::PartialCursor),
         };
 
         Ok(Self { limit, before })
     }
+}
+
+/// Narrows one cursor value to the INTEGER range the columns are stored in.
+fn cursor_column(
+    field: &'static str,
+    value: u64,
+) -> Result<i64, WrappedTransferPageError> {
+    i64::try_from(value).map_err(|_| {
+        WrappedTransferPageError::CursorOutOfRange { field, value }
+    })
 }
 
 /// One page of recorded inbound wrapped-token transfers, highest block first.
@@ -880,11 +897,9 @@ pub(crate) async fn list_inbound_wrapped_transfers(
     page: WrappedTransferPage,
 ) -> Result<Vec<InboundWrappedTransfer>, InboundWrappedTransferReadError> {
     let (before_block, before_log_index, before_network) = match page.before {
-        Some((block, log_index, network)) => (
-            Some(i64::try_from(block)?),
-            Some(i64::try_from(log_index)?),
-            Some(network.as_str()),
-        ),
+        Some((block, log_index, network)) => {
+            (Some(block), Some(log_index), Some(network.as_str()))
+        }
         None => (None, None, None),
     };
 
@@ -2102,6 +2117,19 @@ mod tests {
             WrappedTransferPage::new(None, Some(200), Some(0), None)
                 .unwrap_err(),
             WrappedTransferPageError::PartialCursor
+        );
+        assert_eq!(
+            WrappedTransferPage::new(
+                None,
+                Some(u64::MAX),
+                Some(0),
+                Some(Network::Base)
+            )
+            .unwrap_err(),
+            WrappedTransferPageError::CursorOutOfRange {
+                field: "before_block",
+                value: u64::MAX
+            }
         );
     }
 
