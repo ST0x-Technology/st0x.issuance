@@ -13,6 +13,7 @@
 //! left to the burn recovery reconciler; an infrastructure failure surfaces as
 //! a job error that apalis redrives.
 
+use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -38,6 +39,10 @@ pub(crate) enum BurnJobError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SubmitBurnJob {
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    /// Exact persisted transaction this job is allowed to submit. A stale job
+    /// from before a replacement must never submit the replacement bytes.
+    #[serde(default)]
+    pub(crate) tx_hash: B256,
     pub(crate) execution: BurnExecutionPlan,
 }
 
@@ -55,16 +60,21 @@ impl Job<SubmitBurnContext> for SubmitBurnJob {
     ) -> Result<(), BurnJobError> {
         match ctx
             .burn_manager
-            .submit_intended_burn(&self.issuer_request_id, &self.execution)
+            .submit_intended_burn_for_job(
+                &self.issuer_request_id,
+                &self.execution,
+                self.tx_hash,
+            )
             .await
         {
-            Ok(tx_id) => {
+            Ok(Some(tx_id)) => {
                 self.enqueue_confirm(ctx, tx_id).await?;
                 Ok(())
             }
             // The manager recorded the failure or left an ambiguous broadcast
             // for the burn recovery reconciler; this is not an apalis redrive.
-            Err(BurnManagerError::Redemption(
+            Ok(None)
+            | Err(BurnManagerError::Redemption(
                 RedemptionError::Vault { .. }
                 | RedemptionError::BurnNonceTooLow { .. }
                 | RedemptionError::BurnSubmitRejected { .. },

@@ -12,6 +12,7 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -34,7 +35,9 @@ use crate::network_telemetry::{NetworkTelemetry, NetworkTelemetrySnapshot};
 use crate::receipt_inventory::ReceiptService;
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
-    BurnManager, BurnManagerError, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+    BurnManager, BurnManagerError, BurnTransactionIdentity,
+    MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, ManualBurnReplacementDisposition,
+    ManualBurnReplacementOutcome, ManualBurnReplacementRefusal,
     RecoveryOutcome,
 };
 use crate::redemption::{
@@ -58,6 +61,11 @@ use crate::wrapped_transfer::{
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
+    async fn replace_exhausted_dead_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<ManualBurnReplacementOutcome, BurnManagerError>;
+
     async fn execute_recovered_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -77,6 +85,13 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
 
 #[async_trait]
 impl RedemptionBurnRecovery for BurnManager {
+    async fn replace_exhausted_dead_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<ManualBurnReplacementOutcome, BurnManagerError> {
+        self.replace_exhausted_dead_burn(issuer_request_id).await
+    }
+
     async fn execute_recovered_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -114,6 +129,155 @@ pub(crate) struct ReprocessResponse {
     aggregate_id: String,
     previous_state: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_replacement: Option<ManualBurnReplacementResponse>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ManualBurnReplacementResponse {
+    code: ManualBurnReplacementCode,
+    #[schema(value_type = String)]
+    recovery_id: uuid::Uuid,
+    #[schema(value_type = String)]
+    old_tx_hash: B256,
+    old_nonce: u64,
+    #[schema(value_type = String)]
+    new_tx_hash: B256,
+    new_nonce: u64,
+    queue_dispatch: QueueDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+enum ManualBurnReplacementCode {
+    #[serde(rename = "burn_replacement_queued")]
+    Queued,
+    #[serde(rename = "burn_replacement_reenqueued")]
+    Reenqueued,
+    #[serde(rename = "burn_replacement_confirmation_queued")]
+    ConfirmationQueued,
+    #[serde(rename = "burn_replacement_dispatch_deferred")]
+    DispatchDeferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum QueueDispatch {
+    Queued,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum RecoverRedemptionCode {
+    RedemptionNotFound,
+    AlpacaRequestNotFound,
+    RedemptionTerminal,
+    RecoveryRefused,
+    PriorBurnUnverifiable,
+    RedemptionCommandRejected,
+    UpstreamUnavailable,
+    InternalError,
+    NetworkNotConfigured,
+    BurnReplacementCommittedInspectionRequired,
+    BurnNotProvablyDead,
+    InvalidBurnIdentity,
+    BurnRecoveryNotExhausted,
+    CompetingSignerIntent,
+    BurnReplacementAlreadyQueued,
+    BurnClassificationUnavailable,
+    BurnReplacementPreparationUnavailable,
+    InvalidRecoveryState,
+    BurnReplacementInternalError,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct RecoverRedemptionErrorBody {
+    code: RecoverRedemptionCode,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    recovery_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    old_tx_hash: Option<B256>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_nonce: Option<u64>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub(crate) enum RecoverRedemptionResponseBody {
+    Recovery(ReprocessResponse),
+    Error(RecoverRedemptionErrorBody),
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoverRedemptionError {
+    status: Status,
+    body: RecoverRedemptionErrorBody,
+}
+
+impl RecoverRedemptionError {
+    fn new(
+        status: Status,
+        code: RecoverRedemptionCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            body: RecoverRedemptionErrorBody {
+                code,
+                message: message.into(),
+                recovery_id: None,
+                old_tx_hash: None,
+                old_nonce: None,
+            },
+        }
+    }
+
+    const fn with_old_transaction(
+        mut self,
+        identity: BurnTransactionIdentity,
+    ) -> Self {
+        self.body.old_tx_hash = Some(identity.tx_hash);
+        self.body.old_nonce = Some(identity.nonce);
+        self
+    }
+
+    const fn with_recovery_id(mut self, recovery_id: uuid::Uuid) -> Self {
+        self.body.recovery_id = Some(recovery_id);
+        self
+    }
+}
+
+impl From<Status> for RecoverRedemptionError {
+    fn from(status: Status) -> Self {
+        let code = match status.code {
+            404 => RecoverRedemptionCode::RedemptionNotFound,
+            409 => RecoverRedemptionCode::RedemptionTerminal,
+            422 => RecoverRedemptionCode::RecoveryRefused,
+            502 => RecoverRedemptionCode::UpstreamUnavailable,
+            _ => RecoverRedemptionCode::InternalError,
+        };
+        Self::new(status, code, status.reason_lossy())
+    }
+}
+
+impl<'request> Responder<'request, 'static> for RecoverRedemptionError {
+    fn respond_to(
+        self,
+        _request: &'request rocket::Request<'_>,
+    ) -> response::Result<'static> {
+        let body = serde_json::to_string(
+            &RecoverRedemptionResponseBody::Error(self.body),
+        )
+        .map_err(|_| Status::InternalServerError)?;
+        rocket::Response::build()
+            .status(self.status)
+            .header(ContentType::JSON)
+            .sized_body(body.len(), Cursor::new(body))
+            .ok()
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -190,7 +354,7 @@ struct ReprocessContext {
     /// Replacement externalTxId for a retry burn, when event
     /// history shows a prior accepted burn or an unaccepted retry attempt.
     burn_retry_external_tx_id: Option<BurnExternalTxId>,
-    burn_recovery_exhausted: bool,
+    transaction_recovery_exhausted: bool,
 }
 
 /// Loads all events for a redemption and extracts:
@@ -322,7 +486,7 @@ async fn load_reprocess_context(
             );
             Status::InternalServerError
         })?;
-    let burn_recovery_exhausted = events.iter().any(|event| {
+    let transaction_recovery_exhausted = events.iter().any(|event| {
         matches!(event, RedemptionEvent::BurnRecoveryExhausted { .. })
     }) || events
         .iter()
@@ -345,7 +509,7 @@ async fn load_reprocess_context(
         alpaca_called,
         burning_failed,
         burn_retry_external_tx_id,
-        burn_recovery_exhausted,
+        transaction_recovery_exhausted,
     })
 }
 
@@ -365,18 +529,23 @@ async fn load_reprocess_context(
             description = "Issuer redemption request id of the stuck redemption")
     ),
     responses(
-        (status = 200, description = "Recovery initiated; describes the path taken",
-            body = ReprocessResponse),
-        (status = 404, description = "No redemption found for this id"),
-        (status = 409, description = "Redemption already completed"),
+        (status = 200, description = "Recovery initiated, or a committed replacement requires inspection; describes the path taken",
+            body = RecoverRedemptionResponseBody),
+        (status = 404, description = "No redemption found for this id",
+            body = RecoverRedemptionErrorBody),
+        (status = 409, description = "Redemption already completed",
+            body = RecoverRedemptionErrorBody),
         (status = 422,
             description = "Cannot recover: Alpaca journal pending/rejected, \
                 prior burn not confirmed reverted, transaction burn still \
                 pending, invalid aggregate state, or \
-                the redemption's network has no configured vault service"),
+                the redemption's network has no configured vault service",
+            body = RecoverRedemptionErrorBody),
         (status = 502,
-            description = "Alpaca poll or burn execution failed"),
-        (status = 500, description = "Event load/deserialize or internal failure")
+            description = "Alpaca poll or burn execution failed",
+            body = RecoverRedemptionErrorBody),
+        (status = 500, description = "Event load/deserialize or internal failure",
+            body = RecoverRedemptionErrorBody)
     ),
     security(("internal_api_key" = []))
 )]
@@ -397,17 +566,74 @@ pub(crate) async fn recover_redemption(
     vault_services: &rocket::State<NetworkVaultServices>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
-) -> Result<Json<ReprocessResponse>, Status> {
+) -> Result<Json<RecoverRedemptionResponseBody>, RecoverRedemptionError> {
     let aggregate_id = issuer_request_id.to_string();
 
     let context =
         load_reprocess_context(pool.inner(), &issuer_request_id).await?;
 
-    if context.burn_recovery_exhausted {
-        warn!(target: "admin", aggregate_id = %aggregate_id,
-            "Refusing to re-arm a redemption with exhausted automatic burn recovery"
-        );
-        return Err(Status::UnprocessableEntity);
+    if context.transaction_recovery_exhausted {
+        let outcome = burn_recovery
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    BurnManagerError::ManualReplacementCommitted { .. }
+                ) {
+                    warn!(target: "admin", aggregate_id = %aggregate_id,
+                        %error,
+                        "Exhausted burn replacement committed but its durable \
+                         authorization could not be reloaded"
+                    );
+                } else {
+                    warn!(target: "admin", aggregate_id = %aggregate_id,
+                        %error,
+                        "Exhausted burn replacement was refused"
+                    );
+                }
+                map_manual_burn_replacement_error(&error)
+            })?;
+        let (code, queue_dispatch, message) = match outcome.disposition {
+            ManualBurnReplacementDisposition::Enqueued => (
+                ManualBurnReplacementCode::Queued,
+                QueueDispatch::Queued,
+                "Provably-dead burn replacement authorized and queued",
+            ),
+            ManualBurnReplacementDisposition::Reenqueued => (
+                ManualBurnReplacementCode::Reenqueued,
+                QueueDispatch::Queued,
+                "Existing authorized burn replacement re-enqueued",
+            ),
+            ManualBurnReplacementDisposition::ConfirmationEnqueued => (
+                ManualBurnReplacementCode::ConfirmationQueued,
+                QueueDispatch::Queued,
+                "Landed authorized burn replacement queued for confirmation",
+            ),
+            ManualBurnReplacementDisposition::DispatchDeferred => (
+                ManualBurnReplacementCode::DispatchDeferred,
+                QueueDispatch::Deferred,
+                "Burn replacement authorized; queue dispatch deferred to recovery",
+            ),
+        };
+
+        return Ok(Json(RecoverRedemptionResponseBody::Recovery(
+            ReprocessResponse {
+                aggregate_type: AggregateKind::Redemption,
+                aggregate_id,
+                previous_state: outcome.previous_state.to_string(),
+                message: message.to_string(),
+                manual_replacement: Some(ManualBurnReplacementResponse {
+                    code,
+                    recovery_id: outcome.recovery_id,
+                    old_tx_hash: outcome.previous.tx_hash,
+                    old_nonce: outcome.previous.nonce,
+                    new_tx_hash: outcome.replacement.tx_hash,
+                    new_nonce: outcome.replacement.nonce,
+                    queue_dispatch,
+                }),
+            },
+        )));
     }
 
     let Some(alpaca_data) = context.alpaca_called else {
@@ -418,7 +644,11 @@ pub(crate) async fn recover_redemption(
             issuer_request_id,
             context.metadata,
         )
-        .await;
+        .await
+        .map(|Json(response)| {
+            Json(RecoverRedemptionResponseBody::Recovery(response))
+        })
+        .map_err(Into::into);
     };
 
     // Burn recovery signs on the redemption's own network runtime, so the
@@ -430,7 +660,11 @@ pub(crate) async fn recover_redemption(
                 error = %error,
                 "Cannot recover redemption on an unconfigured network"
             );
-            Status::UnprocessableEntity
+            RecoverRedemptionError::new(
+                Status::UnprocessableEntity,
+                RecoverRedemptionCode::NetworkNotConfigured,
+                error.to_string(),
+            )
         })?;
 
     // Post-Alpaca failure: verify with Alpaca before burning.
@@ -449,6 +683,174 @@ pub(crate) async fn recover_redemption(
         },
     )
     .await
+    .map(|Json(response)| {
+        Json(RecoverRedemptionResponseBody::Recovery(response))
+    })
+}
+
+fn map_manual_burn_replacement_error(
+    error: &BurnManagerError,
+) -> RecoverRedemptionError {
+    match error {
+        BurnManagerError::ManualReplacementCommitted {
+            recovery_id,
+            previous,
+        } => RecoverRedemptionError::new(
+            Status::Ok,
+            RecoverRedemptionCode::BurnReplacementCommittedInspectionRequired,
+            error.to_string(),
+        )
+        .with_recovery_id(*recovery_id)
+        .with_old_transaction(*previous),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::NotProvablyDead {
+                tx_hash,
+                nonce,
+                ..
+            },
+        )
+        | BurnManagerError::Cqrs(AggregateError::UserError(
+            LifecycleError::Apply(RedemptionError::BurnReplacementNotSafe {
+                tx_hash,
+                nonce,
+            }),
+        ))
+        | BurnManagerError::Redemption(
+            RedemptionError::BurnReplacementNotSafe { tx_hash, nonce },
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::BurnNotProvablyDead,
+            error.to_string(),
+        )
+        .with_old_transaction(BurnTransactionIdentity {
+            tx_hash: *tx_hash,
+            nonce: *nonce,
+        }),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::InvalidPersistedIdentity {
+                tx_hash,
+                nonce,
+            },
+        )
+        | BurnManagerError::Cqrs(AggregateError::UserError(
+            LifecycleError::Apply(
+                RedemptionError::PersistedBurnOwnerMismatch { tx_hash, nonce }
+                | RedemptionError::PersistedBurnChainIdMismatch {
+                    tx_hash,
+                    nonce,
+                    ..
+                }
+                | RedemptionError::BurnReplacementChainIdMismatch {
+                    previous_hash: tx_hash,
+                    previous_nonce: nonce,
+                    ..
+                },
+            ),
+        ))
+        | BurnManagerError::Redemption(
+            RedemptionError::PersistedBurnOwnerMismatch { tx_hash, nonce }
+            | RedemptionError::PersistedBurnChainIdMismatch {
+                tx_hash,
+                nonce,
+                ..
+            }
+            | RedemptionError::BurnReplacementChainIdMismatch {
+                previous_hash: tx_hash,
+                previous_nonce: nonce,
+                ..
+            },
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::InvalidBurnIdentity,
+            error.to_string(),
+        )
+        .with_old_transaction(BurnTransactionIdentity {
+            tx_hash: *tx_hash,
+            nonce: *nonce,
+        }),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::BudgetNotExhausted,
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::BurnRecoveryNotExhausted,
+            error.to_string(),
+        ),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::CompetingSignerIntent { .. },
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::CompetingSignerIntent,
+            error.to_string(),
+        ),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::ReplacementAlreadyQueued { .. },
+        ) => RecoverRedemptionError::new(
+            Status::Conflict,
+            RecoverRedemptionCode::BurnReplacementAlreadyQueued,
+            error.to_string(),
+        ),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::TerminalState { .. },
+        ) => RecoverRedemptionError::new(
+            Status::Conflict,
+            RecoverRedemptionCode::RedemptionTerminal,
+            error.to_string(),
+        ),
+        BurnManagerError::Cqrs(AggregateError::UserError(
+            LifecycleError::Apply(
+                RedemptionError::BurnRecoveryClassificationFailed { .. },
+            ),
+        ))
+        | BurnManagerError::Redemption(
+            RedemptionError::BurnRecoveryClassificationFailed { .. },
+        )
+        | BurnManagerError::Vault(_) => RecoverRedemptionError::new(
+            Status::BadGateway,
+            RecoverRedemptionCode::BurnClassificationUnavailable,
+            error.to_string(),
+        ),
+        BurnManagerError::Cqrs(AggregateError::UserError(
+            LifecycleError::Apply(
+                RedemptionError::BurnReplacementPreparationFailed { .. },
+            ),
+        ))
+        | BurnManagerError::Redemption(
+            RedemptionError::BurnReplacementPreparationFailed { .. },
+        ) => RecoverRedemptionError::new(
+            Status::BadGateway,
+            RecoverRedemptionCode::BurnReplacementPreparationUnavailable,
+            error.to_string(),
+        ),
+        BurnManagerError::UnconfiguredNetwork(_)
+        | BurnManagerError::Cqrs(AggregateError::UserError(
+            LifecycleError::Apply(RedemptionError::NetworkNotConfigured {
+                ..
+            }),
+        ))
+        | BurnManagerError::Redemption(
+            RedemptionError::NetworkNotConfigured { .. },
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::NetworkNotConfigured,
+            error.to_string(),
+        ),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::InvalidState { .. },
+        )
+        | BurnManagerError::InvalidAggregateState { .. }
+        | BurnManagerError::Cqrs(AggregateError::UserError(_)) => {
+            RecoverRedemptionError::new(
+                Status::UnprocessableEntity,
+                RecoverRedemptionCode::InvalidRecoveryState,
+                error.to_string(),
+            )
+        }
+        _ => RecoverRedemptionError::new(
+            Status::InternalServerError,
+            RecoverRedemptionCode::BurnReplacementInternalError,
+            error.to_string(),
+        ),
+    }
 }
 
 async fn recover_pre_alpaca(
@@ -485,6 +887,7 @@ async fn recover_pre_alpaca(
         message:
             "Recovered to Detected — RedeemCallManager will re-call Alpaca"
                 .to_string(),
+        manual_replacement: None,
     }))
 }
 
@@ -504,7 +907,7 @@ async fn recover_post_alpaca(
     vault_service: &Arc<dyn VaultService>,
     burn_recovery: &Arc<dyn RedemptionBurnRecovery>,
     input: PostAlpacaRecoveryInput,
-) -> Result<Json<ReprocessResponse>, Status> {
+) -> Result<Json<ReprocessResponse>, RecoverRedemptionError> {
     let PostAlpacaRecoveryInput {
         aggregate_id,
         issuer_request_id,
@@ -541,17 +944,20 @@ async fn recover_post_alpaca(
         .poll_request_status(&alpaca_data.tokenization_request_id)
         .await
         .map_err(|err| {
-            let (status, msg) = match &err {
+            let (status, code, msg) = match &err {
                 AlpacaError::RequestNotFound { .. } => (
                     Status::NotFound,
+                    RecoverRedemptionCode::AlpacaRequestNotFound,
                     "Tokenization request not found at Alpaca (404)",
                 ),
                 AlpacaError::ResponseIdMismatch { .. } => (
                     Status::BadGateway,
+                    RecoverRedemptionCode::UpstreamUnavailable,
                     "Alpaca returned a mismatched tokenization request id",
                 ),
                 AlpacaError::UnsupportedTokenizationNetwork { .. } => (
                     Status::UnprocessableEntity,
+                    RecoverRedemptionCode::RecoveryRefused,
                     "Network is not a published Alpaca TokenizationNetwork value",
                 ),
                 AlpacaError::Reqwest(_)
@@ -559,6 +965,7 @@ async fn recover_post_alpaca(
                 | AlpacaError::Auth(_)
                 | AlpacaError::Api { .. } => (
                     Status::BadGateway,
+                    RecoverRedemptionCode::UpstreamUnavailable,
                     "Failed to poll Alpaca for journal status",
                 ),
             };
@@ -568,7 +975,7 @@ async fn recover_post_alpaca(
                 status = status.code,
                 "{msg}"
             );
-            status
+            RecoverRedemptionError::new(status, code, msg)
         })?;
 
     let (status, alpaca_updated_at) = match &request {
@@ -595,7 +1002,7 @@ async fn recover_post_alpaca(
                 error!(target: "admin", aggregate_id = %aggregate_id,
                     "Alpaca response fields do not match redemption metadata"
                 );
-                return Err(Status::InternalServerError);
+                return Err(Status::InternalServerError.into());
             }
             (status, updated_at)
         }
@@ -603,7 +1010,7 @@ async fn recover_post_alpaca(
             error!(target: "admin", aggregate_id = %aggregate_id,
                 "Alpaca returned Mint request for a redemption tokenization_request_id"
             );
-            return Err(Status::InternalServerError);
+            return Err(Status::InternalServerError.into());
         }
     };
 
@@ -614,14 +1021,14 @@ async fn recover_post_alpaca(
                 tokenization_request_id = %alpaca_data.tokenization_request_id,
                 "Cannot recover: Alpaca journal still pending"
             );
-            return Err(Status::UnprocessableEntity);
+            return Err(Status::UnprocessableEntity.into());
         }
         RedeemRequestStatus::Rejected => {
             info!(target: "admin", aggregate_id = %aggregate_id,
                 tokenization_request_id = %alpaca_data.tokenization_request_id,
                 "Cannot recover: Alpaca journal was rejected"
             );
-            return Err(Status::UnprocessableEntity);
+            return Err(Status::UnprocessableEntity.into());
         }
     }
 
@@ -648,7 +1055,7 @@ async fn recover_post_alpaca(
         error!(target: "admin", aggregate_id = %aggregate_id,
             "Alpaca returned completed status but updated_at is null"
         );
-        return Err(Status::BadGateway);
+        return Err(Status::BadGateway.into());
     };
     let alpaca_journal_completed_at = *alpaca_journal_completed_at;
 
@@ -672,7 +1079,7 @@ async fn recover_post_alpaca(
                 error = %err,
                 "Failed to recover redemption (post-Alpaca)"
             );
-            map_redemption_error(&err)
+            map_resume_burn_error(&err)
         })?;
 
     info!(target: "admin", aggregate_id = %aggregate_id,
@@ -706,6 +1113,7 @@ async fn recover_post_alpaca(
         aggregate_id: aggregate_id.clone(),
         previous_state: "Failed".to_string(),
         message,
+        manual_replacement: None,
     }))
 }
 
@@ -733,7 +1141,7 @@ async fn inspect_prior_burn(
     burning_failed: Option<&BurningFailedData>,
     burn_retry_external_tx_id: Option<BurnExternalTxId>,
     dust_quantity: &Quantity,
-) -> Result<PriorBurnDisposition, Status> {
+) -> Result<PriorBurnDisposition, RecoverRedemptionError> {
     let issuer_request_id = &metadata.issuer_request_id;
     let detected_tx_hash = &metadata.detected_tx_hash;
 
@@ -752,7 +1160,7 @@ async fn inspect_prior_burn(
                         tx_hash = ?tx_id,
                         "Completed burn transaction receipt is missing block number"
                     );
-                    return Err(Status::InternalServerError);
+                    return Err(Status::InternalServerError.into());
                 };
 
                 if bf_data.planned_burns.is_empty() {
@@ -788,7 +1196,7 @@ async fn inspect_prior_burn(
                 tx_id,
                 burn_retry_external_tx_id,
             )),
-            Err(error) => Err(ambiguous_prior_burn_status(
+            Err(error) => Err(ambiguous_prior_burn_error(
                 aggregate_id,
                 issuer_request_id,
                 tx_id,
@@ -837,7 +1245,7 @@ async fn inspect_prior_burn(
                     tx_id,
                     burn_retry_external_tx_id,
                 )),
-                Err(error) => Err(ambiguous_prior_burn_status(
+                Err(error) => Err(ambiguous_prior_burn_error(
                     aggregate_id,
                     issuer_request_id,
                     tx_id,
@@ -859,7 +1267,7 @@ async fn record_existing_burn(
     tx_hash: B256,
     proof: ExistingBurnProof,
     block_number: u64,
-) -> Result<PriorBurnDisposition, Status> {
+) -> Result<PriorBurnDisposition, RecoverRedemptionError> {
     store
         .send(
             issuer_request_id,
@@ -877,7 +1285,7 @@ async fn record_existing_burn(
                 error = %err,
                 "Failed to record existing burn"
             );
-            map_redemption_error(&err)
+            RecoverRedemptionError::from(map_redemption_error(&err))
         })?;
 
     Ok(PriorBurnDisposition::AlreadyRecorded(ReprocessResponse {
@@ -885,6 +1293,7 @@ async fn record_existing_burn(
         aggregate_id: aggregate_id.to_string(),
         previous_state: "Failed".to_string(),
         message: "Existing on-chain burn recorded via tx lookup".to_string(),
+        manual_replacement: None,
     }))
 }
 
@@ -915,12 +1324,12 @@ fn resume_after_reverted_burn(
 /// Maps a non-revert confirmation error to the operator-facing status: a
 /// missing block number is an internal fault, anything else is an ambiguous
 /// outcome needing manual intervention. Shared by both modes.
-fn ambiguous_prior_burn_status(
+fn ambiguous_prior_burn_error(
     aggregate_id: &str,
     issuer_request_id: &IssuerRedemptionRequestId,
     tx_id: &TxId,
     error: &VaultError,
-) -> Status {
+) -> RecoverRedemptionError {
     if let VaultError::MissingBlockNumber { tx_hash } = error {
         // A successful receipt without inclusion proof is a data-integrity
         // failure, not an ambiguous prior-burn outcome — operators must
@@ -929,7 +1338,7 @@ fn ambiguous_prior_burn_status(
             %tx_hash,
             "Completed burn transaction receipt is missing block number"
         );
-        Status::InternalServerError
+        Status::InternalServerError.into()
     } else {
         warn!(target: "admin", aggregate_id = %aggregate_id,
             issuer_request_id = %issuer_request_id,
@@ -937,7 +1346,27 @@ fn ambiguous_prior_burn_status(
             error = %error,
             "Prior burn outcome is ambiguous; manual intervention required"
         );
-        Status::UnprocessableEntity
+        RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::PriorBurnUnverifiable,
+            "Prior burn outcome is ambiguous; manual intervention required",
+        )
+    }
+}
+
+fn map_resume_burn_error(
+    err: &AggregateError<LifecycleError<Redemption>>,
+) -> RecoverRedemptionError {
+    match err {
+        AggregateError::UserError(LifecycleError::Apply(
+            RedemptionError::AlreadyCompleted { .. },
+        )) => Status::Conflict.into(),
+        AggregateError::UserError(_) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::RedemptionCommandRejected,
+            err.to_string(),
+        ),
+        _ => Status::InternalServerError.into(),
     }
 }
 
@@ -1093,6 +1522,7 @@ pub(crate) async fn close_redemption(
         aggregate_id,
         previous_state,
         message,
+        manual_replacement: None,
     }))
 }
 
@@ -1192,6 +1622,7 @@ pub(crate) async fn force_complete_redemption(
             "Force-completed: burn verified on-chain at block {} ({} shares)",
             verification.block_number, verification.shares_burned
         ),
+        manual_replacement: None,
     }))
 }
 
@@ -1398,6 +1829,7 @@ pub(crate) async fn reprocess_mint(
             aggregate_id: aggregate_id.to_string(),
             previous_state: current_state,
             message: "Recovery initiated".to_string(),
+            manual_replacement: None,
         }));
     }
 
@@ -1465,6 +1897,7 @@ pub(crate) async fn reprocess_mint(
         aggregate_id: aggregate_id.to_string(),
         previous_state: current_state,
         message: message.to_string(),
+        manual_replacement: None,
     }))
 }
 
@@ -1640,6 +2073,7 @@ pub(crate) async fn close_mint(
         aggregate_id: aggregate_id.to_string(),
         previous_state: "Unknown".to_string(),
         message,
+        manual_replacement: None,
     }))
 }
 
@@ -3198,8 +3632,9 @@ mod tests {
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use event_sorcery::{Store, StoreBuilder, test_store};
-    use rocket::http::Status;
+    use cqrs_es::AggregateError;
+    use event_sorcery::{LifecycleError, Store, StoreBuilder, test_store};
+    use rocket::http::{ContentType, Status};
     use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -3243,7 +3678,7 @@ mod tests {
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionEvent, RedemptionMetadata, RedemptionView,
+        RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
     use crate::tokenized_asset::schedule::FreezeScheduler;
@@ -3257,7 +3692,7 @@ mod tests {
     use crate::vault::{
         BurnRange, BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
         OrchestratorBurnResult, PreparedMintTx, SendableTxWithHash, TxId,
-        VaultService,
+        VaultError, VaultService,
     };
     use crate::vault::{MintAuthorization, OrchestratorMintedLog};
     use crate::wrapped_transfer::{
@@ -3336,22 +3771,39 @@ mod tests {
         NotABurn,
     }
 
+    #[derive(Clone, Copy, Default)]
+    enum MockManualBurnResult {
+        #[default]
+        Succeeds,
+        NotProvablyDead,
+        ClassificationUnavailable,
+        Committed,
+        PreparationUnavailable,
+        ConfirmationQueued,
+        Reenqueued,
+        DispatchDeferred,
+    }
+
     struct MockBurnRecovery {
         calls: AtomicUsize,
+        manual_calls: AtomicUsize,
         result: MockBurnResult,
         force_calls: AtomicUsize,
         force_result: MockForceResult,
+        manual_result: MockManualBurnResult,
     }
 
     impl Default for MockBurnRecovery {
         fn default() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                manual_calls: AtomicUsize::new(0),
                 result: MockBurnResult::Succeeds(
                     super::RecoveryOutcome::Executed,
                 ),
                 force_calls: AtomicUsize::new(0),
                 force_result: MockForceResult::Verified,
+                manual_result: MockManualBurnResult::Succeeds,
             }
         }
     }
@@ -3359,6 +3811,10 @@ mod tests {
     impl MockBurnRecovery {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        fn manual_calls(&self) -> usize {
+            self.manual_calls.load(Ordering::Relaxed)
         }
 
         fn force_calls(&self) -> usize {
@@ -3380,6 +3836,14 @@ mod tests {
 
     #[async_trait]
     impl super::RedemptionBurnRecovery for ReservationTrackingBurnRecovery {
+        async fn replace_exhausted_dead_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> Result<super::ManualBurnReplacementOutcome, super::BurnManagerError>
+        {
+            unimplemented!("not used by reservation recovery route tests")
+        }
+
         async fn execute_recovered_burn(
             &self,
             issuer_request_id: &IssuerRedemptionRequestId,
@@ -3415,6 +3879,79 @@ mod tests {
 
     #[async_trait]
     impl super::RedemptionBurnRecovery for MockBurnRecovery {
+        async fn replace_exhausted_dead_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> Result<super::ManualBurnReplacementOutcome, super::BurnManagerError>
+        {
+            self.manual_calls.fetch_add(1, Ordering::Relaxed);
+            let disposition = match self.manual_result {
+                MockManualBurnResult::NotProvablyDead => {
+                    return Err(super::BurnManagerError::ManualReplacementRefused(
+                        super::ManualBurnReplacementRefusal::NotProvablyDead {
+                            tx_hash: B256::ZERO,
+                            nonce: 4,
+                            status: BurnTxStatus::StillMineable,
+                        },
+                    ));
+                }
+                MockManualBurnResult::ClassificationUnavailable => {
+                    return Err(super::BurnManagerError::Vault(
+                        VaultError::InvalidReceipt,
+                    ));
+                }
+                MockManualBurnResult::Committed => {
+                    return Err(
+                        super::BurnManagerError::ManualReplacementCommitted {
+                            recovery_id: uuid::Uuid::nil(),
+                            previous: super::BurnTransactionIdentity {
+                                tx_hash: B256::ZERO,
+                                nonce: 4,
+                            },
+                        },
+                    );
+                }
+                MockManualBurnResult::PreparationUnavailable => {
+                    return Err(super::BurnManagerError::Cqrs(
+                        AggregateError::UserError(LifecycleError::Apply(
+                            RedemptionError::BurnReplacementPreparationFailed {
+                                tx_hash: B256::ZERO,
+                                nonce: 4,
+                            },
+                        )),
+                    ));
+                }
+                MockManualBurnResult::Succeeds => {
+                    super::ManualBurnReplacementDisposition::Enqueued
+                }
+                MockManualBurnResult::ConfirmationQueued => {
+                    super::ManualBurnReplacementDisposition::ConfirmationEnqueued
+                }
+                MockManualBurnResult::Reenqueued => {
+                    super::ManualBurnReplacementDisposition::Reenqueued
+                }
+                MockManualBurnResult::DispatchDeferred => {
+                    super::ManualBurnReplacementDisposition::DispatchDeferred
+                }
+            };
+            Ok(super::ManualBurnReplacementOutcome {
+                recovery_id: uuid::Uuid::new_v4(),
+                previous_state:
+                    crate::redemption::RedemptionState::BurnIntended,
+                previous: super::BurnTransactionIdentity {
+                    tx_hash: alloy::primitives::B256::ZERO,
+                    nonce: 4,
+                },
+                replacement: super::BurnTransactionIdentity {
+                    tx_hash: b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    nonce: 5,
+                },
+                disposition,
+            })
+        }
+
         async fn execute_recovered_burn(
             &self,
             _issuer_request_id: &IssuerRedemptionRequestId,
@@ -3923,7 +4460,7 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
-        let Redemption::BurnIntended { .. } = store
+        let Redemption::BurnIntended { sendable_tx, .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -3936,6 +4473,7 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::RecordBurnTxSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
@@ -3951,6 +4489,7 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: None,
                     error: "burn terminally failed".to_string(),
                     tx_id: Some(tx_id.clone()),
                     planned_burns: vec![],
@@ -4243,8 +4782,31 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), Status::UnprocessableEntity);
+        let error = result.unwrap_err();
+        assert_eq!(error.status, Status::UnprocessableEntity);
+        assert_eq!(
+            error.body.code,
+            super::RecoverRedemptionCode::RecoveryRefused
+        );
         assert!(logs_contain_at!(Level::INFO, &["journal still pending"]));
+    }
+
+    #[test]
+    fn resume_burn_rejection_has_distinct_operator_code() {
+        let error = AggregateError::UserError(LifecycleError::Apply(
+            RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: "Detected".to_string(),
+            },
+        ));
+
+        let response = super::map_resume_burn_error(&error);
+
+        assert_eq!(response.status, Status::UnprocessableEntity);
+        assert_eq!(
+            response.body.code,
+            super::RecoverRedemptionCode::RedemptionCommandRejected
+        );
     }
 
     #[traced_test]
@@ -4276,7 +4838,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), Status::UnprocessableEntity);
+        let error = result.unwrap_err();
+        assert_eq!(error.status, Status::UnprocessableEntity);
+        assert_eq!(
+            error.body.code,
+            super::RecoverRedemptionCode::RecoveryRefused
+        );
         assert!(logs_contain_at!(Level::INFO, &["journal was rejected"]));
     }
 
@@ -4308,7 +4875,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), Status::BadGateway);
+        assert_eq!(result.unwrap_err().status, Status::BadGateway);
         assert!(logs_contain_at!(Level::ERROR, &["Failed to poll Alpaca"]));
     }
 
@@ -4337,7 +4904,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), Status::InternalServerError);
+        assert_eq!(result.unwrap_err().status, Status::InternalServerError);
         assert!(logs_contain_at!(
             Level::ERROR,
             &["Mint request", "redemption"]
@@ -4381,7 +4948,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), Status::InternalServerError);
+        assert_eq!(result.unwrap_err().status, Status::InternalServerError);
         assert!(logs_contain_at!(
             Level::ERROR,
             &["do not match redemption metadata"]
@@ -4557,7 +5124,7 @@ mod tests {
             .await
             .expect("IntendBurn failed");
 
-        let Redemption::BurnIntended { .. } = store
+        let Redemption::BurnIntended { sendable_tx, .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -4570,6 +5137,7 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::RecordBurnTxSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
@@ -4586,6 +5154,7 @@ mod tests {
                 RedemptionCommand::RecordBurnFailure {
                     classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: None,
                     error: "burn terminally failed".to_string(),
                     tx_id: Some(tx_id),
                     planned_burns: vec![BurnRecord {
@@ -4734,6 +5303,7 @@ mod tests {
             .await;
 
         let status = response.status();
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
         let body = response.into_string().await.unwrap();
         (status, body)
     }
@@ -4957,7 +5527,7 @@ mod tests {
             )
             .await
             .expect("IntendBurn failed");
-        let Redemption::BurnIntended { .. } = store
+        let Redemption::BurnIntended { sendable_tx, .. } = store
             .load(&metadata.issuer_request_id)
             .await
             .expect("aggregate should load")
@@ -4970,6 +5540,7 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::RecordOrchestratorBurnSubmitted {
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
                     external_tx_id: BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     ),
@@ -4984,6 +5555,7 @@ mod tests {
                 RedemptionCommand::RecordBurnFailure {
                     classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: None,
                     error: "orchestrator burn terminally failed".to_string(),
                     tx_id: Some(tx_id),
                     planned_burns: vec![],
@@ -5231,13 +5803,17 @@ mod tests {
                 burn_recovery_state,
             );
 
-            let (status, _body) = dispatch_recover_redemption(
+            let (status, body) = dispatch_recover_redemption(
                 rocket,
                 &metadata.issuer_request_id,
             )
             .await;
 
             assert_eq!(status, Status::UnprocessableEntity, "case: {case}");
+            assert!(
+                body.contains("\"code\":\"prior_burn_unverifiable\""),
+                "case: {case}, body: {body}"
+            );
             assert_eq!(burn_recovery.calls(), 0, "case: {case}");
             let redemption =
                 store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
@@ -5294,75 +5870,92 @@ mod tests {
         }
     }
 
-    async fn assert_endpoint_refuses_exhausted_burn_recovery(
+    async fn exhaust_burn(
+        store: &Store<Redemption>,
+        metadata: &RedemptionMetadata,
+        params: BurnParams,
+        external_tx_id: Option<BurnExternalTxId>,
         with_marker: bool,
     ) {
-        let pool = setup_pool().await;
-        let store = setup_store(&pool);
-        let tx_id = TxId::random();
-        let tx_hash = tx_id.to_hash().unwrap();
-        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
-        let aggregate_id = metadata.issuer_request_id.to_string();
-        let annotations = if with_marker {
-            vec![RedemptionEvent::BurnRecoveryExhausted {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                tx_hash,
-                nonce: 4,
-                attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-                exhausted_at: Utc::now(),
-            }]
-        } else {
-            (0..MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS)
-                .map(|_| RedemptionEvent::BurnRecoveryAttempted {
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    tx_hash,
-                    nonce: 4,
-                    action: BurnRecoveryAction::Rebroadcast,
-                    attempted_at: Utc::now(),
-                })
-                .collect()
-        };
-        for annotation in annotations {
-            let event_type = match annotation {
-                RedemptionEvent::BurnRecoveryAttempted { .. } => {
-                    "RedemptionEvent::BurnRecoveryAttempted"
-                }
-                RedemptionEvent::BurnRecoveryExhausted { .. } => {
-                    "RedemptionEvent::BurnRecoveryExhausted"
-                }
-                _ => unreachable!(),
-            };
-            sqlx::query(
-                "
-                INSERT INTO events (
-                    aggregate_type,
-                    aggregate_id,
-                    sequence,
-                    event_type,
-                    event_version,
-                    payload,
-                    metadata
-                )
-                SELECT
-                    'Redemption',
-                    ?,
-                    COALESCE(MAX(sequence), 0) + 1,
-                    ?,
-                    '1.0',
-                    ?,
-                    '{}'
-                FROM events
-                WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
-                ",
+                    params,
+                    external_tx_id,
+                },
             )
-            .bind(&aggregate_id)
-            .bind(event_type)
-            .bind(serde_json::to_string(&annotation).unwrap())
-            .bind(&aggregate_id)
-            .execute(&pool)
             .await
             .unwrap();
+        let (tx_hash, nonce) = match store
+            .load(&metadata.issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Redemption::BurnIntended { sendable_tx, .. } => {
+                (sendable_tx.hash, sendable_tx.nonce)
+            }
+            other => panic!("expected BurnIntended, got {other:?}"),
+        };
+        if with_marker {
+            store
+                .send(
+                    &metadata.issuer_request_id,
+                    RedemptionCommand::RecordBurnRecoveryExhausted {
+                        issuer_request_id: metadata.issuer_request_id.clone(),
+                        tx_hash,
+                        nonce,
+                        attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                    },
+                )
+                .await
+                .unwrap();
+        } else {
+            for _ in 0..MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS {
+                store
+                    .send(
+                        &metadata.issuer_request_id,
+                        RedemptionCommand::RecordBurnRecoveryAttempt {
+                            issuer_request_id: metadata
+                                .issuer_request_id
+                                .clone(),
+                            tx_hash,
+                            nonce,
+                            action: BurnRecoveryAction::Rebroadcast,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
         }
+    }
+
+    async fn assert_endpoint_recovers_exhausted_burn(with_marker: bool) {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let metadata = setup_burning(&store).await;
+        let alpaca_data = test_alpaca_data();
+        exhaust_burn(
+            &store,
+            &metadata,
+            BurnParams::VaultDirect {
+                vault: address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+                burns: vec![MultiBurnEntry {
+                    receipt_id: U256::from(99),
+                    burn_shares: U256::from(100),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
+                dust_shares: U256::ZERO,
+                owner: Address::ZERO,
+            },
+            Some(BurnExternalTxId::base(&metadata.detected_tx_hash)),
+            with_marker,
+        )
+        .await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
 
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -5382,12 +5975,19 @@ mod tests {
             burn_recovery_state,
         );
 
-        let (status, _body) =
+        let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
                 .await;
 
-        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(status, Status::Ok);
+        assert_eq!(burn_recovery.manual_calls(), 1);
         assert_eq!(burn_recovery.calls(), 0);
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let replacement = &response["manual_replacement"];
+        assert_eq!(replacement["code"], "burn_replacement_queued");
+        assert_eq!(replacement["old_nonce"], 4);
+        assert_eq!(replacement["new_nonce"], 5);
+        assert_eq!(replacement["queue_dispatch"], "queued");
         let resumed_events: i64 = sqlx::query_scalar(
             "
             SELECT COUNT(*)
@@ -5401,22 +6001,391 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resumed_events, 0);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_recovers_marked_exhausted_burn() {
+        assert_endpoint_recovers_exhausted_burn(true).await;
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_recovers_count_only_exhausted_burn() {
+        assert_endpoint_recovers_exhausted_burn(false).await;
+    }
+
+    async fn dispatch_exhausted_burn_with_result(
+        manual_result: MockManualBurnResult,
+    ) -> (Status, serde_json::Value) {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let metadata = setup_burning(&store).await;
+        exhaust_burn(
+            &store,
+            &metadata,
+            BurnParams::VaultDirect {
+                vault: address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+                burns: vec![],
+                dust_shares: U256::ZERO,
+                owner: Address::ZERO,
+            },
+            None,
+            true,
+        )
+        .await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &test_alpaca_data(),
+            )),
+        });
+        let burn_recovery: Arc<dyn super::RedemptionBurnRecovery> =
+            Arc::new(MockBurnRecovery { manual_result, ..Default::default() });
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+        (status, serde_json::from_str(&body).expect("JSON response"))
+    }
+
+    #[tokio::test]
+    async fn exhausted_burn_second_classification_has_stable_wire_errors() {
+        let (status, body) = dispatch_exhausted_burn_with_result(
+            MockManualBurnResult::NotProvablyDead,
+        )
+        .await;
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(body["code"], "burn_not_provably_dead");
+        assert_eq!(body["old_tx_hash"], B256::ZERO.to_string());
+        assert_eq!(body["old_nonce"], 4);
+
+        let (status, body) = dispatch_exhausted_burn_with_result(
+            MockManualBurnResult::ClassificationUnavailable,
+        )
+        .await;
+        assert_eq!(status, Status::BadGateway);
+        assert_eq!(body["code"], "burn_classification_unavailable");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn committed_replacement_and_preparation_outage_have_stable_wires() {
+        let (status, body) = dispatch_exhausted_burn_with_result(
+            MockManualBurnResult::Committed,
+        )
+        .await;
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            body["code"],
+            "burn_replacement_committed_inspection_required"
+        );
+        assert_eq!(body["recovery_id"], uuid::Uuid::nil().to_string());
+        assert_eq!(body["old_tx_hash"], B256::ZERO.to_string());
+        assert_eq!(body["old_nonce"], 4);
         assert!(logs_contain_at!(
             Level::WARN,
-            &[&aggregate_id, "exhausted automatic burn recovery"]
+            &[
+                "replacement committed",
+                "durable authorization could not be reloaded"
+            ]
         ));
+
+        let (status, body) = dispatch_exhausted_burn_with_result(
+            MockManualBurnResult::PreparationUnavailable,
+        )
+        .await;
+        assert_eq!(status, Status::BadGateway);
+        assert_eq!(body["code"], "burn_replacement_preparation_unavailable");
     }
 
-    #[traced_test]
     #[tokio::test]
-    async fn endpoint_refuses_marked_exhausted_burn_recovery() {
-        assert_endpoint_refuses_exhausted_burn_recovery(true).await;
+    async fn landed_replacement_has_stable_confirmation_wire_response() {
+        let (status, body) = dispatch_exhausted_burn_with_result(
+            MockManualBurnResult::ConfirmationQueued,
+        )
+        .await;
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            body["manual_replacement"]["code"],
+            "burn_replacement_confirmation_queued"
+        );
+        assert_eq!(body["manual_replacement"]["queue_dispatch"], "queued");
     }
 
-    #[traced_test]
     #[tokio::test]
-    async fn endpoint_refuses_count_only_exhausted_burn_recovery() {
-        assert_endpoint_refuses_exhausted_burn_recovery(false).await;
+    async fn replacement_redispatch_outcomes_have_stable_wire_responses() {
+        let cases = [
+            (
+                MockManualBurnResult::Reenqueued,
+                "burn_replacement_reenqueued",
+                "queued",
+            ),
+            (
+                MockManualBurnResult::DispatchDeferred,
+                "burn_replacement_dispatch_deferred",
+                "deferred",
+            ),
+        ];
+
+        for (result, expected_code, expected_dispatch) in cases {
+            let (status, body) =
+                dispatch_exhausted_burn_with_result(result).await;
+
+            assert_eq!(status, Status::Ok);
+            assert_eq!(body["manual_replacement"]["code"], expected_code);
+            assert_eq!(
+                body["manual_replacement"]["queue_dispatch"],
+                expected_dispatch
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_exhaustion_marker_uses_normal_recovery_path() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&store).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnPreparationRecoveryExhausted {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("preparation exhaustion should persist");
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store,
+            pool.clone(),
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(burn_recovery.calls(), 1);
+        assert_eq!(burn_recovery.manual_calls(), 0);
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(response["manual_replacement"].is_null());
+        assert_eq!(
+            response["message"],
+            "Recovered from Failed and executed burn immediately"
+        );
+        let resumed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'Redemption' AND aggregate_id = ? \
+               AND event_type = 'RedemptionEvent::BurnResumed'",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(resumed_events, 1);
+    }
+
+    #[test]
+    fn exhausted_burn_errors_have_stable_statuses_and_codes() {
+        let hash = B256::ZERO;
+        let cases = [
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::NotProvablyDead {
+                        tx_hash: hash,
+                        nonce: 7,
+                        status: BurnTxStatus::StillMineable,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::BurnNotProvablyDead,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::BudgetNotExhausted,
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::BurnRecoveryNotExhausted,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::InvalidPersistedIdentity {
+                        tx_hash: hash,
+                        nonce: 7,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InvalidBurnIdentity,
+            ),
+            (
+                super::BurnManagerError::Redemption(
+                    RedemptionError::PersistedBurnOwnerMismatch {
+                        tx_hash: hash,
+                        nonce: 7,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InvalidBurnIdentity,
+            ),
+            (
+                super::BurnManagerError::Redemption(
+                    RedemptionError::PersistedBurnChainIdMismatch {
+                        tx_hash: hash,
+                        nonce: 7,
+                        expected_chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+                        found_chain_id: Some(
+                            crate::test_utils::ANVIL_CHAIN_ID + 1,
+                        ),
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InvalidBurnIdentity,
+            ),
+            (
+                super::BurnManagerError::Redemption(
+                    RedemptionError::BurnReplacementChainIdMismatch {
+                        previous_hash: hash,
+                        previous_nonce: 7,
+                        replacement_hash: B256::repeat_byte(1),
+                        replacement_nonce: 8,
+                        expected_chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+                        found_chain_id: Some(
+                            crate::test_utils::ANVIL_CHAIN_ID + 1,
+                        ),
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InvalidBurnIdentity,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::ReplacementAlreadyQueued {
+                        tx_hash: hash,
+                        nonce: 7,
+                    },
+                ),
+                Status::Conflict,
+                super::RecoverRedemptionCode::BurnReplacementAlreadyQueued,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::InvalidState {
+                        state: crate::redemption::RedemptionState::Detected,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InvalidRecoveryState,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::CompetingSignerIntent {
+                        network: Network::Base,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::CompetingSignerIntent,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::TerminalState {
+                        state: crate::redemption::RedemptionState::Completed,
+                    },
+                ),
+                Status::Conflict,
+                super::RecoverRedemptionCode::RedemptionTerminal,
+            ),
+            (
+                super::BurnManagerError::Vault(VaultError::InvalidReceipt),
+                Status::BadGateway,
+                super::RecoverRedemptionCode::BurnClassificationUnavailable,
+            ),
+            (
+                super::BurnManagerError::Cqrs(AggregateError::UserError(
+                    LifecycleError::Apply(
+                        RedemptionError::BurnReplacementNotSafe {
+                            tx_hash: hash,
+                            nonce: 8,
+                        },
+                    ),
+                )),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::BurnNotProvablyDead,
+            ),
+            (
+                super::BurnManagerError::Cqrs(AggregateError::UserError(
+                    LifecycleError::Apply(
+                        RedemptionError::BurnRecoveryClassificationFailed {
+                            tx_hash: hash,
+                            nonce: 8,
+                        },
+                    ),
+                )),
+                Status::BadGateway,
+                super::RecoverRedemptionCode::BurnClassificationUnavailable,
+            ),
+            (
+                super::BurnManagerError::UnconfiguredNetwork(
+                    crate::vault::UnconfiguredNetworkError {
+                        network: Network::Base,
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::NetworkNotConfigured,
+            ),
+            (
+                super::BurnManagerError::SharesOverflow,
+                Status::InternalServerError,
+                super::RecoverRedemptionCode::BurnReplacementInternalError,
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let response = super::map_manual_burn_replacement_error(&error);
+            assert_eq!(response.status, expected_status);
+            assert_eq!(response.body.code, expected_code);
+        }
+
+        let recovery_id = uuid::Uuid::new_v4();
+        let response = super::map_manual_burn_replacement_error(
+            &super::BurnManagerError::ManualReplacementCommitted {
+                recovery_id,
+                previous: super::BurnTransactionIdentity {
+                    tx_hash: hash,
+                    nonce: 8,
+                },
+            },
+        );
+        assert_eq!(response.status, Status::Ok);
+        assert_eq!(
+            response.body.code,
+            super::RecoverRedemptionCode::BurnReplacementCommittedInspectionRequired
+        );
+        assert_eq!(response.body.recovery_id, Some(recovery_id));
+        assert_eq!(response.body.old_tx_hash, Some(hash));
     }
 
     #[traced_test]
@@ -5649,7 +6618,7 @@ mod tests {
             burn_recovery_state,
         );
 
-        let (status, _body) =
+        let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
                 .await;
 
@@ -5658,6 +6627,9 @@ mod tests {
             Status::NotFound,
             "RequestNotFound from Alpaca must return 404, not 502"
         );
+        let body: serde_json::Value =
+            serde_json::from_str(&body).expect("JSON response");
+        assert_eq!(body["code"], "alpaca_request_not_found");
         assert_eq!(
             burn_recovery.calls(),
             0,

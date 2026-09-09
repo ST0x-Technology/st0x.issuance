@@ -65,7 +65,8 @@ pub type RealBlockchainServiceProvider = FillProvider<
 /// whole counter, preserving unique assignment for prepared transactions that
 /// are not visible in `pending` yet. A later `pending` value discards any
 /// reusable hole below it, because the node has already accepted a transaction
-/// at that nonce.
+/// at that nonce. The local counter only moves forward, so a lagging
+/// load-balanced RPC response cannot reuse a nonce that this process assigned.
 #[derive(Clone, Debug, Default)]
 pub struct ResyncNonceManager {
     nonces: Arc<StdMutex<HashMap<Address, NonceState>>>,
@@ -107,10 +108,23 @@ impl NonceState {
         }
     }
 
-    fn observe_pending(&mut self, pending: u64) {
-        self.reusable.retain(|nonce| *nonce >= pending);
-        self.next = self.next.max(pending);
+    fn mark_used(&mut self, nonce: u64) {
+        self.reusable.remove(&nonce);
+        if self.next <= nonce {
+            self.next = nonce.saturating_add(1);
+        }
     }
+
+    fn observe_pending(&mut self, pending: u64) {
+        self.next = self.next.max(pending);
+        self.reusable.retain(|nonce| *nonce >= pending && *nonce < self.next);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NonceReservation {
+    ProviderFilled,
+    ReserveNext,
 }
 
 impl ResyncNonceManager {
@@ -143,6 +157,38 @@ impl ResyncNonceManager {
         {
             state.release(nonce);
         }
+    }
+
+    fn mark_used(&self, address: Address, nonce: u64) {
+        self.nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .entry(address)
+            .or_insert_with(|| NonceState::new(nonce.saturating_add(1)))
+            .mark_used(nonce);
+    }
+
+    fn observe_pending(&self, address: Address, pending: u64) {
+        self.nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .entry(address)
+            .or_insert_with(|| NonceState::new(pending))
+            .observe_pending(pending);
+    }
+
+    fn observe_pending_and_take_next(
+        &self,
+        address: Address,
+        pending: u64,
+    ) -> u64 {
+        let mut nonces = self.nonces.lock().expect("nonce cache lock poisoned");
+        let state =
+            nonces.entry(address).or_insert_with(|| NonceState::new(pending));
+        state.observe_pending(pending);
+        let nonce = state.take_next();
+        drop(nonces);
+        nonce
     }
 }
 
@@ -257,10 +303,31 @@ impl RealBlockchainService {
     /// whole signer cache.
     async fn fill_envelope(
         &self,
-        transaction: TransactionRequest,
+        mut transaction: TransactionRequest,
+        nonce_reservation: NonceReservation,
     ) -> Result<TxEnvelope, VaultError> {
         let signer = self.provider.default_signer_address();
-        let nonce_snapshot = self.nonce_manager.snapshot(signer);
+        let nonce_snapshot = match nonce_reservation {
+            NonceReservation::ProviderFilled => {
+                Some(self.nonce_manager.snapshot(signer))
+            }
+            NonceReservation::ReserveNext => None,
+        };
+        let reserved_nonce = match nonce_reservation {
+            NonceReservation::ProviderFilled => None,
+            NonceReservation::ReserveNext => {
+                let pending = self
+                    .provider
+                    .get_transaction_count(signer)
+                    .pending()
+                    .await?;
+                let nonce = self
+                    .nonce_manager
+                    .observe_pending_and_take_next(signer, pending);
+                transaction.nonce = Some(nonce);
+                Some(nonce)
+            }
+        };
         let envelope = match self.provider.fill(transaction).await {
             Ok(sendable) => sendable
                 .try_into_envelope()
@@ -268,7 +335,11 @@ impl RealBlockchainService {
             Err(error) => Err(error.into()),
         };
         if envelope.is_err() {
-            self.nonce_manager.restore(signer, nonce_snapshot);
+            if let Some(nonce) = reserved_nonce {
+                self.nonce_manager.release(signer, nonce);
+            } else if let Some(snapshot) = nonce_snapshot {
+                self.nonce_manager.restore(signer, snapshot);
+            }
         }
         envelope
     }
@@ -363,6 +434,13 @@ impl RealBlockchainService {
     ) -> Result<Option<()>, VaultError> {
         match self.provider.send_raw_transaction(tx).await {
             Ok(pending_tx) => {
+                // A successful RPC response means the signed bytes may have
+                // entered a load-balanced provider's mempool. Even an
+                // impossible returned-hash mismatch is therefore uncertain:
+                // a negative lookup from another backend cannot prove that
+                // reusing this nonce is safe.
+                self.nonce_manager
+                    .mark_used(self.provider.default_signer_address(), nonce);
                 let returned = *pending_tx.tx_hash();
                 if returned != hash {
                     return Err(VaultError::BroadcastHashMismatch {
@@ -373,20 +451,42 @@ impl RealBlockchainService {
                 Ok(Some(()))
             }
             Err(error) => {
-                if self.provider.get_transaction_by_hash(hash).await?.is_none()
+                let signer = self.provider.default_signer_address();
+                if let alloy::transports::RpcError::ErrorResp(response) = &error
+                    && is_nonce_too_low_message(&response.message)
                 {
-                    // The transaction never entered the pool, so its nonce is
-                    // an unfilled gap ahead of the chain. Mark only this nonce
-                    // reusable; later prepared transactions keep their values.
-                    self.nonce_manager
-                        .release(self.provider.default_signer_address(), nonce);
+                    self.nonce_manager.mark_used(signer, nonce);
                     return Err(VaultError::SubmitRejected {
                         tx_hash: hash,
                         nonce,
                         source: error,
                     });
                 }
-                Ok(None)
+
+                if let alloy::transports::RpcError::ErrorResp(response) = &error
+                    && is_definitive_broadcast_rejection(response.code)
+                {
+                    // Protocol-level parse/request errors prove the raw bytes
+                    // were never accepted. Server errors remain ambiguous.
+                    self.nonce_manager.release(signer, nonce);
+                    return Err(VaultError::SubmitRejected {
+                        tx_hash: hash,
+                        nonce,
+                        source: error,
+                    });
+                }
+
+                // A transport or server failure is ambiguous: the node may
+                // have accepted the bytes before the failure surfaced. Reserve
+                // the nonce before the best-effort lookup because a
+                // load-balanced second backend returning `None` cannot prove
+                // rejection.
+                self.nonce_manager.mark_used(signer, nonce);
+                if self.provider.get_transaction_by_hash(hash).await?.is_some()
+                {
+                    return Ok(None);
+                }
+                Err(error.into())
             }
         }
     }
@@ -423,6 +523,10 @@ fn is_nonce_too_low_message(message: &str) -> bool {
     ["nonce too low", "nonce is too low", "oldnonce", "old nonce"]
         .iter()
         .any(|indicator| message.contains(indicator))
+}
+
+const fn is_definitive_broadcast_rejection(code: i64) -> bool {
+    matches!(code, -32700 | -32600 | -32601 | -32602)
 }
 
 #[async_trait]
@@ -469,7 +573,9 @@ impl VaultService for RealBlockchainService {
         // otherwise valid mint. A fixed, generous limit avoids that call
         // entirely; the wallet filler still assigns `from`.
         transaction.gas = Some(MINT_GAS_LIMIT);
-        let envelope = self.fill_envelope(transaction).await?;
+        let envelope = self
+            .fill_envelope(transaction, NonceReservation::ProviderFilled)
+            .await?;
         let prepared_tx = PreparedMintTx {
             nonce: envelope.nonce(),
             hash: *envelope.tx_hash(),
@@ -913,7 +1019,8 @@ impl VaultService for RealBlockchainService {
         tx.gas = Some(BURN_GAS_LIMIT);
 
         // Fill nonce, gas price, gas limit, chain_id from the provider
-        let envelop = self.fill_envelope(tx).await?;
+        let envelop =
+            self.fill_envelope(tx, NonceReservation::ProviderFilled).await?;
         let nonce = envelop.nonce();
         let hash = *envelop.tx_hash();
         let tx = envelop.encoded_2718();
@@ -1004,8 +1111,9 @@ impl VaultService for RealBlockchainService {
         let envelope = sendable_tx.validate_for_owner(owner)?;
         let mut transaction = TransactionRequest::from_transaction(envelope);
         transaction.from = Some(owner);
-        transaction.nonce =
-            Some(self.provider.get_transaction_count(owner).pending().await?);
+        let pending =
+            self.provider.get_transaction_count(owner).pending().await?;
+        self.nonce_manager.observe_pending(owner, pending);
         // Fixed limit instead of re-estimating against `pending` (see
         // `BURN_GAS_LIMIT`); fee fields stay `None` so the replacement still
         // re-prices for the fee bump.
@@ -1015,7 +1123,9 @@ impl VaultService for RealBlockchainService {
         transaction.max_priority_fee_per_gas = None;
         transaction.max_fee_per_blob_gas = None;
 
-        let replacement = self.fill_envelope(transaction).await?;
+        let replacement = self
+            .fill_envelope(transaction, NonceReservation::ReserveNext)
+            .await?;
         let replacement = SendableTxWithHash {
             tx: replacement.encoded_2718(),
             hash: *replacement.tx_hash(),
@@ -1137,7 +1247,8 @@ impl VaultService for RealBlockchainService {
             .burn(params.token, params.amount, Bytes::new())
             .into_transaction_request();
 
-        let envelope = self.fill_envelope(tx).await?;
+        let envelope =
+            self.fill_envelope(tx, NonceReservation::ProviderFilled).await?;
 
         Ok(SendableTxWithHash {
             nonce: envelope.nonce(),
@@ -1312,7 +1423,8 @@ impl VaultService for RealBlockchainService {
             )
             .into_transaction_request();
 
-        let envelope = self.fill_envelope(tx).await?;
+        let envelope =
+            self.fill_envelope(tx, NonceReservation::ProviderFilled).await?;
         let prepared_tx = PreparedMintTx {
             nonce: envelope.nonce(),
             hash: *envelope.tx_hash(),
@@ -1628,7 +1740,7 @@ mod tests {
         fixed_bytes,
     };
     use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, NonceFiller,
+        BlobGasFiller, ChainIdFiller, NonceFiller, NonceManager,
     };
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder};
@@ -1642,6 +1754,7 @@ mod tests {
     use alloy::sol_types::{SolCall, SolError, SolEvent};
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use std::collections::BTreeSet;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -1713,6 +1826,37 @@ mod tests {
         state.observe_pending(11);
 
         assert_eq!(state.take_next(), 13);
+    }
+
+    #[test]
+    fn observed_pending_floor_drops_only_stale_holes() {
+        let mut state =
+            NonceState { next: 7, reusable: BTreeSet::from([5, 8]) };
+
+        state.observe_pending(8);
+
+        assert_eq!(state.next, 8);
+        assert!(state.reusable.is_empty());
+        assert_eq!(state.take_next(), 8);
+        assert_eq!(state.take_next(), 9);
+    }
+
+    #[test]
+    fn taking_next_preserves_ahead_of_rpc_cache() {
+        let mut state = NonceState::new(13);
+
+        state.observe_pending(12);
+
+        assert_eq!(state.take_next(), 13);
+    }
+
+    #[test]
+    fn accepted_explicit_nonce_advances_past_floor() {
+        let mut state = NonceState::new(7);
+        state.observe_pending(8);
+        state.mark_used(8);
+
+        assert_eq!(state.take_next(), 9);
     }
 
     fn test_receipt_info() -> ReceiptInformation {
@@ -1806,14 +1950,16 @@ mod tests {
         asserter.push_success(&1u64); // eth_chainId (WalletFiller, for EIP-155 signing)
     }
 
-    fn create_service_with_asserter(asserter: Asserter) -> impl VaultService {
+    fn create_service_with_asserter(
+        asserter: Asserter,
+    ) -> RealBlockchainService {
         create_service_with_signer(asserter, PrivateKeySigner::random())
     }
 
     fn create_service_with_signer(
         asserter: Asserter,
         signer: PrivateKeySigner,
-    ) -> impl VaultService {
+    ) -> RealBlockchainService {
         let nonce_manager = ResyncNonceManager::default();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -2745,9 +2891,11 @@ mod tests {
      {
         let persisted = persisted_burn_tx(7);
         let owner = persisted.signer_for_test();
-        let pending_nonce = 11u64;
+        let first_pending_nonce = 11u64;
+        let refreshed_pending_nonce = 12u64;
         let asserter = Asserter::new();
-        asserter.push_success(&pending_nonce);
+        asserter.push_success(&first_pending_nonce);
+        asserter.push_success(&refreshed_pending_nonce);
         asserter.push_success(&test_fee_history());
         asserter
             .push_success(&Block::<alloy::rpc::types::Transaction>::default());
@@ -2756,13 +2904,23 @@ mod tests {
         let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
             .expect("test private key should be valid");
         let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, 7);
 
         let replacement = service
             .prepare_replacement_burn_tx(owner, &persisted)
             .await
             .expect("replacement should use the pending wallet nonce");
 
-        assert_eq!(replacement.nonce, pending_nonce);
+        assert_eq!(replacement.nonce, refreshed_pending_nonce);
+        assert_eq!(
+            service
+                .nonce_manager
+                .snapshot(owner)
+                .expect("nonce state should be cached")
+                .next,
+            refreshed_pending_nonce + 1,
+            "signing an explicit replacement must reserve its nonce"
+        );
         let previous_envelope =
             persisted.validate().expect("persisted tx should decode");
         let replacement_envelope =
@@ -2775,9 +2933,158 @@ mod tests {
             &[
                 "Prepared fresh-nonce burn replacement",
                 "previous_nonce=7",
-                "replacement_nonce=11"
+                "replacement_nonce=12"
             ]
         ));
+    }
+
+    #[tokio::test]
+    async fn replacement_reserves_cached_nonce_before_broadcast() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let first_pending_nonce = 11u64;
+        let refreshed_pending_nonce = 12u64;
+        let cached_nonce = 13u64;
+        let asserter = Asserter::new();
+        asserter.push_success(&first_pending_nonce);
+        asserter.push_success(&refreshed_pending_nonce);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&1u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, cached_nonce);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should preserve the local nonce floor");
+
+        assert_eq!(replacement.nonce, cached_nonce);
+        assert_eq!(
+            service
+                .nonce_manager
+                .snapshot(owner)
+                .expect("nonce state should be cached")
+                .next,
+            cached_nonce + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_first_pending_nonce_when_second_rpc_lags() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let first_pending_nonce = 12u64;
+        let lagging_pending_nonce = 11u64;
+        let asserter = Asserter::new();
+        asserter.push_success(&first_pending_nonce);
+        asserter.push_success(&lagging_pending_nonce);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&1u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should preserve the first pending nonce");
+
+        assert_eq!(replacement.nonce, first_pending_nonce);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_fill_keeps_pending_floor_reusable() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let pending_nonce = 11u64;
+        let asserter = Asserter::new();
+        asserter.push_success(&pending_nonce);
+        asserter.push_success(&pending_nonce);
+        asserter.push_failure_msg("fee lookup failed");
+        asserter.push_success(&pending_nonce);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, 6);
+
+        service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect_err("replacement fill should fail");
+
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("cached nonce should remain available"),
+            pending_nonce
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_replacement_broadcast_consumes_explicit_nonce() {
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let nonce = 11u64;
+        let hash = B256::random();
+        let asserter = Asserter::new();
+        asserter.push_success(&hash);
+        asserter.push_success(&(nonce + 1));
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, nonce);
+
+        service
+            .try_broadcast_tx(&[0xde, 0xad], hash, nonce)
+            .await
+            .expect("mock node should accept replacement");
+
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next ordinary fill should use the cache"),
+            nonce + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_broadcast_error_keeps_explicit_nonce_reserved() {
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let nonce = 11u64;
+        let hash = B256::random();
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("internal server error after submission");
+        asserter.push_success(&Option::<RpcTransaction>::None);
+        asserter.push_success(&nonce);
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, nonce);
+
+        service
+            .try_broadcast_tx(&[0xde, 0xad], hash, nonce)
+            .await
+            .expect_err("ambiguous broadcast should remain an error");
+
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next ordinary fill should use the cache"),
+            nonce + 1
+        );
     }
 
     #[tokio::test]
@@ -3260,7 +3567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_burn_returns_submit_rejected_when_the_node_holds_nothing() {
+    async fn submit_burn_stays_ambiguous_when_the_node_holds_nothing() {
         let prepared_tx = SendableTxWithHash::valid_for_test(
             1858,
             test_vault_address(),
@@ -3282,11 +3589,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(VaultError::SubmitRejected { tx_hash, nonce, .. })
-                if tx_hash == prepared_tx.hash && nonce == prepared_tx.nonce
-        ));
+        assert!(
+            matches!(result, Err(VaultError::Rpc(_))),
+            "a negative lookup cannot prove rejection across RPC backends"
+        );
     }
 
     #[tokio::test]

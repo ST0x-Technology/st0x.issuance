@@ -75,6 +75,13 @@ enum MockBehavior {
         started: Arc<Notify>,
         release: Arc<Notify>,
     },
+    /// Burn confirmation waits for an explicit test release, then reports a
+    /// definitive mined revert.
+    #[cfg(test)]
+    ConfirmRevertBlocked {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// `submit_burn` fails with a definitive on-chain revert
     /// (`VaultError::Reverted`), as the synchronous local backend does when a
     /// burn mines but reverts — exercises the submit-failure release path.
@@ -290,6 +297,11 @@ pub(crate) struct MockVaultService {
     checked_tx_outcome: Arc<Mutex<MockCheckTxOutcome>>,
     #[cfg(test)]
     burn_tx_status: Arc<Mutex<MockBurnTxClassification>>,
+    /// Optional per-call burn classification outcomes (FIFO). When non-empty,
+    /// each `classify_burn_tx` pops the next entry; otherwise
+    /// [`Self::burn_tx_status`] is used. Enables TOCTOU recheck tests.
+    #[cfg(test)]
+    burn_tx_status_sequence: Arc<Mutex<Vec<MockBurnTxClassification>>>,
     #[cfg(test)]
     mint_tx_status: Arc<Mutex<MockMintTxClassification>>,
     /// Optional per-call mint classification outcomes (FIFO). When non-empty,
@@ -360,6 +372,8 @@ impl MockVaultService {
             burn_tx_status: Arc::new(Mutex::new(
                 MockBurnTxClassification::Status(BurnTxStatus::StillMineable),
             )),
+            #[cfg(test)]
+            burn_tx_status_sequence: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             mint_tx_status: Arc::new(Mutex::new(
                 MockMintTxClassification::Status(MintTxStatus::StillMineable),
@@ -452,6 +466,16 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_confirm_revert_blocked() -> Self {
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::ConfirmRevertBlocked {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        service
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_for_wallet_lock_attempt(&self) {
         let MockBehavior::WalletLockBlocked { attempted, .. } = &self.behavior
         else {
@@ -471,8 +495,8 @@ impl MockVaultService {
 
     #[cfg(test)]
     pub(crate) async fn wait_for_burn_confirmation(&self) {
-        let MockBehavior::ConfirmPendingBlocked { started, .. } =
-            &self.behavior
+        let (MockBehavior::ConfirmPendingBlocked { started, .. }
+        | MockBehavior::ConfirmRevertBlocked { started, .. }) = &self.behavior
         else {
             panic!("mock does not block burn confirmation");
         };
@@ -481,8 +505,8 @@ impl MockVaultService {
 
     #[cfg(test)]
     pub(crate) fn release_burn_confirmation(&self) {
-        let MockBehavior::ConfirmPendingBlocked { release, .. } =
-            &self.behavior
+        let (MockBehavior::ConfirmPendingBlocked { release, .. }
+        | MockBehavior::ConfirmRevertBlocked { release, .. }) = &self.behavior
         else {
             panic!("mock does not block burn confirmation");
         };
@@ -585,7 +609,10 @@ impl MockVaultService {
         self.replacement_preparation_call_count.store(0, Ordering::Relaxed);
         *self.mint_tx_status.lock().unwrap() =
             MockMintTxClassification::Status(MintTxStatus::StillMineable);
+        *self.burn_tx_status.lock().unwrap() =
+            MockBurnTxClassification::Status(BurnTxStatus::StillMineable);
         self.mint_tx_status_sequence.lock().unwrap().clear();
+        self.burn_tx_status_sequence.lock().unwrap().clear();
         self.confirm_mint_outcomes.lock().unwrap().clear();
         *self.submit_mint_error.lock().unwrap() = None;
         self.burn_nonce_too_low_once.store(false, Ordering::Relaxed);
@@ -776,6 +803,19 @@ impl MockVaultService {
     pub(crate) fn with_burn_tx_classification_failure(self) -> Self {
         *self.burn_tx_status.lock().unwrap() =
             MockBurnTxClassification::RpcError;
+        self
+    }
+
+    /// FIFO classification outcomes for successive `classify_burn_tx` calls.
+    #[cfg(test)]
+    pub(crate) fn with_burn_tx_status_sequence(
+        self,
+        statuses: Vec<BurnTxStatus>,
+    ) -> Self {
+        *self.burn_tx_status_sequence.lock().unwrap() = statuses
+            .into_iter()
+            .map(MockBurnTxClassification::Status)
+            .collect();
         self
     }
 
@@ -1301,6 +1341,12 @@ impl VaultService for MockVaultService {
                 })
             }
             #[cfg(test)]
+            MockBehavior::ConfirmRevertBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::Reverted { tx_hash: MOCK_MINT_TX_HASH })
+            }
+            #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
@@ -1470,6 +1516,12 @@ impl VaultService for MockVaultService {
                     message: "receipt polling timed out".to_string(),
                 })
             }
+            #[cfg(test)]
+            MockBehavior::ConfirmRevertBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH })
+            }
             // SubmitRevert fails at submit; if confirm is somehow reached,
             // return the cached result like the other submit-* behaviors.
             // PrepareTxFails never reaches confirm (fails before submit);
@@ -1562,7 +1614,12 @@ impl VaultService for MockVaultService {
         #[cfg(test)]
         {
             self.burn_classification_call_count.fetch_add(1, Ordering::Relaxed);
-            let classification = *self.burn_tx_status.lock().unwrap();
+            let queued = {
+                let mut sequence = self.burn_tx_status_sequence.lock().unwrap();
+                (!sequence.is_empty()).then(|| sequence.remove(0))
+            };
+            let classification =
+                queued.unwrap_or_else(|| *self.burn_tx_status.lock().unwrap());
             return match classification {
                 MockBurnTxClassification::Status(status) => Ok(status),
                 MockBurnTxClassification::RpcError => {
@@ -1815,6 +1872,12 @@ impl VaultService for MockVaultService {
                 })
             }
             #[cfg(test)]
+            MockBehavior::ConfirmRevertBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH })
+            }
+            #[cfg(test)]
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
@@ -2001,6 +2064,12 @@ impl VaultService for MockVaultService {
                 })
             }
             #[cfg(test)]
+            MockBehavior::ConfirmRevertBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::Reverted { tx_hash: MOCK_MINT_TX_HASH })
+            }
+            #[cfg(test)]
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
@@ -2165,8 +2234,8 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::orchestrator::BurnProofKind;
     use crate::vault::{
-        BurnRequestOrigin, MintAuthorization, MintedLogQuery, MintedLogScan,
-        MultiBurnEntry, MultiBurnParams, OrchestratorMintParams,
+        BurnRequestOrigin, BurnTxStatus, MintAuthorization, MintedLogQuery,
+        MintedLogScan, MultiBurnEntry, MultiBurnParams, OrchestratorMintParams,
         OrchestratorMintResult, OrchestratorMintedLog,
         OrchestratorRevertReason, ReceiptInformation, SendableTxWithHash, TxId,
         VaultError, VaultService,
@@ -2435,7 +2504,12 @@ mod tests {
         let params = test_multi_burn_params();
         let sendable_tx = test_sendable_tx();
         let mock = MockVaultService::new_success()
-            .with_prepared_tx(sendable_tx.clone());
+            .with_prepared_tx(sendable_tx.clone())
+            .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+            .with_burn_tx_status_sequence(vec![
+                BurnTxStatus::Mined,
+                BurnTxStatus::ProvablyDead,
+            ]);
 
         mock.submit_burn(params.clone(), sendable_tx.clone()).await.unwrap();
         mock.submit_burn(params.clone(), sendable_tx.clone()).await.unwrap();
@@ -2478,6 +2552,10 @@ mod tests {
         assert_eq!(
             mock.prepare_burn_tx(&test_multi_burn_params()).await.unwrap(),
             SendableTxWithHash::default(),
+        );
+        assert_eq!(
+            mock.classify_burn_tx(params.owner, &sendable_tx).await.unwrap(),
+            BurnTxStatus::StillMineable,
         );
     }
 

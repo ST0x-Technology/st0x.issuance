@@ -2,6 +2,7 @@ use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     BurnExternalTxId, IssuerRedemptionRequestId, default_redemption_network,
@@ -387,6 +388,18 @@ pub(crate) enum RedemptionEvent {
         attempts: u32,
         exhausted_at: DateTime<Utc>,
     },
+    /// Durable audit record for an operator-authorized replacement beyond the
+    /// automatic recovery cap. Emitted atomically immediately before the
+    /// replacement `BurnIntended` event.
+    ManualBurnReplacementAuthorized {
+        issuer_request_id: IssuerRedemptionRequestId,
+        recovery_id: Uuid,
+        previous_tx_hash: B256,
+        previous_nonce: u64,
+        replacement_tx_hash: B256,
+        replacement_nonce: u64,
+        authorized_at: DateTime<Utc>,
+    },
     BurnPreparationRecoveryExhausted {
         issuer_request_id: IssuerRedemptionRequestId,
         attempts: u32,
@@ -466,6 +479,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnRecoveryExhausted { .. } => {
                 "RedemptionEvent::BurnRecoveryExhausted".to_string()
+            }
+            Self::ManualBurnReplacementAuthorized { .. } => {
+                "RedemptionEvent::ManualBurnReplacementAuthorized".to_string()
             }
             Self::BurnPreparationRecoveryExhausted { .. } => {
                 "RedemptionEvent::BurnPreparationRecoveryExhausted".to_string()
