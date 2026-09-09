@@ -154,7 +154,9 @@ pub fn receipt_inventory_aggregate_id(chain_id: u64, vault: Address) -> String {
 /// Chain ID for the Ethereum test runtime in multichain integration tests.
 pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 
-fn test_config() -> Result<Config, anyhow::Error> {
+/// The default test `Config`; fixtures override fields with struct update
+/// syntax so a new field lands in one place.
+pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
     Ok(Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
