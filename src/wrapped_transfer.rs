@@ -9,13 +9,15 @@
 //! transfers to the admin API. Recovery itself is a manual operation.
 //!
 //! The scan follows the chain head with no confirmation depth, like the
-//! redemption transfer poller: a log read from a block that is later reorged
-//! out leaves a recorded row and a delivered page for a transfer that no
-//! longer exists, and a transaction re-mined above the advanced checkpoint
-//! with a different log index is recorded again under its new identity. Both
-//! are false positives an operator resolves by looking at the chain, which is
-//! the right way round for a backstop whose failure mode must not be a missed
-//! transfer.
+//! redemption transfer poller, so a reorg can go either way. A log read from
+//! a block later reorged out leaves a recorded row and a delivered page for a
+//! transfer that no longer exists, and a transaction re-mined above the
+//! advanced checkpoint under a different log index is recorded again: false
+//! positives an operator resolves by looking at the chain. But a block at or
+//! below the checkpoint that is replaced by one carrying a new inbound
+//! transfer is never re-read, so that transfer is missed: the failure this
+//! backstop exists to prevent. The per-chain finality cutoff that closes it is
+//! RAI-2297.
 //!
 //! Alert dedup is durable: the lifecycle notification is queued under an
 //! idempotency key derived from the log identity, exactly as the
