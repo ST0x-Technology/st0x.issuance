@@ -4710,6 +4710,12 @@ Tiers and routes:
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
+The `burn-excess/internal` route defaults to a dry-run (`execute=false`) and
+returns the proven plan (receipt id, shares, vault, funding log, and the
+on-chain deltas it would burn) in the response body, so an operator reviews the
+exact effect over HTTP before committing with `execute=true` rather than reading
+the process log.
+
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
 validated at startup as all-or-none, non-blank, unpadded, and pairwise distinct.
