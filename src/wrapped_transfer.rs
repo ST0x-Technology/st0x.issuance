@@ -414,8 +414,8 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                     // unreadable checkpoint adds nothing: the token is
                     // already counted as failed.
                     if let Ok(cursor) = self.token_cursor(watched).await {
-                        lag_blocks =
-                            lag_blocks.max(head.saturating_sub(cursor));
+                        lag_blocks = lag_blocks
+                            .max(head.saturating_add(1).saturating_sub(cursor));
                     }
                 }
             }
@@ -537,7 +537,9 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             }
         }
 
-        Ok(head.saturating_sub(cursor))
+        // `cursor` is the next unprocessed block, so the pending count
+        // includes the head itself, as the transfer poller counts it.
+        Ok(head.saturating_add(1).saturating_sub(cursor))
     }
 
     /// Fetches `Transfer` logs of `token` whose `to` is the issuer wallet.

@@ -5199,14 +5199,14 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
   no enabled assets records a success with zero lag, matching the transfer
   poller, so the counter keeps rising to show the loop is alive.
 - **Inbound wrapped-token transfer watcher:** each pass records success or
-  failure in the same shape, with `lag_blocks` the worst per token distance
-  between the chain head and the token's checkpoint at the start of the pass. A
-  pass counts as failed when the head fetch failed, every watched token failed,
-  or every configured token was refused as an enabled vault; a partial token
-  failure keeps the pass successful and surfaces as growing `lag_blocks`,
-  matching the transfer poller. A failed token's own backlog is measured into
-  `lag_blocks` too, so the gauge cannot read healthy while one token stops
-  advancing.
+  failure in the same shape, with `lag_blocks` the worst per token count of
+  blocks still to process at the start of the pass, head included, as the
+  transfer poller counts it. A pass counts as failed when the head fetch failed,
+  every watched token failed, or every configured token was refused as an
+  enabled vault; a partial token failure keeps the pass successful and surfaces
+  as growing `lag_blocks`, matching the transfer poller. A failed token's own
+  backlog is measured into `lag_blocks` too, so the gauge cannot read healthy
+  while one token stops advancing.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 
