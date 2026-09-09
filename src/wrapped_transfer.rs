@@ -832,12 +832,14 @@ pub(crate) enum WrappedTransferPageError {
     PartialCursor,
 }
 
-impl WrappedTransferPage {
-    /// The first page at the default size.
-    pub(crate) const fn first() -> Self {
+/// The first page at the default size.
+impl Default for WrappedTransferPage {
+    fn default() -> Self {
         Self { limit: DEFAULT_WRAPPED_TRANSFER_PAGE, before: None }
     }
+}
 
+impl WrappedTransferPage {
     /// Builds a page from the query parameters a caller supplied, refusing a
     /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE` and a cursor with only
     /// one of its two halves.
@@ -1257,7 +1259,7 @@ mod tests {
 
         let recorded = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::first(),
+            WrappedTransferPage::default(),
         )
         .await
         .unwrap();
@@ -1326,7 +1328,7 @@ mod tests {
 
         let recorded = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::first(),
+            WrappedTransferPage::default(),
         )
         .await
         .unwrap();
@@ -1374,7 +1376,7 @@ mod tests {
 
         let recorded = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::first(),
+            WrappedTransferPage::default(),
         )
         .await
         .unwrap();
@@ -1401,7 +1403,7 @@ mod tests {
         assert!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1471,7 +1473,7 @@ mod tests {
         assert!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1680,7 +1682,7 @@ mod tests {
         assert_eq!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1714,7 +1716,7 @@ mod tests {
         assert!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1801,7 +1803,7 @@ mod tests {
         assert_eq!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1830,7 +1832,7 @@ mod tests {
         assert_eq!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1909,7 +1911,7 @@ mod tests {
         assert_eq!(
             list_inbound_wrapped_transfers(
                 &harness.pool,
-                WrappedTransferPage::first()
+                WrappedTransferPage::default()
             )
             .await
             .unwrap()
@@ -1993,7 +1995,7 @@ mod tests {
 
         let listed = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::first(),
+            WrappedTransferPage::default(),
         )
         .await
         .unwrap();
@@ -2119,7 +2121,7 @@ mod tests {
 
         let error = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::first(),
+            WrappedTransferPage::default(),
         )
         .await
         .unwrap_err();

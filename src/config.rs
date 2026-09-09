@@ -572,7 +572,7 @@ impl Env {
             .filter(|network| {
                 chains.iter().all(|chain| chain.network != *network)
             })
-            .min_by_key(|network| network.as_str())
+            .min_by_key(Network::as_str)
         {
             return Err(ConfigError::WrappedTokensForUnconfiguredNetwork {
                 network,
