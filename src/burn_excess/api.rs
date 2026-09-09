@@ -18,6 +18,7 @@ use rocket::{State, post};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::time::Duration;
 use tracing::{error, warn};
 
 use super::cli::parse_shares;
@@ -32,6 +33,12 @@ use crate::mint::IssuerMintRequestId;
 use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
 use crate::vault::NetworkVaultServices;
+
+/// Caps how long the external burn holds the network's transfer poller paused.
+/// A hung provider or vault call must not stop redemption detection until the
+/// process restarts; on elapse the guard drops and the poller resumes. Chosen
+/// above the expected broadcast-and-confirm window.
+const BURN_EXCESS_EXTERNAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An 18-decimal fixed-point share amount parsed from its decimal-string wire
 /// form at deserialize time, so an invalid or over-precise quantity is refused
@@ -277,17 +284,34 @@ pub(crate) async fn burn_excess_external_ops(
 
     // Quiesce the poller before the exclusion write so it cannot open a
     // spurious Redemption for the funding Transfer. The guard resumes the
-    // poller on success, error, and panic paths alike.
-    let _guard = control.pause().await;
+    // poller on success, error, timeout, and panic paths alike; a poller that
+    // will not confirm parked is a 503 rather than an unprotected burn.
+    let _guard = control.pause().await.map_err(|error| {
+        warn!(target: "admin", network = %body.network, %error,
+            "burn-excess external: poller not quiesced; refusing to run"
+        );
+        Status::ServiceUnavailable
+    })?;
 
-    run_burn_excess_ops(
-        pool.inner(),
-        config,
-        vault_services,
-        request,
-        "external",
+    // Bound the paused window: a hung provider/vault call must not keep the
+    // poller stopped indefinitely. On elapse the guard drops and resumes it.
+    tokio::time::timeout(
+        BURN_EXCESS_EXTERNAL_TIMEOUT,
+        run_burn_excess_ops(
+            pool.inner(),
+            config,
+            vault_services,
+            request,
+            "external",
+        ),
     )
     .await
+    .map_err(|_| {
+        error!(target: "admin", network = %body.network,
+            "burn-excess (external) timed out; poller resumed"
+        );
+        Status::GatewayTimeout
+    })?
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a
