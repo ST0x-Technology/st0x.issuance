@@ -27,13 +27,12 @@
 //! truth that drifts, and would defeat the point, which is that granting an
 //! operator access to a tier is a Workspace admin console change.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use rocket::http::Status;
 use rocket::request::Request;
 use serde::Deserialize;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
