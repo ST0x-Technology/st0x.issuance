@@ -4,14 +4,14 @@
 //! service: the orchestrator address from `[orchestrator.addresses]`, the
 //! wallet from the Turnkey signer, the RPC from the per-network environment.
 
-use std::str::FromStr;
-
+use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get, post};
 use serde::Serialize;
 use sqlx::{Pool, Sqlite};
+use std::str::FromStr;
 use tracing::{error, info, warn};
 use url::Url;
 
@@ -39,7 +39,7 @@ pub(crate) async fn orchestrator_preflight_ops(
     asset: Vec<String>,
 ) -> Result<Json<PreflightResponse>, Status> {
     let network = parse_network(network)?;
-    let (orchestrator, bot, rpc_url, _chain_id, _turnkey) =
+    let OrchestratorContext { orchestrator, bot, rpc_url, .. } =
         resolve_orchestrator_context(config.inner(), network).await?;
 
     let filter = parse_assets(&asset)?;
@@ -96,7 +96,7 @@ pub(crate) async fn orchestrator_verify_signing_ops(
 ) -> Result<Json<VerifySigningResponse>, Status> {
     let network = parse_network(network)?;
     let symbol = parse_underlying(underlying)?;
-    let (orchestrator, bot, rpc_url, chain_id, turnkey) =
+    let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network).await?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
@@ -169,7 +169,7 @@ pub(crate) async fn orchestrator_approve_ops(
 ) -> Result<Json<ApproveResponse>, Status> {
     let network = parse_network(network)?;
     let symbol = parse_underlying(underlying)?;
-    let (orchestrator, bot, rpc_url, chain_id, turnkey) =
+    let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network).await?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
@@ -314,23 +314,23 @@ pub(crate) struct ApproveResponse {
     tx_hash: Option<String>,
 }
 
-/// Resolves the orchestrator address, Turnkey bot wallet, service RPC, and
-/// RPC-verified chain id for `network`, or the HTTP status to fail with. The
-/// returned Turnkey config is what the signing verbs pass to
-/// [`resolve_turnkey_signer`].
+/// Resolved inputs for the orchestrator ops: the orchestrator address, the
+/// Turnkey bot wallet, the service RPC, the RPC-verified chain id, and the
+/// Turnkey config the signing verbs pass to [`resolve_turnkey_signer`].
+struct OrchestratorContext<'a> {
+    orchestrator: Address,
+    bot: Address,
+    rpc_url: Url,
+    chain_id: u64,
+    turnkey: &'a TurnkeyConfig,
+}
+
+/// Resolves the orchestrator context for `network`, or the HTTP status to fail
+/// with.
 async fn resolve_orchestrator_context(
     config: &Config,
     network: Network,
-) -> Result<
-    (
-        alloy::primitives::Address,
-        alloy::primitives::Address,
-        Url,
-        u64,
-        &TurnkeyConfig,
-    ),
-    Status,
-> {
+) -> Result<OrchestratorContext<'_>, Status> {
     let orchestrator = config
         .vault_mode_config
         .orchestrator_address_for(network)
@@ -365,7 +365,7 @@ async fn resolve_orchestrator_context(
             Status::BadGateway
         })?;
 
-    Ok((orchestrator, bot, rpc_url, chain_id, turnkey))
+    Ok(OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey })
 }
 
 fn parse_network(network: &str) -> Result<Network, Status> {
