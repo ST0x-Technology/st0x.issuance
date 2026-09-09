@@ -61,9 +61,9 @@ use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
 /// Interval between polling passes once a watcher is caught up. Inbound
 /// wrapped-token transfers are rare and the alert is not latency critical, so
-/// one `eth_getLogs` per token per minute is plenty.
+/// one `eth_getLogs` per token every ten minutes is plenty.
 pub(crate) const WRAPPED_TRANSFER_POLL_INTERVAL: Duration =
-    Duration::from_secs(60);
+    Duration::from_secs(600);
 
 /// Interval between retries when a polling pass fails (e.g. RPC error).
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -337,7 +337,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
 
                 // Once per token per process: the misconfiguration is
                 // permanent until an operator changes the config, and a pass
-                // runs every minute.
+                // runs every ten minutes.
                 if self.refused.lock().insert(candidate.token) {
                     error!(
                         target: "wrapped_transfer",
