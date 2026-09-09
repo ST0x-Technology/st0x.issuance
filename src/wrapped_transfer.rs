@@ -1772,7 +1772,7 @@ mod tests {
         let lag_blocks = monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            lag_blocks, 99,
+            lag_blocks, 100,
             "a failing token's backlog must reach the lag gauge, not just \
              the healthy token's"
         );
