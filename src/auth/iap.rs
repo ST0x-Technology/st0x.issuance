@@ -34,7 +34,7 @@ use serde::Deserialize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::OpsApiConfig;
 
@@ -372,11 +372,11 @@ impl IapVerifier {
 
     async fn refresh(&self, kid: &str) -> Result<(), IapError> {
         // Another task may have refreshed while this one was on its way here.
-        // Read coldness in the same pass: the throttle branch below needs it,
-        // and reading it there would put an await under the attempt guard (a
-        // std Mutex, which must never be held across an await; the future would
-        // not even be Send).
-        let cache_is_cold = {
+        // Read whether the retained set already holds this kid in the same
+        // pass: the throttle branch below needs it, and reading it there would
+        // put an await under the attempt guard (a std Mutex, which must never
+        // be held across an await; the future would not even be Send).
+        let kid_retained = {
             let guard = self.keys.read().await;
             if let Some(cached) = guard.as_ref()
                 && cached.fetched_at.elapsed() <= JWKS_TTL
@@ -384,7 +384,9 @@ impl IapVerifier {
             {
                 return Ok(());
             }
-            guard.is_none()
+            guard.as_ref().is_some_and(|cached| {
+                cached.keys.iter().any(|(id, _)| id == kid)
+            })
         };
 
         // Claim the single refresh slot or yield to the floor: one outbound
@@ -400,13 +402,21 @@ impl IapVerifier {
             if attempt
                 .is_some_and(|at| at.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL)
             {
-                // Throttled. With retained keys the caller's follow-up lookup
-                // serves them; with a cold cache there is nothing to judge
-                // against, which is the KeysUnavailable case, not a claim that
-                // the token's key is unknown. (`cache_is_cold` is a few
-                // instructions stale; the worst case is one 503 for a request
-                // racing the cache warming, healed on its retry.)
-                if cache_is_cold {
+                // Throttled: one outbound fetch per interval. If the retained
+                // set already holds this kid, the caller's follow-up lookup
+                // serves it (a stale key is still Google's). If it does not - a
+                // cold cache, or a rotation whose new kid an in-flight refresh
+                // may be adding - a follow-up lookup would yield UnknownKey, a
+                // 401 telling the caller to re-authenticate, which cannot help.
+                // Report KeysUnavailable (503) so it retries instead.
+                // (`kid_retained` is a few instructions stale; the worst case is
+                // one 503 for a request racing the cache warming, healed on its
+                // retry.)
+                if !kid_retained {
+                    debug!(
+                        target: "auth", tier = self.tier.as_str(), kid,
+                        "IAP signing key not yet retained while refresh throttled; reporting unavailable"
+                    );
                     return Err(IapError::KeysUnavailable);
                 }
                 return Ok(());
@@ -915,6 +925,44 @@ mod tests {
         assert!(logs_contain_at!(
             Level::WARN,
             &["IAP assertion names an unknown key"]
+        ));
+    }
+
+    /// A rotation race must not 401 a valid token. When a concurrent request
+    /// has claimed the single refresh slot and this one names a kid the
+    /// retained set does not carry yet, report KeysUnavailable (503, retryable)
+    /// rather than UnknownKey (401, which tells the caller to re-authenticate
+    /// and cannot help while the new key is still being fetched).
+    #[traced_test]
+    #[tokio::test]
+    async fn an_absent_kid_during_a_throttled_refresh_is_unavailable() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+        let iap = verifier(READ_AUDIENCE, &jwks);
+
+        // A warm cache holding the current key, with the single refresh slot
+        // already claimed by an in-flight request this interval.
+        let decoding = DecodingKey::from_ec_components(&key.x, &key.y)
+            .expect("test key converts");
+        *iap.keys.write().await = Some(CachedKeys {
+            keys: vec![(TEST_KID.to_string(), decoding)],
+            fetched_at: Instant::now(),
+        });
+        *iap.last_refresh_attempt.lock().expect("not poisoned") =
+            Some(Instant::now());
+
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("rotated-in".to_string());
+        let error = iap
+            .verify(&token_with_header(&key, &header, READ_AUDIENCE))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, IapError::KeysUnavailable), "got: {error:?}");
+        assert_eq!(error.status(), Status::ServiceUnavailable);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["not yet retained while refresh throttled"]
         ));
     }
 }
