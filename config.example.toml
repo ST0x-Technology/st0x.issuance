@@ -40,7 +40,8 @@ vault_mode = "orchestrator"
 # configured chain with no table here has wrapped-token watching disabled
 # (startup WARN). Unknown networks, invalid symbols, malformed or zero
 # addresses, and one address bound to two symbols on a chain are startup
-# errors.
+# errors. This example lists every chain the bot can run; remove the table for
+# any chain this deployment does not configure, or startup fails.
 [wrapped_tokens.base]
 RKLB = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
