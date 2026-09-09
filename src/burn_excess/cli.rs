@@ -147,7 +147,7 @@ pub(crate) async fn run_burn_excess_cli(
 
     let signer_config = shared.signer.into_config()?;
 
-    println!("Using database: {}", shared.database_url);
+    eprintln!("Using database: {}", shared.database_url);
     let pool =
         connect_pool(&shared.database_url, shared.database_max_connections)
             .await?;
