@@ -4705,22 +4705,27 @@ Tiers and routes:
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
 - **breakglass** (`/ops/breakglass/*`): `force-complete/redemption/<id>`,
-  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`.
+  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
+  `burn-excess/external`.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
-The `burn-excess/internal` route responds with `{ executed, outcome }`:
-`executed` echoes whether a mutation was requested, and `outcome` is a tagged
-`plan`, `terminal`, or `close` view. A dry-run (`execute=false`) returns a
-`plan` so an operator reviews the exact effect over HTTP before committing with
+Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
+echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
+`terminal`, or `close` view. A dry-run (`execute=false`) returns a `plan` so an
+operator reviews the exact effect over HTTP before committing with
 `execute=true` rather than reading the process log. In `outcome.plan`, the
 `bind` object carries the receipt id, shares, vault, original recipient, and
 issuer wallet, and `dry_run` reports whether the plan ran. The optional
 `funding_log`, `resume_note`, `freeze_advisory`, and `precondition` fields
 appear only when they apply (an internal plan omits `funding_log`) and are
 omitted rather than sent as null. An already-terminal stream returns a
-`terminal` view and a close returns a `close` view.
+`terminal` view and a close returns a `close` view. `burn-excess/external` also
+records a funding-Transfer exclusion the live redemption transfer poller would
+otherwise read as an AP redemption, so it quiesces that network's poller (the
+current tick finished, no new one started) for the run and resumes it on every
+exit path.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
@@ -4732,8 +4737,8 @@ implies the path exists and wants credentials).
 The IAP layer is a second gate. It refuses a request that reached the VM from
 inside the VPC without passing IAP, rather than trusting the network; it does
 not itself decide who may do what, which is group membership evaluated by IAP
-against each backend's IAM policy. `burn-excess external`, `move-receipts`, and
-`confirm-custody` stay offline `issuer` CLI verbs.
+against each backend's IAM policy. `move-receipts` and `confirm-custody` stay
+offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 
