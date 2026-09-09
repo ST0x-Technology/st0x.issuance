@@ -10,7 +10,7 @@ use std::io;
 use std::str::FromStr;
 use url::Url;
 
-use super::engine::{BurnExcessRequest, run_burn_excess};
+use super::engine::{BurnExcessOutcome, BurnExcessRequest, run_burn_excess};
 use super::proof::BurnExcessMode;
 use crate::Quantity;
 use crate::config::{
@@ -167,7 +167,11 @@ pub(crate) async fn run_burn_excess_cli(
         close: shared.close,
     };
 
-    run_burn_excess_request(&pool, &signer_config, request, confirm).await
+    let outcome =
+        run_burn_excess_request(&pool, &signer_config, request, confirm)
+            .await?;
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    Ok(())
 }
 
 /// Builds the signing and read providers for `request.network` from the service
@@ -179,7 +183,7 @@ async fn run_burn_excess_request(
     signer_config: &SignerConfig,
     request: BurnExcessRequest,
     confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BurnExcessOutcome> {
     let rpc_url = configured_rpc_url(request.network)?;
     let chain_id = verified_chain_id(&rpc_url, request.chain_id).await?;
     let issuer_wallet = signer_config.address()?;
