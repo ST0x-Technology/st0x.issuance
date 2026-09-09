@@ -2066,13 +2066,25 @@ mod tests {
             Some(orch_address())
         );
 
+        // The example shows the multichain shape: every chain the bot can
+        // run has an orchestrator address and a wrapper table.
         let wrapped = resolve_wrapped_tokens(&toml_file).unwrap();
-        let watched = wrapped.watched_on(Network::Base);
-        assert_eq!(watched.len(), 1, "the example must list one Base wrapper");
-        assert_eq!(
-            watched[0].underlying,
-            UnderlyingSymbol::new("RKLB").unwrap()
-        );
+        for network in [Network::Base, Network::Ethereum, Network::HyperEvm] {
+            assert!(
+                cfg.orchestrator_address_for(network).is_some(),
+                "the example must carry an orchestrator address for {network}"
+            );
+            let watched = wrapped.watched_on(network);
+            assert_eq!(
+                watched.len(),
+                1,
+                "the example must list one wrapper on {network}"
+            );
+            assert_eq!(
+                watched[0].underlying,
+                UnderlyingSymbol::new("RKLB").unwrap()
+            );
+        }
     }
 
     #[test]

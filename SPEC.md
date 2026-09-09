@@ -4908,6 +4908,8 @@ default_vault_mode = "vault_direct"
 # network keys and missing, malformed, or zero addresses.
 [orchestrator.addresses]
 base = "0x..."
+ethereum = "0x..."
+hyperevm = "0x..."
 
 # Per-asset override, keyed by underlying symbol. During the pilot exactly one
 # asset carries this; every other asset stays on the default.
@@ -4921,6 +4923,12 @@ vault_mode = "orchestrator"
 # listed network must have a chain configuration; a configured chain with no
 # table here has wrapped-token watching disabled (startup WARN).
 [wrapped_tokens.base]
+RKLB = "0x..."
+
+[wrapped_tokens.ethereum]
+RKLB = "0x..."
+
+[wrapped_tokens.hyperevm]
 RKLB = "0x..."
 ```
 

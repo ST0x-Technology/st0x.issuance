@@ -22,6 +22,8 @@ default_vault_mode = "vault_direct"
 # unknown-network entry is a startup error).
 [orchestrator.addresses]
 base = "0x1234567890abcdef1234567890abcdef12345678"
+ethereum = "0x2222222222222222222222222222222222222222"
+hyperevm = "0x3333333333333333333333333333333333333333"
 
 # Per-asset override, keyed by underlying symbol. The mode is keyed by symbol
 # alone — it applies on every network the asset is listed on; the address is
@@ -41,3 +43,9 @@ vault_mode = "orchestrator"
 # errors.
 [wrapped_tokens.base]
 RKLB = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+
+[wrapped_tokens.ethereum]
+RKLB = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[wrapped_tokens.hyperevm]
+RKLB = "0xcccccccccccccccccccccccccccccccccccccccc"
