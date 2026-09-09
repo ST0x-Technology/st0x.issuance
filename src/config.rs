@@ -5,7 +5,7 @@ use alloy::primitives::{
 use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{Level, warn};
@@ -1141,9 +1141,13 @@ pub(crate) fn load_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
 fn resolve_wrapped_tokens(
     toml: &TomlFile,
 ) -> Result<WrappedTokenConfig, ConfigError> {
+    // Both maps are `HashMap`s, so walk them in key order: which invalid
+    // table or entry surfaces first must not change from one boot to the next.
     let entries = toml
         .wrapped_tokens
         .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
         .map(|(network_key, tokens)| {
             let network = network_key.parse::<Network>().map_err(|_| {
                 ConfigError::UnknownWrappedTokenNetwork {
@@ -1153,6 +1157,8 @@ fn resolve_wrapped_tokens(
 
             tokens
                 .iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
                 .map(|(symbol, value)| {
                     let underlying =
                         UnderlyingSymbol::new(symbol.to_ascii_uppercase())
@@ -2476,8 +2482,13 @@ mod tests {
 
     #[test]
     fn wrapped_tokens_unknown_network_table_is_startup_error() {
+        // Two unknown tables: the error names the first in key order, so the
+        // startup message does not change from one boot to the next.
         let toml: TomlFile = toml::from_str(
             r#"
+            [wrapped_tokens.solana]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+
             [wrapped_tokens.polygon]
             RKLB = "0x00000000000000000000000000000000000000ee"
             "#,
