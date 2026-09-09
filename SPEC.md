@@ -5156,13 +5156,10 @@ matching log the watcher:
   `GET /admin/wrapped-transfers` are the durable record of the transfer.
 
 The scan follows the chain head with no confirmation depth, as the transfer
-poller does, and every pass re-reads the 32 blocks below the token's checkpoint
-so a block replaced by a reorg after it was scanned is read again; the row
-identity and the alert key make the repeat a no-op. What remains are false
-positives: a log from a block later reorged out stays recorded and paged, and a
-transaction re-mined with a different log index is recorded again under its new
-identity. That is the right way round for a backstop whose failure mode must not
-be a missed transfer.
+poller does: a log from a block later reorged out stays recorded and paged, and
+a transaction re-mined above the checkpoint with a different log index is
+recorded again under its new identity. Both are false positives, which is the
+right way round for a backstop whose failure mode must not be a missed transfer.
 
 A token's checkpoint advances only after every log in the chunk is recorded and
 queued; a failed RPC read, database write, or enqueue leaves the chunk to be

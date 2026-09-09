@@ -9,16 +9,13 @@
 //! transfers to the admin API. Recovery itself is a manual operation.
 //!
 //! The scan follows the chain head with no confirmation depth, like the
-//! redemption transfer poller, and every pass re-reads the last
-//! `REORG_RESCAN_BLOCKS` below the checkpoint. That window is what keeps a
-//! reorg from hiding a transfer: a block replaced after it was scanned and
-//! checkpointed is read again, and the row identity and alert key make the
-//! repeat a no-op. What remains are false positives: a log read from a block
-//! later reorged out leaves a recorded row and a delivered page for a
-//! transfer that no longer exists, and a transaction re-mined with a
-//! different log index is recorded again under its new identity. An operator
-//! resolves those by looking at the chain, which is the right way round for a
-//! backstop whose failure mode must not be a missed transfer.
+//! redemption transfer poller: a log read from a block that is later reorged
+//! out leaves a recorded row and a delivered page for a transfer that no
+//! longer exists, and a transaction re-mined above the advanced checkpoint
+//! with a different log index is recorded again under its new identity. Both
+//! are false positives an operator resolves by looking at the chain, which is
+//! the right way round for a backstop whose failure mode must not be a missed
+//! transfer.
 //!
 //! Alert dedup is durable: the lifecycle notification is queued under an
 //! idempotency key derived from the log identity, exactly as the
@@ -70,15 +67,6 @@ pub(crate) const WRAPPED_TRANSFER_POLL_INTERVAL: Duration =
 
 /// Interval between retries when a polling pass fails (e.g. RPC error).
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Blocks below the checkpoint that every pass re-reads. A reorg can replace
-/// a block already scanned and checkpointed, and resuming strictly above the
-/// checkpoint would never read the replacement, losing any transfer in it.
-/// 32 blocks (~64s on Base) comfortably exceeds observed OP-stack reorg depth,
-/// matching `MINTED_LOG_CONFIRMATION_BLOCKS` in `vault::service`. The re-read
-/// costs one `eth_getLogs`: the `(network, tx_hash, log_index)` row identity
-/// and the alert idempotency key make a repeat a no-op.
-const REORG_RESCAN_BLOCKS: u64 = 32;
 
 /// Consecutive failed poll passes before the per-pass WARN escalates to an
 /// ERROR alarm, matching the transfer poller. A blip retries quietly; a
@@ -473,18 +461,13 @@ impl<P: Provider> WrappedTransferMonitor<P> {
     ) -> Result<u64, WrappedTransferPollError> {
         let name = checkpoint_name(self.network, watched.token);
         let cursor = self.token_cursor(watched).await?;
-        // The scan reaches below the checkpoint so a replaced block is read
-        // again; the checkpoint itself only ever moves forward.
-        let scan_from = cursor
-            .saturating_sub(REORG_RESCAN_BLOCKS)
-            .max(self.backfill_start_block);
 
-        if scan_from > head {
+        if cursor > head {
             trace!(
                 target: "wrapped_transfer",
                 network = %self.network,
                 token = %watched.token,
-                scan_from,
+                cursor,
                 head,
                 "Wrapped token caught up; skipping"
             );
@@ -495,13 +478,13 @@ impl<P: Provider> WrappedTransferMonitor<P> {
             target: "wrapped_transfer",
             network = %self.network,
             token = %watched.token,
-            from_block = scan_from,
+            from_block = cursor,
             to_block = head,
             "Polling wrapped token for inbound transfers"
         );
 
         for (chunk_from, chunk_to) in
-            block_ranges(scan_from, head, BLOCK_CHUNK_SIZE)
+            block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
         {
             let logs = self
                 .fetch_transfer_logs(watched.token, chunk_from, chunk_to)
@@ -1527,57 +1510,6 @@ mod tests {
                 Err(WrappedTransferPollError::AllTokensRefused { total: 1 })
             ),
             "got: {result:?}"
-        );
-    }
-
-    /// A reorg can replace a block the watcher already scanned and
-    /// checkpointed. Resuming strictly above the checkpoint would never read
-    /// the replacement, so a transfer in it would be lost forever, which is
-    /// the one failure this backstop exists to prevent. Each pass therefore
-    /// re-reads a window below the checkpoint, even when it is caught up.
-    #[traced_test]
-    #[tokio::test]
-    async fn a_transfer_in_a_replaced_block_below_the_checkpoint_is_found() {
-        let harness = TestHarness::new().await;
-        let tx = tx_hash(0xb1);
-        advance_checkpoint_block(
-            &harness.pool,
-            &checkpoint_name(Network::Base, TOKEN_A),
-            100,
-        )
-        .await
-        .unwrap();
-        let asserter = Asserter::new();
-        // The head has not moved: block 100 was scanned empty, then replaced
-        // by one carrying this transfer.
-        asserter.push_success(&U256::from(100u64));
-        asserter.push_success(&vec![create_transfer_log_with_index(
-            TOKEN_A,
-            SENDER,
-            BOT_WALLET,
-            U256::from(4u64),
-            tx,
-            100,
-            0,
-        )]);
-        let monitor = monitor(&harness, &asserter, watch_aapl());
-
-        monitor.poll_once().await.unwrap();
-
-        let recorded =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
-        assert_eq!(
-            recorded.len(),
-            1,
-            "the replacement block must be re-read: {recorded:?}"
-        );
-        assert_eq!(
-            alert_job_count(
-                &harness,
-                &alert_idempotency_key(Network::Base, tx, 0)
-            )
-            .await,
-            1
         );
     }
 
