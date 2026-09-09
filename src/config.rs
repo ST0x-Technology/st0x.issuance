@@ -565,9 +565,15 @@ impl Env {
         // A wrapped-token table for a chain this deployment does not run
         // would be silently unwatched — the exact gap the watcher closes —
         // so it is a deploy error here rather than a missing alert later.
-        if let Some(network) = wrapped_tokens.networks().find(|network| {
-            chains.iter().all(|chain| chain.network != *network)
-        }) {
+        // `networks()` iterates a `HashMap`, so pick the offending chain in
+        // wire-name order to keep the startup error deterministic.
+        if let Some(network) = wrapped_tokens
+            .networks()
+            .filter(|network| {
+                chains.iter().all(|chain| chain.network != *network)
+            })
+            .min_by_key(|network| network.as_str())
+        {
             return Err(ConfigError::WrappedTokensForUnconfiguredNetwork {
                 network,
             });
@@ -1135,31 +1141,43 @@ pub(crate) fn load_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
 fn resolve_wrapped_tokens(
     toml: &TomlFile,
 ) -> Result<WrappedTokenConfig, ConfigError> {
-    let mut entries = Vec::new();
-
-    for (network_key, tokens) in &toml.wrapped_tokens {
-        let network = network_key.parse::<Network>().map_err(|_| {
-            ConfigError::UnknownWrappedTokenNetwork { key: network_key.clone() }
-        })?;
-
-        for (symbol, value) in tokens {
-            let underlying = UnderlyingSymbol::new(symbol.to_ascii_uppercase())
-                .map_err(|error| ConfigError::InvalidWrappedTokenSymbol {
-                    network,
-                    symbol: symbol.clone(),
-                    error,
-                })?;
-            let token = value.parse::<Address>().map_err(|_| {
-                ConfigError::InvalidWrappedTokenAddress {
-                    network,
-                    underlying: underlying.clone(),
-                    value: value.clone(),
+    let entries = toml
+        .wrapped_tokens
+        .iter()
+        .map(|(network_key, tokens)| {
+            let network = network_key.parse::<Network>().map_err(|_| {
+                ConfigError::UnknownWrappedTokenNetwork {
+                    key: network_key.clone(),
                 }
             })?;
 
-            entries.push(WrappedTokenEntry { network, underlying, token });
-        }
-    }
+            tokens
+                .iter()
+                .map(|(symbol, value)| {
+                    let underlying =
+                        UnderlyingSymbol::new(symbol.to_ascii_uppercase())
+                            .map_err(|error| {
+                                ConfigError::InvalidWrappedTokenSymbol {
+                                    network,
+                                    symbol: symbol.clone(),
+                                    error,
+                                }
+                            })?;
+                    let token = value.parse::<Address>().map_err(|_| {
+                        ConfigError::InvalidWrappedTokenAddress {
+                            network,
+                            underlying: underlying.clone(),
+                            value: value.clone(),
+                        }
+                    })?;
+
+                    Ok(WrappedTokenEntry { network, underlying, token })
+                })
+                .collect::<Result<Vec<_>, ConfigError>>()
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?
+        .into_iter()
+        .flatten();
 
     Ok(WrappedTokenConfig::new(entries)?)
 }
@@ -2534,12 +2552,17 @@ mod tests {
 
     /// A wrapped-token table for a chain the deployment does not run would
     /// be silently unwatched, which is the exact gap this feature closes.
+    /// With two such tables the error names the first in wire-name order,
+    /// so the startup message does not change from one run to the next.
     #[test]
     fn wrapped_tokens_for_unconfigured_network_is_startup_error() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
             r#"
+            [wrapped_tokens.hyperevm]
+            RKLB = "0x00000000000000000000000000000000000000ee"
+
             [wrapped_tokens.ethereum]
             RKLB = "0x00000000000000000000000000000000000000ee"
             "#,
