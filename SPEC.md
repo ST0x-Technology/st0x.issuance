@@ -4830,11 +4830,17 @@ operator can see what needs manual recovery without log access.
 
 **Endpoint:** `GET /admin/wrapped-transfers`
 
-Returns `{"transfers": [...]}`, highest block first, each row carrying
-`network`, `underlying`, `token` (the wrapped-token contract), `from`, `amount`
-(the raw ERC-20 amount as a decimal string, in the wrapper's own base units),
-`tx_hash`, `log_index`, `block_number`, and `detected_at`. Rows are durable:
-they survive restarts and the service never removes them.
+Returns `{"transfers": [...]}`, one page at a time, highest block first. `limit`
+(1 to 1000, default 100) bounds the page, since the table only grows and nothing
+deletes from it; `before_block` and `before_log_index`, given together as the
+last row of the previous page, select the next page by the
+`(block_number,
+log_index)` order so a boundary inside a block skips nothing. A
+limit out of range or a half cursor is a 422. Each row carries `network`,
+`underlying`, `token` (the wrapped-token contract), `from`, `amount` (the raw
+ERC-20 amount as a decimal string, in the wrapper's own base units), `tx_hash`,
+`log_index`, `block_number`, and `detected_at`. Rows are durable: they survive
+restarts and the service never removes them.
 
 ## Configuration
 

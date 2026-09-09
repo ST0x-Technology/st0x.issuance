@@ -805,10 +805,74 @@ pub(crate) enum RecordInboundWrappedTransferError {
     Int(#[from] TryFromIntError),
 }
 
-/// Every recorded inbound wrapped-token transfer, highest block first.
+/// Rows per page when the caller does not say.
+pub(crate) const DEFAULT_WRAPPED_TRANSFER_PAGE: u32 = 100;
+
+/// Largest page a caller may ask for: the table only grows and nothing
+/// deletes from it, so an unbounded read would serialize the whole history.
+pub(crate) const MAX_WRAPPED_TRANSFER_PAGE: u32 = 1000;
+
+/// One page of the recorded transfers, newest first. `before` is the
+/// `(block_number, log_index)` of the last row of the previous page; rows are
+/// ordered by that pair, so a cursor on the pair alone cannot skip the rest of
+/// a block the previous page ended inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WrappedTransferPage {
+    limit: u32,
+    before: Option<(u64, u64)>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum WrappedTransferPageError {
+    #[error(
+        "limit must be between 1 and {MAX_WRAPPED_TRANSFER_PAGE}, got {limit}"
+    )]
+    LimitOutOfRange { limit: u32 },
+    #[error("before_block and before_log_index must be given together")]
+    PartialCursor,
+}
+
+impl WrappedTransferPage {
+    /// The first page at the default size.
+    pub(crate) const fn first() -> Self {
+        Self { limit: DEFAULT_WRAPPED_TRANSFER_PAGE, before: None }
+    }
+
+    /// Builds a page from the query parameters a caller supplied, refusing a
+    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE` and a cursor with only
+    /// one of its two halves.
+    pub(crate) fn new(
+        limit: Option<u32>,
+        before_block: Option<u64>,
+        before_log_index: Option<u64>,
+    ) -> Result<Self, WrappedTransferPageError> {
+        let limit = limit.unwrap_or(DEFAULT_WRAPPED_TRANSFER_PAGE);
+        if limit == 0 || limit > MAX_WRAPPED_TRANSFER_PAGE {
+            return Err(WrappedTransferPageError::LimitOutOfRange { limit });
+        }
+
+        let before = match (before_block, before_log_index) {
+            (None, None) => None,
+            (Some(block), Some(log_index)) => Some((block, log_index)),
+            _ => return Err(WrappedTransferPageError::PartialCursor),
+        };
+
+        Ok(Self { limit, before })
+    }
+}
+
+/// One page of recorded inbound wrapped-token transfers, highest block first.
 pub(crate) async fn list_inbound_wrapped_transfers(
     pool: &Pool<Sqlite>,
+    page: WrappedTransferPage,
 ) -> Result<Vec<InboundWrappedTransfer>, InboundWrappedTransferReadError> {
+    let (before_block, before_log_index) = match page.before {
+        Some((block, log_index)) => {
+            (Some(i64::try_from(block)?), Some(i64::try_from(log_index)?))
+        }
+        None => (None, None),
+    };
+
     let rows = sqlx::query_as::<
         _,
         (String, String, i64, String, String, String, String, i64, String),
@@ -825,9 +889,17 @@ pub(crate) async fn list_inbound_wrapped_transfers(
             block_number,
             detected_at
         FROM inbound_wrapped_transfers
+        WHERE
+            ?1 IS NULL
+            OR block_number < ?1
+            OR (block_number = ?1 AND log_index < ?2)
         ORDER BY block_number DESC, log_index DESC
+        LIMIT ?3
         ",
     )
+    .bind(before_block)
+    .bind(before_log_index)
+    .bind(i64::from(page.limit))
     .fetch_all(pool)
     .await?;
 
@@ -962,7 +1034,8 @@ mod tests {
     use super::{
         InboundWrappedTransfer, InboundWrappedTransferReadError,
         WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
-        WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPollError,
+        WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPage,
+        WrappedTransferPageError, WrappedTransferPollError,
         alert_idempotency_key, checkpoint_name, list_inbound_wrapped_transfers,
         record_inbound_wrapped_transfer,
     };
@@ -1182,8 +1255,12 @@ mod tests {
 
         monitor.poll_once().await.unwrap();
 
-        let recorded =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::first(),
+        )
+        .await
+        .unwrap();
         assert_eq!(recorded.len(), 1, "exactly one row: {recorded:?}");
         let detected_at = recorded[0].detected_at;
         assert!(
@@ -1247,8 +1324,12 @@ mod tests {
         monitor.poll_once().await.unwrap();
         monitor.poll_once().await.unwrap();
 
-        let recorded =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::first(),
+        )
+        .await
+        .unwrap();
         assert_eq!(recorded.len(), 1, "one row after a re-scan: {recorded:?}");
         assert_eq!(
             alert_job_count(
@@ -1291,8 +1372,12 @@ mod tests {
 
         monitor.poll_once().await.unwrap();
 
-        let recorded =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::first(),
+        )
+        .await
+        .unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].from, Address::ZERO);
     }
@@ -1314,10 +1399,13 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert!(
-            list_inbound_wrapped_transfers(&harness.pool)
-                .await
-                .unwrap()
-                .is_empty(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "a zero-value transfer must not be recorded"
         );
         assert_eq!(
@@ -1381,10 +1469,13 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert!(
-            list_inbound_wrapped_transfers(&harness.pool)
-                .await
-                .unwrap()
-                .is_empty(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "neither log belongs to the watched token and wallet"
         );
         assert_eq!(checkpoint(&harness).await, Some(200));
@@ -1404,7 +1495,10 @@ mod tests {
         ));
         assert!(!logs_contain_at!(
             Level::WARN,
-            &["Dropped unidentifiable wrapped-token transfer logs"]
+            &[
+                "Dropped unidentifiable wrapped-token transfer logs",
+                &format!("{:?}", tx_hash(0xa7)),
+            ]
         ));
         assert!(logs_contain_at!(
             Level::DEBUG,
@@ -1584,7 +1678,13 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .len(),
             1,
             "the token must still be scanned"
         );
@@ -1612,10 +1712,13 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert!(
-            list_inbound_wrapped_transfers(&harness.pool)
-                .await
-                .unwrap()
-                .is_empty()
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
         assert_eq!(checkpoint(&harness).await, Some(200));
         assert!(logs_contain_at!(
@@ -1696,7 +1799,13 @@ mod tests {
             "got: {result:?}"
         );
         assert_eq!(
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .len(),
             1
         );
         assert_eq!(checkpoint(&harness).await, None);
@@ -1719,7 +1828,13 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .len(),
             1,
             "the re-read must not duplicate the row"
         );
@@ -1792,7 +1907,13 @@ mod tests {
              the healthy token's"
         );
         assert_eq!(
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::first()
+            )
+            .await
+            .unwrap()
+            .len(),
             1,
             "the healthy token still records its transfer"
         );
@@ -1870,14 +1991,99 @@ mod tests {
             "re-recording the same log identity is a no-op"
         );
 
-        let listed =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
+        let listed = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::first(),
+        )
+        .await
+        .unwrap();
         let block_and_log_index: Vec<(u64, u64)> = listed
             .iter()
             .map(|transfer| (transfer.block_number, transfer.log_index))
             .collect();
         assert_eq!(block_and_log_index, vec![(200, 1), (200, 0), (100, 0)]);
         assert_eq!(listed[0].amount, U256::MAX, "amount round-trips exactly");
+    }
+
+    /// Paging is by `(block_number, log_index)`, so a page boundary inside a
+    /// block does not skip the rest of that block, and the page size is
+    /// bounded on both ends.
+    #[tokio::test]
+    async fn listing_pages_by_block_and_log_index_without_skipping() {
+        let harness = TestHarness::new().await;
+        let base = InboundWrappedTransfer {
+            network: Network::Base,
+            underlying: symbol("AAPL"),
+            token: TOKEN_A,
+            from: SENDER,
+            amount: U256::from(1u64),
+            tx_hash: TX_HASH,
+            log_index: 0,
+            block_number: 100,
+            detected_at: Utc::now(),
+        };
+        for (block_number, log_index, seed) in
+            [(200, 2, 0xc1), (200, 1, 0xc2), (200, 0, 0xc3), (100, 0, 0xc4)]
+        {
+            let row = InboundWrappedTransfer {
+                block_number,
+                log_index,
+                tx_hash: tx_hash(seed),
+                ..base.clone()
+            };
+            assert!(
+                record_inbound_wrapped_transfer(&harness.pool, &row)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let first = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(Some(2), None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+        let first_keys: Vec<(u64, u64)> = first
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(first_keys, vec![(200, 2), (200, 1)]);
+
+        let last = first.last().unwrap();
+        let second = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(
+                Some(2),
+                Some(last.block_number),
+                Some(last.log_index),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let second_keys: Vec<(u64, u64)> = second
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(
+            second_keys,
+            vec![(200, 0), (100, 0)],
+            "the rest of block 200 must not be skipped"
+        );
+
+        assert_eq!(
+            WrappedTransferPage::new(Some(0), None, None).unwrap_err(),
+            WrappedTransferPageError::LimitOutOfRange { limit: 0 }
+        );
+        assert_eq!(
+            WrappedTransferPage::new(Some(1001), None, None).unwrap_err(),
+            WrappedTransferPageError::LimitOutOfRange { limit: 1001 }
+        );
+        assert_eq!(
+            WrappedTransferPage::new(None, Some(200), None).unwrap_err(),
+            WrappedTransferPageError::PartialCursor
+        );
     }
 
     /// A row that cannot be parsed back fails the whole listing rather than
@@ -1911,8 +2117,12 @@ mod tests {
         .await
         .unwrap();
 
-        let error =
-            list_inbound_wrapped_transfers(&harness.pool).await.unwrap_err();
+        let error = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::first(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, InboundWrappedTransferReadError::Network(_)),

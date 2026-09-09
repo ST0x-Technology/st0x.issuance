@@ -53,7 +53,7 @@ use crate::vault::{
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
 };
 use crate::wrapped_transfer::{
-    InboundWrappedTransfer, list_inbound_wrapped_transfers,
+    InboundWrappedTransfer, WrappedTransferPage, list_inbound_wrapped_transfers,
 };
 
 #[async_trait]
@@ -2405,8 +2405,9 @@ impl From<InboundWrappedTransfer> for WrappedTransferEntry {
     }
 }
 
-/// Every inbound wrapped-token transfer the per network watchers recorded,
-/// highest block first.
+/// One page of the inbound wrapped-token transfers the per network watchers
+/// recorded, highest block first; page with `before_block` and
+/// `before_log_index` set to the last row's values.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct WrappedTransfersResponse {
     transfers: Vec<WrappedTransferEntry>,
@@ -2416,24 +2417,44 @@ pub(crate) struct WrappedTransfersResponse {
     get,
     path = "/admin/wrapped-transfers",
     tag = "admin",
+    params(
+        ("limit" = Option<u32>, Query,
+            description = "Rows per page, 1 to 1000; defaults to 100"),
+        ("before_block" = Option<u64>, Query,
+            description = "Cursor: block number of the last row of the \
+                previous page; requires before_log_index"),
+        ("before_log_index" = Option<u64>, Query,
+            description = "Cursor: log index of the last row of the \
+                previous page; requires before_block")
+    ),
     responses(
         (status = 200,
-            description = "Inbound wrapped-token transfers to the issuer \
-                wallet recorded by the per network watchers, highest block \
-                first; each needs manual recovery",
+            description = "One page of inbound wrapped-token transfers to the \
+                issuer wallet recorded by the per network watchers, highest \
+                block first; each needs manual recovery",
             body = WrappedTransfersResponse),
+        (status = 422, description = "Limit out of range or a half cursor"),
         (status = 500, description = "Failed to read the recorded transfers")
     ),
     security(("internal_api_key" = []))
 )]
 #[tracing::instrument(skip(_auth, pool))]
-#[get("/admin/wrapped-transfers")]
+#[get("/admin/wrapped-transfers?<limit>&<before_block>&<before_log_index>")]
 pub(crate) async fn list_wrapped_transfers(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
+    limit: Option<u32>,
+    before_block: Option<u64>,
+    before_log_index: Option<u64>,
 ) -> Result<Json<WrappedTransfersResponse>, Status> {
-    let transfers =
-        list_inbound_wrapped_transfers(pool.inner()).await.map_err(|err| {
+    let page = WrappedTransferPage::new(limit, before_block, before_log_index)
+        .map_err(|error| {
+            warn!(target: "admin", error = %error, "Invalid wrapped-transfer page");
+            Status::UnprocessableEntity
+        })?;
+    let transfers = list_inbound_wrapped_transfers(pool.inner(), page)
+        .await
+        .map_err(|err| {
             error!(
                 target: "admin",
                 error = %err,
