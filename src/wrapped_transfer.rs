@@ -1511,6 +1511,57 @@ mod tests {
         );
     }
 
+    /// A reorg can replace a block the watcher already scanned and
+    /// checkpointed. Resuming strictly above the checkpoint would never read
+    /// the replacement, so a transfer in it would be lost forever, which is
+    /// the one failure this backstop exists to prevent. Each pass therefore
+    /// re-reads a window below the checkpoint, even when it is caught up.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_transfer_in_a_replaced_block_below_the_checkpoint_is_found() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xb1);
+        advance_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, TOKEN_A),
+            100,
+        )
+        .await
+        .unwrap();
+        let asserter = Asserter::new();
+        // The head has not moved: block 100 was scanned empty, then replaced
+        // by one carrying this transfer.
+        asserter.push_success(&U256::from(100u64));
+        asserter.push_success(&vec![create_transfer_log_with_index(
+            TOKEN_A,
+            SENDER,
+            BOT_WALLET,
+            U256::from(4u64),
+            tx,
+            100,
+            0,
+        )]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        let recorded =
+            list_inbound_wrapped_transfers(&harness.pool).await.unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the replacement block must be re-read: {recorded:?}"
+        );
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            1
+        );
+    }
+
     /// A log without a transaction hash cannot be identified, so it cannot be
     /// recorded or deduplicated; it is dropped with a WARN summary and the
     /// checkpoint still advances rather than freezing on it forever.
