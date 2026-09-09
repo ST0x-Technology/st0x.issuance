@@ -291,9 +291,21 @@ deduplicated to at most one repeat alert per hour. Thresholds are all or nothing
 across configured chains; with none set, monitoring is disabled with a startup
 WARN.
 
-`GET /admin/network-telemetry` reports per network telemetry: transfer poller
-and receipt backfill pass counters with failure rate and block lag, plus the gas
-monitor's latest reading. See SPEC.md "Per network monitoring".
+`GET /admin/network-telemetry` reports per network telemetry: transfer poller,
+receipt backfill, and inbound wrapped-token transfer pass counters with failure
+rate and block lag, plus the gas monitor's latest reading. See SPEC.md "Per
+network monitoring".
+
+Every configured chain with `[wrapped_tokens.<network>]` entries in the TOML
+config file also gets an inbound wrapped-token transfer watcher: a transfer of a
+wrapped (ERC-4626) token into the issuer wallet can never be redeemed
+automatically, so the watcher records it, logs an ERROR, and sends a Telegram
+lifecycle notification naming the chain, asset, amount, and transaction,
+deduplicated durably per transfer log. A zero-value transfer is ignored, and a
+configured address that is an enabled asset's vault is refused rather than
+watched. `GET /admin/wrapped-transfers` lists every recorded transfer for manual
+recovery. See SPEC.md "Per network monitoring" -> "Inbound wrapped-token
+transfer alerts".
 
 ## Configuration
 
@@ -305,9 +317,11 @@ Configuration comes from two non-overlapping sources:
   poll intervals, etc.).
 - **The optional TOML config file** (path via the `--config` flag or the
   `CONFIG` environment variable; see `config.example.toml`) — the only source of
-  per-asset vault modes: the `[orchestrator]` section and per-asset `vault_mode`
-  overrides. No environment variable sets vault modes. When the file is absent
-  (or has no orchestrator entries), every asset runs vault-direct.
+  per-asset vault modes (the `[orchestrator]` section and per-asset `vault_mode`
+  overrides) and of the per network `[wrapped_tokens.<network>]` addresses the
+  inbound wrapped-token transfer watcher scans. No environment variable sets
+  either. When the file is absent (or has no orchestrator entries), every asset
+  runs vault-direct; a chain with no wrapped-token table is unwatched.
 
 Because the sources are disjoint there is no precedence between them; each
 setting has exactly one home.
@@ -402,12 +416,11 @@ For detailed architectural patterns and design decisions, see
 ## GCP release path
 
 Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
-`st0x-issuance` binary (`nix build .#bot-oci`, contract in
-`nix/oci-image.nix`). `.github/workflows/build-oci.yml` pushes it to the
-`s01-issuance` Artifact Registry, signs its attestation, and, once the
-devops side has armed it, writes the digest into the GCP staging VM's
-deploy state (a merge to main is a staging deploy). Pushing a `vX.Y.Z` tag
-labels that commit's attested image (`release-tag.yml`); production is
-promoted from that label on the devops side, never from this repo.
-`nix run .#smoke-test-image -- <image>` runs the same startup check CI
-does.
+`st0x-issuance` binary (`nix build .#bot-oci`, contract in `nix/oci-image.nix`).
+`.github/workflows/build-oci.yml` pushes it to the `s01-issuance` Artifact
+Registry, signs its attestation, and, once the devops side has armed it, writes
+the digest into the GCP staging VM's deploy state (a merge to main is a staging
+deploy). Pushing a `vX.Y.Z` tag labels that commit's attested image
+(`release-tag.yml`); production is promoted from that label on the devops side,
+never from this repo. `nix run .#smoke-test-image -- <image>` runs the same
+startup check CI does.

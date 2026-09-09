@@ -2,8 +2,8 @@
 //!
 //! An in memory registry, one entry per configured network, aggregating what
 //! the long running per network loops report: transfer poller passes, periodic
-//! receipt backfill passes (each with block lag), and the gas monitor's latest
-//! native balance reading. `GET /admin/network-telemetry` serves snapshots of
+//! receipt backfill passes and inbound wrapped-token transfer watcher passes
+//! (each with block lag), and the gas monitor's latest native balance reading. `GET /admin/network-telemetry` serves snapshots of
 //! it. Deliberately not persisted: it describes the running process, and the
 //! durable signals (checkpoints, event store) already survive restarts.
 
@@ -75,6 +75,30 @@ impl NetworkTelemetry {
         });
     }
 
+    /// Records an inbound wrapped-token transfer watcher pass that made
+    /// progress. `lag_blocks` is the worst per token distance between the
+    /// chain head and the token's checkpoint at the start of the pass.
+    pub(crate) fn record_wrapped_transfer_poll_success(
+        &self,
+        network: Network,
+        lag_blocks: u64,
+    ) {
+        self.with_stats(network, |stats| {
+            stats.wrapped_transfer.record_success(lag_blocks);
+        });
+    }
+
+    /// Records an inbound wrapped-token transfer watcher pass where nothing
+    /// progressed: the head fetch failed, or every watched token failed.
+    pub(crate) fn record_wrapped_transfer_poll_failure(
+        &self,
+        network: Network,
+    ) {
+        self.with_stats(network, |stats| {
+            stats.wrapped_transfer.record_failure();
+        });
+    }
+
     /// Records a successful gas balance reading for the issuer wallet.
     pub(crate) fn record_gas_reading(
         &self,
@@ -111,6 +135,7 @@ impl NetworkTelemetry {
                     network: *network,
                     transfer_poller: stats.transfer_poller.snapshot(),
                     receipt_backfill: stats.receipt_backfill.snapshot(),
+                    wrapped_transfer: stats.wrapped_transfer.snapshot(),
                     gas: stats.gas.snapshot(),
                 }
             })
@@ -140,6 +165,7 @@ impl NetworkTelemetry {
 struct NetworkStats {
     transfer_poller: PassStats,
     receipt_backfill: PassStats,
+    wrapped_transfer: PassStats,
     gas: GasReading,
 }
 
@@ -238,6 +264,7 @@ pub(crate) struct NetworkTelemetrySnapshot {
     network: Network,
     transfer_poller: PassStatsSnapshot,
     receipt_backfill: PassStatsSnapshot,
+    wrapped_transfer: PassStatsSnapshot,
     gas: GasStatusSnapshot,
 }
 
@@ -315,6 +342,7 @@ mod tests {
         assert_eq!(snapshot[0]["transfer_poller"].get("failure_rate"), None);
         assert_eq!(snapshot[0]["transfer_poller"].get("lag_blocks"), None);
         assert_eq!(snapshot[0]["receipt_backfill"]["passes"], 0);
+        assert_eq!(snapshot[0]["wrapped_transfer"]["passes"], 0);
         assert_eq!(snapshot[0]["gas"]["status"], "unmonitored");
     }
 

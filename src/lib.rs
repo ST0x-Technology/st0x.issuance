@@ -7,6 +7,7 @@ use event_sorcery::{
     EventSourced, ReconcileError, Reconciler, Store, StoreBuilder,
 };
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
+use parking_lot::Mutex;
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,7 @@ use crate::tokenized_asset::{
 };
 use crate::underlying::Underlying;
 use crate::vault::NetworkVaultServices;
+use crate::wrapped_transfer::WrappedTransferMonitor;
 use poll_checkpoint::load_receipt_backfill;
 
 pub mod account;
@@ -102,6 +104,7 @@ pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 pub(crate) mod wallet;
+pub(crate) mod wrapped_transfer;
 
 pub mod bindings;
 
@@ -122,6 +125,9 @@ pub use test_utils::{
 };
 pub use tokenized_asset::cli::run_issuer_cli;
 pub use wallet::SignerConfig;
+pub use wrapped_transfer::{
+    WrappedTokenConfig, WrappedTokenConfigError, WrappedTokenEntry,
+};
 
 struct AggregateCqrsSetup {
     mint_store: Arc<Store<Mint>>,
@@ -815,6 +821,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::schedule_freeze_window,
                 admin::orchestrator_health,
                 admin::network_telemetry,
+                admin::list_wrapped_transfers,
             ],
         )
         .register("/", catchers::json_catchers());
@@ -1855,7 +1862,8 @@ struct PerNetworkTaskDeps<'a, P> {
 }
 
 /// Spawns the per network background loops: one periodic receipt backfill,
-/// one transfer poller, and one gas monitor per configured chain.
+/// one transfer poller, one gas monitor, and one inbound wrapped-token
+/// transfer watcher per configured chain.
 fn spawn_per_network_tasks<P>(
     deps: &PerNetworkTaskDeps<'_, P>,
 ) -> Vec<JoinHandle<()>>
@@ -1922,7 +1930,67 @@ where
         deps.shutdown,
     ));
 
+    handles.extend(spawn_wrapped_transfer_monitors(deps));
+
     handles
+}
+
+/// Spawns one inbound wrapped-token transfer watcher per configured chain
+/// that has `[wrapped_tokens.<network>]` entries. A chain without entries is
+/// unwatched, so the WARN makes that state operator visible; a table for a
+/// chain
+/// with no configuration was already rejected at config load.
+fn spawn_wrapped_transfer_monitors<P>(
+    deps: &PerNetworkTaskDeps<'_, P>,
+) -> Vec<JoinHandle<()>>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    deps.chain_registry
+        .runtimes()
+        .filter_map(|(network, runtime)| {
+            let watched = deps.config.wrapped_tokens.watched_on(*network);
+            if watched.is_empty() {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %network,
+                    "No wrapped tokens configured; inbound wrapped-token \
+                     transfer watching is disabled for this chain"
+                );
+                return None;
+            }
+
+            let network = *network;
+            let provider = runtime.http_provider.clone();
+            let backfill_start_block = runtime.backfill_start_block;
+            let bot_wallet = deps.bot_wallet;
+            let pool = deps.pool.clone();
+            let apalis_pool = deps.apalis_pool.clone();
+            let telemetry = Arc::clone(deps.network_telemetry);
+            let poll_interval = deps.config.wrapped_transfer_poll_interval;
+
+            let mut monitor_shutdown = deps.shutdown.clone();
+            Some(tokio::spawn(async move {
+                let monitor = WrappedTransferMonitor {
+                    network,
+                    provider,
+                    bot_wallet,
+                    backfill_start_block,
+                    watched,
+                    refused: Mutex::default(),
+                    pool,
+                    apalis_pool,
+                    telemetry,
+                    poll_interval,
+                };
+
+                tokio::select! {
+                    () = monitor.run() => {}
+                    _ = monitor_shutdown.changed() => {}
+                }
+            }))
+        })
+        .collect()
 }
 
 /// Spawns one gas balance monitor per configured chain that carries a

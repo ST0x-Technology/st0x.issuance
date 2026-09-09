@@ -1,0 +1,2231 @@
+//! Inbound wrapped-token transfer detection for the issuer wallet.
+//!
+//! The redemption transfer poller watches each asset's vault, i.e. the
+//! unwrapped share token. A redemption sent as the ERC-4626 wrapped token
+//! lands in the issuer wallet without ever being detected or redeemed. This
+//! module is the issuance backstop: per network, it watches the configured
+//! wrapped-token contracts for `Transfer` events to the issuer wallet, records
+//! each one durably, raises an operator alert, and exposes the recorded
+//! transfers to the admin API. Recovery itself is a manual operation.
+//!
+//! The scan follows the chain head with no confirmation depth, like the
+//! redemption transfer poller, so a reorg can go either way. A log read from
+//! a block later reorged out leaves a recorded row and a delivered page for a
+//! transfer that no longer exists, and a transaction re-mined above the
+//! advanced checkpoint under a different log index is recorded again: false
+//! positives an operator resolves by looking at the chain. But a block at or
+//! below the checkpoint that is replaced by one carrying a new inbound
+//! transfer is never re-read, so that transfer is missed: the failure this
+//! backstop exists to prevent. The per-chain finality cutoff that closes it is
+//! RAI-2297.
+//!
+//! Alert dedup is durable: the lifecycle notification is queued under an
+//! idempotency key derived from the log identity, exactly as the
+//! corporate-action notifications are, so a restart or a re-scan never
+//! re-alerts a transfer whose alert was delivered. Unlike the recurring
+//! producers that pattern comes from, this one derives each key once: the
+//! dead-job release before the push only covers a chunk retried because it
+//! failed before its checkpoint advanced. Past that point the log is never
+//! handled again, so a delivery that exhausts its retries is not re-queued
+//! and the recorded row, the ERROR log, and `GET /admin/wrapped-transfers`
+//! are what remains of it.
+
+use alloy::primitives::{Address, TxHash, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::{Filter, Log};
+use alloy::sol_types::SolEvent;
+use alloy::transports::{RpcError, TransportErrorKind};
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
+use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
+use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::{NetworkParseError, UnderlyingSymbolError};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::num::TryFromIntError;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error, info, trace, warn};
+
+use crate::bindings;
+use crate::jobs::{JobQueue, QueuePushError};
+use crate::network_telemetry::NetworkTelemetry;
+use crate::notifications::{
+    LifecycleNotification, SendLifecycleNotification,
+    release_dead_lifecycle_notification_job,
+};
+use crate::poll_checkpoint::{
+    CheckpointError, advance_checkpoint_block, load_checkpoint_block,
+};
+use crate::redemption::poller::{BLOCK_CHUNK_SIZE, block_ranges};
+use crate::tokenized_asset::view::list_enabled_assets;
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
+
+/// Interval between polling passes once a watcher is caught up. Inbound
+/// wrapped-token transfers are rare and the alert is not latency critical, so
+/// one `eth_getLogs` per token every ten minutes is plenty.
+pub(crate) const WRAPPED_TRANSFER_POLL_INTERVAL: Duration =
+    Duration::from_secs(600);
+
+/// Interval between retries when a polling pass fails (e.g. RPC error).
+const RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Consecutive failed poll passes before the per-pass WARN escalates to an
+/// ERROR alarm, matching the transfer poller. A blip retries quietly; a
+/// sustained failure means the backstop is offline and every inbound
+/// wrapped-token transfer in the gap goes unseen until it recovers.
+const MAX_POLL_FAILURES_BEFORE_ALARM: usize = 3;
+
+/// Wrapped-token contract addresses to watch, per network.
+///
+/// Each address maps to the underlying it wraps. Built from the
+/// `[wrapped_tokens.<network>]` tables of the TOML config file; existence
+/// implies the entries passed validation.
+#[derive(Debug, Clone, Default)]
+pub struct WrappedTokenConfig {
+    per_network: HashMap<Network, HashMap<Address, UnderlyingSymbol>>,
+}
+
+/// One `[wrapped_tokens.<network>]` entry: `underlying = "<token>"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedTokenEntry {
+    pub network: Network,
+    pub underlying: UnderlyingSymbol,
+    pub token: Address,
+}
+
+/// One wrapped token a network's watcher scans, with the underlying the alert
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WatchedWrappedToken {
+    pub(crate) token: Address,
+    pub(crate) underlying: UnderlyingSymbol,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WrappedTokenConfigError {
+    #[error(
+        "wrapped token address for {underlying} on {network} is the zero \
+         address"
+    )]
+    ZeroAddress { network: Network, underlying: UnderlyingSymbol },
+    #[error(
+        "wrapped token {token} on {network} is configured for both {first} \
+         and {second}; one address cannot wrap two underlyings on one network"
+    )]
+    AddressCollision {
+        network: Network,
+        token: Address,
+        first: UnderlyingSymbol,
+        second: UnderlyingSymbol,
+    },
+    #[error("{underlying} on {network} has more than one wrapped token entry")]
+    DuplicateUnderlying { network: Network, underlying: UnderlyingSymbol },
+}
+
+impl WrappedTokenConfig {
+    /// Validates the entries: no zero address, and on each network one
+    /// address wraps one underlying and one underlying has one address.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first entry that violates one of those rules.
+    pub fn new(
+        entries: impl IntoIterator<Item = WrappedTokenEntry>,
+    ) -> Result<Self, WrappedTokenConfigError> {
+        let mut per_network: HashMap<
+            Network,
+            HashMap<Address, UnderlyingSymbol>,
+        > = HashMap::new();
+
+        for WrappedTokenEntry { network, underlying, token } in entries {
+            if token.is_zero() {
+                return Err(WrappedTokenConfigError::ZeroAddress {
+                    network,
+                    underlying,
+                });
+            }
+
+            let tokens = per_network.entry(network).or_default();
+            if tokens.values().any(|existing| existing == &underlying) {
+                return Err(WrappedTokenConfigError::DuplicateUnderlying {
+                    network,
+                    underlying,
+                });
+            }
+
+            match tokens.entry(token) {
+                Entry::Occupied(occupied) => {
+                    return Err(WrappedTokenConfigError::AddressCollision {
+                        network,
+                        token,
+                        first: occupied.get().clone(),
+                        second: underlying,
+                    });
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(underlying);
+                }
+            }
+        }
+
+        Ok(Self { per_network })
+    }
+
+    /// The tokens to watch on `network`, sorted by address so a pass scans
+    /// them in a deterministic order. Empty when the network has no entries.
+    pub(crate) fn watched_on(
+        &self,
+        network: Network,
+    ) -> Vec<WatchedWrappedToken> {
+        let mut watched: Vec<WatchedWrappedToken> = self
+            .per_network
+            .get(&network)
+            .into_iter()
+            .flatten()
+            .map(|(token, underlying)| WatchedWrappedToken {
+                token: *token,
+                underlying: underlying.clone(),
+            })
+            .collect();
+        watched.sort_unstable_by_key(|watched| watched.token);
+        watched
+    }
+
+    /// Every network that has at least one entry, so startup can reject a
+    /// table for a chain that has no configuration.
+    pub(crate) fn networks(&self) -> impl Iterator<Item = Network> + '_ {
+        self.per_network.keys().copied()
+    }
+}
+
+/// One recorded inbound wrapped-token transfer, as stored in
+/// `inbound_wrapped_transfers`. `amount` is the raw ERC-20 value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboundWrappedTransfer {
+    pub(crate) network: Network,
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: Address,
+    pub(crate) from: Address,
+    pub(crate) amount: U256,
+    pub(crate) tx_hash: TxHash,
+    pub(crate) log_index: u64,
+    pub(crate) block_number: u64,
+    pub(crate) detected_at: DateTime<Utc>,
+}
+
+/// One network's watcher loop over its configured wrapped tokens. Mirrors the
+/// redemption transfer poller: per token checkpoints in `poll_checkpoints`,
+/// chunked `eth_getLogs`, and a checkpoint that only advances once every log
+/// in the chunk is recorded and its alert queued.
+pub(crate) struct WrappedTransferMonitor<P> {
+    pub(crate) network: Network,
+    pub(crate) provider: P,
+    pub(crate) bot_wallet: Address,
+    pub(crate) backfill_start_block: u64,
+    /// The configured tokens, never empty: a chain with none runs no
+    /// monitor. Each pass scans the subset that is not an enabled vault.
+    pub(crate) watched: Vec<WatchedWrappedToken>,
+    /// Tokens already refused as vaults, so the ERROR is raised once per
+    /// token rather than every pass.
+    pub(crate) refused: Mutex<HashSet<Address>>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) apalis_pool: ApalisSqlitePool,
+    pub(crate) telemetry: Arc<NetworkTelemetry>,
+    pub(crate) poll_interval: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WrappedTransferPollError {
+    // The configured RPC URL carries the provider API key and a transport
+    // error's display can quote the URL it failed to reach, so only the
+    // failure category is rendered, as the gas monitor does.
+    #[error("RPC error: {}", classify_rpc_error(.0))]
+    Rpc(#[from] RpcError<TransportErrorKind>),
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("Failed to record the inbound wrapped-token transfer: {0}")]
+    Record(#[from] RecordInboundWrappedTransferError),
+    #[error("Checkpoint error: {0}")]
+    Checkpoint(#[from] CheckpointError),
+    #[error("Checkpoint overflow: last_processed_block={last_processed_block}")]
+    CheckpointOverflow { last_processed_block: u64 },
+    #[error("Failed to queue the inbound wrapped-token transfer alert: {0}")]
+    QueuePush(#[from] QueuePushError),
+    #[error("all {total} wrapped tokens failed the poll pass")]
+    AllTokensFailed { total: usize },
+    #[error(
+        "all {total} configured wrapped tokens are enabled asset vaults; \
+         nothing is being scanned"
+    )]
+    AllTokensRefused { total: usize },
+}
+
+impl<P: Provider> WrappedTransferMonitor<P> {
+    /// Runs the polling loop forever. Never returns; the spawn site pairs it
+    /// with the shutdown channel in a `select!`, like the transfer poller.
+    pub(crate) async fn run(&self) {
+        info!(
+            target: "wrapped_transfer",
+            network = %self.network,
+            watched = ?self.watched,
+            "Watching wrapped tokens for inbound transfers to the issuer \
+             wallet"
+        );
+
+        let mut consecutive_failures = 0_usize;
+        loop {
+            match self.poll_once().await {
+                Err(error) => {
+                    consecutive_failures += 1;
+                    log_poll_failure(
+                        self.network,
+                        &error,
+                        consecutive_failures,
+                    );
+                    self.telemetry
+                        .record_wrapped_transfer_poll_failure(self.network);
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    continue;
+                }
+                Ok(lag_blocks) => {
+                    self.telemetry.record_wrapped_transfer_poll_success(
+                        self.network,
+                        lag_blocks,
+                    );
+                }
+            }
+
+            consecutive_failures = 0;
+            tokio::time::sleep(self.poll_interval).await;
+        }
+    }
+
+    /// The configured tokens this pass may scan.
+    ///
+    /// A wrapped-token address that is also an enabled asset's vault on this
+    /// network would make every genuine redemption transfer look like an
+    /// un-redeemable inbound one, so it is refused rather than scanned.
+    /// Assets are enabled at runtime, so this runs per pass, as the receipt
+    /// backfill re-reads its asset set. A failed asset read leaves the list
+    /// alone: an unverified scan still detects real transfers, while dropping
+    /// the list would disable the backstop over a database blip.
+    async fn watchable(&self) -> Vec<WatchedWrappedToken> {
+        let vaults: Vec<Address> = match list_enabled_assets(&self.pool).await {
+            Ok(assets) => assets
+                .into_iter()
+                .filter(|asset| asset.network == self.network)
+                .map(|asset| asset.vault)
+                .collect(),
+            Err(error) => {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    error = %error,
+                    "Could not read the enabled assets to check the \
+                     configured wrapped tokens against their vaults; \
+                     scanning them unchecked"
+                );
+                Vec::new()
+            }
+        };
+
+        self.watched
+            .iter()
+            .filter(|candidate| {
+                if !vaults.contains(&candidate.token) {
+                    return true;
+                }
+
+                // Once per token per process: the misconfiguration is
+                // permanent until an operator changes the config, and a pass
+                // runs every ten minutes.
+                if self.refused.lock().insert(candidate.token) {
+                    error!(
+                        target: "wrapped_transfer",
+                        network = %self.network,
+                        token = %candidate.token,
+                        underlying = %candidate.underlying,
+                        "Configured wrapped token is an enabled asset's vault \
+                         on this network; refusing to scan it, since every \
+                         redemption transfer would be recorded and paged as \
+                         an un-redeemable inbound transfer"
+                    );
+                }
+
+                false
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// One pass: scan every watched token from its checkpoint to one shared
+    /// chain head. A per token failure does not starve the others, since each
+    /// token owns its checkpoint and resumes next pass; a pass where every
+    /// token failed propagates, since that is indistinguishable from the
+    /// watcher being offline.
+    ///
+    /// Returns the worst per token distance between the head and the token's
+    /// checkpoint at the start of the pass, which telemetry reports as the
+    /// watcher's block lag.
+    async fn poll_once(&self) -> Result<u64, WrappedTransferPollError> {
+        let watchable = self.watchable().await;
+
+        // Refusing every configured token leaves the backstop scanning
+        // nothing, which telemetry must read as a failed pass rather than a
+        // healthy one with zero lag.
+        if watchable.is_empty() {
+            return Err(WrappedTransferPollError::AllTokensRefused {
+                total: self.watched.len(),
+            });
+        }
+
+        // One head for the whole pass so every token scans to a consistent
+        // block.
+        let head = self.provider.get_block_number().await?;
+
+        let mut failed_tokens: Vec<Address> = Vec::new();
+        let mut lag_blocks = 0_u64;
+        for watched in &watchable {
+            match self.poll_token(watched, head).await {
+                Ok(token_lag) => lag_blocks = lag_blocks.max(token_lag),
+                Err(error) => {
+                    debug!(
+                        target: "wrapped_transfer",
+                        network = %self.network,
+                        token = %watched.token,
+                        error = %error,
+                        "Failed to poll wrapped token; will retry next pass \
+                         from its checkpoint"
+                    );
+                    failed_tokens.push(watched.token);
+                    // A failed token is the one furthest behind, so its
+                    // backlog is exactly what the gauge must not hide. An
+                    // unreadable checkpoint adds nothing: the token is
+                    // already counted as failed.
+                    if let Ok(cursor) = self.token_cursor(watched).await {
+                        lag_blocks = lag_blocks
+                            .max(head.saturating_add(1).saturating_sub(cursor));
+                    }
+                }
+            }
+        }
+
+        if !failed_tokens.is_empty() {
+            warn!(
+                target: "wrapped_transfer",
+                network = %self.network,
+                failed_token_count = failed_tokens.len(),
+                failed_tokens = ?failed_tokens,
+                total_tokens = watchable.len(),
+                "Wrapped-token transfer poll pass completed with token \
+                 failures; each resumes from its checkpoint next pass"
+            );
+
+            if failed_tokens.len() == watchable.len() {
+                return Err(WrappedTransferPollError::AllTokensFailed {
+                    total: watchable.len(),
+                });
+            }
+        }
+
+        Ok(lag_blocks)
+    }
+
+    /// The block this token resumes from: its checkpoint plus one, floored
+    /// at `backfill_start_block`, or that start block when it has none.
+    async fn token_cursor(
+        &self,
+        watched: &WatchedWrappedToken,
+    ) -> Result<u64, WrappedTransferPollError> {
+        let name = checkpoint_name(self.network, watched.token);
+
+        match load_checkpoint_block(&self.pool, &name).await? {
+            None => Ok(self.backfill_start_block),
+            Some(last_processed) => {
+                let next = last_processed.checked_add(1).ok_or(
+                    WrappedTransferPollError::CheckpointOverflow {
+                        last_processed_block: last_processed,
+                    },
+                )?;
+                Ok(next.max(self.backfill_start_block))
+            }
+        }
+    }
+
+    /// Scans one token from its checkpoint (or `backfill_start_block` when
+    /// it has none) up to `head`, handling each log and advancing the
+    /// checkpoint per chunk.
+    async fn poll_token(
+        &self,
+        watched: &WatchedWrappedToken,
+        head: u64,
+    ) -> Result<u64, WrappedTransferPollError> {
+        let name = checkpoint_name(self.network, watched.token);
+        let cursor = self.token_cursor(watched).await?;
+
+        if cursor > head {
+            trace!(
+                target: "wrapped_transfer",
+                network = %self.network,
+                token = %watched.token,
+                cursor,
+                head,
+                "Wrapped token caught up; skipping"
+            );
+            return Ok(0);
+        }
+
+        debug!(
+            target: "wrapped_transfer",
+            network = %self.network,
+            token = %watched.token,
+            from_block = cursor,
+            to_block = head,
+            "Polling wrapped token for inbound transfers"
+        );
+
+        for (chunk_from, chunk_to) in
+            block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
+        {
+            let logs = self
+                .fetch_transfer_logs(watched.token, chunk_from, chunk_to)
+                .await?;
+
+            let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
+            let mut filtered_tx_hashes: Vec<Option<TxHash>> = Vec::new();
+            for log in &logs {
+                match self.handle_log(watched, log).await? {
+                    HandledLog::Dropped { tx_hash } => {
+                        dropped_tx_hashes.push(tx_hash);
+                    }
+                    HandledLog::Filtered { tx_hash } => {
+                        filtered_tx_hashes.push(tx_hash);
+                    }
+                    HandledLog::Recorded | HandledLog::Ignored => {}
+                }
+            }
+
+            advance_checkpoint_block(&self.pool, &name, chunk_to).await?;
+
+            // Nothing is lost here, the logs are fully identified and not
+            // ours, but the filter asked the node to exclude them, so their
+            // presence means the provider ignored the filter.
+            if !filtered_tx_hashes.is_empty() {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    count = filtered_tx_hashes.len(),
+                    tx_hashes = ?filtered_tx_hashes,
+                    chunk_from,
+                    chunk_to,
+                    "Skipped wrapped-token transfer logs the filter should \
+                     have excluded; the provider ignored the filter"
+                );
+            }
+
+            // The advance above makes the drop permanent, and the per log
+            // detail is DEBUG (loop-body rule), so this per chunk summary is
+            // the operator's only signal.
+            if !dropped_tx_hashes.is_empty() {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    count = dropped_tx_hashes.len(),
+                    tx_hashes = ?dropped_tx_hashes,
+                    chunk_from,
+                    chunk_to,
+                    "Dropped unidentifiable wrapped-token transfer logs; they \
+                     cannot be recorded or alerted"
+                );
+            }
+        }
+
+        // `cursor` is the next unprocessed block, so the pending count
+        // includes the head itself, as the transfer poller counts it.
+        Ok(head.saturating_add(1).saturating_sub(cursor))
+    }
+
+    /// Fetches `Transfer` logs of `token` whose `to` is the issuer wallet.
+    /// Every ERC-20 emits the same `Transfer(address,address,uint256)`, so
+    /// the vault binding's event matches and decodes the wrapper's logs too.
+    async fn fetch_transfer_logs(
+        &self,
+        token: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>, WrappedTransferPollError> {
+        let filter = Filter::new()
+            .address(token)
+            .event_signature(
+                bindings::OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
+            )
+            .topic2(self.bot_wallet.into_word())
+            .from_block(from_block)
+            .to_block(to_block);
+
+        Ok(self.provider.get_logs(&filter).await?)
+    }
+
+    /// Records the log and queues its alert. Both steps are idempotent on the
+    /// log identity, so a chunk retried after a partial failure can neither
+    /// double-record nor double-alert. A log that cannot be identified (no tx
+    /// hash, block number, or log index, or an undecodable payload) is
+    /// `Dropped`: retrying it would freeze the checkpoint forever.
+    async fn handle_log(
+        &self,
+        watched: &WatchedWrappedToken,
+        log: &Log,
+    ) -> Result<HandledLog, WrappedTransferPollError> {
+        let transfer = match identify_transfer(
+            self.network,
+            self.bot_wallet,
+            watched,
+            log,
+        ) {
+            Ok(transfer) => transfer,
+            Err(reason) => {
+                let tx_hash = log.transaction_hash;
+                let handled = if reason.is_filter_mismatch() {
+                    HandledLog::Filtered { tx_hash }
+                } else {
+                    HandledLog::Dropped { tx_hash }
+                };
+                debug!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    tx_hash = ?tx_hash,
+                    log_index = ?log.log_index,
+                    reason = %reason,
+                    "Skipping wrapped-token transfer log"
+                );
+                return Ok(handled);
+            }
+        };
+
+        // ERC-20 requires a zero-value transfer to emit `Transfer` like any
+        // other (EIP-20, "Transfer event"), so an unauthenticated sender can
+        // emit one to the issuer wallet for the price of gas. Nothing moved,
+        // so there is nothing to recover and nothing to page about.
+        if transfer.amount.is_zero() {
+            debug!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                token = %transfer.token,
+                from = %transfer.from,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                "Ignoring zero-value wrapped-token transfer to the issuer \
+                 wallet; it moves nothing and needs no recovery"
+            );
+            return Ok(HandledLog::Ignored);
+        }
+
+        if record_inbound_wrapped_transfer(&self.pool, &transfer).await? {
+            error!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                underlying = %transfer.underlying,
+                token = %transfer.token,
+                from = %transfer.from,
+                amount = %transfer.amount,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                block_number = transfer.block_number,
+                "Inbound wrapped-token transfer to the issuer wallet; it \
+                 cannot be redeemed automatically and needs manual recovery"
+            );
+        } else {
+            debug!(
+                target: "wrapped_transfer",
+                network = %transfer.network,
+                tx_hash = %transfer.tx_hash,
+                log_index = transfer.log_index,
+                "Inbound wrapped-token transfer already recorded; re-queueing \
+                 its alert is a no-op"
+            );
+        }
+
+        let key = alert_idempotency_key(
+            transfer.network,
+            transfer.tx_hash,
+            transfer.log_index,
+        );
+        // Only a chunk that failed before its checkpoint advanced brings the
+        // same key back here; releasing a dead delivery lets that retry queue
+        // the alert instead of colliding with the corpse of the first one.
+        release_dead_lifecycle_notification_job(&self.pool, &key).await?;
+        JobQueue::<SendLifecycleNotification>::new(&self.apalis_pool)
+            .push_with_idempotency_key(
+                SendLifecycleNotification {
+                    notification:
+                        LifecycleNotification::InboundWrappedTransfer {
+                            network: transfer.network,
+                            underlying: transfer.underlying,
+                            token: transfer.token,
+                            from: transfer.from,
+                            amount: transfer.amount,
+                            tx_hash: transfer.tx_hash,
+                            log_index: transfer.log_index,
+                        },
+                },
+                key,
+            )
+            .await?;
+
+        Ok(HandledLog::Recorded)
+    }
+}
+
+/// Outcome of handling one log: recorded (and its alert queued), ignored
+/// because it moves nothing, filtered because it is identified but not ours
+/// (the node should have excluded it), or dropped because the log cannot be
+/// identified. The last two carry what identity the log had: both are
+/// permanent once the chunk is checkpointed, and the summary WARN is all the
+/// operator gets.
+enum HandledLog {
+    Recorded,
+    Ignored,
+    Filtered { tx_hash: Option<TxHash> },
+    Dropped { tx_hash: Option<TxHash> },
+}
+
+/// Decodes one `Transfer` log into a record, or `None` when the log lacks
+/// the fields that make up its identity, does not decode as a `Transfer`, or
+/// is not a transfer of `watched.token` to the issuer wallet.
+///
+/// The emitter and recipient are constrained by the `eth_getLogs` filter
+/// already, so re-checking them here is defense in depth: the row is labelled
+/// with `watched.underlying`, which is only true of a log this token emitted,
+/// and `detect_transfer` re-derives `log.address()` the same way.
+fn identify_transfer(
+    network: Network,
+    bot_wallet: Address,
+    watched: &WatchedWrappedToken,
+    log: &Log,
+) -> Result<InboundWrappedTransfer, UnidentifiableLog> {
+    if log.address() != watched.token {
+        return Err(UnidentifiableLog::OtherEmitter { emitter: log.address() });
+    }
+
+    let event =
+        bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
+
+    if event.to != bot_wallet {
+        return Err(UnidentifiableLog::OtherRecipient { recipient: event.to });
+    }
+
+    Ok(InboundWrappedTransfer {
+        network,
+        underlying: watched.underlying.clone(),
+        token: watched.token,
+        from: event.from,
+        amount: event.value,
+        tx_hash: log.transaction_hash.ok_or(UnidentifiableLog::NoTxHash)?,
+        log_index: log.log_index.ok_or(UnidentifiableLog::NoLogIndex)?,
+        block_number: log
+            .block_number
+            .ok_or(UnidentifiableLog::NoBlockNumber)?,
+        detected_at: Utc::now(),
+    })
+}
+
+/// Why a log cannot become an [`InboundWrappedTransfer`]. Each one is
+/// permanent for that log, so the reason is what the operator gets instead of
+/// a retry.
+#[derive(Debug, thiserror::Error)]
+enum UnidentifiableLog {
+    #[error("log was not emitted by the watched token but by {emitter}")]
+    OtherEmitter { emitter: Address },
+    #[error("recipient is not the issuer wallet but {recipient}")]
+    OtherRecipient { recipient: Address },
+    #[error("log does not decode as an ERC-20 Transfer: {0}")]
+    Undecodable(#[from] alloy::sol_types::Error),
+    #[error("log has no transaction hash")]
+    NoTxHash,
+    #[error("log has no log index")]
+    NoLogIndex,
+    #[error("log has no block number")]
+    NoBlockNumber,
+}
+
+impl UnidentifiableLog {
+    /// Whether the log is fully identified and merely not ours: a case the
+    /// `eth_getLogs` filter should have excluded, as opposed to a log that
+    /// has lost its identity.
+    const fn is_filter_mismatch(&self) -> bool {
+        matches!(self, Self::OtherEmitter { .. } | Self::OtherRecipient { .. })
+    }
+}
+
+/// Records `transfer` unless its `(network, tx_hash, log_index)` identity is
+/// already stored. Returns whether the row was newly inserted.
+pub(crate) async fn record_inbound_wrapped_transfer(
+    pool: &Pool<Sqlite>,
+    transfer: &InboundWrappedTransfer,
+) -> Result<bool, RecordInboundWrappedTransferError> {
+    let result = sqlx::query(
+        "
+        INSERT INTO inbound_wrapped_transfers (
+            network,
+            tx_hash,
+            log_index,
+            token,
+            underlying,
+            from_address,
+            amount,
+            block_number,
+            detected_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(network, tx_hash, log_index) DO NOTHING
+        ",
+    )
+    .bind(transfer.network.as_str())
+    .bind(format!("{:#x}", transfer.tx_hash))
+    .bind(i64::try_from(transfer.log_index)?)
+    .bind(format!("{:#x}", transfer.token))
+    .bind(transfer.underlying.as_str())
+    .bind(format!("{:#x}", transfer.from))
+    .bind(transfer.amount.to_string())
+    .bind(i64::try_from(transfer.block_number)?)
+    .bind(transfer.detected_at.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// A transfer could not be written to `inbound_wrapped_transfers`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecordInboundWrappedTransferError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error("block number or log index exceeds SQLite INTEGER range: {0}")]
+    Int(#[from] TryFromIntError),
+}
+
+/// Rows per page when the caller does not say.
+pub(crate) const DEFAULT_WRAPPED_TRANSFER_PAGE: u32 = 100;
+
+/// Largest page a caller may ask for: the table only grows and nothing
+/// deletes from it, so an unbounded read would serialize the whole history.
+pub(crate) const MAX_WRAPPED_TRANSFER_PAGE: u32 = 1000;
+
+/// One page of the recorded transfers, newest first. `before` is the
+/// `(block_number, log_index, network)` of the last row of the previous page.
+/// The listing spans every network, and two chains can share a block number
+/// and log index, so the network is what makes the order total: rows are
+/// ordered by the triple, and a cursor on the triple cannot skip a row tied
+/// with the one the previous page ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WrappedTransferPage {
+    limit: u32,
+    /// Already narrowed to SQLite's INTEGER range, so binding cannot fail.
+    before: Option<(i64, i64, Network)>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum WrappedTransferPageError {
+    #[error(
+        "limit must be between 1 and {MAX_WRAPPED_TRANSFER_PAGE}, got {limit}"
+    )]
+    LimitOutOfRange { limit: u32 },
+    #[error(
+        "before_block, before_log_index, and before_network must be given \
+         together"
+    )]
+    PartialCursor,
+    #[error("{field} exceeds the stored range: {value}")]
+    CursorOutOfRange { field: &'static str, value: u64 },
+}
+
+/// The first page at the default size.
+impl Default for WrappedTransferPage {
+    fn default() -> Self {
+        Self { limit: DEFAULT_WRAPPED_TRANSFER_PAGE, before: None }
+    }
+}
+
+impl WrappedTransferPage {
+    /// Builds a page from the query parameters a caller supplied, refusing a
+    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE`, a cursor missing any of
+    /// its three parts, and a cursor value the stored INTEGER columns cannot
+    /// hold, so every bad parameter is the caller's error rather than a 500
+    /// at query time.
+    pub(crate) fn new(
+        limit: Option<u32>,
+        before_block: Option<u64>,
+        before_log_index: Option<u64>,
+        before_network: Option<Network>,
+    ) -> Result<Self, WrappedTransferPageError> {
+        let limit = limit.unwrap_or(DEFAULT_WRAPPED_TRANSFER_PAGE);
+        if limit == 0 || limit > MAX_WRAPPED_TRANSFER_PAGE {
+            return Err(WrappedTransferPageError::LimitOutOfRange { limit });
+        }
+
+        let before = match (before_block, before_log_index, before_network) {
+            (None, None, None) => None,
+            (Some(block), Some(log_index), Some(network)) => Some((
+                cursor_column("before_block", block)?,
+                cursor_column("before_log_index", log_index)?,
+                network,
+            )),
+            _ => return Err(WrappedTransferPageError::PartialCursor),
+        };
+
+        Ok(Self { limit, before })
+    }
+}
+
+/// Narrows one cursor value to the INTEGER range the columns are stored in.
+fn cursor_column(
+    field: &'static str,
+    value: u64,
+) -> Result<i64, WrappedTransferPageError> {
+    i64::try_from(value).map_err(|_| {
+        WrappedTransferPageError::CursorOutOfRange { field, value }
+    })
+}
+
+/// One page of recorded inbound wrapped-token transfers, highest block first.
+pub(crate) async fn list_inbound_wrapped_transfers(
+    pool: &Pool<Sqlite>,
+    page: WrappedTransferPage,
+) -> Result<Vec<InboundWrappedTransfer>, InboundWrappedTransferReadError> {
+    let (before_block, before_log_index, before_network) = match page.before {
+        Some((block, log_index, network)) => {
+            (Some(block), Some(log_index), Some(network.as_str()))
+        }
+        None => (None, None, None),
+    };
+
+    let rows = sqlx::query_as::<
+        _,
+        (String, String, i64, String, String, String, String, i64, String),
+    >(
+        "
+        SELECT
+            network,
+            tx_hash,
+            log_index,
+            token,
+            underlying,
+            from_address,
+            amount,
+            block_number,
+            detected_at
+        FROM inbound_wrapped_transfers
+        WHERE
+            ?1 IS NULL
+            OR block_number < ?1
+            OR (block_number = ?1 AND log_index < ?2)
+            OR (block_number = ?1 AND log_index = ?2 AND network < ?3)
+        ORDER BY block_number DESC, log_index DESC, network DESC
+        LIMIT ?4
+        ",
+    )
+    .bind(before_block)
+    .bind(before_log_index)
+    .bind(before_network)
+    .bind(i64::from(page.limit))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(
+            |(
+                network,
+                tx_hash,
+                log_index,
+                token,
+                underlying,
+                from_address,
+                amount,
+                block_number,
+                detected_at,
+            )| {
+                Ok(InboundWrappedTransfer {
+                    network: network.parse()?,
+                    underlying: UnderlyingSymbol::new(underlying)?,
+                    token: token.parse()?,
+                    from: from_address.parse()?,
+                    amount: amount.parse()?,
+                    tx_hash: tx_hash.parse()?,
+                    log_index: u64::try_from(log_index)?,
+                    block_number: u64::try_from(block_number)?,
+                    detected_at: DateTime::parse_from_rfc3339(&detected_at)?
+                        .with_timezone(&Utc),
+                })
+            },
+        )
+        .collect()
+}
+
+/// A stored row failed to parse back into its typed form.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InboundWrappedTransferReadError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error("stored network is not a known network: {0}")]
+    Network(#[from] NetworkParseError),
+    #[error("stored underlying symbol is invalid: {0}")]
+    UnderlyingSymbol(#[from] UnderlyingSymbolError),
+    #[error("stored address or hash is invalid: {0}")]
+    Hex(#[from] alloy::hex::FromHexError),
+    #[error("stored amount is not a decimal integer: {0}")]
+    Amount(#[from] alloy::primitives::ruint::ParseError),
+    #[error("stored timestamp is not RFC 3339: {0}")]
+    Timestamp(#[from] chrono::ParseError),
+    #[error("stored block number or log index is negative: {0}")]
+    Int(#[from] TryFromIntError),
+}
+
+/// Checkpoint name for one network's scan of one wrapped token, in the same
+/// per-(network, address) shape as the transfer poller's.
+fn checkpoint_name(network: Network, token: Address) -> String {
+    format!("wrapped_transfer_poll:{network}:{token:#x}")
+}
+
+/// The category of an RPC failure, with no transport detail: the display of
+/// the wrapped error can quote the configured URL, API key and all.
+const fn classify_rpc_error(
+    error: &RpcError<TransportErrorKind>,
+) -> &'static str {
+    match error {
+        RpcError::ErrorResp(_) => "rpc error response",
+        RpcError::NullResp => "null response",
+        RpcError::UnsupportedFeature(_) => "unsupported feature",
+        RpcError::LocalUsageError(_) => "local usage error",
+        RpcError::SerError(_) => "serialization error",
+        RpcError::DeserError { .. } => "deserialization error",
+        RpcError::Transport(_) => "transport error",
+    }
+}
+
+/// Emits the log for a failed poll pass: WARN while the failure may still be
+/// a blip, escalating to ERROR once `consecutive_failures` reaches
+/// [`MAX_POLL_FAILURES_BEFORE_ALARM`], where the backstop is offline and an
+/// inbound wrapped-token transfer can land unseen.
+fn log_poll_failure(
+    network: Network,
+    error: &WrappedTransferPollError,
+    consecutive_failures: usize,
+) {
+    if consecutive_failures >= MAX_POLL_FAILURES_BEFORE_ALARM {
+        error!(
+            target: "wrapped_transfer",
+            %network,
+            error = %error,
+            consecutive_failures,
+            retry_after_secs = RETRY_INTERVAL.as_secs(),
+            "Wrapped-token transfer poll pass has failed repeatedly; inbound \
+             wrapped-token transfers are undetected until it recovers"
+        );
+    } else {
+        warn!(
+            target: "wrapped_transfer",
+            %network,
+            error = %error,
+            consecutive_failures,
+            retry_after_secs = RETRY_INTERVAL.as_secs(),
+            "Wrapped-token transfer poll pass failed; will retry from the \
+             last checkpoint"
+        );
+    }
+}
+
+/// Durable idempotency key of the alert for one transfer log.
+fn alert_idempotency_key(
+    network: Network,
+    tx_hash: TxHash,
+    log_index: u64,
+) -> String {
+    format!("notify:wrapped-transfer:{network}:{tx_hash:#x}:{log_index}")
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::network::EthereumWallet;
+    use alloy::primitives::{Address, TxHash, U256, address, b256};
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::types::Log;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::transports::{RpcError, TransportErrorKind};
+    use chrono::Utc;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tracing::Level;
+    use tracing_test::traced_test;
+
+    use super::{
+        InboundWrappedTransfer, InboundWrappedTransferReadError,
+        WatchedWrappedToken, WrappedTokenConfig, WrappedTokenConfigError,
+        WrappedTokenEntry, WrappedTransferMonitor, WrappedTransferPage,
+        WrappedTransferPageError, WrappedTransferPollError,
+        alert_idempotency_key, checkpoint_name, list_inbound_wrapped_transfers,
+        record_inbound_wrapped_transfer,
+    };
+    use crate::jobs::job_type;
+    use crate::mint::test_utils::TestHarness;
+    use crate::network_telemetry::NetworkTelemetry;
+    use crate::notifications::SendLifecycleNotification;
+    use crate::poll_checkpoint::{
+        advance_checkpoint_block, load_checkpoint_block,
+    };
+    use crate::redemption::test_utils::create_transfer_log_with_index;
+    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::tokenized_asset::{Network, UnderlyingSymbol};
+
+    fn symbol(value: &str) -> UnderlyingSymbol {
+        UnderlyingSymbol::new(value).unwrap()
+    }
+
+    fn entry(
+        network: Network,
+        underlying: &str,
+        token: Address,
+    ) -> WrappedTokenEntry {
+        WrappedTokenEntry { network, underlying: symbol(underlying), token }
+    }
+
+    const TOKEN_A: Address =
+        address!("0x00000000000000000000000000000000000000aa");
+    const TOKEN_B: Address =
+        address!("0x00000000000000000000000000000000000000bb");
+    const BOT_WALLET: Address =
+        address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    const SENDER: Address =
+        address!("0x9999999999999999999999999999999999999999");
+    const TX_HASH: TxHash = b256!(
+        "0x1111111111111111111111111111111111111111111111111111111111111111"
+    );
+
+    /// Every test in this module logs into one process-wide buffer that the
+    /// log assertions scan, so a test asserting on its own lines needs a
+    /// transaction hash that no sibling test emits.
+    fn tx_hash(seed: u8) -> TxHash {
+        TxHash::repeat_byte(seed)
+    }
+
+    /// The same address may wrap the same underlying on two chains
+    /// (deterministic deploys), and each network's watch list is sorted by
+    /// address regardless of entry order.
+    #[test]
+    fn watched_tokens_are_per_network_and_sorted_by_address() {
+        let config = WrappedTokenConfig::new([
+            entry(Network::Base, "AAPL", TOKEN_B),
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Ethereum, "RKLB", TOKEN_A),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.watched_on(Network::Base),
+            vec![
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("RKLB")
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_B,
+                    underlying: symbol("AAPL")
+                },
+            ]
+        );
+        assert_eq!(
+            config.watched_on(Network::Ethereum),
+            vec![WatchedWrappedToken {
+                token: TOKEN_A,
+                underlying: symbol("RKLB")
+            }]
+        );
+        assert!(config.watched_on(Network::HyperEvm).is_empty());
+
+        let mut networks: Vec<Network> = config.networks().collect();
+        networks.sort_unstable_by_key(Network::as_str);
+        assert_eq!(networks, vec![Network::Base, Network::Ethereum]);
+    }
+
+    #[test]
+    fn zero_address_is_rejected() {
+        let error = WrappedTokenConfig::new([entry(
+            Network::Base,
+            "RKLB",
+            Address::ZERO,
+        )])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::ZeroAddress {
+                network: Network::Base,
+                underlying: symbol("RKLB"),
+            }
+        );
+    }
+
+    /// One address cannot wrap two underlyings on one network: an inbound
+    /// transfer of it could not be attributed to an asset.
+    #[test]
+    fn one_address_for_two_underlyings_on_a_network_is_rejected() {
+        let error = WrappedTokenConfig::new([
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Base, "AAPL", TOKEN_A),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::AddressCollision {
+                network: Network::Base,
+                token: TOKEN_A,
+                first: symbol("RKLB"),
+                second: symbol("AAPL"),
+            }
+        );
+    }
+
+    #[test]
+    fn two_addresses_for_one_underlying_on_a_network_is_rejected() {
+        let error = WrappedTokenConfig::new([
+            entry(Network::Base, "RKLB", TOKEN_A),
+            entry(Network::Base, "RKLB", TOKEN_B),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            WrappedTokenConfigError::DuplicateUnderlying {
+                network: Network::Base,
+                underlying: symbol("RKLB"),
+            }
+        );
+    }
+
+    fn monitor(
+        harness: &TestHarness,
+        asserter: &Asserter,
+        watched: Vec<WatchedWrappedToken>,
+    ) -> WrappedTransferMonitor<impl Provider> {
+        WrappedTransferMonitor {
+            network: Network::Base,
+            provider: ProviderBuilder::new()
+                .wallet(EthereumWallet::from(PrivateKeySigner::random()))
+                .connect_mocked_client(asserter.clone()),
+            bot_wallet: BOT_WALLET,
+            backfill_start_block: 0,
+            watched,
+            refused: Mutex::default(),
+            pool: harness.pool.clone(),
+            apalis_pool: harness.apalis_pool.clone(),
+            telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
+            poll_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn watch_aapl() -> Vec<WatchedWrappedToken> {
+        vec![WatchedWrappedToken { token: TOKEN_A, underlying: symbol("AAPL") }]
+    }
+
+    fn inbound_log(
+        tx_hash: TxHash,
+        from: Address,
+        amount: U256,
+        log_index: u64,
+    ) -> Log {
+        create_transfer_log_with_index(
+            TOKEN_A, from, BOT_WALLET, amount, tx_hash, 120, log_index,
+        )
+    }
+
+    async fn alert_job_count(harness: &TestHarness, key: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND idempotency_key = ?",
+        )
+        .bind(job_type::<SendLifecycleNotification>())
+        .bind(key)
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn checkpoint(harness: &TestHarness) -> Option<u64> {
+        token_checkpoint(harness, TOKEN_A).await
+    }
+
+    async fn token_checkpoint(
+        harness: &TestHarness,
+        token: Address,
+    ) -> Option<u64> {
+        load_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, token),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The checkpoint moves to the pass head rather than the log's block:
+    /// every log in the chunk was handled, so re-scanning the gap could only
+    /// re-derive rows the identity key already holds.
+    #[traced_test]
+    #[tokio::test]
+    async fn poll_records_alerts_and_checkpoints_an_inbound_transfer() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa1);
+        let amount = U256::from(5_000_000_000_000_000_000_u128);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 3)]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one row: {recorded:?}");
+        let detected_at = recorded[0].detected_at;
+        assert!(
+            (Utc::now() - detected_at).num_seconds().abs() < 60,
+            "detected_at must be now-ish: {detected_at}"
+        );
+        assert_eq!(
+            recorded[0],
+            InboundWrappedTransfer {
+                network: Network::Base,
+                underlying: symbol("AAPL"),
+                token: TOKEN_A,
+                from: SENDER,
+                amount,
+                tx_hash: tx,
+                log_index: 3,
+                block_number: 120,
+                detected_at,
+            }
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 3)
+            )
+            .await,
+            1,
+            "one durable alert job keyed by the log identity"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Inbound wrapped-token transfer",
+                "network=base",
+                "underlying=AAPL",
+                &format!("token={TOKEN_A}"),
+                &format!("from={SENDER}"),
+                "amount=5000000000000000000",
+                &format!("tx_hash={tx}"),
+            ]
+        ));
+    }
+
+    /// A re-scan (here: the head moved and the same log came back) must
+    /// neither duplicate the row nor queue a second alert, and must not page
+    /// the operator again: the repeat is DEBUG, not ERROR.
+    #[traced_test]
+    #[tokio::test]
+    async fn rescanning_a_recorded_transfer_duplicates_neither_row_nor_alert() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa2);
+        let amount = U256::from(1u64);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 0)]);
+        asserter.push_success(&U256::from(300u64));
+        asserter.push_success(&vec![inbound_log(tx, SENDER, amount, 0)]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+        monitor.poll_once().await.unwrap();
+
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.len(), 1, "one row after a re-scan: {recorded:?}");
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            1
+        );
+        assert_eq!(checkpoint(&harness).await, Some(300));
+        assert_eq!(
+            log_count_at!(
+                Level::ERROR,
+                &["Inbound wrapped-token transfer", &format!("tx_hash={tx}")]
+            ),
+            1,
+            "the operator is paged once per transfer"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["already recorded", &format!("tx_hash={tx}")]
+        ));
+    }
+
+    /// A wrapper `deposit` with the issuer wallet as receiver mints straight
+    /// into the wallet: `from` is the zero address, and it is just as lost as
+    /// a plain transfer, so it must be recorded rather than skipped as a mint.
+    #[tokio::test]
+    async fn a_wrapper_deposit_straight_to_the_issuer_wallet_is_recorded() {
+        let harness = TestHarness::new().await;
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx_hash(0xa3),
+            Address::ZERO,
+            U256::from(2u64),
+            0,
+        )]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        let recorded = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].from, Address::ZERO);
+    }
+
+    /// ERC-20 mandates that a zero-value transfer emits `Transfer` like any
+    /// other, so anyone can emit one to the issuer wallet for the price of
+    /// gas. Nothing moved and nothing needs recovery, so it must not reach
+    /// the operator or the table.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_zero_value_transfer_is_ignored() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa6);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(tx, SENDER, U256::ZERO, 0)]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a zero-value transfer must not be recorded"
+        );
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            0,
+            "a zero-value transfer must not page the operator"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        assert_eq!(
+            log_count_at!(
+                Level::ERROR,
+                &["Inbound wrapped-token transfer", &format!("tx_hash={tx}")]
+            ),
+            0
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["zero-value", &format!("tx_hash={tx}")]
+        ));
+    }
+
+    /// The `to` and emitter constraints live in the `eth_getLogs` filter, so
+    /// a filter the provider ignores, a wrong topic index, or a stale RPC
+    /// would hand back logs that belong to nobody here. Re-checking both
+    /// against the log itself keeps such a log out of the table, the way the
+    /// redemption poller re-derives `log.address()` before it acts.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_log_from_another_token_or_to_another_wallet_is_dropped() {
+        let harness = TestHarness::new().await;
+        let other_wallet =
+            address!("0x1234123412341234123412341234123412341234");
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![
+            create_transfer_log_with_index(
+                TOKEN_B,
+                SENDER,
+                BOT_WALLET,
+                U256::from(1u64),
+                tx_hash(0xa7),
+                120,
+                0,
+            ),
+            create_transfer_log_with_index(
+                TOKEN_A,
+                SENDER,
+                other_wallet,
+                U256::from(1u64),
+                tx_hash(0xa8),
+                120,
+                1,
+            ),
+        ]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "neither log belongs to the watched token and wallet"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        // Nothing was lost: both logs are fully identified and simply not
+        // ours, so they must not be reported as unidentifiable. They still
+        // get their own WARN, because a provider handing back logs the filter
+        // should have excluded is worth knowing about.
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Skipped wrapped-token transfer logs the filter should have \
+                 excluded",
+                "count=2",
+                &format!("{:?}", tx_hash(0xa7)),
+                &format!("{:?}", tx_hash(0xa8)),
+            ]
+        ));
+        assert!(!logs_contain_at!(
+            Level::WARN,
+            &[
+                "Dropped unidentifiable wrapped-token transfer logs",
+                &format!("{:?}", tx_hash(0xa7)),
+            ]
+        ));
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["reason=", "log was not emitted by the watched token"]
+        ));
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["reason=", "recipient is not the issuer wallet"]
+        ));
+    }
+
+    /// The configured RPC URL carries the provider API key, and a transport
+    /// error's display can quote the URL it failed to reach, so the poll
+    /// failure log must name the failure category only.
+    #[traced_test]
+    #[test]
+    fn a_transport_failure_is_logged_without_the_rpc_url() {
+        let error = WrappedTransferPollError::Rpc(RpcError::Transport(
+            TransportErrorKind::Custom(Box::new(std::io::Error::other(
+                "error sending request for url \
+                 (https://base-mainnet.example.com/v2/SECRET_API_KEY)",
+            ))),
+        ));
+
+        super::log_poll_failure(Network::Base, &error, 1);
+
+        assert!(logs_contain_at!(Level::WARN, &["transport error"]));
+        assert_eq!(
+            log_count_at!(Level::WARN, &["SECRET_API_KEY"]),
+            0,
+            "the provider API key must never reach the log"
+        );
+    }
+
+    /// The escalation policy for consecutive pass failures: WARN below
+    /// `MAX_POLL_FAILURES_BEFORE_ALARM` (the loop retries quietly), ERROR at
+    /// the threshold, where the backstop is offline and every inbound
+    /// wrapped-token transfer in the gap goes unseen until it recovers.
+    #[traced_test]
+    #[test]
+    fn log_poll_failure_escalates_from_warn_to_error_at_the_alarm_threshold() {
+        let error = WrappedTransferPollError::AllTokensFailed { total: 1 };
+
+        super::log_poll_failure(Network::Base, &error, 1);
+        super::log_poll_failure(Network::Base, &error, 2);
+
+        // The count is filtered by this error's own text: the log buffer the
+        // macro scans is shared by every test in the module.
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &[
+                    "will retry from the last checkpoint",
+                    "all 1 wrapped tokens failed",
+                ]
+            ),
+            2,
+            "each below-threshold failure must WARN"
+        );
+        assert!(
+            !logs_contain_at!(Level::ERROR, &["failed repeatedly"]),
+            "no ERROR before the alarm threshold is reached"
+        );
+
+        super::log_poll_failure(Network::Base, &error, 3);
+
+        assert!(
+            logs_contain_at!(
+                Level::ERROR,
+                &["failed repeatedly", "consecutive_failures=3"]
+            ),
+            "the third consecutive failure must escalate to ERROR"
+        );
+    }
+
+    /// Assets are enabled at runtime, so a vault that collides with a
+    /// configured wrapped token can appear after the watcher started. The
+    /// check has to run every pass, or the watcher keeps paging the operator
+    /// for genuine redemptions it can never clear.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_vault_enabled_after_startup_is_refused_on_the_next_pass() {
+        let harness = TestHarness::new().await;
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&Vec::<Log>::new());
+        // `watchable` keeps the configured order, and this vec puts the
+        // vault first, so an unfiltered pass would spend the single queued
+        // `eth_getLogs` response on the vault and fail on TOKEN_A.
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![
+                WatchedWrappedToken {
+                    token: vault,
+                    underlying: symbol("AAPL"),
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("RKLB"),
+                },
+            ],
+        );
+
+        harness.setup_account_and_asset().await;
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(token_checkpoint(&harness, TOKEN_A).await, Some(200));
+        assert_eq!(
+            token_checkpoint(&harness, vault).await,
+            None,
+            "the vault must never be scanned"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["is an enabled asset's vault", &format!("token={vault}")]
+        ));
+    }
+
+    /// A pass that refused every configured token scans nothing, which is the
+    /// backstop being offline. It must read as a failed pass rather than a
+    /// healthy one, or telemetry says the watcher is fine while nothing is
+    /// watched.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_pass_that_refuses_every_token_fails() {
+        let harness = TestHarness::new().await;
+        harness.setup_account_and_asset().await;
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        // No queued responses: a pass that scans nothing must not reach the
+        // chain at all.
+        let asserter = Asserter::new();
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![WatchedWrappedToken {
+                token: vault,
+                underlying: symbol("AAPL"),
+            }],
+        );
+
+        let result = monitor.poll_once().await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WrappedTransferPollError::AllTokensRefused { total: 1 })
+            ),
+            "got: {result:?}"
+        );
+    }
+
+    /// When the asset view cannot be read, the configured tokens are scanned
+    /// unchecked rather than not at all: an unverified scan still detects a
+    /// real transfer, while an empty watch list would disable the backstop
+    /// over a database blip.
+    #[traced_test]
+    #[tokio::test]
+    async fn an_unreadable_asset_view_leaves_the_tokens_watched() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xb2);
+        sqlx::query("DROP TABLE tokenized_asset_view")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "the token must still be scanned"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Could not read the enabled assets", "scanning them unchecked"]
+        ));
+    }
+
+    /// A log without a transaction hash cannot be identified, so it cannot be
+    /// recorded or deduplicated; it is dropped with a WARN summary and the
+    /// checkpoint still advances rather than freezing on it forever.
+    #[traced_test]
+    #[tokio::test]
+    async fn an_unidentifiable_log_is_dropped_with_a_warn_and_the_checkpoint_advances()
+     {
+        let harness = TestHarness::new().await;
+        let mut log = inbound_log(tx_hash(0xa4), SENDER, U256::from(1u64), 0);
+        log.transaction_hash = None;
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![log]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Dropped unidentifiable wrapped-token transfer logs", "count=1"]
+        ));
+    }
+
+    /// A failed `eth_getLogs` must leave the token's checkpoint alone so the
+    /// range is retried, and a pass where every token failed fails the pass.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_failed_log_fetch_fails_the_pass_and_holds_the_checkpoint() {
+        let harness = TestHarness::new().await;
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_failure_msg("simulated eth_getLogs failure");
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        let result = monitor.poll_once().await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WrappedTransferPollError::AllTokensFailed { total: 1 })
+            ),
+            "got: {result:?}"
+        );
+        assert_eq!(checkpoint(&harness).await, None);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+                "total_tokens=1",
+            ]
+        ));
+    }
+
+    /// If the alert cannot be queued, the transfer is still recorded (that
+    /// insert happens first) but the checkpoint must not advance: the next
+    /// pass re-scans the range and queues the alert, so it is never lost.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_failed_alert_enqueue_holds_the_checkpoint_for_a_retry() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa5);
+        // Hidden rather than dropped, so the recovery leg below can put the
+        // queue back exactly as apalis created it.
+        sqlx::query("ALTER TABLE Jobs RENAME TO JobsHidden")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        let result = monitor.poll_once().await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WrappedTransferPollError::AllTokensFailed { total: 1 })
+            ),
+            "got: {result:?}"
+        );
+        assert_eq!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(checkpoint(&harness).await, None);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+            ]
+        ));
+
+        // The checkpoint held, so the next pass re-reads the same log: the
+        // row is already there, and this is the one path that re-derives the
+        // alert key, so the alert it could not queue is queued now.
+        sqlx::query("ALTER TABLE JobsHidden RENAME TO Jobs")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "the re-read must not duplicate the row"
+        );
+        assert_eq!(
+            alert_job_count(
+                &harness,
+                &alert_idempotency_key(Network::Base, tx, 0)
+            )
+            .await,
+            1,
+            "exactly one alert, queued on the recovery pass"
+        );
+        assert_eq!(checkpoint(&harness).await, Some(200));
+    }
+
+    /// One token's `eth_getLogs` failing must not starve its siblings: the
+    /// healthy token still records and checkpoints, the pass stays `Ok`, and
+    /// only the failing token resumes from its own checkpoint next pass.
+    #[traced_test]
+    #[tokio::test]
+    async fn one_failing_token_leaves_the_others_polling() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xa9);
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(3u64),
+            0,
+        )]);
+        asserter.push_failure_msg("simulated eth_getLogs failure");
+        let monitor = monitor(
+            &harness,
+            &asserter,
+            vec![
+                WatchedWrappedToken {
+                    token: TOKEN_A,
+                    underlying: symbol("AAPL"),
+                },
+                WatchedWrappedToken {
+                    token: TOKEN_B,
+                    underlying: symbol("RKLB"),
+                },
+            ],
+        );
+
+        // Checkpoints far apart, so the reported lag says which token it
+        // came from: the failing one is the further behind.
+        advance_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, TOKEN_A),
+            190,
+        )
+        .await
+        .unwrap();
+        advance_checkpoint_block(
+            &harness.pool,
+            &checkpoint_name(Network::Base, TOKEN_B),
+            100,
+        )
+        .await
+        .unwrap();
+
+        let lag_blocks = monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            lag_blocks, 100,
+            "a failing token's backlog must reach the lag gauge, not just \
+             the healthy token's"
+        );
+        assert_eq!(
+            list_inbound_wrapped_transfers(
+                &harness.pool,
+                WrappedTransferPage::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "the healthy token still records its transfer"
+        );
+        assert_eq!(token_checkpoint(&harness, TOKEN_A).await, Some(200));
+        assert_eq!(
+            token_checkpoint(&harness, TOKEN_B).await,
+            Some(100),
+            "the failing token holds its checkpoint for a retry"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "poll pass completed with token failures",
+                "failed_token_count=1",
+                "total_tokens=2",
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn listing_orders_by_block_then_log_index_and_repeats_are_no_ops() {
+        let harness = TestHarness::new().await;
+        let older = InboundWrappedTransfer {
+            network: Network::Base,
+            underlying: symbol("AAPL"),
+            token: TOKEN_A,
+            from: SENDER,
+            amount: U256::from(1u64),
+            tx_hash: TX_HASH,
+            log_index: 0,
+            block_number: 100,
+            detected_at: Utc::now(),
+        };
+        let newer = InboundWrappedTransfer {
+            block_number: 200,
+            log_index: 1,
+            // The largest value an ERC-20 can move, to prove the decimal
+            // string in the TEXT column round-trips without loss.
+            amount: U256::MAX,
+            tx_hash: b256!(
+                "0x2222222222222222222222222222222222222222222222222222222222222222"
+            ),
+            ..older.clone()
+        };
+        // Same block as `newer`, lower log index: several inbound transfers
+        // in one block is exactly what the tie-break orders.
+        let same_block = InboundWrappedTransfer {
+            block_number: 200,
+            log_index: 0,
+            tx_hash: b256!(
+                "0x3333333333333333333333333333333333333333333333333333333333333333"
+            ),
+            ..older.clone()
+        };
+
+        assert!(
+            record_inbound_wrapped_transfer(&harness.pool, &older)
+                .await
+                .unwrap()
+        );
+        assert!(
+            record_inbound_wrapped_transfer(&harness.pool, &newer)
+                .await
+                .unwrap()
+        );
+        assert!(
+            record_inbound_wrapped_transfer(&harness.pool, &same_block)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !record_inbound_wrapped_transfer(&harness.pool, &older)
+                .await
+                .unwrap(),
+            "re-recording the same log identity is a no-op"
+        );
+
+        let listed = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::default(),
+        )
+        .await
+        .unwrap();
+        let block_and_log_index: Vec<(u64, u64)> = listed
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(block_and_log_index, vec![(200, 1), (200, 0), (100, 0)]);
+        assert_eq!(listed[0].amount, U256::MAX, "amount round-trips exactly");
+    }
+
+    /// Paging is by `(block_number, log_index)`, so a page boundary inside a
+    /// block does not skip the rest of that block, and the page size is
+    /// bounded on both ends.
+    #[tokio::test]
+    async fn listing_pages_by_block_and_log_index_without_skipping() {
+        let harness = TestHarness::new().await;
+        let base = InboundWrappedTransfer {
+            network: Network::Base,
+            underlying: symbol("AAPL"),
+            token: TOKEN_A,
+            from: SENDER,
+            amount: U256::from(1u64),
+            tx_hash: TX_HASH,
+            log_index: 0,
+            block_number: 100,
+            detected_at: Utc::now(),
+        };
+        for (block_number, log_index, seed) in
+            [(200, 2, 0xc1), (200, 1, 0xc2), (200, 0, 0xc3), (100, 0, 0xc4)]
+        {
+            let row = InboundWrappedTransfer {
+                block_number,
+                log_index,
+                tx_hash: tx_hash(seed),
+                ..base.clone()
+            };
+            assert!(
+                record_inbound_wrapped_transfer(&harness.pool, &row)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let first = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(Some(2), None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+        let first_keys: Vec<(u64, u64)> = first
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(first_keys, vec![(200, 2), (200, 1)]);
+
+        let last = first.last().unwrap();
+        let second = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(
+                Some(2),
+                Some(last.block_number),
+                Some(last.log_index),
+                Some(last.network),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let second_keys: Vec<(u64, u64)> = second
+            .iter()
+            .map(|transfer| (transfer.block_number, transfer.log_index))
+            .collect();
+        assert_eq!(
+            second_keys,
+            vec![(200, 0), (100, 0)],
+            "the rest of block 200 must not be skipped"
+        );
+
+        assert_eq!(
+            WrappedTransferPage::new(Some(0), None, None, None).unwrap_err(),
+            WrappedTransferPageError::LimitOutOfRange { limit: 0 }
+        );
+        assert_eq!(
+            WrappedTransferPage::new(Some(1001), None, None, None).unwrap_err(),
+            WrappedTransferPageError::LimitOutOfRange { limit: 1001 }
+        );
+        assert_eq!(
+            WrappedTransferPage::new(None, Some(200), Some(0), None)
+                .unwrap_err(),
+            WrappedTransferPageError::PartialCursor
+        );
+        assert_eq!(
+            WrappedTransferPage::new(
+                None,
+                Some(u64::MAX),
+                Some(0),
+                Some(Network::Base)
+            )
+            .unwrap_err(),
+            WrappedTransferPageError::CursorOutOfRange {
+                field: "before_block",
+                value: u64::MAX
+            }
+        );
+    }
+
+    /// The listing spans networks, and two chains can share a block number
+    /// and a log index, so the network is part of the order and the cursor:
+    /// a page boundary on such a tie must not skip the row on the other chain.
+    #[tokio::test]
+    async fn listing_pages_across_networks_tied_on_block_and_log_index() {
+        let harness = TestHarness::new().await;
+        for (network, seed) in
+            [(Network::Base, 0xd1), (Network::Ethereum, 0xd2)]
+        {
+            let row = InboundWrappedTransfer {
+                network,
+                underlying: symbol("AAPL"),
+                token: TOKEN_A,
+                from: SENDER,
+                amount: U256::from(1u64),
+                tx_hash: tx_hash(seed),
+                log_index: 0,
+                block_number: 200,
+                detected_at: Utc::now(),
+            };
+            assert!(
+                record_inbound_wrapped_transfer(&harness.pool, &row)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let first = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(Some(1), None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        let last = &first[0];
+
+        let second = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(
+                Some(1),
+                Some(last.block_number),
+                Some(last.log_index),
+                Some(last.network),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.len(), 1, "the tied row on the other chain");
+        assert_ne!(second[0].network, last.network);
+    }
+
+    /// A row that cannot be parsed back fails the whole listing rather than
+    /// being skipped: the endpoint exists to show an operator every transfer
+    /// awaiting manual recovery, and a listing silently missing one is worse
+    /// than a listing that reports it is broken.
+    #[tokio::test]
+    async fn one_unparsable_row_fails_the_whole_listing() {
+        let harness = TestHarness::new().await;
+        sqlx::query(
+            "
+            INSERT INTO inbound_wrapped_transfers (
+                network,
+                tx_hash,
+                log_index,
+                token,
+                underlying,
+                from_address,
+                amount,
+                block_number,
+                detected_at
+            )
+            VALUES ('mars', ?, 0, ?, 'AAPL', ?, '1', 100, ?)
+            ",
+        )
+        .bind(format!("{TX_HASH:#x}"))
+        .bind(format!("{TOKEN_A:#x}"))
+        .bind(format!("{SENDER:#x}"))
+        .bind(Utc::now().to_rfc3339())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        let error = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, InboundWrappedTransferReadError::Network(_)),
+            "got: {error:?}"
+        );
+    }
+}

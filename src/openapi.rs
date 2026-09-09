@@ -36,6 +36,7 @@ expressed as an OpenAPI scheme."
         crate::admin::schedule_freeze_window,
         crate::admin::orchestrator_health,
         crate::admin::network_telemetry,
+        crate::admin::list_wrapped_transfers,
     ),
     components(schemas(
         st0x_issuance_dto::TokenizedAssetDetailResponse,
@@ -69,6 +70,8 @@ expressed as an OpenAPI scheme."
         crate::admin::AssetVaultModeStatus,
         crate::admin::OrchestratorHealthResponse,
         crate::admin::NetworkTelemetryResponse,
+        crate::admin::WrappedTransfersResponse,
+        crate::admin::WrappedTransferEntry,
         crate::network_telemetry::NetworkTelemetrySnapshot,
         crate::network_telemetry::PassStatsSnapshot,
         crate::network_telemetry::GasStatusSnapshot,
@@ -128,6 +131,7 @@ mod tests {
             "/admin/close/mint/{aggregate_id}",
             "/admin/freeze-schedules",
             "/admin/network-telemetry",
+            "/admin/wrapped-transfers",
             "/internal/mints/{tokenization_request_id}/authorization",
         ] {
             assert!(

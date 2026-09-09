@@ -2,7 +2,7 @@
 
 mod telegram;
 
-use alloy::primitives::{Address, U256, utils::format_ether};
+use alloy::primitives::{Address, TxHash, U256, utils::format_ether};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ pub(crate) enum NotificationKind {
     RedemptionResumed,
     RedemptionResumeFailed,
     LowGasBalance,
+    InboundWrappedTransfer,
 }
 
 impl NotificationKind {
@@ -43,6 +44,7 @@ impl NotificationKind {
             Self::RedemptionResumed => "redemption_resumed",
             Self::RedemptionResumeFailed => "redemption_resume_failed",
             Self::LowGasBalance => "low_gas_balance",
+            Self::InboundWrappedTransfer => "inbound_wrapped_transfer",
         }
     }
 }
@@ -85,6 +87,19 @@ pub(crate) enum LifecycleNotification {
         balance: U256,
         threshold: U256,
     },
+    /// A transfer of a configured wrapped token into the issuer wallet; not
+    /// redeemable automatically, so the operator must recover it by hand.
+    InboundWrappedTransfer {
+        network: Network,
+        underlying: UnderlyingSymbol,
+        token: Address,
+        from: Address,
+        amount: U256,
+        tx_hash: TxHash,
+        /// With `tx_hash`, the log identity the alert is keyed on: two
+        /// transfers in one transaction render as two distinct alerts.
+        log_index: u64,
+    },
 }
 
 impl LifecycleNotification {
@@ -110,6 +125,9 @@ impl LifecycleNotification {
                 NotificationKind::RedemptionResumeFailed
             }
             Self::LowGasBalance { .. } => NotificationKind::LowGasBalance,
+            Self::InboundWrappedTransfer { .. } => {
+                NotificationKind::InboundWrappedTransfer
+            }
         }
     }
 
@@ -165,6 +183,31 @@ impl LifecycleNotification {
                     format_ether(*threshold)
                 )
             }
+            Self::InboundWrappedTransfer {
+                network,
+                underlying,
+                token,
+                from,
+                amount,
+                tx_hash,
+                log_index,
+            } => format!(
+                // The raw value, not a scaled one: ERC-4626 does not fix a
+                // share token at 18 decimals and this repo never reads the
+                // wrapper's `decimals()`, so scaling here would state a
+                // precision nobody verified.
+                // The scan follows the chain head, so a reorged-out log
+                // still pages. Returning tokens against such a page would
+                // send the wallet's own holdings out, hence the instruction.
+                "Inbound wrapped-token transfer on {network}: {amount} base \
+                 units of wrapped {underlying} ({token}) from {from} to the \
+                 issuer wallet in tx {tx_hash} (log {log_index}); not \
+                 redeemable automatically. \
+                 Verify the transaction and the wallet balance on chain \
+                 before returning or redeeming anything: the watcher follows \
+                 the chain head, so a reorg can leave a page for tokens that \
+                 never arrived"
+            ),
         }
     }
 }
@@ -670,6 +713,41 @@ mod tests {
             "Low gas on hyperevm: issuer wallet \
              0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
              1.000000000000000000 HYPE (threshold 2.000000000000000000 HYPE)"
+        );
+    }
+
+    /// The amount is the raw on-chain value. ERC-4626 does not fix a share
+    /// token at 18 decimals (EIP-4626 only recommends mirroring the asset,
+    /// and OpenZeppelin's implementation adds a decimals offset), and this
+    /// repo never reads the wrapper's `decimals()`, so scaling it here would
+    /// state a precision nobody verified.
+    #[test]
+    fn inbound_wrapped_transfer_message_names_chain_asset_amount_and_tx() {
+        let notification = LifecycleNotification::InboundWrappedTransfer {
+            network: Network::Ethereum,
+            underlying: underlying(),
+            token: address!("0x0000000000000000000000000000000000001010"),
+            from: address!("0x9999999999999999999999999999999999999999"),
+            amount: parse_ether("7.5").unwrap(),
+            tx_hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            log_index: 3,
+        };
+
+        assert_eq!(notification.kind().as_str(), "inbound_wrapped_transfer");
+        assert_eq!(
+            notification.message(),
+            "Inbound wrapped-token transfer on ethereum: 7500000000000000000 \
+             base units of wrapped AAPL \
+             (0x0000000000000000000000000000000000001010) from \
+             0x9999999999999999999999999999999999999999 to the issuer wallet \
+             in tx \
+             0x1111111111111111111111111111111111111111111111111111111111111111 \
+             (log 3); not redeemable automatically. Verify the transaction and the \
+             wallet balance on chain before returning or redeeming anything: \
+             the watcher follows the chain head, so a reorg can leave a page \
+             for tokens that never arrived"
         );
     }
 

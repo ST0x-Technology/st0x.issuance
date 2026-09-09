@@ -154,7 +154,9 @@ pub fn receipt_inventory_aggregate_id(chain_id: u64, vault: Address) -> String {
 /// Chain ID for the Ethereum test runtime in multichain integration tests.
 pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 
-fn test_config() -> Result<Config, anyhow::Error> {
+/// The default test `Config`; fixtures override fields with struct update
+/// syntax so a new field lands in one place.
+pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
     Ok(Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
@@ -164,6 +166,9 @@ fn test_config() -> Result<Config, anyhow::Error> {
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
+        wrapped_tokens: crate::wrapped_transfer::WrappedTokenConfig::default(),
+        wrapped_transfer_poll_interval:
+            crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,
@@ -1026,6 +1031,9 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     }
     if module.contains("::network_telemetry") {
         return "network_telemetry";
+    }
+    if module.contains("::wrapped_transfer") {
+        return "wrapped_transfer";
     }
 
     if module.contains("::mint") {

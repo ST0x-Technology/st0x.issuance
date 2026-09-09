@@ -288,6 +288,8 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         backfill_start_block: 0,
         receipt_poll_interval: Duration::from_millis(500),
         gas_poll_interval: Duration::from_millis(200),
+        wrapped_tokens: st0x_issuance::WrappedTokenConfig::default(),
+        wrapped_transfer_poll_interval: Duration::from_millis(200),
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()

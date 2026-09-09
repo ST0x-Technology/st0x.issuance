@@ -179,6 +179,26 @@ fn log_delivery_failure(
                 "notification_delivery_failed"
             );
         }
+        LifecycleNotification::InboundWrappedTransfer {
+            network,
+            underlying,
+            tx_hash,
+            log_index,
+            ..
+        } => {
+            tracing::error!(
+                target: "notifications",
+                event = "notification_delivery_failed",
+                notification_kind = notification.kind().as_str(),
+                network = %network,
+                underlying = %underlying,
+                tx_hash = %tx_hash,
+                log_index,
+                error = %error,
+                cause = ?cause,
+                "notification_delivery_failed"
+            );
+        }
     }
 }
 

@@ -1935,20 +1935,22 @@ same channel.
 
 Notifications describe the lifecycle transition and its correlation identifier
 but never include wallet balances, raw token quantities, credentials, or signing
-material. Delivery happens only after the corresponding durable state transition
-succeeds. Telegram unavailability cannot roll back or fail the financial
-workflow. A separately queued `SendLifecycleNotification` job returns delivery
-failures to apalis so the durable row retries; direct best-effort delivery after
-an already-committed transition records a structured error instead. Failure to
-queue a notification increments `notification_enqueue_failures` but does not
-abort corporate-action processing or prevent the remaining windows from being
-armed. If post-commit outcome inspection fails, the applied transition remains
-durable, its `FreezeApplied` or `UnfreezeApplied` notification is suppressed,
-and a structured ERROR is emitted. A failed freeze transition has one durable
-failure notification per underlying, hold, and transition; retries reuse that
-row rather than emitting one message per attempt. Replaying an idempotent
-command that produces no new domain transition does not emit another
-notification.
+material; the per network operational alerts (low gas, inbound wrapped-token
+transfers — see "Per network monitoring") are the exception and carry the
+observed balance or amount, because the operator acts on that number. Delivery
+happens only after the corresponding durable state transition succeeds. Telegram
+unavailability cannot roll back or fail the financial workflow. A separately
+queued `SendLifecycleNotification` job returns delivery failures to apalis so
+the durable row retries; direct best-effort delivery after an already-committed
+transition records a structured error instead. Failure to queue a notification
+increments `notification_enqueue_failures` but does not abort corporate-action
+processing or prevent the remaining windows from being armed. If post-commit
+outcome inspection fails, the applied transition remains durable, its
+`FreezeApplied` or `UnfreezeApplied` notification is suppressed, and a
+structured ERROR is emitted. A failed freeze transition has one durable failure
+notification per underlying, hold, and transition; retries reuse that row rather
+than emitting one message per attempt. Replaying an idempotent command that
+produces no new domain transition does not emit another notification.
 
 Telegram configuration is all-or-none: bot token and chat id must either both be
 present or both be absent, and the forum topic is optional only when the channel
@@ -4807,6 +4809,10 @@ Returns one row per configured network, sorted by network wire name:
   at the start of the most recent successful pass.
 - `receipt_backfill`: the same counter shape for the periodic receipt backfill
   loop, with `lag_blocks` measured against the receipt backfill checkpoints.
+- `wrapped_transfer`: the same counter shape for the inbound wrapped-token
+  transfer watcher, with `lag_blocks` measured against the per-(network, token)
+  wrapped-transfer checkpoints. A chain with no `[wrapped_tokens]` entries runs
+  no watcher, so its counters stay at zero.
 - `gas`: the gas monitor's latest reading for the issuer wallet:
   `{"status": "ok" | "low", "balance_wei", "threshold_wei", "checked_at"}`,
   `{"status": "unavailable", "error"}` when the last balance read failed, or
@@ -4815,6 +4821,27 @@ Returns one row per configured network, sorted by network wire name:
 Counters live in process memory and reset on restart; `failure_rate` is
 `failures / passes` and is absent until the first pass completes. See "Per
 network monitoring" for what counts as a failed pass.
+
+### Inbound Wrapped-Token Transfers
+
+Lists every inbound wrapped-token transfer the per network watcher has recorded
+(see "Per network monitoring" -> "Inbound wrapped-token transfer alerts"), so an
+operator can see what needs manual recovery without log access.
+
+**Endpoint:** `GET /admin/wrapped-transfers`
+
+Returns `{"transfers": [...]}`, one page at a time, highest block first. `limit`
+(1 to 1000, default 100) bounds the page, since the table only grows and nothing
+deletes from it; `before_block`, `before_log_index`, and `before_network`, given
+together as the last row of the previous page, select the next page by the
+`(block_number, log_index, network)` order. The listing spans every network and
+two chains can share a block number and log index, so the network is what makes
+the order total: a boundary inside a block, or on such a tie, skips nothing. A
+limit out of range, an incomplete cursor, or an unknown cursor network is a 422.
+Each row carries `network`, `underlying`, `token` (the wrapped-token contract),
+`from`, `amount` (the raw ERC-20 amount as a decimal string, in the wrapper's
+own base units), `tx_hash`, `log_index`, `block_number`, and `detected_at`. Rows
+are durable: they survive restarts and the service never removes them.
 
 ## Configuration
 
@@ -4867,11 +4894,11 @@ METRICS_PORT=9090
 The orchestrator migration introduces a TOML configuration file, passed via a
 `--config <path>` CLI argument — the same pattern the liquidity bot uses. It is
 the home for structured, per-asset configuration that environment variables
-express poorly; today it carries only the orchestrator-migration settings
-(migrating the environment variables above into it is out of scope for the
-migration). The flag is optional: with no config file (or one containing no
-orchestrator entries) every asset is vault-direct, which is the dark-deploy
-default.
+express poorly; today it carries the orchestrator-migration settings and the per
+network wrapped-token addresses (migrating the environment variables above into
+it is out of scope for the migration). The flag is optional: with no config file
+(or one containing no orchestrator entries) every asset is vault-direct, which
+is the dark-deploy default.
 
 ```toml
 [orchestrator]
@@ -4888,15 +4915,34 @@ default_vault_mode = "vault_direct"
 # network keys and missing, malformed, or zero addresses.
 [orchestrator.addresses]
 base = "0x..."
+ethereum = "0x..."
+hyperevm = "0x..."
 
 # Per-asset override, keyed by underlying symbol. During the pilot exactly one
 # asset carries this; every other asset stays on the default.
 [assets.RKLB]
 vault_mode = "orchestrator"
+
+# Wrapped-token (ERC-4626 wrapper) contract addresses, one table per network
+# (base | ethereum | hyperevm), keyed by underlying symbol. Inbound transfers
+# of these tokens to the issuer wallet cannot be redeemed; the per network
+# watcher records and alerts on them (see "Per network monitoring"). Every
+# listed network must have a chain configuration; a configured chain with no
+# table here has wrapped-token watching disabled (startup WARN).
+[wrapped_tokens.base]
+RKLB = "0x..."
+
+[wrapped_tokens.ethereum]
+RKLB = "0x..."
+
+[wrapped_tokens.hyperevm]
+RKLB = "0x..."
 ```
 
-Parsing is strict (unknown keys and invalid `vault_mode` strings are startup
-errors — no silent fallback defaults), and
+Parsing is strict (unknown keys, invalid `vault_mode` strings, and
+`[wrapped_tokens]` entries with an unknown network, an invalid symbol, a
+malformed or zero address, or one address bound to two underlyings on a chain
+are startup errors — no silent fallback defaults), and
 `Config::vault_mode_for(&UnderlyingSymbol) -> VaultMode` resolves an asset's
 mode as: per-asset override if present, else `default_vault_mode`, else
 `VaultDirect`. See "Orchestrator Migration" -> "Dual-Mode Operation and Cutover"
@@ -5019,10 +5065,11 @@ rekey change itself.
 
 ## Per network monitoring
 
-Every configured chain gets per network telemetry for the long running loops,
-and a low gas monitor on the issuer wallet's native balance whenever a gas
-threshold is configured for it. Both are keyed by `Network`, so a chain added to
-the `ChainRegistry` is covered without further wiring.
+Every configured chain gets per network telemetry for the long running loops, a
+low gas monitor on the issuer wallet's native balance whenever a gas threshold
+is configured for it, and an inbound wrapped-token transfer watcher whenever
+wrapped-token addresses are configured for it. All are keyed by `Network`, so a
+chain added to the `ChainRegistry` is covered without further wiring.
 
 ### Gas balance monitoring
 
@@ -5070,6 +5117,87 @@ Alert state lives in process memory; a restart alerts once more for a wallet
 still below the threshold, which is the desired behavior for an unresolved
 condition.
 
+### Inbound wrapped-token transfer alerts
+
+The transfer poller watches each asset's vault, i.e. the unwrapped share token,
+so a redemption sent as the ERC-4626 wrapped token lands in the issuer wallet
+without ever being detected or redeemed. The liquidity bot guards its own unwrap
+step; this watcher is the issuance backstop: it cannot redeem such a transfer,
+but it must never lose one silently.
+
+**Configuration:** the TOML config file's `[wrapped_tokens.<network>]` tables
+map each underlying symbol to that chain's wrapped-token contract address (see
+"TOML Configuration File"). Entries are validated at startup: an unknown
+network, an invalid symbol, a malformed or zero address, one address bound to
+two underlyings on the same chain, or a network with no chain configuration is a
+startup error. A configured chain with no entries logs a startup WARN that
+wrapped-token watching is disabled for it. When a chain's watcher starts it
+announces the tokens it watches at INFO. Every pass then refuses any configured
+address that is an enabled asset's vault on that chain, logged at ERROR the
+first time each address is refused: scanning a vault would record and page every
+genuine redemption transfer as an un-redeemable inbound one. The check runs per
+pass rather than once, because assets are enabled at runtime. A pass whose every
+configured address is refused scans nothing, so it counts as a failed pass: the
+backstop is offline, and telemetry and the WARN/ERROR escalation say so rather
+than reporting a healthy watcher with zero lag. A failed asset read leaves the
+list unchecked for that pass rather than disabling the backstop.
+
+**Behavior:** one watcher per configured chain with entries polls `eth_getLogs`
+for ERC-20 `Transfer` events on every configured wrapped token where `to` is the
+issuer wallet, in block chunks from a per-(network, token) checkpoint
+(`wrapped_transfer_poll:{network}:{token_address_lowercase}` in
+`poll_checkpoints`, starting at `backfill_start_block` when the token has none)
+up to the chain head. Every sender counts, including the zero address (a wrapper
+deposit made straight to the issuer wallet). A zero-value transfer is ignored at
+DEBUG, neither recorded nor alerted: ERC-20 emits `Transfer` for it like any
+other, so an unauthenticated sender could otherwise page the operator for the
+price of gas, and nothing moved that could need recovery. For each remaining
+matching log the watcher:
+
+- records the transfer durably in `inbound_wrapped_transfers`, keyed by
+  `(network, tx_hash, log_index)` so a re-scan cannot record it twice;
+- emits an ERROR log naming the network, underlying, wrapped token, sender,
+  amount, and transaction hash when the transfer is first recorded; the amount
+  is the raw on-chain value, since ERC-4626 does not fix a share token at 18
+  decimals and the service never reads the wrapper's `decimals()`;
+- queues an `InboundWrappedTransfer` lifecycle notification (Telegram when
+  configured) carrying the same fields under the durable idempotency key
+  `notify:wrapped-transfer:{network}:{tx_hash}:{log_index}` — the dedup the
+  corporate-action notifications use, so a restart or re-scan never re-alerts a
+  transfer already delivered. The key is derived once per log rather than every
+  pass, so releasing a dead delivery only helps a chunk retried before its
+  checkpoint advanced: a notification that exhausts its retries after that is
+  not re-queued, and the recorded row, the ERROR log, and
+  `GET /admin/wrapped-transfers` are the durable record of the transfer.
+
+The scan follows the chain head with no confirmation depth, as the transfer
+poller does, so a reorg can go either way: a log from a block later reorged out
+stays recorded and paged, a transaction re-mined above the checkpoint under a
+different log index is recorded again, and a block at or below the checkpoint
+replaced by one carrying a new inbound transfer is never re-read, so that
+transfer is missed. The first two are false positives an operator resolves on
+chain; the last is the failure this backstop exists to prevent, and the
+per-chain finality cutoff that closes it is RAI-2297.
+
+A token's checkpoint advances only after every log in the chunk is recorded and
+queued; a failed RPC read, database write, or enqueue leaves the chunk to be
+retried next pass, so no inbound transfer is skipped. A log missing its
+transaction hash, block number, or log index cannot be identified and is dropped
+with a WARN summary rather than freezing the checkpoint. A failed pass is logged
+at WARN and retried, escalating to ERROR after three consecutive failures, where
+the backstop is offline and an inbound transfer can land unseen; the watcher
+never exits. Each pass reports success or failure to the per network telemetry
+registry, so a watcher that is failing every pass is visible on
+`GET /admin/network-telemetry` as well as in the log.
+
+Operators list what was detected via `GET /admin/wrapped-transfers` (see Admin
+API). Recovery — unwrapping and returning or redeeming the tokens — is a manual
+operation, and it starts with verifying the transaction and the issuer wallet's
+balance on chain: the watcher follows the chain head, so a reorged-out log
+leaves a row and a page for tokens that never arrived, and returning tokens
+against such a page would send the wallet's own holdings out. The alert text
+says so.
+
 ### Per network telemetry
 
 An in memory registry, created at startup for the configured networks,
@@ -5089,6 +5217,17 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
   backlog cannot be measured and a success would understate the lag. A pass with
   no enabled assets records a success with zero lag, matching the transfer
   poller, so the counter keeps rising to show the loop is alive.
+- **Inbound wrapped-token transfer watcher:** each pass records success or
+  failure in the same shape, with `lag_blocks` the worst per token count of
+  blocks still to process at the start of the pass, head included, as the
+  transfer poller counts it. A pass counts as failed when the head fetch failed,
+  every watched token failed, or every configured token was refused as an
+  enabled vault; a partial token failure keeps the pass successful and surfaces
+  as growing `lag_blocks`, matching the transfer poller. A failed token's own
+  backlog is measured into `lag_blocks` too, so the gauge cannot read healthy
+  while one token stops advancing, except when the token's checkpoint itself
+  cannot be read: that token then contributes nothing to the gauge and is
+  visible only as a failed token in the pass WARN.
 - **Gas monitor:** every poll records the latest reading (`ok`, `low`, or
   `unavailable` with the read error); unconfigured chains report `unmonitored`.
 
