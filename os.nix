@@ -34,6 +34,7 @@ in
     (modulesPath + "/profiles/qemu-guest.nix")
     ./disko.nix
     ./nix/cloud-init.nix
+    ./nix/ingress.nix
     ./nix/upgradeable-services.nix
   ];
 
@@ -71,13 +72,11 @@ in
     groups.st0x = { };
   };
 
-  networking.firewall = {
-    enable = true;
-    # Public Alpaca callbacks keep the pre-NixOS Docker endpoint on port 8000.
-    # SSH is public too (openssh.openFirewall above): key-only auth enforced by
-    # PasswordAuthentication=false, brute-force noise curbed by fail2ban.
-    allowedTCPPorts = [ 8000 ];
-  };
+  # The API ports (8000 while Rocket is public, 80/443 for the TLS proxy) are
+  # opened by nix/ingress.nix, which owns that switch. SSH is public
+  # (openssh.openFirewall above): key-only auth enforced by
+  # PasswordAuthentication=false, brute-force noise curbed by fail2ban.
+  networking.firewall.enable = true;
 
   fileSystems."/mnt/data" = {
     device = "/dev/disk/by-id/scsi-0DO_Volume_${volumeName}";

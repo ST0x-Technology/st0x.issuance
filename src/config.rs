@@ -229,6 +229,10 @@ pub struct Config {
     /// they don't have to wait a full production interval for a reading.
     pub gas_poll_interval: Duration,
     pub auth: AuthConfig,
+    /// True when the host-local nginx TLS proxy fronts this server. Rebinds
+    /// Rocket to loopback and trusts the proxy-set `X-Real-IP` header for the
+    /// client IP the whitelists check.
+    pub behind_proxy: bool,
     pub log_level: LogLevel,
     /// Console log output format; see [`LogFormat`].
     pub log_format: LogFormat,
@@ -294,6 +298,24 @@ impl Config {
     }
 }
 
+/// Parses a boolean deployment flag, accepting the spellings an operator or a
+/// templating step is likely to produce.
+///
+/// clap's stock boolean parser takes only `true`/`false`, so `1` or an empty
+/// value from an unset template variable aborts startup. These flags are read
+/// on a unit with `Restart=always`, which turns that into a crash loop during
+/// the very cutover the flag exists for, so a wider vocabulary is worth more
+/// than strictness. An empty value means "not set", i.e. the default.
+fn parse_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "expected a boolean (true/false, 1/0, yes/no, on/off), got '{other}'"
+        )),
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
@@ -352,6 +374,21 @@ struct Env {
 
     #[clap(flatten)]
     auth: AuthConfig,
+
+    #[arg(
+        long,
+        env = "BEHIND_PROXY",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        value_parser = parse_flag,
+        help = "Run behind the host-local nginx TLS proxy: bind Rocket to \
+                loopback and take the client IP from the X-Real-IP header \
+                the proxy sets. Set from the st0x.ingress.behindProxy Nix \
+                option, which opens the matching nginx routes; never enable \
+                it while Rocket is reachable on a non-loopback address, or \
+                clients could spoof X-Real-IP past the IP whitelists"
+    )]
+    behind_proxy: bool,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -559,6 +596,7 @@ impl Env {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
             auth: self.auth,
+            behind_proxy: self.behind_proxy,
             log_level: self.log_level,
             log_format: self.log_format,
             environment: self.environment,
@@ -1261,6 +1299,26 @@ mod tests {
     use crate::auth::IpWhitelist;
     use crate::test_utils::logs_contain_at;
 
+    #[test]
+    fn parse_flag_accepts_the_common_boolean_spellings() {
+        for raw in ["true", "TRUE", " true ", "1", "yes", "on"] {
+            assert_eq!(parse_flag(raw), Ok(true), "expected {raw} to be true");
+        }
+
+        for raw in ["false", "0", "no", "off", ""] {
+            assert_eq!(
+                parse_flag(raw),
+                Ok(false),
+                "expected {raw} to be false"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_flag_rejects_a_value_that_is_not_a_boolean() {
+        assert!(parse_flag("maybe").is_err());
+    }
+
     fn minimal_args() -> Vec<&'static str> {
         vec![
             "test-binary",
@@ -1310,6 +1368,27 @@ mod tests {
         let env = Env::try_parse_from(args).unwrap();
         let config = env.into_config().unwrap();
         assert_eq!(config.log_format, LogFormat::Json);
+    }
+
+    /// `behind_proxy` picks the listener (loopback vs all interfaces) and
+    /// whether `X-Real-IP` is trusted, so the default must stay off and an
+    /// explicit value must survive the conversion into [`Config`].
+    #[test]
+    fn behind_proxy_defaults_off_and_explicit_value_reaches_config() {
+        let env = Env::try_parse_from(minimal_args()).unwrap();
+        assert!(!env.behind_proxy);
+        assert!(!env.into_config().unwrap().behind_proxy);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--behind-proxy", "true"]);
+        let env = Env::try_parse_from(args).unwrap();
+        assert!(env.behind_proxy);
+        assert!(env.into_config().unwrap().behind_proxy);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--behind-proxy", "false"]);
+        let env = Env::try_parse_from(args).unwrap();
+        assert!(!env.into_config().unwrap().behind_proxy);
     }
 
     #[test]

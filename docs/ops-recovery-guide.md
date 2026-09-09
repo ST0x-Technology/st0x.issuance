@@ -13,10 +13,21 @@ export ISSUER_API_KEY=$(grep ISSUER_API_KEY /mnt/volume_nyc3_02/.env | cut -d= -
 
 Every example below assumes this is set.
 
+The app listens on port 8000 while it is its own public listener, and on
+**8001**, bound to loopback, once `st0x.ingress.behindProxy` is on
+(`nix/ingress.nix`). `/admin/*` is never proxied by nginx in either mode, so
+these commands always run on the box; only the port moves. Confirm which one
+is live and export it before you start; every example below uses it:
+
+```bash
+ss -tlnp | grep st0x-issuance
+export ISSUER_API_PORT=8000   # 8001 once behindProxy is on
+```
+
 ## Step 1: Check what's stuck
 
 ```bash
-curl -s -H "X-API-KEY: $ISSUER_API_KEY" http://localhost:8000/admin/stuck | python3 -m json.tool
+curl -s -H "X-API-KEY: $ISSUER_API_KEY" http://localhost:$ISSUER_API_PORT/admin/stuck | python3 -m json.tool
 ```
 
 This returns all transactions in non-terminal, non-progressing states. Each
@@ -164,7 +175,7 @@ whether it succeeded or reverted.
 
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
-  http://localhost:8000/admin/reprocess/mint/<aggregate_id> | python3 -m json.tool
+  http://localhost:$ISSUER_API_PORT/admin/reprocess/mint/<aggregate_id> | python3 -m json.tool
 ```
 
 This retries recovery inline (no restart needed). Reprocess re-drives the
@@ -185,7 +196,7 @@ budget), reprocess once more. A 409 Conflict response means it already completed
 
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
-  http://localhost:8000/admin/recover/redemption/<issuer_request_id> | python3 -m json.tool
+  http://localhost:$ISSUER_API_PORT/admin/recover/redemption/<issuer_request_id> | python3 -m json.tool
 ```
 
 This **executes the burn inline** — no restart needed. The endpoint first
@@ -218,7 +229,7 @@ not proof that a burn succeeded.
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/json" \
   -d '{"reason": "Reconciled off-chain; do not retry this redemption"}' \
-  http://localhost:8000/admin/close/redemption/<issuer_request_id> | python3 -m json.tool
+  http://localhost:$ISSUER_API_PORT/admin/close/redemption/<issuer_request_id> | python3 -m json.tool
 ```
 
 **Close a mint:**
@@ -226,7 +237,7 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/js
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/json" \
   -d '{"reason": "Deposit succeeded on-chain but callback failed"}' \
-  http://localhost:8000/admin/close/mint/<aggregate_id> | python3 -m json.tool
+  http://localhost:$ISSUER_API_PORT/admin/close/mint/<aggregate_id> | python3 -m json.tool
 ```
 
 Closing just marks the transaction as done in our system. **It does not perform
@@ -248,7 +259,7 @@ persisted burn landed but the bot did not record completion:
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/json" \
   -d '{"burn_tx_hash": "0x...", "reason": "Verified expected burn on-chain"}' \
-  http://localhost:8000/admin/force-complete/redemption/<issuer_request_id> | python3 -m json.tool
+  http://localhost:$ISSUER_API_PORT/admin/force-complete/redemption/<issuer_request_id> | python3 -m json.tool
 ```
 
 The endpoint verifies a successful receipt and the expected vault burn before
