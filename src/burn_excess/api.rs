@@ -20,7 +20,8 @@ use tracing::{error, warn};
 
 use super::cli::parse_shares;
 use super::engine::{
-    BurnExcessEngineError, BurnExcessRequest, run_burn_excess,
+    BurnExcessEngineError, BurnExcessOutcome, BurnExcessRequest,
+    run_burn_excess,
 };
 use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
@@ -79,6 +80,9 @@ pub(crate) struct BurnExcessInternalRequest {
 pub(crate) struct BurnExcessResponse {
     /// Whether a mutation was requested (`execute`); a dry-run reports `false`.
     executed: bool,
+    /// The proven plan or terminal report: what a dry-run would burn, or what
+    /// an execute committed.
+    outcome: BurnExcessOutcome,
 }
 
 /// Breakglass-tier internal excess-share burn. Above debug because it signs and
@@ -146,7 +150,7 @@ pub(crate) async fn burn_excess_internal_ops(
     };
     let executed = request.execute;
 
-    run_burn_excess(
+    let outcome = run_burn_excess(
         pool.inner(),
         vault_service.as_ref(),
         &read_provider,
@@ -168,7 +172,7 @@ pub(crate) async fn burn_excess_internal_ops(
         map_burn_excess_error(&error)
     })?;
 
-    Ok(Json(BurnExcessResponse { executed }))
+    Ok(Json(BurnExcessResponse { executed, outcome }))
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a
