@@ -192,10 +192,16 @@ impl LifecycleNotification {
                 // share token at 18 decimals and this repo never reads the
                 // wrapper's `decimals()`, so scaling here would state a
                 // precision nobody verified.
+                // The scan follows the chain head, so a reorged-out log
+                // still pages. Returning tokens against such a page would
+                // send the wallet's own holdings out, hence the instruction.
                 "Inbound wrapped-token transfer on {network}: {amount} base \
                  units of wrapped {underlying} ({token}) from {from} to the \
-                 issuer wallet in tx {tx_hash}; not redeemable automatically, \
-                 manual recovery required"
+                 issuer wallet in tx {tx_hash}; not redeemable automatically. \
+                 Verify the transaction and the wallet balance on chain \
+                 before returning or redeeming anything: the watcher follows \
+                 the chain head, so a reorg can leave a page for tokens that \
+                 never arrived"
             ),
         }
     }
