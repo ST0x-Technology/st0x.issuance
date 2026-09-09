@@ -4708,14 +4708,15 @@ Tiers and routes:
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
 - **breakglass** (`/ops/breakglass/*`): `force-complete/redemption/<id>`,
-  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`.
+  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
+  `burn-excess/external`.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
-The `burn-excess/internal` route responds with `{ executed, outcome }`:
-`executed` echoes whether a mutation was requested, and `outcome` is a tagged
-`plan`, `terminal`, or `close` view. For a `Start` or `Resume` request with
+Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
+echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
+`terminal`, or `close` view. For a `Start` or `Resume` request with
 `close=false`, a dry-run (`execute=false`) returns a `plan` so an operator
 reviews the exact effect over HTTP before committing with `execute=true` rather
 than reading the process log. In `outcome.plan`, `path` is `internal` or
@@ -4728,7 +4729,10 @@ exclusion write), and `false` for an executed plan. The optional `funding_log`,
 they apply (an internal plan omits `funding_log`) and are omitted rather than
 sent as null. The `ReportOnly` path returns a `terminal` view regardless of
 `execute` or `close`; `close=true` on `Start` or `Resume` returns a `close`
-view.
+view. `burn-excess/external` also records a funding-Transfer exclusion the live
+redemption transfer poller would otherwise read as an AP redemption, so it
+quiesces that network's poller (the current tick finished, no new one started)
+for the run and resumes it on every exit path.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
@@ -4750,9 +4754,8 @@ fails with a retryable 503 when the endpoint is unreachable and no usable key is
 retained. It also returns 503 when another request holds the refresh slot inside
 that throttle interval and the retained set does not contain the token's key id,
 including during a cold-cache request or key rotation. These failures never
-become a wrong-audience or forged-token acceptance. `burn-excess
-external`,
-`move-receipts`, and `confirm-custody` stay offline `issuer` CLI verbs.
+become a wrong-audience or forged-token acceptance. `move-receipts` and
+`confirm-custody` stay offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 
