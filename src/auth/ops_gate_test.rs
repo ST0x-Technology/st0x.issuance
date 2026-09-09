@@ -17,6 +17,7 @@ use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::Level;
 use tracing_test::traced_test;
@@ -40,6 +41,7 @@ use crate::receipt_inventory::{
 use crate::redemption::burn_manager::{
     BurnManagerError, ManualBurnReplacementOutcome, RecoveryOutcome,
 };
+use crate::redemption::poller_pause::PollerPauses;
 use crate::redemption::{
     IssuerRedemptionRequestId, Redemption, RedemptionServices,
 };
@@ -322,6 +324,7 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
+        .manage(PollerPauses::new(HashMap::new()))
         .mount(
             "/",
             rocket::routes![
@@ -329,6 +332,7 @@ async fn real_ops_routes_require_an_iap_assertion() {
                 crate::admin::reprocess_mint_ops,
                 crate::admin::orchestrator_health_ops,
                 crate::burn_excess::api::burn_excess_internal_ops,
+                crate::burn_excess::api::burn_excess_external_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
@@ -356,6 +360,14 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .dispatch()
         .await;
     assert_eq!(burn.status(), Status::Unauthorized);
+
+    let burn_external = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(burn_external.status(), Status::Unauthorized);
 
     let preflight =
         client.get("/ops/read/orchestrator-preflight/base").dispatch().await;

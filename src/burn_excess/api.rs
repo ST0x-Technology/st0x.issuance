@@ -1,12 +1,14 @@
-//! Breakglass HTTP route for the internal-path excess-share burn.
+//! Breakglass HTTP routes for the internal- and external-path excess-share
+//! burns.
 //!
-//! The external path stays offline (`issuer burn-excess external`) until the
-//! transfer poller can be paused from a running service; internal never touches
-//! the poller. The route signs through the running service's vault service, so
-//! the burn shares the wallet lock and nonce manager every live mint and
-//! redemption burn uses, and the engine self-gates on wallet quiescence under
-//! that lock (an unresolved mint/redemption burn intent on the network refuses
-//! with `Conflict`), so this is safe to run against a live service.
+//! `internal` never touches the redemption transfer poller. `external` records
+//! a funding-Transfer exclusion the live poller would otherwise read as an AP
+//! redemption, so it quiesces that network's poller for the run and resumes it
+//! on every exit path. Both sign through the running service's vault service,
+//! so the burn shares the wallet lock and nonce manager every live mint and
+//! redemption burn uses, and both self-gate on wallet quiescence under that
+//! lock (an unresolved mint/redemption burn intent on the network refuses with
+//! `Conflict`).
 
 use alloy::primitives::{B256, U256};
 use alloy::providers::ProviderBuilder;
@@ -27,6 +29,7 @@ use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
 use crate::config::{Config, configured_rpc_url, wss_to_http};
 use crate::mint::IssuerMintRequestId;
+use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
 use crate::vault::NetworkVaultServices;
 
@@ -115,25 +118,6 @@ pub(crate) async fn burn_excess_internal_ops(
         return Err(Status::UnprocessableEntity);
     }
 
-    let vault_service =
-        vault_services.service(body.network).map_err(|error| {
-            warn!(target: "admin", %error, "burn-excess refused");
-            Status::UnprocessableEntity
-        })?;
-    let issuer_wallet = config.signer.address().map_err(|error| {
-        error!(target: "admin", %error, "burn-excess signer address unavailable");
-        Status::InternalServerError
-    })?;
-    let rpc_url = configured_rpc_url(body.network).map_err(|error| {
-        error!(target: "admin", %error, "burn-excess RPC unavailable");
-        Status::InternalServerError
-    })?;
-    let http_url = wss_to_http(&rpc_url).map_err(|error| {
-        error!(target: "admin", %error, "burn-excess RPC unavailable");
-        Status::InternalServerError
-    })?;
-    let read_provider = ProviderBuilder::new().connect_http(http_url);
-
     let request = BurnExcessRequest {
         mode: BurnExcessMode::Internal,
         issuer_request_id: body.issuer_request_id,
@@ -148,10 +132,50 @@ pub(crate) async fn burn_excess_internal_ops(
         execute: body.execute,
         close: body.close,
     };
+
+    run_burn_excess_ops(
+        pool.inner(),
+        config,
+        vault_services,
+        request,
+        "internal",
+    )
+    .await
+}
+
+/// Runs the engine for both routes through the running service's per-network
+/// vault service, so the burn takes the same wallet lock and nonce manager as
+/// every live mint and redemption burn, with a read provider on the network's
+/// configured RPC. `path` names the route for the failure log.
+async fn run_burn_excess_ops(
+    pool: &Pool<Sqlite>,
+    config: &Config,
+    vault_services: &NetworkVaultServices,
+    request: BurnExcessRequest,
+    path: &'static str,
+) -> Result<Json<BurnExcessResponse>, Status> {
+    let vault_service =
+        vault_services.service(request.network).map_err(|error| {
+            warn!(target: "admin", %error, path, "burn-excess refused");
+            Status::UnprocessableEntity
+        })?;
+    let issuer_wallet = config.signer.address().map_err(|error| {
+        error!(target: "admin", %error, path, "burn-excess signer address unavailable");
+        Status::InternalServerError
+    })?;
+    let rpc_url = configured_rpc_url(request.network).map_err(|error| {
+        error!(target: "admin", %error, path, "burn-excess RPC unavailable");
+        Status::InternalServerError
+    })?;
+    let http_url = wss_to_http(&rpc_url).map_err(|error| {
+        error!(target: "admin", %error, path, "burn-excess RPC unavailable");
+        Status::InternalServerError
+    })?;
+    let read_provider = ProviderBuilder::new().connect_http(http_url);
     let executed = request.execute;
 
     let outcome = run_burn_excess(
-        pool.inner(),
+        pool,
         vault_service.as_ref(),
         &read_provider,
         issuer_wallet,
@@ -168,11 +192,102 @@ pub(crate) async fn burn_excess_internal_ops(
     )
     .await
     .map_err(|error| {
-        error!(target: "admin", %error, "burn-excess (internal) failed");
+        error!(target: "admin", %error, path, "burn-excess failed");
         map_burn_excess_error(&error)
     })?;
 
     Ok(Json(BurnExcessResponse { executed, outcome }))
+}
+
+/// Operator inputs for an external-path excess burn, mirroring the
+/// `burn-excess external` CLI flags. `funding_tx_hash` is the on-chain Transfer
+/// that moved the excess shares into the issuer wallet; `shares` is an
+/// 18-decimal fixed-point amount as a decimal string.
+#[derive(Deserialize)]
+pub(crate) struct BurnExcessExternalRequest {
+    issuer_request_id: IssuerMintRequestId,
+    deposit_tx_hash: B256,
+    funding_tx_hash: B256,
+    receipt_id: U256,
+    shares: Shares,
+    reason: String,
+    #[serde(default)]
+    incident_id: Option<String>,
+    network: Network,
+    chain_id: u64,
+    /// Perform the mutation (exclusion write + sign/broadcast). Default is a
+    /// dry-run that proves the plan without touching chain or state.
+    #[serde(default)]
+    execute: bool,
+    /// Close a dead intended/submitted stream instead of burning.
+    #[serde(default)]
+    close: bool,
+}
+
+/// Breakglass-tier external-path excess-share burn. Unlike `internal`, the
+/// excess shares arrived via an on-chain Transfer into the wallet the
+/// redemption transfer poller watches, so the funding-Transfer exclusion must
+/// land before the poller reads that log or the live poller opens a spurious
+/// `Redemption` for shares being burned. The handler quiesces that network's
+/// poller (confirmed idle, no tick in flight) for the whole run and resumes it
+/// on every exit path via the guard.
+#[post(
+    "/ops/breakglass/burn-excess/external",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn burn_excess_external_ops(
+    _auth: BreakglassOps,
+    pool: &State<Pool<Sqlite>>,
+    config: &State<Config>,
+    vault_services: &State<NetworkVaultServices>,
+    poller_pauses: &State<PollerPauses>,
+    body: Json<BurnExcessExternalRequest>,
+) -> Result<Json<BurnExcessResponse>, Status> {
+    let body = body.into_inner();
+
+    if body.chain_id != body.network.chain_id() {
+        warn!(target: "admin", network = %body.network, chain_id = body.chain_id,
+            "burn-excess chain_id does not match network"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
+
+    let Some(control) = poller_pauses.control(body.network) else {
+        warn!(target: "admin", network = %body.network,
+            "burn-excess external has no transfer poller to quiesce for network"
+        );
+        return Err(Status::UnprocessableEntity);
+    };
+
+    let request = BurnExcessRequest {
+        mode: BurnExcessMode::External,
+        issuer_request_id: body.issuer_request_id,
+        deposit_tx_hash: body.deposit_tx_hash,
+        funding_tx_hash: Some(body.funding_tx_hash),
+        receipt_id: body.receipt_id,
+        shares: body.shares.into_u256(),
+        reason: body.reason,
+        incident_id: body.incident_id,
+        network: body.network,
+        chain_id: body.chain_id,
+        execute: body.execute,
+        close: body.close,
+    };
+
+    // Quiesce the poller before the exclusion write so it cannot open a
+    // spurious Redemption for the funding Transfer. The guard resumes the
+    // poller on success, error, and panic paths alike.
+    let _guard = control.pause().await;
+
+    run_burn_excess_ops(
+        pool.inner(),
+        config,
+        vault_services,
+        request,
+        "external",
+    )
+    .await
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a

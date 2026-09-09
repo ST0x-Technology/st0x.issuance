@@ -67,6 +67,7 @@ use crate::redemption::{
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     poller::{TransferPoller, TransferPollerConfig},
+    poller_pause::{PollerPauses, poller_pause},
     redeem_call_manager::RedeemCallManager,
     view::{RedemptionViewReactor, rebuild_redemption_view},
 };
@@ -401,8 +402,8 @@ pub async fn initialize_rocket(
         ),
     );
 
-    background_task_handles.extend(spawn_per_network_tasks(
-        &PerNetworkTaskDeps {
+    let (per_network_handles, poller_pauses) =
+        spawn_per_network_tasks(&PerNetworkTaskDeps {
             chain_registry: &chain_registry,
             config: &config,
             pool: &pool,
@@ -414,8 +415,8 @@ pub async fn initialize_rocket(
             lifecycle_notifier: &lifecycle_notifier,
             network_telemetry: &network_telemetry,
             shutdown: &shutdown_rx,
-        },
-    ));
+        });
+    background_task_handles.extend(per_network_handles);
 
     maintain_background_job_tables(&pool, &apalis_pool).await;
 
@@ -455,6 +456,7 @@ pub async fn initialize_rocket(
         ),
         ops_verifiers: build_ops_verifiers(&config)?,
         underlying_store,
+        poller_pauses,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
@@ -651,6 +653,10 @@ struct RocketState {
     /// The Underlying aggregate store backing the capital-tier freeze/unfreeze
     /// and read-tier status ops routes.
     underlying_store: Arc<Store<Underlying>>,
+    /// Per-network controls to pause the redemption transfer poller so a
+    /// breakglass op (burn-excess external) can write a funding-Transfer
+    /// exclusion without racing a live poll.
+    poller_pauses: PollerPauses,
     background_tasks: BackgroundTasks,
 }
 
@@ -819,6 +825,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.receipts)
         .manage(state.network_telemetry)
         .manage(state.underlying_store)
+        .manage(state.poller_pauses)
         .mount(
             "/",
             routes![
@@ -866,6 +873,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::freeze_underlying_ops,
                 admin::unfreeze_underlying_ops,
                 burn_excess::api::burn_excess_internal_ops,
+                burn_excess::api::burn_excess_external_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
@@ -1915,11 +1923,12 @@ struct PerNetworkTaskDeps<'a, P> {
 /// transfer watcher per configured chain.
 fn spawn_per_network_tasks<P>(
     deps: &PerNetworkTaskDeps<'_, P>,
-) -> Vec<JoinHandle<()>>
+) -> (Vec<JoinHandle<()>>, PollerPauses)
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
     let mut handles = Vec::new();
+    let mut poller_pauses = HashMap::new();
 
     for (network, runtime) in deps.chain_registry.runtimes() {
         handles.push(spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
@@ -1961,10 +1970,13 @@ where
             telemetry: deps.network_telemetry.clone(),
         });
 
+        let (control, pause) = poller_pause();
+        poller_pauses.insert(*network, control);
+
         let mut poller_shutdown = deps.shutdown.clone();
         handles.push(tokio::spawn(async move {
             tokio::select! {
-                () = poller.run() => {}
+                () = poller.run(pause) => {}
                 _ = poller_shutdown.changed() => {}
             }
         }));
@@ -1981,7 +1993,7 @@ where
 
     handles.extend(spawn_wrapped_transfer_monitors(deps));
 
-    handles
+    (handles, PollerPauses::new(poller_pauses))
 }
 
 /// Spawns one inbound wrapped-token transfer watcher per configured chain
