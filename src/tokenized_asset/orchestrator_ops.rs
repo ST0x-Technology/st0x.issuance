@@ -15,11 +15,11 @@ use std::str::FromStr;
 use tracing::{error, info, warn};
 use url::Url;
 
-use super::cli::{preflight_assets, verified_chain_id};
+use super::cli::preflight_assets;
 use super::view::find_vault;
 use super::{Network, UnderlyingSymbol};
 use crate::auth::{CapitalOps, DebugOps, ReadOps};
-use crate::config::{Config, configured_rpc_url};
+use crate::config::Config;
 use crate::vault::onboarding::{
     ApprovalOutcome, OnboardingError, OrchestratorReadiness,
     check_orchestrator_readiness, ensure_unlimited_approval,
@@ -40,7 +40,7 @@ pub(crate) async fn orchestrator_preflight_ops(
 ) -> Result<Json<PreflightResponse>, Status> {
     let network = parse_network(network)?;
     let OrchestratorContext { orchestrator, bot, rpc_url, .. } =
-        resolve_orchestrator_context(config.inner(), network).await?;
+        resolve_orchestrator_context(config.inner(), network)?;
 
     let filter = parse_assets(&asset)?;
     let assets = preflight_assets(
@@ -97,7 +97,7 @@ pub(crate) async fn orchestrator_verify_signing_ops(
     let network = parse_network(network)?;
     let symbol = parse_underlying(underlying)?;
     let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
-        resolve_orchestrator_context(config.inner(), network).await?;
+        resolve_orchestrator_context(config.inner(), network)?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
         .await
@@ -170,7 +170,7 @@ pub(crate) async fn orchestrator_approve_ops(
     let network = parse_network(network)?;
     let symbol = parse_underlying(underlying)?;
     let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
-        resolve_orchestrator_context(config.inner(), network).await?;
+        resolve_orchestrator_context(config.inner(), network)?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
         .await
@@ -315,8 +315,8 @@ pub(crate) struct ApproveResponse {
 }
 
 /// Resolved inputs for the orchestrator ops: the orchestrator address, the
-/// Turnkey bot wallet, the service RPC, the RPC-verified chain id, and the
-/// Turnkey config the signing verbs pass to [`resolve_turnkey_signer`].
+/// Turnkey bot wallet, and the network's configured RPC endpoint, chain id, and
+/// Turnkey config that the signing verbs pass to [`resolve_turnkey_signer`].
 struct OrchestratorContext<'a> {
     orchestrator: Address,
     bot: Address,
@@ -327,7 +327,7 @@ struct OrchestratorContext<'a> {
 
 /// Resolves the orchestrator context for `network`, or the HTTP status to fail
 /// with.
-async fn resolve_orchestrator_context(
+fn resolve_orchestrator_context(
     config: &Config,
     network: Network,
 ) -> Result<OrchestratorContext<'_>, Status> {
@@ -349,21 +349,18 @@ async fn resolve_orchestrator_context(
     };
     let bot = turnkey.settings.address;
 
-    let rpc_url = configured_rpc_url(network).map_err(|error| {
-        error!(target: "asset", %network, %error,
-            "No configured RPC for network"
-        );
-        Status::InternalServerError
-    })?;
-
-    let chain_id = verified_chain_id(&rpc_url, network.chain_id())
-        .await
-        .map_err(|error| {
-            error!(target: "asset", %network, %error,
-                "RPC chain-id verification failed"
+    let chain = config
+        .chains
+        .iter()
+        .find(|candidate| candidate.network == network)
+        .ok_or_else(|| {
+            error!(target: "asset", %network,
+                "No chain configuration for network"
             );
-            Status::BadGateway
+            Status::InternalServerError
         })?;
+    let rpc_url = chain.rpc_url.clone();
+    let chain_id = chain.chain_id;
 
     Ok(OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey })
 }
