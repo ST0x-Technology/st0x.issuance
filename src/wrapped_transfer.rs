@@ -667,6 +667,7 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                             from: transfer.from,
                             amount: transfer.amount,
                             tx_hash: transfer.tx_hash,
+                            log_index: transfer.log_index,
                         },
                 },
                 key,

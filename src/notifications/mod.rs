@@ -96,6 +96,9 @@ pub(crate) enum LifecycleNotification {
         from: Address,
         amount: U256,
         tx_hash: TxHash,
+        /// With `tx_hash`, the log identity the alert is keyed on: two
+        /// transfers in one transaction render as two distinct alerts.
+        log_index: u64,
     },
 }
 
@@ -187,6 +190,7 @@ impl LifecycleNotification {
                 from,
                 amount,
                 tx_hash,
+                log_index,
             } => format!(
                 // The raw value, not a scaled one: ERC-4626 does not fix a
                 // share token at 18 decimals and this repo never reads the
@@ -197,7 +201,8 @@ impl LifecycleNotification {
                 // send the wallet's own holdings out, hence the instruction.
                 "Inbound wrapped-token transfer on {network}: {amount} base \
                  units of wrapped {underlying} ({token}) from {from} to the \
-                 issuer wallet in tx {tx_hash}; not redeemable automatically. \
+                 issuer wallet in tx {tx_hash} (log {log_index}); not \
+                 redeemable automatically. \
                  Verify the transaction and the wallet balance on chain \
                  before returning or redeeming anything: the watcher follows \
                  the chain head, so a reorg can leave a page for tokens that \
@@ -727,6 +732,7 @@ mod tests {
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
+            log_index: 3,
         };
 
         assert_eq!(notification.kind().as_str(), "inbound_wrapped_transfer");
@@ -737,8 +743,8 @@ mod tests {
              (0x0000000000000000000000000000000000001010) from \
              0x9999999999999999999999999999999999999999 to the issuer wallet \
              in tx \
-             0x1111111111111111111111111111111111111111111111111111111111111111; \
-             not redeemable automatically. Verify the transaction and the \
+             0x1111111111111111111111111111111111111111111111111111111111111111 \
+             (log 3); not redeemable automatically. Verify the transaction and the \
              wallet balance on chain before returning or redeeming anything: \
              the watcher follows the chain head, so a reorg can leave a page \
              for tokens that never arrived"

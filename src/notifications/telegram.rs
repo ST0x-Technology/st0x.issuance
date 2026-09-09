@@ -183,6 +183,7 @@ fn log_delivery_failure(
             network,
             underlying,
             tx_hash,
+            log_index,
             ..
         } => {
             tracing::error!(
@@ -192,6 +193,7 @@ fn log_delivery_failure(
                 network = %network,
                 underlying = %underlying,
                 tx_hash = %tx_hash,
+                log_index,
                 error = %error,
                 cause = ?cause,
                 "notification_delivery_failed"
