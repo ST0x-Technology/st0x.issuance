@@ -15,3 +15,8 @@ CREATE TABLE inbound_wrapped_transfers (
     detected_at TEXT NOT NULL,
     PRIMARY KEY (network, tx_hash, log_index)
 );
+
+-- The operator listing pages newest first by this triple; SQLite walks the
+-- index backwards for the DESC order, so the keyset scan never sorts the table.
+CREATE INDEX inbound_wrapped_transfers_by_block
+    ON inbound_wrapped_transfers (block_number, log_index, network);

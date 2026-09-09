@@ -813,13 +813,15 @@ pub(crate) const DEFAULT_WRAPPED_TRANSFER_PAGE: u32 = 100;
 pub(crate) const MAX_WRAPPED_TRANSFER_PAGE: u32 = 1000;
 
 /// One page of the recorded transfers, newest first. `before` is the
-/// `(block_number, log_index)` of the last row of the previous page; rows are
-/// ordered by that pair, so a cursor on the pair alone cannot skip the rest of
-/// a block the previous page ended inside.
+/// `(block_number, log_index, network)` of the last row of the previous page.
+/// The listing spans every network, and two chains can share a block number
+/// and log index, so the network is what makes the order total: rows are
+/// ordered by the triple, and a cursor on the triple cannot skip a row tied
+/// with the one the previous page ended on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WrappedTransferPage {
     limit: u32,
-    before: Option<(u64, u64)>,
+    before: Option<(u64, u64, Network)>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -828,7 +830,10 @@ pub(crate) enum WrappedTransferPageError {
         "limit must be between 1 and {MAX_WRAPPED_TRANSFER_PAGE}, got {limit}"
     )]
     LimitOutOfRange { limit: u32 },
-    #[error("before_block and before_log_index must be given together")]
+    #[error(
+        "before_block, before_log_index, and before_network must be given \
+         together"
+    )]
     PartialCursor,
 }
 
@@ -841,21 +846,24 @@ impl Default for WrappedTransferPage {
 
 impl WrappedTransferPage {
     /// Builds a page from the query parameters a caller supplied, refusing a
-    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE` and a cursor with only
-    /// one of its two halves.
+    /// limit outside `1..=MAX_WRAPPED_TRANSFER_PAGE` and a cursor missing any
+    /// of its three parts.
     pub(crate) fn new(
         limit: Option<u32>,
         before_block: Option<u64>,
         before_log_index: Option<u64>,
+        before_network: Option<Network>,
     ) -> Result<Self, WrappedTransferPageError> {
         let limit = limit.unwrap_or(DEFAULT_WRAPPED_TRANSFER_PAGE);
         if limit == 0 || limit > MAX_WRAPPED_TRANSFER_PAGE {
             return Err(WrappedTransferPageError::LimitOutOfRange { limit });
         }
 
-        let before = match (before_block, before_log_index) {
-            (None, None) => None,
-            (Some(block), Some(log_index)) => Some((block, log_index)),
+        let before = match (before_block, before_log_index, before_network) {
+            (None, None, None) => None,
+            (Some(block), Some(log_index), Some(network)) => {
+                Some((block, log_index, network))
+            }
             _ => return Err(WrappedTransferPageError::PartialCursor),
         };
 
@@ -868,11 +876,13 @@ pub(crate) async fn list_inbound_wrapped_transfers(
     pool: &Pool<Sqlite>,
     page: WrappedTransferPage,
 ) -> Result<Vec<InboundWrappedTransfer>, InboundWrappedTransferReadError> {
-    let (before_block, before_log_index) = match page.before {
-        Some((block, log_index)) => {
-            (Some(i64::try_from(block)?), Some(i64::try_from(log_index)?))
-        }
-        None => (None, None),
+    let (before_block, before_log_index, before_network) = match page.before {
+        Some((block, log_index, network)) => (
+            Some(i64::try_from(block)?),
+            Some(i64::try_from(log_index)?),
+            Some(network.as_str()),
+        ),
+        None => (None, None, None),
     };
 
     let rows = sqlx::query_as::<
@@ -895,12 +905,14 @@ pub(crate) async fn list_inbound_wrapped_transfers(
             ?1 IS NULL
             OR block_number < ?1
             OR (block_number = ?1 AND log_index < ?2)
-        ORDER BY block_number DESC, log_index DESC
-        LIMIT ?3
+            OR (block_number = ?1 AND log_index = ?2 AND network < ?3)
+        ORDER BY block_number DESC, log_index DESC, network DESC
+        LIMIT ?4
         ",
     )
     .bind(before_block)
     .bind(before_log_index)
+    .bind(before_network)
     .bind(i64::from(page.limit))
     .fetch_all(pool)
     .await?;
@@ -2042,7 +2054,7 @@ mod tests {
 
         let first = list_inbound_wrapped_transfers(
             &harness.pool,
-            WrappedTransferPage::new(Some(2), None, None).unwrap(),
+            WrappedTransferPage::new(Some(2), None, None, None).unwrap(),
         )
         .await
         .unwrap();
@@ -2059,6 +2071,7 @@ mod tests {
                 Some(2),
                 Some(last.block_number),
                 Some(last.log_index),
+                Some(last.network),
             )
             .unwrap(),
         )
@@ -2075,17 +2088,70 @@ mod tests {
         );
 
         assert_eq!(
-            WrappedTransferPage::new(Some(0), None, None).unwrap_err(),
+            WrappedTransferPage::new(Some(0), None, None, None).unwrap_err(),
             WrappedTransferPageError::LimitOutOfRange { limit: 0 }
         );
         assert_eq!(
-            WrappedTransferPage::new(Some(1001), None, None).unwrap_err(),
+            WrappedTransferPage::new(Some(1001), None, None, None).unwrap_err(),
             WrappedTransferPageError::LimitOutOfRange { limit: 1001 }
         );
         assert_eq!(
-            WrappedTransferPage::new(None, Some(200), None).unwrap_err(),
+            WrappedTransferPage::new(None, Some(200), Some(0), None)
+                .unwrap_err(),
             WrappedTransferPageError::PartialCursor
         );
+    }
+
+    /// The listing spans networks, and two chains can share a block number
+    /// and a log index, so the network is part of the order and the cursor:
+    /// a page boundary on such a tie must not skip the row on the other chain.
+    #[tokio::test]
+    async fn listing_pages_across_networks_tied_on_block_and_log_index() {
+        let harness = TestHarness::new().await;
+        for (network, seed) in
+            [(Network::Base, 0xd1), (Network::Ethereum, 0xd2)]
+        {
+            let row = InboundWrappedTransfer {
+                network,
+                underlying: symbol("AAPL"),
+                token: TOKEN_A,
+                from: SENDER,
+                amount: U256::from(1u64),
+                tx_hash: tx_hash(seed),
+                log_index: 0,
+                block_number: 200,
+                detected_at: Utc::now(),
+            };
+            assert!(
+                record_inbound_wrapped_transfer(&harness.pool, &row)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let first = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(Some(1), None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        let last = &first[0];
+
+        let second = list_inbound_wrapped_transfers(
+            &harness.pool,
+            WrappedTransferPage::new(
+                Some(1),
+                Some(last.block_number),
+                Some(last.log_index),
+                Some(last.network),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.len(), 1, "the tied row on the other chain");
+        assert_ne!(second[0].network, last.network);
     }
 
     /// A row that cannot be parsed back fails the whole listing rather than

@@ -4832,15 +4832,16 @@ operator can see what needs manual recovery without log access.
 
 Returns `{"transfers": [...]}`, one page at a time, highest block first. `limit`
 (1 to 1000, default 100) bounds the page, since the table only grows and nothing
-deletes from it; `before_block` and `before_log_index`, given together as the
-last row of the previous page, select the next page by the
-`(block_number,
-log_index)` order so a boundary inside a block skips nothing. A
-limit out of range or a half cursor is a 422. Each row carries `network`,
-`underlying`, `token` (the wrapped-token contract), `from`, `amount` (the raw
-ERC-20 amount as a decimal string, in the wrapper's own base units), `tx_hash`,
-`log_index`, `block_number`, and `detected_at`. Rows are durable: they survive
-restarts and the service never removes them.
+deletes from it; `before_block`, `before_log_index`, and `before_network`, given
+together as the last row of the previous page, select the next page by the
+`(block_number, log_index, network)` order. The listing spans every network and
+two chains can share a block number and log index, so the network is what makes
+the order total: a boundary inside a block, or on such a tie, skips nothing. A
+limit out of range, an incomplete cursor, or an unknown cursor network is a 422.
+Each row carries `network`, `underlying`, `token` (the wrapped-token contract),
+`from`, `amount` (the raw ERC-20 amount as a decimal string, in the wrapper's
+own base units), `tx_hash`, `log_index`, `block_number`, and `detected_at`. Rows
+are durable: they survive restarts and the service never removes them.
 
 ## Configuration
 

@@ -2406,8 +2406,8 @@ impl From<InboundWrappedTransfer> for WrappedTransferEntry {
 }
 
 /// One page of the inbound wrapped-token transfers the per network watchers
-/// recorded, highest block first; page with `before_block` and
-/// `before_log_index` set to the last row's values.
+/// recorded, highest block first; page with `before_block`,
+/// `before_log_index`, and `before_network` set to the last row's values.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct WrappedTransfersResponse {
     transfers: Vec<WrappedTransferEntry>,
@@ -2422,10 +2422,13 @@ pub(crate) struct WrappedTransfersResponse {
             description = "Rows per page, 1 to 1000; defaults to 100"),
         ("before_block" = Option<u64>, Query,
             description = "Cursor: block number of the last row of the \
-                previous page; requires before_log_index"),
+                previous page; requires the other two cursor fields"),
         ("before_log_index" = Option<u64>, Query,
             description = "Cursor: log index of the last row of the \
-                previous page; requires before_block")
+                previous page; requires the other two cursor fields"),
+        ("before_network" = Option<String>, Query,
+            description = "Cursor: network of the last row of the previous \
+                page; requires the other two cursor fields")
     ),
     responses(
         (status = 200,
@@ -2433,25 +2436,42 @@ pub(crate) struct WrappedTransfersResponse {
                 issuer wallet recorded by the per network watchers, highest \
                 block first; each needs manual recovery",
             body = WrappedTransfersResponse),
-        (status = 422, description = "Limit out of range or a half cursor"),
+        (status = 422,
+            description = "Limit out of range, an incomplete cursor, or an \
+                unknown cursor network"),
         (status = 500, description = "Failed to read the recorded transfers")
     ),
     security(("internal_api_key" = []))
 )]
 #[tracing::instrument(skip(_auth, pool))]
-#[get("/admin/wrapped-transfers?<limit>&<before_block>&<before_log_index>")]
+#[get(
+    "/admin/wrapped-transfers?<limit>&<before_block>&<before_log_index>&<before_network>"
+)]
 pub(crate) async fn list_wrapped_transfers(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
     limit: Option<u32>,
     before_block: Option<u64>,
     before_log_index: Option<u64>,
+    before_network: Option<&str>,
 ) -> Result<Json<WrappedTransfersResponse>, Status> {
-    let page = WrappedTransferPage::new(limit, before_block, before_log_index)
+    let before_network = before_network
+        .map(str::parse::<Network>)
+        .transpose()
         .map_err(|error| {
-            warn!(target: "admin", error = %error, "Invalid wrapped-transfer page");
+            warn!(target: "admin", error = %error, "Invalid cursor network");
             Status::UnprocessableEntity
         })?;
+    let page = WrappedTransferPage::new(
+        limit,
+        before_block,
+        before_log_index,
+        before_network,
+    )
+    .map_err(|error| {
+        warn!(target: "admin", error = %error, "Invalid wrapped-transfer page");
+        Status::UnprocessableEntity
+    })?;
     let transfers = list_inbound_wrapped_transfers(pool.inner(), page)
         .await
         .map_err(|err| {
