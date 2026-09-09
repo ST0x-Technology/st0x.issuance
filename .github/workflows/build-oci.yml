@@ -6,14 +6,14 @@ name: build-oci
 # attestor) -> roll staging once the GCP staging VM exists.
 #
 # A MERGE TO MAIN DEPLOYS GCP STAGING (roll-staging job at the bottom): the
-# staging plane is a GCE VM that pulls its deploy state, so the job writes
-# the digest into the images.env object the VM's roll timer polls. The VM
-# verifies the issuance-image attestation of everything it adopts, so this
-# job cannot make it run an unsigned image. Whether the roll is ARMED is
-# derived, not configured: the deploy identity's only access to that object
-# is a grant the devops side creates when it flips images.yaml ci_rolls to
-# true, so the job probes the object first and stands down cleanly while the
-# grant does not exist.
+# shared app-release workflow (ST0x-Technology/.github) publishes
+# config.staging.toml as a version of the staging runtime-config secret and
+# writes the digest + that version into the images.env object the staging
+# VM's roll timer polls. The VM verifies the issuance-image attestation of
+# everything it adopts, so this job cannot make it run an unsigned image.
+# Its rights on the staging project come from the devops side (write on
+# images.env, publish config versions); without them the job fails at the
+# write, which is the honest answer once staging exists.
 #
 # Auth: GitHub OIDC -> the s01-artifacts WIF provider, bound to
 # issuance-deployer (main only; the WIF binding lives in s01.devops
@@ -24,8 +24,10 @@ name: build-oci
 # Coexists with deploy-staging.yaml / deploy-prod.yaml (the DigitalOcean
 # deploy-rs path) until the staging cutover retires the staging half.
 #
-# PRODUCTION IS NOT DEPLOYED FROM THIS REPO: promote a staging-proven digest
-# via s01.devops (gated apply). This SA holds nothing in production.
+# Production is deployed from this repo too, but never by this workflow:
+# release-tag.yml (a version tag) and production-release.yml (a config
+# merge or a rollback dispatch) run the same shared workflow as
+# issuance-releaser behind the production project's app-deploy PAM grant.
 
 on:
   push:
@@ -181,141 +183,27 @@ jobs:
             echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
           fi
 
-  # STAGING ROLLS ON EVERY MAIN MERGE once armed. What this job may touch is
-  # exactly one object: the IAM grant behind DEPLOYER_SA is objectAdmin
-  # conditioned to gs://s01-issuance-staging-config/images.env (s01.devops
-  # terraform/staging-issuance), created only when images.yaml ci_rolls is
-  # true. It rewrites the BOT_IMAGE line in place and preserves every other
-  # line byte for byte, in particular GATED_SERVICE_REPLICAS, the workload
-  # gate, which must never be settable from this repo. Terraform reads the
-  # digest back on every plan, so an apply recomposes what this job wrote
-  # instead of undoing it.
+  # STAGING ROLLS ON EVERY MAIN MERGE: the shared app-release workflow in
+  # bot-vm mode, as issuance-deployer, no PAM (staging is the fast path).
+  # validate_command stays empty for now: validate-config parses the whole
+  # environment (secrets included), so it cannot judge the TOML alone; boot
+  # is the gate until the binary grows a config-only validation mode.
   roll-staging:
     needs: build-push
-    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
-    env:
-      CONFIG_BUCKET: s01-issuance-staging-config
-      DIGEST: ${{ needs.build-push.outputs.digest }}
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
-        with:
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.DEPLOYER_SA }}
-
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
-
-      # Armed-ness is the grant: no access to images.env means the devops
-      # side has not flipped ci_rolls (or has flipped it back to pin a
-      # digest by manifest), and the right outcome is a clean stand-down,
-      # not a red build. It is a WARNING annotation (yellow on the run and
-      # in the PR checks), with the exact answer quoted, so a grant that
-      # was meant to be there but was misapplied is visible on the very
-      # next merge rather than hiding behind a green tick. Anything other
-      # than a permission or not-found answer is a real failure.
-      - name: Probe the deploy state object
-        id: probe
-        run: |
-          set -euo pipefail
-          if out=$(gcloud storage objects describe "gs://${CONFIG_BUCKET}/images.env" \
-              --format='value(generation)' 2>&1); then
-            echo "generation=${out}" >> "$GITHUB_OUTPUT"
-            echo "armed=true" >> "$GITHUB_OUTPUT"
-          elif grep -qiE "403|permission|denied|404|not found|no such object" <<<"$out"; then
-            echo "::warning title=staging roll not armed::no access to gs://${CONFIG_BUCKET}/images.env; image pushed and attested, nothing deployed. If ci_rolls is meant to be on, the deployer's images.env grant is missing. gcloud said: ${out}"
-            {
-              echo "### staging roll: not armed"
-              echo "Image pushed and attested; no deploy. \`gcloud storage objects describe\` answered:"
-              echo '```'
-              echo "$out"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "armed=false" >> "$GITHUB_OUTPUT"
-          else
-            printf '%s\n' "$out"
-            exit 1
-          fi
-
-      - name: Rewrite images.env with the digest just built
-        if: steps.probe.outputs.armed == 'true'
-        id: roll
-        run: |
-          set -euo pipefail
-          if ! grep -qE "^${AR_REPO}/${IMAGE}@sha256:[0-9a-f]{64}$" <<<"$DIGEST"; then
-            echo "::error::build-push handed over an unexpected digest ('${DIGEST}')"
-            exit 1
-          fi
-
-          # The generation from the probe pins the precondition on the write
-          # across the whole read-modify-write: a concurrent writer (a devops
-          # apply) fails the cp itself instead of being caught only by the
-          # read-back.
-          GENERATION="${{ steps.probe.outputs.generation }}"
-          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
-          cp current.env next.env
-
-          # Refuse to write a file that is missing anything: a dropped
-          # GATED_SERVICE_REPLICAS takes the whole stack unit down.
-          for key in BOT_IMAGE GATED_SERVICE_REPLICAS; do
-            grep -q "^${key}=" current.env \
-              || { echo "::error::images.env has no ${key}; refusing to write"; exit 1; }
-          done
-
-          sed -i "s|^BOT_IMAGE=.*|BOT_IMAGE=${DIGEST}|" next.env
-
-          echo "--- images.env ---"
-          cat next.env
-
-          echo "gated=$(grep -qx 'GATED_SERVICE_REPLICAS=0' next.env && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "bot=$(grep -m1 '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
-
-          if cmp -s current.env next.env; then
-            echo "::notice::images.env already carries this digest; verifying adoption only"
-            exit 0
-          fi
-
-          gcloud storage cp --if-generation-match="$GENERATION" \
-            next.env "gs://${CONFIG_BUCKET}/images.env" || {
-            echo "::error::images.env changed under us (a concurrent devops apply?); re-run this job"
-            exit 1
-          }
-
-          # Read back: Terraform writes this object too; losing that race
-          # must be a red job, not a box that quietly rolls backwards.
-          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > readback.env
-          cmp -s next.env readback.env || {
-            echo "::error::images.env was overwritten by another writer; re-run this job"
-            diff -u next.env readback.env || true
-            exit 1
-          }
-
-      # The roll is only real once the box has taken it: the timer publishes
-      # deployed.env after a SUCCESSFUL stack restart. Runs whenever the
-      # workload is not gated off, including when the write above was a
-      # no-op: after a failed roll a re-run's write changes nothing and the
-      # verification must still happen.
-      - name: Wait for the VM to adopt it
-        if: steps.probe.outputs.armed == 'true' && steps.roll.outputs.gated == 'false'
-        run: |
-          set -euo pipefail
-          want="${{ steps.roll.outputs.bot }}"
-          for _ in $(seq 1 40); do
-            if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
-              if grep -qxF "$want" <<<"$out"; then
-                echo "::notice::s01-issuance-staging rolled to ${GITHUB_SHA}"
-                exit 0
-              fi
-            elif grep -qiE "403|permission|denied" <<<"$out"; then
-              echo "::error::cannot READ deployed.env; the deployer SA lacks the read grant (s01.devops staging-issuance):"
-              echo "$out"
-              exit 1
-            fi
-            sleep 15
-          done
-          echo "::error::the VM has not published this digest after 10 minutes." \
-            "Check the roll timer: gcloud compute ssh s01-issuance-staging --project s01-issuance-staging" \
-            "--zone europe-west3-a --tunnel-through-iap --command 'journalctl -u s01-issuance-staging-roll -n 50'"
-          exit 1
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # app-release @ .github main
+    with:
+      environment: staging
+      runtime: bot-vm
+      project: s01-issuance-staging
+      config_bucket: s01-issuance-staging-config
+      ar_repo: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+      images: s01-issuance=BOT_IMAGE
+      attestor: projects/s01-artifacts/attestors/issuance-image
+      service_account: issuance-deployer@s01-artifacts.iam.gserviceaccount.com
+      wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+      image_tag: ${{ github.sha }}
+      config_file: config.staging.toml
+      config_secret: issuance-runtime-config
