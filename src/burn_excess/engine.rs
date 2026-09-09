@@ -713,15 +713,13 @@ async fn close_stream(
         }
     }
 
-    let view = BurnExcessCloseView {
-        path,
-        state: state.state_name().to_string(),
-        reason: reason.to_string(),
-        dry_run: !execute,
-    };
-
     if !execute {
-        return Ok(view);
+        return Ok(BurnExcessCloseView {
+            path,
+            state: state.state_name().to_string(),
+            reason: reason.to_string(),
+            dry_run: true,
+        });
     }
 
     if !confirm(&format!(
@@ -738,7 +736,13 @@ async fn close_stream(
         )
         .await?;
 
-    Ok(view)
+    // The stream is now `Closed`; report that rather than the pre-close state.
+    Ok(BurnExcessCloseView {
+        path,
+        state: "Closed".to_string(),
+        reason: reason.to_string(),
+        dry_run: false,
+    })
 }
 
 /// Shared handles for burn-excess mutation steps (avoids long arg lists).
@@ -3200,7 +3204,7 @@ mod tests {
         let store =
             seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
 
-        run_burn_excess(
+        let dry_run_outcome = run_burn_excess(
             &pool,
             &MockVaultService::new_success(),
             &offline_provider(),
@@ -3217,6 +3221,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let dry_run_close = match dry_run_outcome {
+            BurnExcessOutcome::Close(close) => close,
+            other => panic!("expected a close outcome, got: {other:?}"),
+        };
+        assert!(dry_run_close.dry_run);
+        assert_eq!(dry_run_close.state, "FundingExcluded");
 
         assert!(
             matches!(
@@ -3243,7 +3254,7 @@ mod tests {
             "an abandoned Path B recovery must hold the gate before close"
         );
 
-        run_burn_excess(
+        let execute_outcome = run_burn_excess(
             &pool,
             &MockVaultService::new_success(),
             &offline_provider(),
@@ -3260,6 +3271,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let execute_close = match execute_outcome {
+            BurnExcessOutcome::Close(close) => close,
+            other => panic!("expected a close outcome, got: {other:?}"),
+        };
+        assert!(!execute_close.dry_run);
+        assert_eq!(execute_close.state, "Closed");
 
         assert!(matches!(
             store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
