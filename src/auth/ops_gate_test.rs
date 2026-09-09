@@ -19,6 +19,8 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tracing::Level;
 use tracing_test::traced_test;
 
@@ -31,6 +33,7 @@ use crate::account::Account;
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
 use crate::alpaca::mock::MockAlpacaService;
+use crate::burn_excess::api::BurnExcessExternalRequest;
 use crate::chain::ConfiguredNetworks;
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
@@ -41,7 +44,9 @@ use crate::receipt_inventory::{
 use crate::redemption::burn_manager::{
     BurnManagerError, ManualBurnReplacementOutcome, RecoveryOutcome,
 };
-use crate::redemption::poller_pause::PollerPauses;
+use crate::redemption::poller_pause::{
+    PollerPause, PollerPauses, poller_pause,
+};
 use crate::redemption::{
     IssuerRedemptionRequestId, Redemption, RedemptionServices,
 };
@@ -409,13 +414,17 @@ async fn a_debug_token_cannot_burn_excess() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
+        .manage(PollerPauses::new(HashMap::new()))
         .mount(
             "/",
-            rocket::routes![crate::burn_excess::api::burn_excess_internal_ops],
+            rocket::routes![
+                crate::burn_excess::api::burn_excess_internal_ops,
+                crate::burn_excess::api::burn_excess_external_ops
+            ],
         );
     let client = Client::tracked(rocket).await.unwrap();
 
-    let response = client
+    let internal = client
         .post("/ops/breakglass/burn-excess/internal")
         .header(rocket::http::ContentType::JSON)
         .header(rocket::http::Header::new(
@@ -425,8 +434,19 @@ async fn a_debug_token_cannot_burn_excess() {
         .body("{}")
         .dispatch()
         .await;
+    assert_eq!(internal.status(), Status::Unauthorized);
 
-    assert_eq!(response.status(), Status::Unauthorized);
+    let external = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, DEBUG_AUDIENCE),
+        ))
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(external.status(), Status::Unauthorized);
     assert!(logs_contain_at!(
         Level::WARN,
         &["IAP assertion failed validation"]
@@ -507,6 +527,7 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory)),
         network_telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
         underlying_store,
+        poller_pauses: PollerPauses::new(HashMap::new()),
         background_tasks: crate::BackgroundTasks {
             shutdown,
             handles: Vec::new(),
@@ -550,6 +571,158 @@ async fn role_prefixes_are_absent_without_ops_api_config() {
             "{path} must be absent"
         );
     }
+}
+
+/// Spawns a poller loop that counts its ticks, so a test can observe whether a
+/// pause quiesced it. Ticks fast so a resume is visible within a short window.
+fn spawn_counting_poller(
+    mut pause: PollerPause,
+    ticks: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            pause.wait_while_paused().await;
+            ticks.fetch_add(1, Ordering::SeqCst);
+            pause.interruptible_sleep(Duration::from_millis(10)).await;
+        }
+    })
+}
+
+/// A well-formed external burn body for `network`; the mint it names does not
+/// exist in an empty store, so the engine errors once the handler runs.
+fn external_body(network: Network) -> String {
+    serde_json::json!({
+        "issuer_request_id": "00000000-0000-0000-0000-000000000000",
+        "deposit_tx_hash": format!("0x{}", "00".repeat(32)),
+        "funding_tx_hash": format!("0x{}", "11".repeat(32)),
+        "receipt_id": "0x1",
+        "shares": "1.0",
+        "reason": "excess share burn test",
+        "network": network,
+        "chain_id": network.chain_id(),
+    })
+    .to_string()
+}
+
+/// A network with no pause control is refused with 422 before any burn, and a
+/// poller running for a different network is left untouched.
+#[tokio::test]
+async fn external_burn_without_a_pause_control_is_refused() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+
+    let (ethereum_control, ethereum_pause) = poller_pause();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let poller = spawn_counting_poller(ethereum_pause, ticks.clone());
+    let mut controls = HashMap::new();
+    controls.insert(Network::Ethereum, ethereum_control);
+
+    let rocket = setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(PollerPauses::new(controls))
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let body = external_body(Network::Base);
+    assert!(
+        serde_json::from_str::<BurnExcessExternalRequest>(&body).is_ok(),
+        "the test body must be well-formed, so the 422 is the handler's \
+         missing-control refusal, not a request-parse rejection"
+    );
+
+    let before = ticks.load(Ordering::SeqCst);
+    let response = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(body)
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::UnprocessableEntity);
+
+    // The unrelated Ethereum poller keeps ticking; a Base burn never paused it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        ticks.load(Ordering::SeqCst) > before,
+        "a burn for another network must not pause this poller"
+    );
+
+    poller.abort();
+}
+
+/// The pause guard resumes the poller on the handler's error paths, not only on
+/// success: an erroring burn leaves the network's poller running.
+#[tokio::test]
+async fn external_burn_resumes_the_poller_after_an_error() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+
+    let (control, pause) = poller_pause();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let poller = spawn_counting_poller(pause, ticks.clone());
+    let mut controls = HashMap::new();
+    controls.insert(Network::Base, control);
+
+    let rocket = setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(PollerPauses::new(controls))
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let body = external_body(Network::Base);
+    assert!(
+        serde_json::from_str::<BurnExcessExternalRequest>(&body).is_ok(),
+        "the test body must be well-formed, so the error is the handler's, \
+         not a request-parse rejection"
+    );
+
+    let response = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(body)
+        .dispatch()
+        .await;
+
+    // The well-formed body ran the handler, which paused the poller then
+    // errored building the burn; the guard must resume the poller on that
+    // error path just as on success.
+    assert!(
+        response.status().code >= 400,
+        "the burn must fail, got {}",
+        response.status()
+    );
+
+    // The guard dropped on the error return, so the poller resumes ticking.
+    let resumed_from = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        ticks.load(Ordering::SeqCst) > resumed_from,
+        "the guard must resume the poller after the handler errors"
+    );
+
+    poller.abort();
 }
 
 async fn migrated_pool() -> Pool<Sqlite> {
