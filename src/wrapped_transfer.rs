@@ -1558,6 +1558,42 @@ mod tests {
         );
     }
 
+    /// When the asset view cannot be read, the configured tokens are scanned
+    /// unchecked rather than not at all: an unverified scan still detects a
+    /// real transfer, while an empty watch list would disable the backstop
+    /// over a database blip.
+    #[traced_test]
+    #[tokio::test]
+    async fn an_unreadable_asset_view_leaves_the_tokens_watched() {
+        let harness = TestHarness::new().await;
+        let tx = tx_hash(0xb2);
+        sqlx::query("DROP TABLE tokenized_asset_view")
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![inbound_log(
+            tx,
+            SENDER,
+            U256::from(1u64),
+            0,
+        )]);
+        let monitor = monitor(&harness, &asserter, watch_aapl());
+
+        monitor.poll_once().await.unwrap();
+
+        assert_eq!(
+            list_inbound_wrapped_transfers(&harness.pool).await.unwrap().len(),
+            1,
+            "the token must still be scanned"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Could not read the enabled assets", "scanning them unchecked"]
+        ));
+    }
+
     /// A log without a transaction hash cannot be identified, so it cannot be
     /// recorded or deduplicated; it is dropped with a WARN summary and the
     /// checkpoint still advances rather than freezing on it forever.
