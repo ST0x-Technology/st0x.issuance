@@ -20,6 +20,7 @@ use super::view::find_vault;
 use super::{Network, UnderlyingSymbol};
 use crate::auth::{CapitalOps, DebugOps, ReadOps};
 use crate::config::Config;
+use crate::mint::has_unresolved_signer_intent;
 use crate::vault::onboarding::{
     ApprovalOutcome, OnboardingError, OrchestratorReadiness,
     check_orchestrator_readiness, ensure_unlimited_approval,
@@ -213,6 +214,26 @@ pub(crate) async fn orchestrator_approve_ops(
             "Refusing approve: vaultLogicIsExpected() is false"
         );
         return Err(Status::UnprocessableEntity);
+    }
+
+    // The approval broadcasts from the production wallet, so refuse while an
+    // unresolved mint or redemption signer intent already holds a signed nonce
+    // on this network: both would fill from the same pending nonce and one
+    // would fail nonce-too-low, leaving the bot's recovery to reconcile a
+    // submission it did not make. Same network-keyed gate the breakglass
+    // burn-excess route applies via `require_wallet_intent_gates`.
+    if has_unresolved_signer_intent(pool.inner(), network, None).await.map_err(
+        |error| {
+            error!(target: "asset", %network, %error,
+                "Failed to check signer intents before approve"
+            );
+            Status::InternalServerError
+        },
+    )? {
+        warn!(target: "asset", %network,
+            "Refusing approve: an unresolved signer intent holds the wallet nonce"
+        );
+        return Err(Status::Conflict);
     }
 
     let outcome =
