@@ -491,16 +491,37 @@ impl<P: Provider> WrappedTransferMonitor<P> {
                 .await?;
 
             let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
+            let mut filtered_tx_hashes: Vec<Option<TxHash>> = Vec::new();
             for log in &logs {
                 match self.handle_log(watched, log).await? {
                     HandledLog::Dropped { tx_hash } => {
                         dropped_tx_hashes.push(tx_hash);
+                    }
+                    HandledLog::Filtered { tx_hash } => {
+                        filtered_tx_hashes.push(tx_hash);
                     }
                     HandledLog::Recorded | HandledLog::Ignored => {}
                 }
             }
 
             advance_checkpoint_block(&self.pool, &name, chunk_to).await?;
+
+            // Nothing is lost here, the logs are fully identified and not
+            // ours, but the filter asked the node to exclude them, so their
+            // presence means the provider ignored the filter.
+            if !filtered_tx_hashes.is_empty() {
+                warn!(
+                    target: "wrapped_transfer",
+                    network = %self.network,
+                    token = %watched.token,
+                    count = filtered_tx_hashes.len(),
+                    tx_hashes = ?filtered_tx_hashes,
+                    chunk_from,
+                    chunk_to,
+                    "Skipped wrapped-token transfer logs the filter should \
+                     have excluded; the provider ignored the filter"
+                );
+            }
 
             // The advance above makes the drop permanent, and the per log
             // detail is DEBUG (loop-body rule), so this per chunk summary is
@@ -564,18 +585,22 @@ impl<P: Provider> WrappedTransferMonitor<P> {
         ) {
             Ok(transfer) => transfer,
             Err(reason) => {
+                let tx_hash = log.transaction_hash;
+                let handled = if reason.is_filter_mismatch() {
+                    HandledLog::Filtered { tx_hash }
+                } else {
+                    HandledLog::Dropped { tx_hash }
+                };
                 debug!(
                     target: "wrapped_transfer",
                     network = %self.network,
                     token = %watched.token,
-                    tx_hash = ?log.transaction_hash,
+                    tx_hash = ?tx_hash,
                     log_index = ?log.log_index,
                     reason = %reason,
-                    "Skipping unidentifiable wrapped-token transfer log"
+                    "Skipping wrapped-token transfer log"
                 );
-                return Ok(HandledLog::Dropped {
-                    tx_hash: log.transaction_hash,
-                });
+                return Ok(handled);
             }
         };
 
@@ -653,13 +678,15 @@ impl<P: Provider> WrappedTransferMonitor<P> {
 }
 
 /// Outcome of handling one log: recorded (and its alert queued), ignored
-/// because it moves nothing, or dropped because the log cannot be identified.
-/// A dropped log carries what identity it had, since the drop is permanent
-/// once the chunk is checkpointed and the summary WARN is all the operator
-/// gets.
+/// because it moves nothing, filtered because it is identified but not ours
+/// (the node should have excluded it), or dropped because the log cannot be
+/// identified. The last two carry what identity the log had: both are
+/// permanent once the chunk is checkpointed, and the summary WARN is all the
+/// operator gets.
 enum HandledLog {
     Recorded,
     Ignored,
+    Filtered { tx_hash: Option<TxHash> },
     Dropped { tx_hash: Option<TxHash> },
 }
 
@@ -720,6 +747,15 @@ enum UnidentifiableLog {
     NoLogIndex,
     #[error("log has no block number")]
     NoBlockNumber,
+}
+
+impl UnidentifiableLog {
+    /// Whether the log is fully identified and merely not ours: a case the
+    /// `eth_getLogs` filter should have excluded, as opposed to a log that
+    /// has lost its identity.
+    const fn is_filter_mismatch(&self) -> bool {
+        matches!(self, Self::OtherEmitter { .. } | Self::OtherRecipient { .. })
+    }
 }
 
 /// Records `transfer` unless its `(network, tx_hash, log_index)` identity is
@@ -1352,14 +1388,23 @@ mod tests {
             "neither log belongs to the watched token and wallet"
         );
         assert_eq!(checkpoint(&harness).await, Some(200));
+        // Nothing was lost: both logs are fully identified and simply not
+        // ours, so they must not be reported as unidentifiable. They still
+        // get their own WARN, because a provider handing back logs the filter
+        // should have excluded is worth knowing about.
         assert!(logs_contain_at!(
             Level::WARN,
             &[
-                "Dropped unidentifiable wrapped-token transfer logs",
+                "Skipped wrapped-token transfer logs the filter should have \
+                 excluded",
                 "count=2",
                 &format!("{:?}", tx_hash(0xa7)),
                 &format!("{:?}", tx_hash(0xa8)),
             ]
+        ));
+        assert!(!logs_contain_at!(
+            Level::WARN,
+            &["Dropped unidentifiable wrapped-token transfer logs"]
         ));
         assert!(logs_contain_at!(
             Level::DEBUG,
