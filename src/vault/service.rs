@@ -380,7 +380,11 @@ impl RealBlockchainService {
                     // reusable; later prepared transactions keep their values.
                     self.nonce_manager
                         .release(self.provider.default_signer_address(), nonce);
-                    return Err(error.into());
+                    return Err(VaultError::SubmitRejected {
+                        tx_hash: hash,
+                        nonce,
+                        source: error,
+                    });
                 }
                 Ok(None)
             }
@@ -392,17 +396,26 @@ fn classify_burn_broadcast_error(
     error: VaultError,
     sendable_tx: &SendableTxWithHash,
 ) -> VaultError {
-    if let VaultError::Rpc(alloy::transports::RpcError::ErrorResp(response)) =
-        &error
-        && is_nonce_too_low_message(&response.message)
-    {
-        return VaultError::BurnNonceTooLow {
-            tx_hash: sendable_tx.hash,
-            nonce: sendable_tx.nonce,
-        };
+    match error {
+        VaultError::Rpc(alloy::transports::RpcError::ErrorResp(response))
+            if is_nonce_too_low_message(&response.message) =>
+        {
+            VaultError::BurnNonceTooLow {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            }
+        }
+        VaultError::SubmitRejected {
+            source: alloy::transports::RpcError::ErrorResp(response),
+            ..
+        } if is_nonce_too_low_message(&response.message) => {
+            VaultError::BurnNonceTooLow {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            }
+        }
+        error => error,
     }
-
-    error
 }
 
 fn is_nonce_too_low_message(message: &str) -> bool {
@@ -3219,6 +3232,82 @@ mod tests {
                 "RPC message `{message}` should classify as nonce too low"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn submit_burn_stays_ambiguous_when_the_node_holds_the_hash() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = prepared_tx.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Some(rpc_transaction(&prepared_tx.tx, owner)));
+        let service = create_service_with_asserter(asserter);
+
+        let submitted = service
+            .submit_burn(test_multi_burn_params(owner), prepared_tx.clone())
+            .await
+            .expect("a held hash must keep the broadcast ambiguous");
+
+        assert_eq!(submitted.tx_id, TxId::from(prepared_tx.hash));
+    }
+
+    #[tokio::test]
+    async fn submit_burn_returns_submit_rejected_when_the_node_holds_nothing() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            1858,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Option::<RpcTransaction>::None);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .submit_burn(
+                test_multi_burn_params(prepared_tx.signer_for_test()),
+                prepared_tx.clone(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::SubmitRejected { tx_hash, nonce, .. })
+                if tx_hash == prepared_tx.hash && nonce == prepared_tx.nonce
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_mint_stays_ambiguous_when_the_node_holds_the_hash() {
+        let prepared = persisted_mint_tx(7);
+        let owner = prepared.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "txpool is full".into(),
+            data: None,
+        });
+        asserter.push_success(&Some(rpc_transaction(&prepared.tx, owner)));
+        let service = create_service_with_asserter(asserter);
+
+        let submitted = service
+            .submit_mint(&prepared)
+            .await
+            .expect("a held hash must keep the broadcast ambiguous");
+
+        assert_eq!(submitted.tx_id, TxId::from(prepared.hash));
     }
 
     #[tokio::test]

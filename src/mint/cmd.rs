@@ -64,6 +64,19 @@ pub(crate) enum MintCommand {
         tx_id: TxId,
     },
 
+    /// Records a raw transaction the RPC node rejected before accepting it.
+    /// Pure: produces `MintSubmitRejected` from the payload, no I/O. Valid
+    /// from `MintIntended`; idempotent: a no-op once the mint has advanced
+    /// past submission or already recorded the rejection. The handler rejects
+    /// a payload whose `tx_hash` or `nonce` differs from the persisted
+    /// transaction.
+    RecordSubmitRejected {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        error: String,
+    },
+
     /// Records the outcome of a successful on-chain mint confirmation performed
     /// by a durable `ConfirmMintJob`. Pure: produces `TokensMinted` from the
     /// payload, no I/O. Idempotent — a no-op if the mint already advanced past

@@ -115,6 +115,13 @@ pub(crate) enum MintEvent {
         prepared_tx: PreparedMintTx,
         intended_at: DateTime<Utc>,
     },
+    MintSubmitRejected {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        error: String,
+        rejected_at: DateTime<Utc>,
+    },
     TokensMinted {
         issuer_request_id: IssuerMintRequestId,
         tx_hash: B256,
@@ -253,6 +260,9 @@ impl DomainEvent for MintEvent {
             }
             Self::MintTxIntended { .. } => {
                 "MintEvent::MintTxIntended".to_string()
+            }
+            Self::MintSubmitRejected { .. } => {
+                "MintEvent::MintSubmitRejected".to_string()
             }
             Self::TokensMinted { .. } => "MintEvent::TokensMinted".to_string(),
             Self::MintingFailed { .. } => {

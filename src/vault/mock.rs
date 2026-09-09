@@ -318,6 +318,10 @@ pub(crate) struct MockVaultService {
     /// error, then allows subsequent submissions.
     #[cfg(test)]
     burn_nonce_too_low_once: Arc<AtomicBool>,
+    /// Rejects the next burn submission with a `SubmitRejected` error whose
+    /// hash the node does not hold, then allows subsequent submissions.
+    #[cfg(test)]
+    burn_submit_rejected_once: Arc<AtomicBool>,
     #[cfg(test)]
     last_burn_proof_kind: Arc<Mutex<Option<BurnProofKind>>>,
 }
@@ -379,6 +383,8 @@ impl MockVaultService {
             #[cfg(test)]
             burn_nonce_too_low_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            burn_submit_rejected_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             last_burn_proof_kind: Arc::new(Mutex::new(None)),
         }
     }
@@ -401,6 +407,13 @@ impl MockVaultService {
     pub(crate) fn new_nonce_too_low() -> Self {
         let service = Self::new_success();
         service.burn_nonce_too_low_once.store(true, Ordering::Relaxed);
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_submit_rejected() -> Self {
+        let service = Self::new_success();
+        service.burn_submit_rejected_once.store(true, Ordering::Relaxed);
         service
     }
 
@@ -576,6 +589,7 @@ impl MockVaultService {
         self.confirm_mint_outcomes.lock().unwrap().clear();
         *self.submit_mint_error.lock().unwrap() = None;
         self.burn_nonce_too_low_once.store(false, Ordering::Relaxed);
+        self.burn_submit_rejected_once.store(false, Ordering::Relaxed);
         *self.orchestrator.readiness.lock().unwrap() = None;
         *self.orchestrator.confirm_revert.lock().unwrap() = None;
         *self.orchestrator.last_params.lock().unwrap() = None;
@@ -1054,6 +1068,21 @@ const MOCK_MINT_TX_HASH: alloy::primitives::B256 =
 const MOCK_BURN_TX_HASH: alloy::primitives::B256 =
     b256!("0x4545454545454545454545454545454545454545454545454545454545454545");
 
+#[cfg(test)]
+fn submit_rejected_error(tx_hash: B256, nonce: u64) -> VaultError {
+    VaultError::SubmitRejected {
+        tx_hash,
+        nonce,
+        source: alloy::transports::RpcError::ErrorResp(
+            alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: "txpool is full".into(),
+                data: None,
+            },
+        ),
+    }
+}
+
 /// Matches the canonical orchestrator test fixture's `alpaca_quantity` of
 /// 17 tokens in share-wei: the confirm handler rejects a `shares_burned`
 /// that diverges from the persisted quantity, so the fallback result must
@@ -1339,6 +1368,14 @@ impl VaultService for MockVaultService {
                 tx_hash: prepared_tx.hash,
                 nonce: prepared_tx.nonce,
             });
+        }
+
+        #[cfg(test)]
+        if self.burn_submit_rejected_once.swap(false, Ordering::Relaxed) {
+            return Err(submit_rejected_error(
+                prepared_tx.hash,
+                prepared_tx.nonce,
+            ));
         }
 
         #[cfg(test)]
@@ -1667,6 +1704,14 @@ impl VaultService for MockVaultService {
                 tx_hash: sendable_tx.hash,
                 nonce: sendable_tx.nonce,
             });
+        }
+
+        #[cfg(test)]
+        if self.burn_submit_rejected_once.swap(false, Ordering::Relaxed) {
+            return Err(submit_rejected_error(
+                sendable_tx.hash,
+                sendable_tx.nonce,
+            ));
         }
 
         #[cfg(test)]
