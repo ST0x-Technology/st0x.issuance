@@ -1025,7 +1025,13 @@ async fn intend_submit_confirm<P: Provider>(
     ctx: &MutationCtx<'_, P>,
 ) -> Result<(), BurnExcessEngineError> {
     // Irreversible sign boundary: re-check gates, balances, and Path B
-    // exclusion index.
+    // exclusion index. The wallet is held from the intent check through
+    // broadcast because the intent check is what makes the nonce safe: a
+    // concurrent mint, redemption burn, or excess burn on another deposit
+    // runs its own check under the same lock, so it cannot pass between this
+    // check and the persisted intent and sign a second transaction on the
+    // nonce `prepare_burn_tx` fixes here.
+    let wallet_guard = ctx.vault_service.lock_wallet().await;
     require_wallet_intent_gates(
         ctx.pool,
         ctx.request.network,
@@ -1071,6 +1077,7 @@ async fn intend_submit_confirm<P: Provider>(
         )
         .await?;
     println!("Submitted excess burn tx={:#x}", sendable_tx.hash);
+    drop(wallet_guard);
 
     confirm_and_complete(&ConfirmCtx {
         pool: ctx.pool,
@@ -1599,6 +1606,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
     use crate::account::ClientId;
@@ -1618,7 +1626,8 @@ mod tests {
     use crate::vault::mock::MockVaultService;
     use crate::vault::service::{RealBlockchainService, ResyncNonceManager};
     use crate::vault::{
-        BurnTxStatus, MultiBurnResult, MultiBurnResultEntry, SendableTxWithHash,
+        BurnTxStatus, MultiBurnResult, MultiBurnResultEntry, PreparedMintTx,
+        SendableTxWithHash, VaultError,
     };
     use crate::{Quantity, VaultMode};
 
@@ -2736,6 +2745,255 @@ mod tests {
         assert!(
             store.load(&BurnExcessId::new(deposit_tx)).await.unwrap().is_none(),
             "a refused re-check must leave no BurnExcess stream behind"
+        );
+    }
+
+    /// Inserts the `MintTxIntended` a mint job persists while holding the
+    /// wallet, which reserves the network's signer for that mint.
+    async fn seed_mint_tx_intended(
+        pool: &Pool<Sqlite>,
+        issuer_request_id: &IssuerMintRequestId,
+    ) {
+        let intended = MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx: PreparedMintTx::valid_for_test(
+                1,
+                format!("mint-{issuer_request_id}"),
+            ),
+            intended_at: Utc::now(),
+        };
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 2, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .bind(intended.event_type())
+        .bind(serde_json::to_string(&intended).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Runs an execute request on its own task so the test can observe it
+    /// parked on the wallet while another signer holds it.
+    fn spawn_burn(
+        pool: &Pool<Sqlite>,
+        mock: &Arc<MockVaultService>,
+        provider: &(impl Provider + Clone + 'static),
+        issuer_wallet: Address,
+        request: BurnExcessRequest,
+    ) -> tokio::task::JoinHandle<Result<(), BurnExcessEngineError>> {
+        let pool = pool.clone();
+        let mock = Arc::clone(mock);
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            run_burn_excess(
+                &pool,
+                mock.as_ref(),
+                &provider,
+                issuer_wallet,
+                request,
+                |_| Ok(true),
+            )
+            .await
+        })
+    }
+
+    async fn wait_for_wallet_lock_calls(
+        mock: &MockVaultService,
+        expected: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.get_wallet_lock_call_count() < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the burn must contend for the wallet before its intent check");
+    }
+
+    /// Two excess burns on different deposits share one wallet. The second
+    /// must not run its intent check until the first has persisted its intent:
+    /// otherwise both checks pass and both sign on the same nonce.
+    #[tokio::test]
+    async fn a_second_excess_burn_waits_for_the_first_to_persist_its_intent() {
+        let pool = pool().await;
+        let (evm, _real_service, provider, _) = prepared_evm().await;
+        let underlying = seed_listing(&pool, evm.vault_address).await;
+        let first_id = IssuerMintRequestId::random();
+        let second_id = IssuerMintRequestId::random();
+        seed_mint_initiated(&pool, &first_id, &underlying).await;
+        seed_mint_initiated(&pool, &second_id, &underlying).await;
+        let (first_receipt, shares, _, first_deposit) =
+            mint_with_info(&evm, evm.wallet_address, &first_id).await;
+        let (second_receipt, _, _, second_deposit) =
+            mint_with_info(&evm, evm.wallet_address, &second_id).await;
+
+        let mock = Arc::new(
+            MockVaultService::new_prepare_burn_blocked()
+                .with_share_balance(shares),
+        );
+
+        let first = spawn_burn(
+            &pool,
+            &mock,
+            &provider,
+            evm.wallet_address,
+            request(
+                BurnExcessMode::Internal,
+                first_id,
+                first_deposit,
+                first_receipt,
+                None,
+                true,
+            ),
+        );
+        // Past its intent check, inside signing, intent not yet persisted:
+        // the window a second burn must not be able to check inside.
+        mock.wait_for_burn_preparation().await;
+
+        let second = spawn_burn(
+            &pool,
+            &mock,
+            &provider,
+            evm.wallet_address,
+            request(
+                BurnExcessMode::Internal,
+                second_id,
+                second_deposit,
+                second_receipt,
+                None,
+                true,
+            ),
+        );
+        wait_for_wallet_lock_calls(&mock, 2).await;
+        assert!(
+            !second.is_finished(),
+            "the second burn must wait for the wallet, not check intents \
+             inside the first burn's window"
+        );
+        assert_eq!(mock.burn_preparation_call_count(), 1);
+
+        mock.release_burn_preparation();
+        let first_error = first.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                first_error,
+                BurnExcessEngineError::Vault(
+                    VaultError::ConfirmationPending { .. }
+                )
+            ),
+            "the first burn must submit and stay unresolved, got: \
+             {first_error:?}"
+        );
+        let second_error = second.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                second_error,
+                BurnExcessEngineError::UnresolvedExcessBurnIntent
+            ),
+            "the second burn's intent check must see the first burn's \
+             persisted intent, got: {second_error:?}"
+        );
+        assert_eq!(
+            mock.burn_preparation_call_count(),
+            1,
+            "only the first burn may sign while its intent is unresolved"
+        );
+
+        let store = burn_excess_store(pool.clone()).await.unwrap();
+        assert!(matches!(
+            store.load(&BurnExcessId::new(first_deposit)).await.unwrap(),
+            Some(BurnExcess::Submitted { .. })
+        ));
+        assert!(
+            store
+                .load(&BurnExcessId::new(second_deposit))
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused second burn must leave no stream behind"
+        );
+    }
+
+    /// An excess burn racing normal issuance. The mint job holds the wallet
+    /// from its own intent check through signing and its persisted intent, so
+    /// the burn must not check for intents until that intent is on record.
+    #[tokio::test]
+    async fn an_excess_burn_waits_behind_a_mint_holding_the_wallet() {
+        let pool = pool().await;
+        let (evm, _real_service, provider, _) = prepared_evm().await;
+        let underlying = seed_listing(&pool, evm.vault_address).await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_initiated(&pool, &issuer_request_id, &underlying).await;
+        let (receipt_id, shares, _, deposit_tx) =
+            mint_with_info(&evm, evm.wallet_address, &issuer_request_id).await;
+        let concurrent_mint = IssuerMintRequestId::random();
+        seed_mint_initiated(&pool, &concurrent_mint, &underlying).await;
+
+        let mock = Arc::new(
+            MockVaultService::new_success().with_share_balance(shares),
+        );
+        // The mint job takes the wallet before its own intent check.
+        let mint_guard = mock.lock_wallet().await;
+
+        let burn = spawn_burn(
+            &pool,
+            &mock,
+            &provider,
+            evm.wallet_address,
+            request(
+                BurnExcessMode::Internal,
+                issuer_request_id,
+                deposit_tx,
+                receipt_id,
+                None,
+                true,
+            ),
+        );
+        wait_for_wallet_lock_calls(&mock, 2).await;
+        assert!(
+            !burn.is_finished(),
+            "the burn must wait for the wallet, not check intents past a \
+             mint that holds it"
+        );
+        assert_eq!(mock.burn_preparation_call_count(), 0);
+
+        // The mint signs and persists its intent, still holding the wallet.
+        seed_mint_tx_intended(&pool, &concurrent_mint).await;
+        drop(mint_guard);
+
+        let error = burn.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BurnExcessEngineError::UnresolvedSignerIntent {
+                    network: Network::Base
+                }
+            ),
+            "the burn's intent check must see the mint's persisted intent, \
+             got: {error:?}"
+        );
+        assert_eq!(
+            mock.burn_preparation_call_count(),
+            0,
+            "the burn must not sign behind a mint's live nonce"
+        );
+
+        let store = burn_excess_store(pool.clone()).await.unwrap();
+        assert!(
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap().is_none(),
+            "a refused burn must leave no stream behind"
         );
     }
 

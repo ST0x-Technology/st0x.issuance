@@ -68,6 +68,15 @@ enum MockBehavior {
         attempted: Arc<Notify>,
         release: Arc<Notify>,
     },
+    /// Burn preparation waits for an explicit test release, holding the caller
+    /// between its wallet-intent check and its persisted intent; confirmation
+    /// then reports an uncertain pending result so that intent stays
+    /// unresolved for whoever signs next.
+    #[cfg(test)]
+    PrepareBurnBlocked {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Burn confirmation waits for an explicit test release, then reports an
     /// uncertain pending result.
     #[cfg(test)]
@@ -476,6 +485,16 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_prepare_burn_blocked() -> Self {
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::PrepareBurnBlocked {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        service
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_for_wallet_lock_attempt(&self) {
         let MockBehavior::WalletLockBlocked { attempted, .. } = &self.behavior
         else {
@@ -489,6 +508,24 @@ impl MockVaultService {
         let MockBehavior::WalletLockBlocked { release, .. } = &self.behavior
         else {
             panic!("mock does not block wallet lock acquisition");
+        };
+        release.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_burn_preparation(&self) {
+        let MockBehavior::PrepareBurnBlocked { started, .. } = &self.behavior
+        else {
+            panic!("mock does not block burn preparation");
+        };
+        started.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_burn_preparation(&self) {
+        let MockBehavior::PrepareBurnBlocked { release, .. } = &self.behavior
+        else {
+            panic!("mock does not block burn preparation");
         };
         release.notify_one();
     }
@@ -1348,6 +1385,7 @@ impl VaultService for MockVaultService {
             }
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::PrepareBurnBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
@@ -1527,6 +1565,13 @@ impl VaultService for MockVaultService {
             // PrepareTxFails never reaches confirm (fails before submit);
             // if somehow called, return the cached result.
             #[cfg(test)]
+            MockBehavior::PrepareBurnBlocked { .. } => {
+                Err(VaultError::ConfirmationPending {
+                    tx_id: _tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
@@ -1596,6 +1641,12 @@ impl VaultService for MockVaultService {
             self.burn_preparation_call_count.fetch_add(1, Ordering::Relaxed);
             if matches!(self.behavior, MockBehavior::PrepareTxFails) {
                 return Err(VaultError::InvalidReceipt);
+            }
+            if let MockBehavior::PrepareBurnBlocked { started, release } =
+                &self.behavior
+            {
+                started.notify_one();
+                release.notified().await;
             }
             // Use configured tx if present, otherwise fall back to default.
             // Cloned (not taken) so retries can re-use the same configured tx.
@@ -1880,6 +1931,7 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::PrepareBurnBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
@@ -2072,6 +2124,7 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::PrepareBurnBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {

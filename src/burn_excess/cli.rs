@@ -171,11 +171,10 @@ pub(crate) async fn run_burn_excess_cli(
 }
 
 /// Builds the signing and read providers for `request.network` from the service
-/// environment and signer, then runs the dual-path orchestration. Shared by the
-/// `issuer burn-excess` CLI and the breakglass HTTP route: the RPC is the
-/// configured per-network endpoint (`CHAIN_<NETWORK>_RPC_URL`, or legacy
-/// `RPC_URL` for Base) and the wallet is the service signer.
-pub(crate) async fn run_burn_excess_request(
+/// environment and signer, then runs the dual-path orchestration. The offline
+/// CLI has no running service to borrow a vault service from, so it builds its
+/// own; the breakglass HTTP route signs through the service's shared one.
+async fn run_burn_excess_request(
     pool: &Pool<Sqlite>,
     signer_config: &SignerConfig,
     request: BurnExcessRequest,

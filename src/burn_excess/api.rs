@@ -2,11 +2,14 @@
 //!
 //! The external path stays offline (`issuer burn-excess external`) until the
 //! transfer poller can be paused from a running service; internal never touches
-//! the poller. The engine self-gates on wallet quiescence (an unresolved
-//! mint/redemption burn intent on the network refuses with `Conflict`), so this
-//! is safe to run against a live service.
+//! the poller. The route signs through the running service's vault service, so
+//! the burn shares the wallet lock and nonce manager every live mint and
+//! redemption burn uses, and the engine self-gates on wallet quiescence under
+//! that lock (an unresolved mint/redemption burn intent on the network refuses
+//! with `Conflict`), so this is safe to run against a live service.
 
 use alloy::primitives::{B256, U256};
+use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, post};
@@ -15,13 +18,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use tracing::{error, warn};
 
-use super::cli::{parse_shares, run_burn_excess_request};
-use super::engine::{BurnExcessEngineError, BurnExcessRequest};
+use super::cli::parse_shares;
+use super::engine::{
+    BurnExcessEngineError, BurnExcessRequest, run_burn_excess,
+};
 use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
-use crate::config::Config;
+use crate::config::{Config, configured_rpc_url, wss_to_http};
 use crate::mint::IssuerMintRequestId;
 use crate::tokenized_asset::Network;
+use crate::vault::NetworkVaultServices;
 
 /// An 18-decimal fixed-point share amount parsed from its decimal-string wire
 /// form at deserialize time, so an invalid or over-precise quantity is refused
@@ -87,6 +93,7 @@ pub(crate) async fn burn_excess_internal_ops(
     _auth: BreakglassOps,
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
+    vault_services: &State<NetworkVaultServices>,
     body: Json<BurnExcessInternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
     let body = body.into_inner();
@@ -97,6 +104,25 @@ pub(crate) async fn burn_excess_internal_ops(
         );
         return Err(Status::UnprocessableEntity);
     }
+
+    let vault_service =
+        vault_services.service(body.network).map_err(|error| {
+            warn!(target: "admin", %error, "burn-excess refused");
+            Status::UnprocessableEntity
+        })?;
+    let issuer_wallet = config.signer.address().map_err(|error| {
+        error!(target: "admin", %error, "burn-excess signer address unavailable");
+        Status::InternalServerError
+    })?;
+    let rpc_url = configured_rpc_url(body.network).map_err(|error| {
+        error!(target: "admin", %error, "burn-excess RPC unavailable");
+        Status::InternalServerError
+    })?;
+    let http_url = wss_to_http(&rpc_url).map_err(|error| {
+        error!(target: "admin", %error, "burn-excess RPC unavailable");
+        Status::InternalServerError
+    })?;
+    let read_provider = ProviderBuilder::new().connect_http(http_url);
 
     let request = BurnExcessRequest {
         mode: BurnExcessMode::Internal,
@@ -114,18 +140,18 @@ pub(crate) async fn burn_excess_internal_ops(
     };
     let executed = request.execute;
 
-    run_burn_excess_request(
+    run_burn_excess(
         pool.inner(),
-        &config.signer,
+        vault_service.as_ref(),
+        &read_provider,
+        issuer_wallet,
         request,
         |_: &str| Ok::<bool, std::io::Error>(true),
     )
     .await
     .map_err(|error| {
         error!(target: "admin", %error, "burn-excess (internal) failed");
-        error
-            .downcast_ref::<BurnExcessEngineError>()
-            .map_or(Status::InternalServerError, map_burn_excess_error)
+        map_burn_excess_error(&error)
     })?;
 
     Ok(Json(BurnExcessResponse { executed }))
