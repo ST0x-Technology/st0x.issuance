@@ -27,7 +27,10 @@
 //! truth that drifts, and would defeat the point, which is that granting an
 //! operator access to a tier is a Workspace admin console change.
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    get_current_timestamp,
+};
 use rocket::http::Status;
 use rocket::request::Request;
 use serde::Deserialize;
@@ -58,8 +61,15 @@ const JWKS_TTL: Duration = Duration::from_secs(3600);
 /// requests to Google.
 const UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Tolerance for clock skew between Google and this VM when checking `exp`.
-const LEEWAY_SECS: u64 = 60;
+/// Tolerance for clock skew between Google and this VM, applied to both `exp`
+/// (may be this far in the past) and `iat` (may be this far in the future).
+/// Google's signed-header guidance allows 30 seconds.
+const CLOCK_SKEW_SECS: u64 = 30;
+
+/// Longest `exp - iat` an assertion may claim. Google mints IAP tokens for
+/// ten minutes; its guidance caps the accepted lifetime at that plus twice the
+/// skew, so a token that verifies but claims an hour is not one IAP issued.
+const MAX_TOKEN_LIFETIME_SECS: u64 = 10 * 60 + 2 * CLOCK_SKEW_SECS;
 
 /// Timeout for a single JWKS fetch. Load-bearing, not hygiene: the verifier's
 /// refresh slot is held for the duration of a fetch, so an unbounded request
@@ -246,6 +256,13 @@ struct IapClaims {
     /// Present for human callers. Absent for service accounts on some paths,
     /// which is why it is optional and used only for logging.
     email: Option<String>,
+    /// Issued-at, seconds since the epoch. Required: `jsonwebtoken` checks
+    /// only `exp`, so a future-issued token would otherwise pass. Checked in
+    /// [`IapVerifier::verify`] against the skew and the maximum lifetime.
+    iat: u64,
+    /// Expiry, seconds since the epoch. `jsonwebtoken` already refuses a past
+    /// `exp`; read here to bound `exp - iat`.
+    exp: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,11 +283,14 @@ impl IapVerifier {
         let mut validation = Validation::new(Algorithm::ES256);
         validation.set_audience(&[audience]);
         validation.set_issuer(&[IAP_ISSUER]);
-        validation.leeway = LEEWAY_SECS;
+        validation.leeway = CLOCK_SKEW_SECS;
         // `exp` is what bounds a stolen token's usefulness, so its absence must
-        // be a rejection rather than an unbounded token.
-        validation.required_spec_claims =
-            ["exp", "aud", "iss"].into_iter().map(String::from).collect();
+        // be a rejection rather than an unbounded token; `iat` is what lets the
+        // lifetime and future-issue checks below run at all.
+        validation.required_spec_claims = ["exp", "iat", "aud", "iss"]
+            .into_iter()
+            .map(String::from)
+            .collect();
 
         Self {
             tier,
@@ -312,15 +332,38 @@ impl IapVerifier {
                 IapError::Rejected
             })?;
 
+        let IapClaims { sub, email, iat, exp } = claims.claims;
+
+        // `jsonwebtoken` validates `exp` but never reads `iat`. Google requires
+        // both: an assertion must have been issued in the past (within skew),
+        // and its lifetime must not exceed what IAP itself mints. A token that
+        // passes the signature check but claims a future issue time or an
+        // hour of validity was not minted by IAP, whatever key signed it.
+        let now = get_current_timestamp();
+        if iat > now.saturating_add(CLOCK_SKEW_SECS) {
+            warn!(
+                target: "auth", tier = self.tier.as_str(), iat, now,
+                "IAP assertion issued in the future"
+            );
+            return Err(IapError::Rejected);
+        }
+        if exp > iat.saturating_add(MAX_TOKEN_LIFETIME_SECS) {
+            warn!(
+                target: "auth", tier = self.tier.as_str(), iat, exp,
+                "IAP assertion lifetime exceeds the maximum IAP issues"
+            );
+            return Err(IapError::Rejected);
+        }
+
         info!(
             target: "auth",
             tier = self.tier.as_str(),
-            subject = %claims.claims.sub,
-            email = claims.claims.email.as_deref().unwrap_or("<none>"),
+            subject = %sub,
+            email = email.as_deref().unwrap_or("<none>"),
             "IAP assertion accepted"
         );
 
-        Ok(claims.claims.sub)
+        Ok(sub)
     }
 
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapError> {
@@ -569,7 +612,49 @@ mod tests {
         email: String,
         aud: String,
         iss: String,
+        /// `None` omits the claim entirely, to mint a token without `iat`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iat: Option<u64>,
         exp: u64,
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs()
+    }
+
+    fn claims(
+        audience: &str,
+        issuer: &str,
+        iat: Option<u64>,
+        exp: u64,
+    ) -> TestClaims {
+        TestClaims {
+            sub: "accounts.google.com:1234".to_string(),
+            email: "operator@rainlang.xyz".to_string(),
+            aud: audience.to_string(),
+            iss: issuer.to_string(),
+            iat,
+            exp,
+        }
+    }
+
+    fn kid_header() -> Header {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_string());
+        header
+    }
+
+    /// Signs `claims` under `header` with the test key.
+    fn mint(key: &TestKey, header: &Header, claims: &TestClaims) -> String {
+        encode(
+            header,
+            claims,
+            &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
+        )
+        .expect("token encodes")
     }
 
     /// A P-256 keypair standing in for Google's: the JWK halves that go in the
@@ -598,39 +683,21 @@ mod tests {
         }
     }
 
+    /// A current assertion for `audience` from `issuer`, issued now and
+    /// expiring `expires_in_secs` from now (negative for an already-expired
+    /// token).
     fn token(
         key: &TestKey,
         audience: &str,
         issuer: &str,
         expires_in_secs: i64,
     ) -> String {
+        let now = now_secs();
         let exp = u64::try_from(
-            i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("after epoch")
-                    .as_secs(),
-            )
-            .expect("fits i64")
-                + expires_in_secs,
+            i64::try_from(now).expect("fits i64") + expires_in_secs,
         )
         .expect("not before epoch");
-
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(TEST_KID.to_string());
-
-        encode(
-            &header,
-            &TestClaims {
-                sub: "accounts.google.com:1234".to_string(),
-                email: "operator@rainlang.xyz".to_string(),
-                aud: audience.to_string(),
-                iss: issuer.to_string(),
-                exp,
-            },
-            &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
-        )
-        .expect("token encodes")
+        mint(key, &kid_header(), &claims(audience, issuer, Some(now), exp))
     }
 
     /// Encodes a token with a caller-supplied header (to drive a missing or
@@ -640,30 +707,8 @@ mod tests {
         header: &Header,
         audience: &str,
     ) -> String {
-        let exp = u64::try_from(
-            i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("after epoch")
-                    .as_secs(),
-            )
-            .expect("fits i64")
-                + 300,
-        )
-        .expect("not before epoch");
-
-        encode(
-            header,
-            &TestClaims {
-                sub: "accounts.google.com:1234".to_string(),
-                email: "operator@rainlang.xyz".to_string(),
-                aud: audience.to_string(),
-                iss: IAP_ISSUER.to_string(),
-                exp,
-            },
-            &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
-        )
-        .expect("token encodes")
+        let now = now_secs();
+        mint(key, header, &claims(audience, IAP_ISSUER, Some(now), now + 300))
     }
 
     fn jwks_server(key: &TestKey) -> MockServer {
@@ -963,6 +1008,97 @@ mod tests {
         assert!(logs_contain_at!(
             Level::DEBUG,
             &["not yet retained while refresh throttled"]
+        ));
+    }
+
+    /// Google requires `iat` in the past. `jsonwebtoken` never reads it, so a
+    /// signed, unexpired token for this audience stamped with a future issue
+    /// time would otherwise be accepted.
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_an_assertion_issued_in_the_future() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+        let now = now_secs();
+
+        let token = mint(
+            &key,
+            &kid_header(),
+            &claims(READ_AUDIENCE, IAP_ISSUER, Some(now + 300), now + 600),
+        );
+        let error =
+            verifier(READ_AUDIENCE, &jwks).verify(&token).await.unwrap_err();
+
+        assert!(matches!(error, IapError::Rejected), "got: {error:?}");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion issued in the future"]
+        ));
+    }
+
+    /// The skew allowance is real: an `iat` a few seconds ahead of this VM's
+    /// clock (ordinary drift from Google's) is accepted, not refused.
+    #[tokio::test]
+    async fn accepts_an_assertion_issued_within_clock_skew() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+        let now = now_secs();
+
+        let token = mint(
+            &key,
+            &kid_header(),
+            &claims(READ_AUDIENCE, IAP_ISSUER, Some(now + 10), now + 300),
+        );
+        let subject = verifier(READ_AUDIENCE, &jwks).verify(&token).await;
+
+        assert_eq!(subject.unwrap(), "accounts.google.com:1234");
+    }
+
+    /// IAP mints ten-minute tokens. One claiming an hour verifies under the
+    /// key but is not something IAP issued, so it is refused.
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_an_assertion_with_an_excessive_lifetime() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+        let now = now_secs();
+
+        let token = mint(
+            &key,
+            &kid_header(),
+            &claims(READ_AUDIENCE, IAP_ISSUER, Some(now), now + 3600),
+        );
+        let error =
+            verifier(READ_AUDIENCE, &jwks).verify(&token).await.unwrap_err();
+
+        assert!(matches!(error, IapError::Rejected), "got: {error:?}");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion lifetime exceeds the maximum IAP issues"]
+        ));
+    }
+
+    /// Without `iat` neither the future-issue nor the lifetime check can run,
+    /// so its absence is a rejection, like a missing `exp`.
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_an_assertion_without_an_issued_at() {
+        let key = test_key();
+        let jwks = jwks_server(&key);
+        let now = now_secs();
+
+        let token = mint(
+            &key,
+            &kid_header(),
+            &claims(READ_AUDIENCE, IAP_ISSUER, None, now + 300),
+        );
+        let error =
+            verifier(READ_AUDIENCE, &jwks).verify(&token).await.unwrap_err();
+
+        assert!(matches!(error, IapError::Rejected), "got: {error:?}");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["IAP assertion failed validation"]
         ));
     }
 }
