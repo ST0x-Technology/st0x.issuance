@@ -2,6 +2,9 @@
 //! routes (missing assertion, own-tier acceptance, cross-tier rejection) and
 //! the real `/ops/*` handlers (gated when mounted, absent when unconfigured).
 
+use alloy::primitives::B256;
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
+use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use event_sorcery::StoreBuilder;
@@ -14,14 +17,29 @@ use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 use tracing::Level;
 use tracing_test::traced_test;
 
 use super::iap::ASSERTION_HEADER;
 use super::{BreakglassOps, CapitalOps, DebugOps, OpsApiVerifiers, ReadOps};
+use crate::admin::RedemptionBurnRecovery;
+use crate::alpaca::AlpacaService;
+use crate::alpaca::mock::MockAlpacaService;
 use crate::config::OpsApiConfig;
+use crate::receipt_inventory::{
+    CqrsReceiptService, ReceiptInventory, ReceiptService,
+};
+use crate::redemption::burn_manager::{
+    BurnManagerError, ManualBurnReplacementOutcome, RecoveryOutcome,
+};
+use crate::redemption::{
+    IssuerRedemptionRequestId, Redemption, RedemptionServices,
+};
 use crate::test_utils::{logs_contain_at, setup_test_rocket};
+use crate::tokenized_asset::schedule::FreezeScheduler;
 use crate::underlying::Underlying;
+use crate::vault::{BurnVerification, NetworkVaultServices};
 
 const TEST_KID: &str = "test-key";
 const IAP_ISSUER: &str = "https://cloud.google.com/iap";
@@ -510,4 +528,175 @@ async fn capital_freeze_admits_its_token_and_refuses_an_unlisted_underlying() {
         .await;
 
     assert_eq!(response.status(), Status::NotFound);
+}
+
+/// Burn recovery that must never be reached: the IAP gate refuses every
+/// request in these tests before a handler runs, so any call here is a gate
+/// failure, not a recovery scenario.
+struct UnreachableBurnRecovery;
+
+#[async_trait]
+impl RedemptionBurnRecovery for UnreachableBurnRecovery {
+    async fn replace_exhausted_dead_burn(
+        &self,
+        _: &IssuerRedemptionRequestId,
+    ) -> Result<ManualBurnReplacementOutcome, BurnManagerError> {
+        unreachable!("the IAP gate refuses before the handler runs")
+    }
+
+    async fn execute_recovered_burn(
+        &self,
+        _: &IssuerRedemptionRequestId,
+    ) -> Result<RecoveryOutcome, BurnManagerError> {
+        unreachable!("the IAP gate refuses before the handler runs")
+    }
+
+    async fn force_complete_burn(
+        &self,
+        _: &IssuerRedemptionRequestId,
+        _: B256,
+        _: String,
+        _: Option<B256>,
+    ) -> Result<BurnVerification, BurnManagerError> {
+        unreachable!("the IAP gate refuses before the handler runs")
+    }
+}
+
+/// The full app rocket plus every piece of state the recovery, close,
+/// force-complete, and freeze-schedule handlers declare, so all of them can be
+/// mounted (Rocket refuses to ignite a route whose `State` is unmanaged). The
+/// gate refuses before any handler runs, so none of this state is exercised.
+async fn recovery_ops_rocket(
+    verifiers: OpsApiVerifiers,
+) -> rocket::Rocket<rocket::Build> {
+    let rocket = setup_test_rocket().await.expect("test rocket builds");
+    let pool = rocket.state::<Pool<Sqlite>>().expect("pool managed").clone();
+    let vaults = rocket
+        .state::<NetworkVaultServices>()
+        .expect("vault services managed")
+        .clone();
+    let freeze_scheduler = FreezeScheduler::new(
+        rocket.state::<ApalisSqlitePool>().expect("apalis pool managed"),
+        pool.clone(),
+    );
+
+    let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
+        .build(RedemptionServices::new(vaults))
+        .await
+        .expect("redemption store builds");
+    let receipt_inventory = StoreBuilder::<ReceiptInventory>::new(pool)
+        .build(())
+        .await
+        .expect("receipt inventory store builds");
+    let receipts: Arc<dyn ReceiptService> =
+        Arc::new(CqrsReceiptService::new(receipt_inventory));
+    let burn_recovery: Arc<dyn RedemptionBurnRecovery> =
+        Arc::new(UnreachableBurnRecovery);
+    let alpaca: Arc<dyn AlpacaService> =
+        Arc::new(MockAlpacaService::new_success());
+
+    rocket
+        .manage(verifiers)
+        .manage(redemption_store)
+        .manage(receipts)
+        .manage(burn_recovery)
+        .manage(alpaca)
+        .manage(freeze_scheduler)
+        .mount(
+            "/",
+            rocket::routes![
+                crate::admin::recover_redemption_ops,
+                crate::admin::close_redemption_ops,
+                crate::admin::force_complete_redemption_ops,
+                crate::admin::close_mint_ops,
+                crate::admin::schedule_freeze_window_ops
+            ],
+        )
+}
+
+const REQUEST_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The recovery, close, force-complete, and freeze-schedule handlers, mounted
+/// on the full app state, are refused without an IAP assertion.
+#[traced_test]
+#[tokio::test]
+async fn recovery_ops_routes_require_an_iap_assertion() {
+    let verifiers =
+        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
+    let client =
+        Client::tracked(recovery_ops_rocket(verifiers).await).await.unwrap();
+
+    let recover = client
+        .post(format!("/ops/debug/recover/redemption/{REQUEST_ID}"))
+        .dispatch()
+        .await;
+    assert_eq!(recover.status(), Status::Unauthorized);
+
+    for path in [
+        format!("/ops/breakglass/close/redemption/{REQUEST_ID}"),
+        format!("/ops/breakglass/force-complete/redemption/{REQUEST_ID}"),
+        format!("/ops/breakglass/close/mint/{REQUEST_ID}"),
+        "/ops/capital/freeze-schedules".to_string(),
+    ] {
+        let response = client
+            .post(&path)
+            .header(rocket::http::ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "{path}");
+    }
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["Request carries no IAP assertion"]
+    ));
+}
+
+/// The done-when tier boundaries on the real handlers: a debug token cannot
+/// force-complete, close, or schedule a freeze, and a read token cannot
+/// recover. Each is refused before the handler runs.
+#[traced_test]
+#[tokio::test]
+async fn lower_tier_tokens_cannot_recover_close_force_complete_or_freeze() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client =
+        Client::tracked(recovery_ops_rocket(verifiers).await).await.unwrap();
+
+    let recover = client
+        .post(format!("/ops/debug/recover/redemption/{REQUEST_ID}"))
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, READ_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(recover.status(), Status::Unauthorized);
+
+    for path in [
+        format!("/ops/breakglass/close/redemption/{REQUEST_ID}"),
+        format!("/ops/breakglass/force-complete/redemption/{REQUEST_ID}"),
+        format!("/ops/breakglass/close/mint/{REQUEST_ID}"),
+        "/ops/capital/freeze-schedules".to_string(),
+    ] {
+        let response = client
+            .post(&path)
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                ASSERTION_HEADER,
+                token(&key, DEBUG_AUDIENCE),
+            ))
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "{path}");
+    }
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
 }
