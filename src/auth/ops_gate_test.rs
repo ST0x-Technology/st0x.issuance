@@ -2,7 +2,7 @@
 //! routes (missing assertion, own-tier acceptance, cross-tier rejection) and
 //! the real `/ops/*` handlers (gated when mounted, absent when unconfigured).
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, address};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -17,6 +17,7 @@ use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::{TokenizedAssetDetailResponse, TokenizedAssetStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +31,11 @@ use super::{
     BreakglassOps, CapitalOps, DebugOps, FailedAuthRateLimiter,
     OpsApiVerifiers, ReadOps,
 };
-use crate::account::Account;
+use crate::account::view::find_by_client_id;
+use crate::account::{
+    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId,
+    RegisterAccountResponse, WhitelistWalletResponse,
+};
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
 use crate::alpaca::mock::MockAlpacaService;
@@ -1240,5 +1245,139 @@ async fn a_read_token_cannot_onboard_but_reads_network_diagnostics() {
         Level::WARN,
         &["IAP assertion failed validation"]
     ));
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+}
+
+/// Registers the test operator account through the debug twin. A named
+/// function rather than a closure because the response borrows the client and
+/// a closure cannot spell that lifetime.
+async fn register_operator_account<'client>(
+    client: &'client Client,
+    key: &TestKey,
+) -> rocket::local::asynchronous::LocalResponse<'client> {
+    client
+        .post("/ops/debug/accounts")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(key, DEBUG_AUDIENCE),
+        ))
+        .body(r#"{"email":"operator@example.com"}"#)
+        .dispatch()
+        .await
+}
+
+/// A debug token runs the onboarding twins end to end, each step's effect
+/// visible to the next: register an account (a repeat is refused, so the email
+/// claim persisted), link it, whitelist and unwhitelist a wallet (the account
+/// view carries then drops it), add an asset, and read its detail back with
+/// the full response contract. The twins are wired to the real handlers.
+#[traced_test]
+#[tokio::test]
+async fn a_debug_token_onboards_an_account_and_lists_an_asset() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client =
+        Client::tracked(onboarding_ops_rocket(verifiers).await).await.unwrap();
+    let debug_token = || {
+        rocket::http::Header::new(ASSERTION_HEADER, token(&key, DEBUG_AUDIENCE))
+    };
+    let wallet: Address =
+        address!("0x0000000000000000000000000000000000000001");
+    let vault: Address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let registered = register_operator_account(&client, &key).await;
+    assert_eq!(registered.status(), Status::Ok);
+    let client_id: ClientId = registered
+        .into_json::<RegisterAccountResponse>()
+        .await
+        .expect("registration response body")
+        .client_id;
+
+    // The email claim persisted: registering it again is refused.
+    let repeat = register_operator_account(&client, &key).await;
+    assert_eq!(repeat.status(), Status::Conflict);
+
+    // Linking is Alpaca's ITN step, not an operator verb, so it happens through
+    // the store; whitelisting requires a linked account.
+    let rocket = client.rocket();
+    let account_store =
+        rocket.state::<Arc<Store<Account>>>().expect("account store managed");
+    let pool = rocket.state::<Pool<Sqlite>>().expect("pool managed");
+    account_store
+        .send(
+            &client_id,
+            AccountCommand::LinkToAlpaca {
+                alpaca_account: AlpacaAccountNumber("ALP-1".to_string()),
+            },
+        )
+        .await
+        .expect("link succeeds");
+
+    let whitelisted = client
+        .post(format!("/ops/debug/accounts/{client_id}/wallets"))
+        .header(rocket::http::ContentType::JSON)
+        .header(debug_token())
+        .body(format!(r#"{{"wallet":"{wallet}"}}"#))
+        .dispatch()
+        .await;
+    assert_eq!(whitelisted.status(), Status::Ok);
+    assert!(
+        whitelisted
+            .into_json::<WhitelistWalletResponse>()
+            .await
+            .expect("whitelist response body")
+            .success
+    );
+    let Some(AccountView::LinkedToAlpaca { whitelisted_wallets, .. }) =
+        find_by_client_id(pool, &client_id).await.expect("view loads")
+    else {
+        panic!("expected a linked account view");
+    };
+    assert_eq!(whitelisted_wallets, vec![wallet]);
+
+    let unwhitelisted = client
+        .delete(format!("/ops/debug/accounts/{client_id}/wallets/{wallet}"))
+        .header(debug_token())
+        .dispatch()
+        .await;
+    assert_eq!(unwhitelisted.status(), Status::Ok);
+    let Some(AccountView::LinkedToAlpaca { whitelisted_wallets, .. }) =
+        find_by_client_id(pool, &client_id).await.expect("view loads")
+    else {
+        panic!("expected a linked account view");
+    };
+    assert!(whitelisted_wallets.is_empty(), "the wallet must be removed");
+
+    let added = client
+        .post("/ops/debug/tokenized-assets")
+        .header(rocket::http::ContentType::JSON)
+        .header(debug_token())
+        .body(format!(
+            r#"{{"underlying":"AAPL","token":"tAAPL","network":"base","vault":"{vault}"}}"#
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(added.status(), Status::Created);
+
+    // The listing persisted and the detail contract carries every field.
+    let detail = client
+        .get("/ops/debug/tokenized-assets/AAPL?network=base")
+        .header(debug_token())
+        .dispatch()
+        .await;
+    assert_eq!(detail.status(), Status::Ok);
+    let detail = detail
+        .into_json::<TokenizedAssetDetailResponse>()
+        .await
+        .expect("detail response body");
+    assert_eq!(detail.underlying, UnderlyingSymbol::new("AAPL").unwrap());
+    assert_eq!(detail.token, TokenSymbol::new("tAAPL"));
+    assert_eq!(detail.network, Network::Base);
+    assert_eq!(detail.vault, vault);
+    assert_eq!(detail.status, TokenizedAssetStatus::Enabled);
+
     assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
 }
