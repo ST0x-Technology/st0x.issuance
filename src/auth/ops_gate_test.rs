@@ -98,6 +98,7 @@ struct TestClaims {
     email: String,
     aud: String,
     iss: String,
+    iat: u64,
     exp: u64,
 }
 
@@ -126,17 +127,10 @@ fn test_key() -> TestKey {
 }
 
 fn token(key: &TestKey, audience: &str) -> String {
-    let exp = u64::try_from(
-        i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after epoch")
-                .as_secs(),
-        )
-        .expect("fits i64")
-            + 300,
-    )
-    .expect("not before epoch");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs();
 
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(TEST_KID.to_string());
@@ -148,7 +142,8 @@ fn token(key: &TestKey, audience: &str) -> String {
             email: "operator@rainlang.xyz".to_string(),
             aud: audience.to_string(),
             iss: IAP_ISSUER.to_string(),
-            exp,
+            iat: now,
+            exp: now + 300,
         },
         &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
     )
