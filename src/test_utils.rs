@@ -199,6 +199,19 @@ pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
 /// - Rate limiter initialization fails
 pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>>
 {
+    setup_test_rocket_with_config(test_config()?).await
+}
+
+/// [`setup_test_rocket`] with a caller-supplied [`Config`], for tests that
+/// need service configuration the default test config does not carry (a
+/// configured chain, for instance).
+///
+/// # Errors
+///
+/// Same as [`setup_test_rocket`].
+pub async fn setup_test_rocket_with_config(
+    config: Config,
+) -> anyhow::Result<rocket::Rocket<rocket::Build>> {
     // Both sqlx major versions must address the same file: private in-memory
     // databases do not share the Jobs table used by the confirmation route.
     let database_path =
@@ -252,7 +265,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Build rocket
     Ok(rocket::build()
-        .manage(test_config()?)
+        .manage(config)
         .manage(account_store)
         .manage(tokenized_asset_store)
         .manage(mint_store)
