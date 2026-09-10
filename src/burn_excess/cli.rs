@@ -167,25 +167,38 @@ pub(crate) async fn run_burn_excess_cli(
         close: shared.close,
     };
 
-    let outcome =
-        run_burn_excess_request(&pool, &signer_config, request, confirm)
-            .await?;
+    // The offline CLI has no service config to consult: it resolves the RPC
+    // from the environment and proves the chain id against it, since nothing
+    // verified that endpoint at startup.
+    let rpc_url = configured_rpc_url(shared.network)?;
+    let chain_id = verified_chain_id(&rpc_url, shared.chain_id).await?;
+
+    let outcome = run_burn_excess_request(
+        &pool,
+        &signer_config,
+        rpc_url,
+        chain_id,
+        request,
+        confirm,
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     Ok(())
 }
 
-/// Builds the signing and read providers for `request.network` from the service
-/// environment and signer, then runs the dual-path orchestration. The offline
-/// CLI has no running service to borrow a vault service from, so it builds its
-/// own; the breakglass HTTP route signs through the service's shared one.
+/// Builds the signing and read providers for `rpc_url` from the signer, then
+/// runs the dual-path orchestration. The offline CLI has no running service to
+/// borrow a vault service from, so it builds its own here, with `rpc_url` and
+/// the verified `chain_id` resolved by the caller; the breakglass HTTP routes
+/// sign through the service's shared vault service instead.
 async fn run_burn_excess_request(
     pool: &Pool<Sqlite>,
     signer_config: &SignerConfig,
+    rpc_url: Url,
+    chain_id: u64,
     request: BurnExcessRequest,
     confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
 ) -> anyhow::Result<BurnExcessOutcome> {
-    let rpc_url = configured_rpc_url(request.network)?;
-    let chain_id = verified_chain_id(&rpc_url, request.chain_id).await?;
     let issuer_wallet = signer_config.address()?;
 
     let resolved = match signer_config {

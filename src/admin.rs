@@ -3028,10 +3028,26 @@ pub(crate) struct NetworkTelemetryResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, telemetry))]
 #[get("/admin/network-telemetry")]
 pub(crate) fn network_telemetry(
     _auth: InternalAuth,
+    telemetry: &rocket::State<Arc<NetworkTelemetry>>,
+) -> Json<NetworkTelemetryResponse> {
+    network_telemetry_logic(telemetry)
+}
+
+/// Read-tier operator route mirroring [`network_telemetry`], gated by IAP
+/// (`ReadOps`) instead of the internal API key.
+#[get("/ops/read/network-telemetry")]
+pub(crate) fn network_telemetry_ops(
+    _auth: ReadOps,
+    telemetry: &rocket::State<Arc<NetworkTelemetry>>,
+) -> Json<NetworkTelemetryResponse> {
+    network_telemetry_logic(telemetry)
+}
+
+#[tracing::instrument(skip(telemetry))]
+fn network_telemetry_logic(
     telemetry: &rocket::State<Arc<NetworkTelemetry>>,
 ) -> Json<NetworkTelemetryResponse> {
     Json(NetworkTelemetryResponse { networks: telemetry.snapshot() })
@@ -3113,12 +3129,52 @@ pub(crate) struct WrappedTransfersResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool))]
 #[get(
     "/admin/wrapped-transfers?<limit>&<before_block>&<before_log_index>&<before_network>"
 )]
 pub(crate) async fn list_wrapped_transfers(
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+    limit: Option<u32>,
+    before_block: Option<u64>,
+    before_log_index: Option<u64>,
+    before_network: Option<&str>,
+) -> Result<Json<WrappedTransfersResponse>, Status> {
+    list_wrapped_transfers_logic(
+        pool,
+        limit,
+        before_block,
+        before_log_index,
+        before_network,
+    )
+    .await
+}
+
+/// Read-tier operator route mirroring [`list_wrapped_transfers`], gated by
+/// IAP (`ReadOps`) instead of the internal API key.
+#[get(
+    "/ops/read/wrapped-transfers?<limit>&<before_block>&<before_log_index>&<before_network>"
+)]
+pub(crate) async fn list_wrapped_transfers_ops(
+    _auth: ReadOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+    limit: Option<u32>,
+    before_block: Option<u64>,
+    before_log_index: Option<u64>,
+    before_network: Option<&str>,
+) -> Result<Json<WrappedTransfersResponse>, Status> {
+    list_wrapped_transfers_logic(
+        pool,
+        limit,
+        before_block,
+        before_log_index,
+        before_network,
+    )
+    .await
+}
+
+#[tracing::instrument(skip(pool))]
+async fn list_wrapped_transfers_logic(
     pool: &rocket::State<Pool<Sqlite>>,
     limit: Option<u32>,
     before_block: Option<u64>,
