@@ -103,6 +103,15 @@ impl PollerPauseControl {
             Err(PollerNotParked)
         }
     }
+
+    /// Test hook: a receiver on the poller's parked signal. The poller writes
+    /// it only on a real park, so a receiver whose `has_changed()` stays false
+    /// proves no pause ever reached the poller, not even one resumed before
+    /// the test looked.
+    #[cfg(test)]
+    pub(crate) fn parked_signal(&self) -> watch::Receiver<bool> {
+        self.parked.clone()
+    }
 }
 
 /// Resumes the poller when dropped. Resuming is a plain non-blocking signal, so

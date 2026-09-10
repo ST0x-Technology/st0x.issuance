@@ -614,6 +614,7 @@ async fn external_burn_without_a_pause_control_is_refused() {
         OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
 
     let (ethereum_control, ethereum_pause) = poller_pause();
+    let ethereum_parked = ethereum_control.parked_signal();
     let ticks = Arc::new(AtomicUsize::new(0));
     let poller = spawn_counting_poller(ethereum_pause, ticks.clone());
     let mut controls = HashMap::new();
@@ -637,7 +638,6 @@ async fn external_burn_without_a_pause_control_is_refused() {
          missing-control refusal, not a request-parse rejection"
     );
 
-    let before = ticks.load(Ordering::SeqCst);
     let response = client
         .post("/ops/breakglass/burn-excess/external")
         .header(rocket::http::ContentType::JSON)
@@ -651,11 +651,12 @@ async fn external_burn_without_a_pause_control_is_refused() {
 
     assert_eq!(response.status(), Status::UnprocessableEntity);
 
-    // The unrelated Ethereum poller keeps ticking; a Base burn never paused it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The poller writes `parked` only on a real park, so a Base burn that
+    // paused Ethereum even briefly and resumed before this line would have
+    // moved the signal. It must not have.
     assert!(
-        ticks.load(Ordering::SeqCst) > before,
-        "a burn for another network must not pause this poller"
+        !ethereum_parked.has_changed().expect("Ethereum poller still running"),
+        "a burn for another network must never park this poller"
     );
 
     poller.abort();
@@ -671,6 +672,7 @@ async fn external_burn_resumes_the_poller_after_an_error() {
         OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
 
     let (control, pause) = poller_pause();
+    let base_parked = control.parked_signal();
     let ticks = Arc::new(AtomicUsize::new(0));
     let poller = spawn_counting_poller(pause, ticks.clone());
     let mut controls = HashMap::new();
@@ -712,6 +714,14 @@ async fn external_burn_resumes_the_poller_after_an_error() {
         response.status().code >= 400,
         "the burn must fail, got {}",
         response.status()
+    );
+
+    // The poller writes `parked` only on a real park: the handler must have
+    // actually quiesced the poller before erroring, or "resumes" below proves
+    // nothing.
+    assert!(
+        base_parked.has_changed().expect("Base poller still running"),
+        "the handler must park the poller before the burn runs"
     );
 
     // The guard dropped on the error return, so the poller resumes ticking.
