@@ -83,9 +83,20 @@ impl PollerPauseControl {
     ) -> Result<PollerPauseGuard, PollerNotParked> {
         let permit = Arc::clone(&self.serialize).lock_owned().await;
 
-        let _ = self.pause.send(true);
         let mut parked = self.parked.clone();
         let confirmed = tokio::time::timeout(POLLER_PARK_TIMEOUT, async {
+            // The previous guard's resume may not have reached the poller
+            // yet, so `parked` can still hold that request's stale `true`.
+            // Wait for the poller to report itself running before asking
+            // again: with pausers serialized, the `true` awaited below can
+            // then only be the acknowledgement of THIS request. Accepting a
+            // stale one would hand out a guard while the poller goes on to
+            // run a tick - the exact race the pause exists to prevent.
+            while *parked.borrow_and_update() {
+                parked.changed().await.map_err(|_| ())?;
+            }
+
+            let _ = self.pause.send(true);
             while !*parked.borrow_and_update() {
                 parked.changed().await.map_err(|_| ())?;
             }
@@ -301,6 +312,55 @@ mod tests {
             "the poller resumed and ticked between the two pauses"
         );
 
+        poller.abort();
+    }
+
+    /// A guard's resume may not have reached the poller when the next pauser
+    /// arrives, so `parked` can still hold the previous request's stale
+    /// `true`. The second pause must not accept that acknowledgement: it has
+    /// to let the poller actually resume and re-park for its own request, or
+    /// a guard would exist while the poller runs a tick - the race that opens
+    /// a spurious redemption. Deterministic on the single-threaded test
+    /// runtime: a pause that reuses the stale ack returns without yielding, so
+    /// the poller never gets to resume and the tick count stays put.
+    #[tokio::test(start_paused = true)]
+    async fn a_back_to_back_pause_waits_for_the_poller_to_resume_and_repark() {
+        let (control, mut pause) = poller_pause();
+        let ticks = Arc::new(AtomicUsize::new(0));
+
+        let loop_ticks = ticks.clone();
+        let poller = tokio::spawn(async move {
+            loop {
+                pause.wait_while_paused().await;
+                loop_ticks.fetch_add(1, Ordering::SeqCst);
+                pause.interruptible_sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let first = control.pause().await.unwrap();
+        let ticks_under_first = ticks.load(Ordering::SeqCst);
+        drop(first);
+
+        // Re-pause before the poller has observed the resume: `parked` still
+        // reads the first request's `true`.
+        let second = control.pause().await.unwrap();
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            ticks_under_first + 1,
+            "the second pause must let the poller resume and tick once before \
+             taking a fresh park, not reuse the first request's acknowledgement"
+        );
+
+        // The poller is genuinely parked for the second guard: no tick while
+        // it is held, however long.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            ticks_under_first + 1,
+            "no tick may run while the second guard is held"
+        );
+
+        drop(second);
         poller.abort();
     }
 }
