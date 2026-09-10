@@ -4707,9 +4707,12 @@ Tiers and routes:
 
 - **read** (`/ops/read/*`): `stuck`, `orchestrator-health`,
   `status/<underlying>`, `orchestrator-preflight/<network>`,
-  `snapshots/<aggregate_type>/<aggregate_id>`.
+  `snapshots/<aggregate_type>/<aggregate_id>`, `network-telemetry`,
+  `wrapped-transfers`.
 - **debug** (`/ops/debug/*`): `recover/redemption/<id>`, `reprocess/mint/<id>`,
-  `orchestrator-verify-signing/<network>/<underlying>`.
+  `orchestrator-verify-signing/<network>/<underlying>`, `accounts`,
+  `accounts/<client_id>/wallets` (`POST` and `DELETE .../<wallet>`),
+  `tokenized-assets/<underlying>?<network>`, `tokenized-assets`.
 - **capital** (`/ops/capital/*`): `freeze/<underlying>`,
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
@@ -4749,6 +4752,14 @@ outcome unknown (the burn may be excluded, intended, or submitted), so the
 operator re-invokes the route for the same deposit to read the persisted stream
 and resume it from wherever it stopped.
 
+Both `burn-excess` routes take the network's RPC endpoint and chain id from the
+service's startup-verified chain configuration, never from a request-time
+environment read, so a deployment that supplies its RPC as a flag rather than an
+env var serves them too; a network with no chain configuration is a 500. The
+offline `issuer burn-excess` CLI keeps resolving from the environment and
+proving the chain id against the RPC, since nothing verified that endpoint at
+startup.
+
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
 validated at startup as all-or-none, non-blank, unpadded, and pairwise distinct.
@@ -4767,8 +4778,9 @@ stale Google key is still Google's, and a refresh prompted by an unrecognized
 key id is throttled to one outbound fetch per minute per tier. Only when the
 endpoint is unreachable and no usable key is retained does that tier's
 verification fail with a retryable 503, so a transient JWKS outage never becomes
-a wrong-audience or forged-token acceptance. `move-receipts` and
-`confirm-custody` stay offline `issuer` CLI verbs.
+a wrong-audience or forged-token acceptance. Every `InternalAuth` operator route
+now has an `/ops` twin; `move-receipts` and `confirm-custody` stay offline
+`issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 

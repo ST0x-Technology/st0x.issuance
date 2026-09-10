@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::Level;
 use tracing_test::traced_test;
+use url::Url;
 
 use super::iap::ASSERTION_HEADER;
 use super::{
@@ -34,7 +35,7 @@ use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
 use crate::alpaca::mock::MockAlpacaService;
 use crate::burn_excess::api::BurnExcessExternalRequest;
-use crate::chain::ConfiguredNetworks;
+use crate::chain::{ChainConfig, ConfiguredNetworks};
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
 use crate::network_telemetry::NetworkTelemetry;
@@ -50,7 +51,10 @@ use crate::redemption::poller_pause::{
 use crate::redemption::{
     IssuerRedemptionRequestId, Redemption, RedemptionServices,
 };
-use crate::test_utils::{logs_contain_at, setup_test_rocket, test_config};
+use crate::test_utils::{
+    logs_contain_at, setup_test_rocket, setup_test_rocket_with_config,
+    test_config,
+};
 use crate::tokenized_asset::schedule::FreezeScheduler;
 use crate::tokenized_asset::{
     AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -58,6 +62,7 @@ use crate::tokenized_asset::{
 };
 use crate::underlying::Underlying;
 use crate::vault::{BurnVerification, NetworkVaultServices};
+use crate::wallet::SignerConfig;
 
 const TEST_KID: &str = "test-key";
 const IAP_ISSUER: &str = "https://cloud.google.com/iap";
@@ -678,7 +683,20 @@ async fn external_burn_resumes_the_poller_after_an_error() {
     let mut controls = HashMap::new();
     controls.insert(Network::Base, control);
 
-    let rocket = setup_test_rocket()
+    // A configured Base chain and no CHAIN_BASE_RPC_URL in the environment:
+    // the route must take its endpoint and chain id from here. The default
+    // test signer is the zero key, which signer resolution refuses before the
+    // engine runs; a real (nonzero) key lets the request reach the engine.
+    let mut config = test_config().expect("test config builds");
+    config.chains = vec![ChainConfig {
+        network: Network::Base,
+        chain_id: Network::Base.chain_id(),
+        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        backfill_start_block: 0,
+        low_gas_threshold: None,
+    }];
+    config.signer = SignerConfig::Local(B256::repeat_byte(7));
+    let rocket = setup_test_rocket_with_config(config)
         .await
         .expect("test rocket builds")
         .manage(verifiers)
@@ -711,11 +729,11 @@ async fn external_burn_resumes_the_poller_after_an_error() {
     // errored in the engine; the guard must resume the poller on that error
     // path just as on success. The exact status matters: a broad `>= 400`
     // would also accept a 503 pause-acquisition failure, where no guard ever
-    // exists. The test config carries no RPC, so the engine fails at provider
-    // setup before any mint lookup (a missing-mint 404 needs a live RPC), and
-    // that non-engine error maps to the handler's 500 fallback - which unlike
-    // 503/504 can only be reached once the pause succeeded and the engine ran.
-    assert_eq!(response.status(), Status::InternalServerError);
+    // exists. 404 is the engine refusing the absent mint, reachable only once
+    // the pause succeeded and the engine ran - and only because the route
+    // took the RPC and chain id from `config.chains` rather than the
+    // environment (unset here) and dialed nothing first (no node listens).
+    assert_eq!(response.status(), Status::NotFound);
 
     // The poller writes `parked` only on a real park: the handler must have
     // actually quiesced the poller before erroring, or "resumes" below proves
@@ -1074,4 +1092,153 @@ async fn lower_tier_tokens_cannot_recover_close_force_complete_or_freeze() {
         Level::WARN,
         &["IAP assertion failed validation"]
     ));
+}
+
+/// The full app rocket plus the state the account, tokenized-asset, and
+/// network-diagnostic twins declare beyond what [`setup_test_rocket`]
+/// manages.
+async fn onboarding_ops_rocket(
+    verifiers: OpsApiVerifiers,
+) -> rocket::Rocket<rocket::Build> {
+    setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(ConfiguredNetworks::from_iter([Network::Base]))
+        .manage(Arc::new(NetworkTelemetry::new([Network::Base])))
+        .mount(
+            "/",
+            rocket::routes![
+                crate::account::api::register_account_ops,
+                crate::account::api::whitelist_wallet_ops,
+                crate::account::api::unwhitelist_wallet_ops,
+                crate::tokenized_asset::api::get_tokenized_asset_ops,
+                crate::tokenized_asset::api::add_tokenized_asset_ops,
+                crate::admin::network_telemetry_ops,
+                crate::admin::list_wrapped_transfers_ops
+            ],
+        )
+}
+
+const WALLET: &str = "0x0000000000000000000000000000000000000001";
+
+/// The account, tokenized-asset, and network-diagnostic twins, mounted on the
+/// full app state, are refused without an IAP assertion.
+#[traced_test]
+#[tokio::test]
+async fn onboarding_ops_routes_require_an_iap_assertion() {
+    let verifiers =
+        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
+    let client =
+        Client::tracked(onboarding_ops_rocket(verifiers).await).await.unwrap();
+
+    for path in ["/ops/debug/accounts", "/ops/debug/tokenized-assets"] {
+        let response = client
+            .post(path)
+            .header(rocket::http::ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "{path}");
+    }
+
+    let whitelist = client
+        .post(format!("/ops/debug/accounts/{REQUEST_ID}/wallets"))
+        .header(rocket::http::ContentType::JSON)
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(whitelist.status(), Status::Unauthorized);
+
+    let unwhitelist = client
+        .delete(format!("/ops/debug/accounts/{REQUEST_ID}/wallets/{WALLET}"))
+        .dispatch()
+        .await;
+    assert_eq!(unwhitelist.status(), Status::Unauthorized);
+
+    for path in [
+        "/ops/debug/tokenized-assets/AAPL?network=base",
+        "/ops/read/network-telemetry",
+        "/ops/read/wrapped-transfers",
+    ] {
+        let response = client.get(path).dispatch().await;
+        assert_eq!(response.status(), Status::Unauthorized, "{path}");
+    }
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["Request carries no IAP assertion"]
+    ));
+}
+
+/// A read token is refused on every debug-tier onboarding route (account
+/// registration, wallet whitelisting, asset listing all change what the bot
+/// mints and to whom) but admitted on the read-tier diagnostics, which then
+/// serve: the twins are wired to the real handlers, not only gated.
+#[traced_test]
+#[tokio::test]
+async fn a_read_token_cannot_onboard_but_reads_network_diagnostics() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let client =
+        Client::tracked(onboarding_ops_rocket(verifiers).await).await.unwrap();
+    let read_token = || {
+        rocket::http::Header::new(ASSERTION_HEADER, token(&key, READ_AUDIENCE))
+    };
+
+    for path in ["/ops/debug/accounts", "/ops/debug/tokenized-assets"] {
+        let response = client
+            .post(path)
+            .header(rocket::http::ContentType::JSON)
+            .header(read_token())
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "{path}");
+    }
+
+    let whitelist = client
+        .post(format!("/ops/debug/accounts/{REQUEST_ID}/wallets"))
+        .header(rocket::http::ContentType::JSON)
+        .header(read_token())
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(whitelist.status(), Status::Unauthorized);
+
+    let unwhitelist = client
+        .delete(format!("/ops/debug/accounts/{REQUEST_ID}/wallets/{WALLET}"))
+        .header(read_token())
+        .dispatch()
+        .await;
+    assert_eq!(unwhitelist.status(), Status::Unauthorized);
+
+    let detail = client
+        .get("/ops/debug/tokenized-assets/AAPL?network=base")
+        .header(read_token())
+        .dispatch()
+        .await;
+    assert_eq!(detail.status(), Status::Unauthorized);
+
+    let telemetry = client
+        .get("/ops/read/network-telemetry")
+        .header(read_token())
+        .dispatch()
+        .await;
+    assert_eq!(telemetry.status(), Status::Ok);
+
+    let transfers = client
+        .get("/ops/read/wrapped-transfers")
+        .header(read_token())
+        .dispatch()
+        .await;
+    assert_eq!(transfers.status(), Status::Ok);
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
 }
