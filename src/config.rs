@@ -507,6 +507,85 @@ struct Env {
 
     #[arg(
         long,
+        env = "CHAIN_ROBINHOOD_RPC_URL",
+        requires_all = [
+            "chain_robinhood_chain_id",
+            "chain_robinhood_backfill_start_block"
+        ],
+        help = "Robinhood Chain RPC endpoint; setting it requires the full \
+                CHAIN_ROBINHOOD_* group and enables the Robinhood chain"
+    )]
+    chain_robinhood_rpc_url: Option<Url>,
+
+    #[arg(
+        long,
+        env = "CHAIN_ROBINHOOD_CHAIN_ID",
+        requires = "chain_robinhood_rpc_url",
+        help = "Chain ID for the Robinhood group; must be Robinhood Chain's \
+                canonical 4663"
+    )]
+    chain_robinhood_chain_id: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_ROBINHOOD_BACKFILL_START_BLOCK",
+        requires = "chain_robinhood_rpc_url",
+        help = "Receipt-backfill start block for the Robinhood group"
+    )]
+    chain_robinhood_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_ROBINHOOD_LOW_GAS_THRESHOLD",
+        requires = "chain_robinhood_rpc_url",
+        help = "Low gas alert threshold for the Robinhood group, in ETH \
+                (e.g. \"0.05\")"
+    )]
+    chain_robinhood_low_gas_threshold: Option<String>,
+
+    // The env prefix follows the network's wire name, as every other group
+    // does, so BNB Smart Chain's variables are CHAIN_BINANCE_* -- "binance" is
+    // Alpaca's published TokenizationNetwork spelling for chain 56.
+    #[arg(
+        long,
+        env = "CHAIN_BINANCE_RPC_URL",
+        requires_all = [
+            "chain_binance_chain_id",
+            "chain_binance_backfill_start_block"
+        ],
+        help = "BNB Smart Chain RPC endpoint; setting it requires the full \
+                CHAIN_BINANCE_* group and enables the BNB Smart Chain chain"
+    )]
+    chain_binance_rpc_url: Option<Url>,
+
+    #[arg(
+        long,
+        env = "CHAIN_BINANCE_CHAIN_ID",
+        requires = "chain_binance_rpc_url",
+        help = "Chain ID for the BNB Smart Chain group; must be BNB Smart \
+                Chain's canonical 56"
+    )]
+    chain_binance_chain_id: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_BINANCE_BACKFILL_START_BLOCK",
+        requires = "chain_binance_rpc_url",
+        help = "Receipt-backfill start block for the BNB Smart Chain group"
+    )]
+    chain_binance_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CHAIN_BINANCE_LOW_GAS_THRESHOLD",
+        requires = "chain_binance_rpc_url",
+        help = "Low gas alert threshold for the BNB Smart Chain group, in BNB \
+                (e.g. \"0.05\")"
+    )]
+    chain_binance_low_gas_threshold: Option<String>,
+
+    #[arg(
+        long,
         env = "CONFIG",
         help = "Path to TOML configuration file for orchestrator/vault-mode settings. \
                 Omitting this arg (or providing a file with no [orchestrator] section) \
@@ -693,9 +772,33 @@ impl Env {
                     .as_deref(),
             },
         )?;
+        let robinhood = Self::optional_chain_config(
+            Network::Robinhood,
+            &ChainGroupEnv {
+                rpc_url: self.chain_robinhood_rpc_url.as_ref(),
+                chain_id: self.chain_robinhood_chain_id,
+                backfill_start_block: self.chain_robinhood_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_robinhood_low_gas_threshold
+                    .as_deref(),
+            },
+        )?;
+        let binance = Self::optional_chain_config(
+            Network::BnbSmartChain,
+            &ChainGroupEnv {
+                rpc_url: self.chain_binance_rpc_url.as_ref(),
+                chain_id: self.chain_binance_chain_id,
+                backfill_start_block: self.chain_binance_backfill_start_block,
+                low_gas_threshold: self
+                    .chain_binance_low_gas_threshold
+                    .as_deref(),
+            },
+        )?;
         let mut chains = vec![base.clone()];
         chains.extend(ethereum);
         chains.extend(hyperevm);
+        chains.extend(robinhood);
+        chains.extend(binance);
 
         Ok((base, chains))
     }
@@ -1014,7 +1117,7 @@ pub enum ConfigError {
     MissingOrchestratorAddressForNetwork(#[from] MissingOrchestratorAddress),
     #[error(
         "Invalid [orchestrator.addresses] key '{key}': not a known network \
-         (expected one of: base, ethereum, hyperevm)"
+         (expected one of: base, ethereum, hyperevm, robinhood, binance)"
     )]
     UnknownOrchestratorNetwork { key: String },
     #[error(
@@ -1030,7 +1133,7 @@ pub enum ConfigError {
     },
     #[error(
         "Invalid [wrapped_tokens] table '{key}': not a known network \
-         (expected one of: base, ethereum, hyperevm)"
+         (expected one of: base, ethereum, hyperevm, robinhood, binance)"
     )]
     UnknownWrappedTokenNetwork { key: String },
     #[error("Invalid [wrapped_tokens.{network}] key '{symbol}': {error}")]
@@ -1085,10 +1188,10 @@ struct TomlFile {
 #[serde(deny_unknown_fields)]
 struct OrchestratorSection {
     /// Per-network orchestrator contract addresses, keyed by the network's
-    /// wire name (`base`, `ethereum`, `hyperevm`). Each chain carries its
-    /// own deployment; keys and addresses are validated in
-    /// `resolve_vault_modes` (unknown networks and zero/malformed addresses
-    /// are startup errors).
+    /// wire name (`base`, `ethereum`, `hyperevm`, `robinhood`, `binance`).
+    /// Each chain carries its own deployment; keys and addresses are
+    /// validated in `resolve_vault_modes` (unknown networks and zero or
+    /// malformed addresses are startup errors).
     addresses: Option<HashMap<String, String>>,
     default_vault_mode: Option<VaultModeStr>,
 }
@@ -1323,6 +1426,12 @@ fn resolve_configured_rpc_url(
         }
         Network::HyperEvm => {
             ("CHAIN_HYPEREVM_RPC_URL", None, "CHAIN_HYPEREVM_RPC_URL")
+        }
+        Network::Robinhood => {
+            ("CHAIN_ROBINHOOD_RPC_URL", None, "CHAIN_ROBINHOOD_RPC_URL")
+        }
+        Network::BnbSmartChain => {
+            ("CHAIN_BINANCE_RPC_URL", None, "CHAIN_BINANCE_RPC_URL")
         }
     };
 
@@ -2093,7 +2202,13 @@ mod tests {
         // The example shows the multichain shape: every chain the bot can
         // run has an orchestrator address and a wrapper table.
         let wrapped = resolve_wrapped_tokens(&toml_file).unwrap();
-        for network in [Network::Base, Network::Ethereum, Network::HyperEvm] {
+        for network in [
+            Network::Base,
+            Network::Ethereum,
+            Network::HyperEvm,
+            Network::Robinhood,
+            Network::BnbSmartChain,
+        ] {
             assert!(
                 cfg.orchestrator_address_for(network).is_some(),
                 "the example must carry an orchestrator address for {network}"

@@ -239,6 +239,15 @@ Bug fixes and improvements that don't fit into the original phases.
       linking more than one wallet to an account
 - [ ] [#96](https://github.com/ST0x-Technology/st0x.issuance/issues/96) - Create
       a sandbox environment for Alpaca to test integrations against
+- [x] [RAI-2284](https://linear.app/makeitrain/issue/RAI-2284) /
+      [RAI-2312](https://linear.app/makeitrain/issue/RAI-2312) - Add Robinhood
+      Chain (4663) and BNB Smart Chain (56) as issuance networks: `Network`
+      variants, `CHAIN_ROBINHOOD_*` / `CHAIN_BINANCE_*` environment groups,
+      signer-intent network CHECK, and config/doc surfaces. Neither chain is
+      enabled until its `CHAIN_<NETWORK>_RPC_URL` lands in the deployment
+      secrets, and Robinhood's Alpaca wire name is tracked by
+      [RAI-2289](https://linear.app/makeitrain/issue/RAI-2289).
+  - **PR:** [#396](https://github.com/ST0x-Technology/st0x.issuance/pull/396)
 
 #### Reliability
 

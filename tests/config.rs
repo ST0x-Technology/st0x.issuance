@@ -156,6 +156,76 @@ fn hyperevm_group_bound_to_the_testnet_chain_id_fails_validation() {
     );
 }
 
+#[test]
+fn complete_robinhood_environment_group_is_valid() {
+    let output = legacy_base_command()
+        .env("CHAIN_ROBINHOOD_RPC_URL", "http://127.0.0.1:11545")
+        .env("CHAIN_ROBINHOOD_CHAIN_ID", "4663")
+        .env("CHAIN_ROBINHOOD_BACKFILL_START_BLOCK", "1000")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", command_stderr(&output));
+}
+
+#[test]
+fn robinhood_group_bound_to_the_wrong_chain_id_fails_validation() {
+    let output = legacy_base_command()
+        .env("CHAIN_ROBINHOOD_RPC_URL", "http://127.0.0.1:11545")
+        .env("CHAIN_ROBINHOOD_CHAIN_ID", "42161")
+        .env("CHAIN_ROBINHOOD_BACKFILL_START_BLOCK", "1000")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a Robinhood label on chain 42161 must not validate"
+    );
+    let stderr = command_stderr(&output);
+    assert!(
+        stderr.contains("CHAIN_ROBINHOOD_CHAIN_ID is 42161")
+            && stderr.contains("is chain 4663;"),
+        "the error must name both the configured and the expected chain, \
+         got: {stderr}"
+    );
+}
+
+/// BNB Smart Chain's group prefix follows the network's wire name, so the
+/// variables read `CHAIN_BINANCE_*` rather than `CHAIN_BNB_*`.
+#[test]
+fn complete_binance_environment_group_is_valid() {
+    let output = legacy_base_command()
+        .env("CHAIN_BINANCE_RPC_URL", "http://127.0.0.1:12545")
+        .env("CHAIN_BINANCE_CHAIN_ID", "56")
+        .env("CHAIN_BINANCE_BACKFILL_START_BLOCK", "1000")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", command_stderr(&output));
+}
+
+#[test]
+fn binance_group_bound_to_the_testnet_chain_id_fails_validation() {
+    let output = legacy_base_command()
+        .env("CHAIN_BINANCE_RPC_URL", "http://127.0.0.1:12545")
+        .env("CHAIN_BINANCE_CHAIN_ID", "97")
+        .env("CHAIN_BINANCE_BACKFILL_START_BLOCK", "1000")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a BNB Smart Chain label on chain 97 must not validate"
+    );
+    let stderr = command_stderr(&output);
+    assert!(
+        stderr.contains("CHAIN_BINANCE_CHAIN_ID is 97")
+            && stderr.contains("is chain 56;"),
+        "the error must name both the configured and the expected chain, \
+         got: {stderr}"
+    );
+}
+
 /// A lone `CHAIN_BASE_RPC_URL` must fail the group requirement rather than
 /// silently falling back to the legacy flat Base variables.
 #[test]

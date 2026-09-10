@@ -283,13 +283,13 @@ instead of rescanning the full configured historical range.
 ## Per network monitoring
 
 Every configured chain gets a gas balance monitor on the issuer wallet's native
-balance (ETH on Base and Ethereum, HYPE on HyperEVM). Thresholds come from
-`CHAIN_<NETWORK>_LOW_GAS_THRESHOLD` (or the flat `LOW_GAS_THRESHOLD` for the
-legacy Base configuration) as decimal native token amounts; a balance below the
-threshold raises an ERROR log and a Telegram lifecycle notification,
-deduplicated to at most one repeat alert per hour. Thresholds are all or nothing
-across configured chains; with none set, monitoring is disabled with a startup
-WARN.
+balance (ETH on Base, Ethereum, and Robinhood Chain, HYPE on HyperEVM, BNB on
+BNB Smart Chain). Thresholds come from `CHAIN_<NETWORK>_LOW_GAS_THRESHOLD` (or
+the flat `LOW_GAS_THRESHOLD` for the legacy Base configuration) as decimal
+native token amounts; a balance below the threshold raises an ERROR log and a
+Telegram lifecycle notification, deduplicated to at most one repeat alert per
+hour. Thresholds are all or nothing across configured chains; with none set,
+monitoring is disabled with a startup WARN.
 
 `GET /admin/network-telemetry` reports per network telemetry: transfer poller,
 receipt backfill, and inbound wrapped-token transfer pass counters with failure
