@@ -90,8 +90,14 @@ pub(crate) async fn orchestrator_preflight_ops(
 /// Signs (never broadcasts) one transaction per required shape; a policy
 /// denial surfaces here rather than during the first live mint.
 #[post("/ops/debug/orchestrator-verify-signing/<network>/<underlying>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn orchestrator_verify_signing_ops(
-    _auth: DebugOps,
+    auth: DebugOps,
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     network: &str,
@@ -163,8 +169,14 @@ pub(crate) async fn orchestrator_verify_signing_ops(
 /// unlimited allowance sends nothing. Refuses if the configured address does
 /// not verify as a healthy orchestrator.
 #[post("/ops/capital/orchestrator-approve/<network>/<underlying>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn orchestrator_approve_ops(
-    _auth: CapitalOps,
+    auth: CapitalOps,
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     network: &str,

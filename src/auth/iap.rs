@@ -104,6 +104,22 @@ impl OpsTier {
     }
 }
 
+/// The verified operator behind an accepted assertion, carried into the
+/// mutating tier guards so a route can attribute what it does. Only the IAP
+/// subject id is kept: it is stable and never reused, and unlike the email it
+/// is not personal data to retain in logs. Displays as that subject, so a
+/// route's `operator` span names the actor on every record inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpsPrincipal {
+    subject: String,
+}
+
+impl std::fmt::Display for OpsPrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.subject)
+    }
+}
+
 /// One IAP verifier per tier, sharing a single HTTP client and JWKS document.
 ///
 /// Held in Rocket managed state and read by the per-tier request guards. Absent
@@ -199,11 +215,11 @@ pub(crate) fn build_jwks_client() -> Result<reqwest::Client, reqwest::Error> {
 ///
 /// Reads the assertion header, verifies signature, issuer, expiry, and the
 /// tier's pinned audience, and logs the accepted operator identity. Returns the
-/// verified subject id so a caller can attribute the action.
+/// verified principal so the route can attribute the action.
 pub(crate) async fn authenticate_ops(
     request: &Request<'_>,
     tier: OpsTier,
-) -> Result<String, IapError> {
+) -> Result<OpsPrincipal, IapError> {
     let verifiers = request.rocket().state::<OpsApiVerifiers>().ok_or_else(|| {
         warn!(target: "auth", tier = tier.as_str(), "Ops API verifiers missing from state");
         IapError::Unconfigured
@@ -307,8 +323,8 @@ impl IapVerifier {
         Self { jwks_url, ..Self::new(audience, tier, reqwest::Client::new()) }
     }
 
-    /// Returns the caller's stable subject id once the assertion checks out.
-    async fn verify(&self, token: &str) -> Result<String, IapError> {
+    /// Returns the caller's principal once the assertion checks out.
+    async fn verify(&self, token: &str) -> Result<OpsPrincipal, IapError> {
         let header = decode_header(token).map_err(|error| {
             warn!(target: "auth", tier = self.tier.as_str(), %error, "Malformed IAP assertion header");
             IapError::MalformedAssertion
@@ -363,7 +379,7 @@ impl IapVerifier {
             "IAP assertion accepted"
         );
 
-        Ok(sub)
+        Ok(OpsPrincipal { subject: sub })
     }
 
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapError> {
@@ -749,7 +765,7 @@ mod tests {
             .verify(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300))
             .await;
 
-        assert_eq!(subject.unwrap(), "accounts.google.com:1234");
+        assert_eq!(subject.unwrap().to_string(), "accounts.google.com:1234");
     }
 
     /// The property the whole design rests on: IAP binds a token to the backend
@@ -892,7 +908,7 @@ mod tests {
         let subject =
             iap.verify(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)).await;
 
-        assert_eq!(subject.unwrap(), "accounts.google.com:1234");
+        assert_eq!(subject.unwrap().to_string(), "accounts.google.com:1234");
         // The staleness did trigger a refresh attempt; the failure just did not
         // take the retained keys down with it.
         mock.assert_calls(1);
@@ -916,7 +932,10 @@ mod tests {
         for _ in 0..3 {
             let subject =
                 iap.verify(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)).await;
-            assert_eq!(subject.unwrap(), "accounts.google.com:1234");
+            assert_eq!(
+                subject.unwrap().to_string(),
+                "accounts.google.com:1234"
+            );
         }
 
         // The first request's failed refresh stamps last_refresh_attempt; the
@@ -1051,7 +1070,7 @@ mod tests {
         );
         let subject = verifier(READ_AUDIENCE, &jwks).verify(&token).await;
 
-        assert_eq!(subject.unwrap(), "accounts.google.com:1234");
+        assert_eq!(subject.unwrap().to_string(), "accounts.google.com:1234");
     }
 
     /// IAP mints ten-minute tokens. One claiming an hour verifies under the

@@ -580,8 +580,14 @@ pub(crate) async fn recover_redemption(
 /// Debug-tier operator route mirroring [`recover_redemption`], gated by IAP
 /// (`DebugOps`) instead of the internal API key.
 #[post("/ops/debug/recover/redemption/<issuer_request_id>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn recover_redemption_ops(
-    _auth: DebugOps,
+    auth: DebugOps,
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
@@ -1533,8 +1539,14 @@ pub(crate) async fn close_redemption(
     format = "json",
     data = "<body>"
 )]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn close_redemption_ops(
-    _auth: BreakglassOps,
+    auth: BreakglassOps,
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1668,8 +1680,14 @@ pub(crate) async fn force_complete_redemption(
     format = "json",
     data = "<body>"
 )]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn force_complete_redemption_ops(
-    _auth: BreakglassOps,
+    auth: BreakglassOps,
     pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
@@ -1861,8 +1879,14 @@ pub(crate) async fn reprocess_mint(
 /// Debug-tier operator route mirroring [`reprocess_mint`], gated by IAP
 /// (`DebugOps`) instead of the internal API key.
 #[post("/ops/debug/reprocess/mint/<aggregate_id>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn reprocess_mint_ops(
-    _auth: DebugOps,
+    auth: DebugOps,
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     store: &rocket::State<Arc<Store<Mint>>>,
@@ -2153,8 +2177,14 @@ pub(crate) async fn close_mint(
     format = "json",
     data = "<body>"
 )]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn close_mint_ops(
-    _auth: BreakglassOps,
+    auth: BreakglassOps,
     store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     vault_services: &rocket::State<NetworkVaultServices>,
@@ -3780,8 +3810,14 @@ pub(crate) async fn schedule_freeze_window(
 /// freeze gates token supply, so it sits above debug — the issue requires that
 /// debug cannot freeze. Gated by IAP (`CapitalOps`).
 #[post("/ops/capital/freeze-schedules", format = "json", data = "<body>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn schedule_freeze_window_ops(
-    _auth: CapitalOps,
+    auth: CapitalOps,
     scheduler: &rocket::State<FreezeScheduler>,
     body: Json<ScheduleFreezeWindowRequest>,
 ) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
@@ -3927,8 +3963,14 @@ pub(crate) async fn asset_status_ops(
 /// Capital-tier immediate freeze of an underlying on all networks. Above debug
 /// because holding a freeze gates token supply.
 #[post("/ops/capital/freeze/<underlying>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn freeze_underlying_ops(
-    _auth: CapitalOps,
+    auth: CapitalOps,
     store: &rocket::State<Arc<Store<Underlying>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     underlying: UnderlyingParam,
@@ -3954,8 +3996,14 @@ pub(crate) async fn freeze_underlying_ops(
 
 /// Capital-tier release of the operator freeze hold.
 #[post("/ops/capital/unfreeze/<underlying>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn unfreeze_underlying_ops(
-    _auth: CapitalOps,
+    auth: CapitalOps,
     store: &rocket::State<Arc<Store<Underlying>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     underlying: UnderlyingParam,

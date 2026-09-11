@@ -2,7 +2,7 @@
 //! routes (missing assertion, own-tier acceptance, cross-tier rejection) and
 //! the real `/ops/*` handlers (gated when mounted, absent when unconfigured).
 
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -38,6 +38,10 @@ use crate::redemption::{
 };
 use crate::test_utils::{logs_contain_at, setup_test_rocket};
 use crate::tokenized_asset::schedule::FreezeScheduler;
+use crate::tokenized_asset::{
+    AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    UnderlyingSymbol,
+};
 use crate::underlying::Underlying;
 use crate::vault::{BurnVerification, NetworkVaultServices};
 
@@ -523,6 +527,72 @@ async fn capital_freeze_admits_its_token_and_refuses_an_unlisted_underlying() {
         .await;
 
     assert_eq!(response.status(), Status::NotFound);
+}
+
+/// A mutating route's records name the operator: the freeze log line carries
+/// the assertion's subject id (never the email) via the handler's `operator`
+/// span, so an audit can attribute the action from the service logs alone.
+#[traced_test]
+#[tokio::test]
+async fn a_capital_freeze_is_attributed_to_the_assertion_subject() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let rocket = underlying_ops_rocket(verifiers).await;
+    let pool = rocket.state::<Pool<Sqlite>>().expect("pool managed").clone();
+    let (assets, _projection) =
+        StoreBuilder::<TokenizedAsset>::new(pool.clone())
+            .build(())
+            .await
+            .expect("tokenized asset store builds");
+    let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+    assets
+        .send(
+            &AssetKey::new(underlying.clone(), Network::Base),
+            TokenizedAssetCommand::Add {
+                underlying,
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
+                vault: Address::repeat_byte(0x11),
+            },
+        )
+        .await
+        .expect("listing seeds");
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let response = client
+        .post("/ops/capital/freeze/AAPL")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, CAPITAL_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::Ok);
+    logs_assert(|lines: &[&str]| {
+        let freeze_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|line| {
+                line.contains("Freezing underlying across all networks")
+            })
+            .collect();
+        if freeze_lines.is_empty() {
+            return Err("no freeze record was logged".to_string());
+        }
+        for line in freeze_lines {
+            if !line.contains("operator{subject=accounts.google.com:1234}") {
+                return Err(format!(
+                    "freeze record lacks the operator: {line}"
+                ));
+            }
+            if line.contains("operator@rainlang.xyz") {
+                return Err(format!("freeze record carries the email: {line}"));
+            }
+        }
+        Ok(())
+    });
 }
 
 /// Burn recovery that must never be reached: the IAP gate refuses every
