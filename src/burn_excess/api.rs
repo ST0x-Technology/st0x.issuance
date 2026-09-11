@@ -152,7 +152,15 @@ pub(crate) async fn burn_excess_internal_ops(
         &read_provider,
         issuer_wallet,
         request,
-        |_: &str| Ok::<bool, std::io::Error>(true),
+        |plan: &str| {
+            // The CLI operator reads this plan before authorizing the burn;
+            // here the request's `execute` stood in for that answer, so the
+            // plan is recorded instead, next to the reason and incident.
+            warn!(target: "admin", plan,
+                "burn-excess (internal) auto-approving operator-confirmed plan"
+            );
+            Ok::<bool, std::io::Error>(true)
+        },
     )
     .await
     .map_err(|error| {
