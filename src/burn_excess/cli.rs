@@ -112,7 +112,7 @@ pub(crate) struct BurnExcessExternalArgs {
     funding_tx_hash: B256,
 }
 
-fn parse_shares(value: &str) -> Result<U256, String> {
+pub(crate) fn parse_shares(value: &str) -> Result<U256, String> {
     let decimal = rust_decimal::Decimal::from_str(value)
         .map_err(|error| format!("invalid shares decimal: {error}"))?;
     Quantity::new(decimal)
@@ -145,25 +145,46 @@ pub(crate) async fn run_burn_excess_cli(
         );
     }
 
-    // Same process environment the service loads (issuer bin calls dotenv).
-    // Grouped CHAIN_* wins for Base when both forms are present.
-    let rpc_url = configured_rpc_url(shared.network)?;
+    let signer_config = shared.signer.into_config()?;
 
     println!("Using database: {}", shared.database_url);
-    println!(
-        "Using configured RPC for network {} (host {})",
-        shared.network,
-        rpc_url.host_str().unwrap_or("(none)")
-    );
     let pool =
         connect_pool(&shared.database_url, shared.database_max_connections)
             .await?;
 
-    let chain_id = verified_chain_id(&rpc_url, shared.chain_id).await?;
-    let signer_config = shared.signer.into_config()?;
+    let request = BurnExcessRequest {
+        mode,
+        issuer_request_id: shared.issuer_request_id,
+        deposit_tx_hash: shared.deposit_tx_hash,
+        funding_tx_hash,
+        receipt_id: shared.receipt_id,
+        shares: shared.shares,
+        reason: shared.reason,
+        incident_id: shared.incident_id,
+        network: shared.network,
+        chain_id: shared.chain_id,
+        execute: shared.execute,
+        close: shared.close,
+    };
+
+    run_burn_excess_request(&pool, &signer_config, request, confirm).await
+}
+
+/// Builds the signing and read providers for `request.network` from the service
+/// environment and signer, then runs the dual-path orchestration. The offline
+/// CLI has no running service to borrow a vault service from, so it builds its
+/// own; the breakglass HTTP route signs through the service's shared one.
+async fn run_burn_excess_request(
+    pool: &Pool<Sqlite>,
+    signer_config: &SignerConfig,
+    request: BurnExcessRequest,
+    confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
+) -> anyhow::Result<()> {
+    let rpc_url = configured_rpc_url(request.network)?;
+    let chain_id = verified_chain_id(&rpc_url, request.chain_id).await?;
     let issuer_wallet = signer_config.address()?;
 
-    let resolved = match &signer_config {
+    let resolved = match signer_config {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
         SignerConfig::Turnkey(config) => {
             resolve_turnkey_signer(config, chain_id)?
@@ -186,23 +207,8 @@ pub(crate) async fn run_burn_excess_cli(
 
     let read_provider = ProviderBuilder::new().connect_http(http_url);
 
-    let request = BurnExcessRequest {
-        mode,
-        issuer_request_id: shared.issuer_request_id,
-        deposit_tx_hash: shared.deposit_tx_hash,
-        funding_tx_hash,
-        receipt_id: shared.receipt_id,
-        shares: shared.shares,
-        reason: shared.reason,
-        incident_id: shared.incident_id,
-        network: shared.network,
-        chain_id,
-        execute: shared.execute,
-        close: shared.close,
-    };
-
     run_burn_excess(
-        &pool,
+        pool,
         &vault_service,
         &read_provider,
         issuer_wallet,

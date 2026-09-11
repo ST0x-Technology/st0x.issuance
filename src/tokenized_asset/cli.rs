@@ -1245,7 +1245,7 @@ fn orchestrator_address_from(
 /// filter symbol with no enabled listing on the network is an error rather
 /// than silently skipped — a typo'd symbol must not produce a READY verdict
 /// that never checked the intended asset.
-async fn preflight_assets(
+pub(crate) async fn preflight_assets(
     pool: &Pool<Sqlite>,
     network: Network,
     filter: &[UnderlyingSymbol],
@@ -1304,7 +1304,7 @@ async fn preflight_assets(
 /// meant; disagreement means the vault address, the inventory key, or the
 /// endpoint is wrong — and a deterministic deployment can put the same vault
 /// address on both chains, so reaching the contract proves nothing.
-async fn verified_chain_id(
+pub(crate) async fn verified_chain_id(
     rpc_url: &Url,
     expected_chain_id: u64,
 ) -> anyhow::Result<u64> {
@@ -1520,6 +1520,16 @@ impl AssetAdmin {
             StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
         Ok(Self { store, pool })
+    }
+
+    /// Builds an admin over the running service's already-open store and pool,
+    /// for the HTTP operator routes. The CLI path uses [`connect`], which opens
+    /// its own pool while the service is stopped.
+    pub(crate) const fn from_managed(
+        store: Arc<Store<Underlying>>,
+        pool: Pool<Sqlite>,
+    ) -> Self {
+        Self { store, pool }
     }
 
     /// Reads the current freeze status, or `None` if the underlying has no
