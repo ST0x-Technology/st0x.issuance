@@ -167,13 +167,17 @@ impl PollerPause {
         let _ = self.parked.send(false);
     }
 
-    /// Sleeps for `interval`, returning early if a pause is requested so the
-    /// next [`Self::wait_while_paused`] parks promptly instead of after a full
-    /// idle interval.
+    /// Sleeps for `interval`, returning early only if a pause is requested so
+    /// the next [`Self::wait_while_paused`] parks promptly instead of after a
+    /// full idle interval. Waits for the value `true` rather than any change:
+    /// a pause that was requested and withdrawn during the previous tick (a
+    /// pauser that timed out waiting for the park) leaves an unseen change
+    /// behind, and reacting to it would cut a retry backoff short and re-poll
+    /// a failing RPC at once.
     pub(crate) async fn interruptible_sleep(&mut self, interval: Duration) {
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
-            _ = self.pause.changed() => {}
+            _ = self.pause.wait_for(|paused| *paused) => {}
         }
     }
 }
@@ -362,5 +366,37 @@ mod tests {
 
         drop(second);
         poller.abort();
+    }
+
+    /// A pause that was requested and withdrawn while the poller was mid-tick
+    /// (a pauser that timed out waiting for the park) must not cut the next
+    /// sleep short: the sleep is the failure backoff, and honouring a stale
+    /// resume would re-poll a failing RPC at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_pause_does_not_cut_the_sleep_short() {
+        let (control, mut pause) = poller_pause();
+        // The poller never parks (it is mid-tick), so the pause times out and
+        // is withdrawn before the poller reaches its sleep.
+        assert!(control.pause().await.is_err());
+
+        let started = tokio::time::Instant::now();
+        pause.interruptible_sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(5),
+            "a pause already withdrawn must leave the full backoff in place"
+        );
+    }
+
+    /// A live pause request still ends the sleep at once, so the poller parks
+    /// promptly rather than after a full idle interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_pause_ends_the_sleep_at_once() {
+        let (control, mut pause) = poller_pause();
+        let _ = control.pause.send(true);
+
+        let started = tokio::time::Instant::now();
+        pause.interruptible_sleep(Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }
