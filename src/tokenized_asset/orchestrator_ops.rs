@@ -5,7 +5,7 @@
 //! wallet from the Turnkey signer, the RPC from the per-network environment.
 
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use rocket::http::Status;
 use rocket::request::FromParam;
 use rocket::serde::json::Json;
@@ -28,6 +28,7 @@ use crate::vault::onboarding::{
     check_orchestrator_readiness, ensure_unlimited_approval,
     prove_signing_shapes,
 };
+use crate::vault::{NetworkVaultServices, VaultService};
 use crate::wallet::SignerConfig;
 use crate::wallet::turnkey::{TurnkeyConfig, resolve_turnkey_signer};
 
@@ -179,6 +180,7 @@ pub(crate) async fn orchestrator_approve_ops(
     auth: CapitalOps,
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
+    vault_services: &State<NetworkVaultServices>,
     network: &str,
     underlying: UnderlyingParam,
 ) -> Result<Json<ApproveResponse>, Status> {
@@ -230,35 +232,20 @@ pub(crate) async fn orchestrator_approve_ops(
         return Err(Status::UnprocessableEntity);
     }
 
-    // The approval broadcasts from the production wallet, so refuse while an
-    // unresolved mint or redemption signer intent already holds a signed nonce
-    // on this network: both would fill from the same pending nonce and one
-    // would fail nonce-too-low, leaving the bot's recovery to reconcile a
-    // submission it did not make. Same network-keyed gate the breakglass
-    // burn-excess route applies via `require_wallet_intent_gates`.
-    if has_unresolved_signer_intent(pool.inner(), network, None).await.map_err(
-        |error| {
-            error!(target: "asset", %network, %error,
-                "Failed to check signer intents before approve"
-            );
-            Status::InternalServerError
-        },
-    )? {
-        warn!(target: "asset", %network,
-            "Refusing approve: an unresolved signer intent holds the wallet nonce"
-        );
-        return Err(Status::Conflict);
-    }
-
-    let outcome =
-        ensure_unlimited_approval(&provider, vault, orchestrator, bot)
-            .await
-            .map_err(|error| {
-                error!(target: "asset", %orchestrator, %vault, %error,
-                    "Orchestrator approval failed"
-                );
-                map_onboarding_error(&error)
-            })?;
+    let vault_service = vault_services.service(network).map_err(|error| {
+        warn!(target: "asset", %error, "Refusing approve");
+        Status::UnprocessableEntity
+    })?;
+    let outcome = approve_under_wallet_lock(
+        vault_service.as_ref(),
+        pool.inner(),
+        network,
+        &provider,
+        vault,
+        orchestrator,
+        bot,
+    )
+    .await?;
 
     let response = match outcome {
         ApprovalOutcome::AlreadyUnlimited => {
@@ -273,6 +260,53 @@ pub(crate) async fn orchestrator_approve_ops(
         "Orchestrator approval settled"
     );
     Ok(Json(response))
+}
+
+/// Broadcasts the approval from the production wallet under the network's
+/// service wallet lock, the one every live mint and redemption burn holds
+/// while it checks intents and signs. The lock is taken before the intent
+/// check so no live flow can persist a signed nonce between the check and
+/// this broadcast; while it is held no live flow fills a nonce either, so the
+/// pending count this route's provider reads is the one to use. The lock is
+/// held until the receipt is in, since the service's nonce manager resyncs
+/// from the chain's pending count and must not observe this transaction only
+/// halfway through. Refuses with 409 while an unresolved mint or redemption
+/// signer intent already holds a signed nonce on this network: both would
+/// fill from the same pending nonce and one would fail nonce-too-low, leaving
+/// the bot's recovery to reconcile a submission it did not make.
+async fn approve_under_wallet_lock<P: Provider>(
+    vault_service: &dyn VaultService,
+    pool: &Pool<Sqlite>,
+    network: Network,
+    provider: &P,
+    vault: Address,
+    orchestrator: Address,
+    bot: Address,
+) -> Result<ApprovalOutcome, Status> {
+    let _wallet_guard = vault_service.lock_wallet().await;
+
+    if has_unresolved_signer_intent(pool, network, None).await.map_err(
+        |error| {
+            error!(target: "asset", %network, %error,
+                "Failed to check signer intents before approve"
+            );
+            Status::InternalServerError
+        },
+    )? {
+        warn!(target: "asset", %network,
+            "Refusing approve: an unresolved signer intent holds the wallet nonce"
+        );
+        return Err(Status::Conflict);
+    }
+
+    ensure_unlimited_approval(provider, vault, orchestrator, bot).await.map_err(
+        |error| {
+            error!(target: "asset", %orchestrator, %vault, %error,
+                "Orchestrator approval failed"
+            );
+            map_onboarding_error(&error)
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -436,5 +470,218 @@ const fn map_onboarding_error(error: &OnboardingError) -> Status {
         | Transport(_)
         | ApprovalReverted { .. }
         | ApprovalNotEffective { .. } => Status::BadGateway,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::network::EthereumWallet;
+    use alloy::primitives::{Address, U256, address};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+    use chrono::Utc;
+    use cqrs_es::DomainEvent;
+    use rocket::http::Status;
+    use rust_decimal::Decimal;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{Pool, Sqlite};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::approve_under_wallet_lock;
+    use crate::account::ClientId;
+    use crate::bindings::OffchainAssetReceiptVault;
+    use crate::mint::{IssuerMintRequestId, MintEvent, TokenizationRequestId};
+    use crate::test_utils::LocalEvm;
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+    use crate::vault::PreparedMintTx;
+    use crate::vault::mock::MockVaultService;
+    use crate::{Quantity, VaultMode};
+
+    async fn migrated_pool() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_mint_event(
+        pool: &Pool<Sqlite>,
+        issuer_request_id: &IssuerMintRequestId,
+        sequence: i64,
+        event: &MintEvent,
+    ) {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, ?, ?, '1.0', ?, '{}')
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .bind(sequence)
+        .bind(event.event_type())
+        .bind(serde_json::to_string(event).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Persists the `MintTxIntended` a mint job records while holding the
+    /// wallet, which reserves the network's signer for that mint.
+    async fn seed_mint_holding_the_signer(pool: &Pool<Sqlite>) {
+        let issuer_request_id = IssuerMintRequestId::random();
+        insert_mint_event(
+            pool,
+            &issuer_request_id,
+            1,
+            &MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok"),
+                quantity: Quantity::new(Decimal::new(1, 0)),
+                underlying: UnderlyingSymbol::new("PTY").unwrap(),
+                token: TokenSymbol::new("tPTY"),
+                network: Network::Base,
+                client_id: ClientId::new(),
+                wallet: address!("0xA9C16673F65AE808688cB18952AFE3d9658C808f"),
+                initiated_at: Utc::now(),
+                mint_mode: VaultMode::VaultDirect,
+            },
+        )
+        .await;
+        insert_mint_event(
+            pool,
+            &issuer_request_id,
+            2,
+            &MintEvent::MintTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx: PreparedMintTx::valid_for_test(
+                    1,
+                    format!("mint-{issuer_request_id}"),
+                ),
+                intended_at: Utc::now(),
+            },
+        )
+        .await;
+    }
+
+    /// The approval must take the service wallet lock before it checks for
+    /// signer intents: a mint that signs while the approval is queued on the
+    /// lock persists its intent under that lock, and the approval, once it
+    /// acquires the lock, must see it and refuse rather than broadcast on the
+    /// nonce the mint just took.
+    #[tokio::test]
+    async fn approve_checks_intents_only_once_it_holds_the_wallet_lock() {
+        let evm = LocalEvm::new().await.unwrap();
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let pool = migrated_pool().await;
+        let vault_service =
+            Arc::new(MockVaultService::new_wallet_lock_blocked());
+        let orchestrator = Address::repeat_byte(0x42);
+
+        let approval = tokio::spawn({
+            let vault_service = Arc::clone(&vault_service);
+            let pool = pool.clone();
+            let provider = provider.clone();
+            let vault = evm.vault_address;
+            let bot = evm.wallet_address;
+            async move {
+                approve_under_wallet_lock(
+                    vault_service.as_ref(),
+                    &pool,
+                    Network::Base,
+                    &provider,
+                    vault,
+                    orchestrator,
+                    bot,
+                )
+                .await
+            }
+        });
+
+        // Queued on the wallet: a mint holding it signs and persists its intent.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vault_service.wait_for_wallet_lock_attempt(),
+        )
+        .await
+        .expect(
+            "the approval must contend for the wallet before anything else",
+        );
+        assert!(
+            !approval.is_finished(),
+            "the approval must not run its intent check before it holds the wallet"
+        );
+        seed_mint_holding_the_signer(&pool).await;
+        vault_service.release_wallet_lock();
+
+        let error = approval.await.unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            Status::Conflict,
+            "the intent check must see the mint that signed while the approval waited"
+        );
+        let allowance =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .allowance(evm.wallet_address, orchestrator)
+                .call()
+                .await
+                .unwrap();
+        assert_eq!(
+            allowance,
+            U256::ZERO,
+            "a refused approval must not have broadcast"
+        );
+    }
+
+    /// With the wallet free and no intent outstanding the approval lands.
+    #[tokio::test]
+    async fn approve_broadcasts_under_a_free_wallet() {
+        let evm = LocalEvm::new().await.unwrap();
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let pool = migrated_pool().await;
+        let vault_service = MockVaultService::new_success();
+        let orchestrator = Address::repeat_byte(0x42);
+
+        approve_under_wallet_lock(
+            &vault_service,
+            &pool,
+            Network::Base,
+            &provider,
+            evm.vault_address,
+            orchestrator,
+            evm.wallet_address,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vault_service.get_wallet_lock_call_count(), 1);
+        let allowance =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .allowance(evm.wallet_address, orchestrator)
+                .call()
+                .await
+                .unwrap();
+        assert_eq!(allowance, U256::MAX);
     }
 }
