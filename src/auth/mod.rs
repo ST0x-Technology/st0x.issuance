@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use iap::{IapError, OpsTier, authenticate_ops};
+use iap::{IapError, OpsPrincipal, OpsTier, authenticate_ops};
 pub(crate) use iap::{OpsApiVerifiers, build_jwks_client};
 pub use ip_whitelist::{InternalIpWhitelist, IpWhitelist};
 pub(crate) use rate_limit::FailedAuthRateLimiter;
@@ -143,21 +143,22 @@ impl<'r> FromRequest<'r> for InternalAuth {
 
 /// Resolves a tier guard: the request must carry an IAP assertion whose
 /// audience matches the tier's backend, else it fails with the tier verifier's
-/// status. Shared by the four tier guards below; `guard` is the unit value
-/// returned on success.
+/// status. Shared by the four tier guards below; `guard` wraps the verified
+/// principal so the route can attribute what it does.
 async fn ops_outcome<Guard>(
     request: &Request<'_>,
     tier: OpsTier,
-    guard: Guard,
+    guard: impl FnOnce(OpsPrincipal) -> Guard,
 ) -> Outcome<Guard, IapError> {
     match authenticate_ops(request, tier).await {
-        Ok(_) => Outcome::Success(guard),
+        Ok(principal) => Outcome::Success(guard(principal)),
         Err(error) => Outcome::Error((error.status(), error)),
     }
 }
 
 /// Guard for read-tier operator endpoints: health, status, views, and database
-/// snapshots.
+/// snapshots. Carries no principal: reads change nothing to attribute, and the
+/// accepted-assertion log already names who read.
 pub(crate) struct ReadOps;
 
 #[rocket::async_trait]
@@ -167,13 +168,14 @@ impl<'r> FromRequest<'r> for ReadOps {
     async fn from_request(
         request: &'r Request<'_>,
     ) -> Outcome<Self, Self::Error> {
-        ops_outcome(request, OpsTier::Read, Self).await
+        ops_outcome(request, OpsTier::Read, |_| Self).await
     }
 }
 
 /// Guard for debug-tier operator endpoints: safe recovery such as reprocess,
-/// recover, and reconcile.
-pub(crate) struct DebugOps;
+/// recover, and reconcile. Carries the verified operator; the route runs
+/// under an `operator` span naming it so its records are attributable.
+pub(crate) struct DebugOps(pub(crate) OpsPrincipal);
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for DebugOps {
@@ -187,8 +189,9 @@ impl<'r> FromRequest<'r> for DebugOps {
 }
 
 /// Guard for capital-tier operator endpoints: operations that move funds or
-/// change token supply (freeze/unfreeze, approvals).
-pub(crate) struct CapitalOps;
+/// change token supply (freeze/unfreeze, approvals). Carries the verified
+/// operator like [`DebugOps`].
+pub(crate) struct CapitalOps(pub(crate) OpsPrincipal);
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for CapitalOps {
@@ -202,8 +205,9 @@ impl<'r> FromRequest<'r> for CapitalOps {
 }
 
 /// Guard for breakglass-tier operator endpoints: operations that override
-/// normal safety checks (force-complete, close, burn-excess).
-pub(crate) struct BreakglassOps;
+/// normal safety checks (force-complete, close, burn-excess). Carries the
+/// verified operator like [`DebugOps`].
+pub(crate) struct BreakglassOps(pub(crate) OpsPrincipal);
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for BreakglassOps {
