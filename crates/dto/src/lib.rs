@@ -139,6 +139,24 @@ pub enum Network {
     /// before ITN mint/redeem traffic names this network.
     #[serde(rename = "hyperevm")]
     HyperEvm,
+    /// Robinhood Chain, Robinhood's Arbitrum Orbit L2 (chain 4663).
+    ///
+    /// Not yet listed in Alpaca's published `TokenizationNetwork` enum
+    /// (<https://docs.alpaca.markets/reference/posttokenizationredeem>), so
+    /// the `"robinhood"` wire value must be confirmed against live Alpaca
+    /// before ITN mint/redeem traffic names this network.
+    #[serde(rename = "robinhood")]
+    Robinhood,
+    /// BNB Smart Chain (chain 56).
+    ///
+    /// Alpaca publishes this network as `"binance"`, not `"bnb"`, in its
+    /// `TokenizationNetwork` enum
+    /// (<https://docs.alpaca.markets/reference/posttokenizationredeem>), so
+    /// the wire value deliberately differs from the variant name: the wire
+    /// string is Alpaca's contract, while the variant names the chain as it
+    /// is known everywhere else.
+    #[serde(rename = "binance")]
+    BnbSmartChain,
 }
 
 impl Network {
@@ -149,6 +167,8 @@ impl Network {
             Self::Base => "base",
             Self::Ethereum => "ethereum",
             Self::HyperEvm => "hyperevm",
+            Self::Robinhood => "robinhood",
+            Self::BnbSmartChain => "binance",
         }
     }
 
@@ -165,18 +185,23 @@ impl Network {
             Self::Base => 8453,
             Self::Ethereum => 1,
             Self::HyperEvm => 999,
+            Self::Robinhood => 4663,
+            Self::BnbSmartChain => 56,
         }
     }
 
     /// The symbol of the native token that pays gas on this network.
     ///
-    /// Used when rendering native balance amounts for operators: Base and
-    /// Ethereum pay gas in ETH, HyperEVM (chain 999) pays gas in HYPE.
+    /// Used when rendering native balance amounts for operators: Base,
+    /// Ethereum, and Robinhood Chain (an Arbitrum Orbit L2, chain 4663) pay
+    /// gas in ETH, HyperEVM (chain 999) pays gas in HYPE, and BNB Smart Chain
+    /// (chain 56) pays gas in BNB.
     #[must_use]
     pub const fn native_currency(&self) -> &'static str {
         match self {
-            Self::Base | Self::Ethereum => "ETH",
+            Self::Base | Self::Ethereum | Self::Robinhood => "ETH",
             Self::HyperEvm => "HYPE",
+            Self::BnbSmartChain => "BNB",
         }
     }
 }
@@ -201,6 +226,8 @@ impl FromStr for Network {
             "base" => Ok(Self::Base),
             "ethereum" => Ok(Self::Ethereum),
             "hyperevm" => Ok(Self::HyperEvm),
+            "robinhood" => Ok(Self::Robinhood),
+            "binance" => Ok(Self::BnbSmartChain),
             other => {
                 Err(NetworkParseError::Unsupported { value: other.to_string() })
             }
@@ -577,6 +604,16 @@ mod tests {
             serde_json::from_value::<Network>(json!("ethereum")).unwrap(),
             Network::Ethereum
         );
+        assert_eq!(
+            serde_json::from_value::<Network>(json!("robinhood")).unwrap(),
+            Network::Robinhood
+        );
+        // BNB Smart Chain rides on Alpaca's spelling, so the variant name and
+        // the wire value diverge; the wire value is the contract.
+        assert_eq!(
+            serde_json::from_value::<Network>(json!("binance")).unwrap(),
+            Network::BnbSmartChain
+        );
     }
 
     // `Network` is a closed enum, so an unsupported or wrong-cased network must
@@ -584,9 +621,15 @@ mod tests {
     // invariant that replaced the old unvalidated `Network(String)` newtype.
     #[test]
     fn network_rejects_unknown_and_non_snake_case_variants() {
-        for invalid in
-            [json!("arbitrum"), json!("Base"), json!("BASE"), json!("")]
-        {
+        for invalid in [
+            json!("arbitrum"),
+            json!("Base"),
+            json!("BASE"),
+            json!(""),
+            // The chain's own name is not the wire value Alpaca publishes.
+            json!("bnb"),
+            json!("bnb_smart_chain"),
+        ] {
             assert!(
                 serde_json::from_value::<Network>(invalid.clone()).is_err(),
                 "{invalid} must not deserialize as Network"
@@ -608,13 +651,46 @@ mod tests {
         assert_eq!(TokenSymbol::new("tSGOV").to_string(), "tSGOV");
         assert_eq!(Network::Base.to_string(), "base");
         assert_eq!(Network::Ethereum.to_string(), "ethereum");
+        assert_eq!(Network::Robinhood.to_string(), "robinhood");
+        assert_eq!(Network::BnbSmartChain.to_string(), "binance");
+    }
+
+    // The chain id is what re-keys the receipt inventory when a network label
+    // is bound to the wrong chain, and the native currency is what operator
+    // gas alerts are denominated in; both are per-variant constants with no
+    // other guard, so pin them.
+    #[test]
+    fn networks_carry_their_canonical_chain_id_and_native_currency() {
+        let expected = [
+            (Network::Base, 8453, "ETH"),
+            (Network::Ethereum, 1, "ETH"),
+            (Network::HyperEvm, 999, "HYPE"),
+            // Robinhood Chain is an Arbitrum Orbit L2 and pays gas in ETH.
+            (Network::Robinhood, 4663, "ETH"),
+            (Network::BnbSmartChain, 56, "BNB"),
+        ];
+
+        for (network, chain_id, native_currency) in expected {
+            assert_eq!(network.chain_id(), chain_id, "chain id for {network}");
+            assert_eq!(
+                network.native_currency(),
+                native_currency,
+                "native currency for {network}"
+            );
+        }
     }
 
     #[test]
     fn network_from_str_parses_wire_values() {
         assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
         assert_eq!("ethereum".parse::<Network>().unwrap(), Network::Ethereum);
+        assert_eq!("robinhood".parse::<Network>().unwrap(), Network::Robinhood);
+        assert_eq!(
+            "binance".parse::<Network>().unwrap(),
+            Network::BnbSmartChain
+        );
         assert!("arbitrum".parse::<Network>().is_err());
+        assert!("bnb".parse::<Network>().is_err());
     }
 
     #[test]

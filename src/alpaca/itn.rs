@@ -13,9 +13,22 @@ pub(crate) const REDEEM_CALLBACK_OPENAPI_REFERENCE: &str =
 
 /// `TokenizationNetwork` enum values from Alpaca Broker API OpenAPI
 /// (`components.schemas.TokenizationNetwork.enum`).
+///
+/// `"robinhood"` is the one entry not yet in that published enum: Robinhood
+/// Chain issuance is being onboarded and the wire name is pending Alpaca's
+/// confirmation. It is listed here so the issued-network check below stays a
+/// real assertion; drop it again if Alpaca publishes a different spelling.
 pub(crate) const TOKENIZATION_NETWORK_WIRE_STRINGS: &[&str] = &[
-    "solana", "arbitrum", "ethereum", "binance", "base", "ton", "tron",
-    "mantle", "hyperevm",
+    "solana",
+    "arbitrum",
+    "ethereum",
+    "binance",
+    "base",
+    "ton",
+    "tron",
+    "mantle",
+    "hyperevm",
+    "robinhood",
 ];
 
 /// Returns whether `wire` is a published Alpaca ITN `TokenizationNetwork` value.
@@ -34,7 +47,13 @@ mod tests {
 
     #[test]
     fn issued_network_wire_strings_are_alpaca_itn_values() {
-        for network in [Network::Base, Network::Ethereum, Network::HyperEvm] {
+        for network in [
+            Network::Base,
+            Network::Ethereum,
+            Network::HyperEvm,
+            Network::Robinhood,
+            Network::BnbSmartChain,
+        ] {
             let wire = network.as_str();
             assert!(
                 accepts_network_wire_string(wire),

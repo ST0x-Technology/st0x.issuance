@@ -714,6 +714,19 @@ mod tests {
              0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
              1.000000000000000000 HYPE (threshold 2.000000000000000000 HYPE)"
         );
+
+        let binance = LifecycleNotification::LowGasBalance {
+            network: Network::BnbSmartChain,
+            wallet,
+            balance: parse_ether("0.05").unwrap(),
+            threshold: parse_ether("0.10").unwrap(),
+        };
+        assert_eq!(
+            binance.message(),
+            "Low gas on binance: issuer wallet \
+             0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
+             0.050000000000000000 BNB (threshold 0.100000000000000000 BNB)"
+        );
     }
 
     /// The amount is the raw on-chain value. ERC-4626 does not fix a share

@@ -4017,8 +4017,11 @@ The `network` field must be one of Alpaca's published `TokenizationNetwork` wire
 strings (`solana`, `arbitrum`, `ethereum`, `binance`, `base`, `ton`, `tron`,
 `mantle` per
 [Alpaca's redeem callback OpenAPI](https://docs.alpaca.markets/reference/posttokenizationredeem)).
-We currently send `base` or `ethereum` depending on the redemption aggregate's
-network.
+We send the wire value of the redemption aggregate's network: `base`,
+`ethereum`, `hyperevm`, `robinhood`, or `binance` (BNB Smart Chain, whose wire
+name is Alpaca's spelling rather than the chain's own). `robinhood` is not in
+the published enum above and is pending Alpaca-side confirmation before ITN
+traffic names it.
 
 The `issuer_request_id` is the full redemption tx hash
 (`IssuerRedemptionRequestId::Full`). Redemptions recorded before this format
@@ -4977,13 +4980,17 @@ default_vault_mode = "vault_direct"
 
 # ST0xOrchestrator contract addresses, one per network — each chain carries
 # its own deployment. Keys are network wire names (base | ethereum |
-# hyperevm). Required when any asset resolves to orchestrator mode: startup
-# then demands an entry for EVERY configured chain, and rejects unknown
-# network keys and missing, malformed, or zero addresses.
+# hyperevm | robinhood | binance — BNB Smart Chain is spelled "binance",
+# matching Alpaca's published TokenizationNetwork value). Required when any
+# asset resolves to orchestrator mode: startup then demands an entry for
+# EVERY configured chain, and rejects unknown network keys and missing,
+# malformed, or zero addresses.
 [orchestrator.addresses]
 base = "0x..."
 ethereum = "0x..."
 hyperevm = "0x..."
+robinhood = "0x..."
+binance = "0x..."
 
 # Per-asset override, keyed by underlying symbol. During the pilot exactly one
 # asset carries this; every other asset stays on the default.
@@ -4991,11 +4998,12 @@ hyperevm = "0x..."
 vault_mode = "orchestrator"
 
 # Wrapped-token (ERC-4626 wrapper) contract addresses, one table per network
-# (base | ethereum | hyperevm), keyed by underlying symbol. Inbound transfers
-# of these tokens to the issuer wallet cannot be redeemed; the per network
-# watcher records and alerts on them (see "Per network monitoring"). Every
-# listed network must have a chain configuration; a configured chain with no
-# table here has wrapped-token watching disabled (startup WARN).
+# (base | ethereum | hyperevm | robinhood | binance), keyed by underlying
+# symbol. Inbound transfers of these tokens to the issuer wallet cannot be
+# redeemed; the per network watcher records and alerts on them (see "Per
+# network monitoring"). Every listed network must have a chain configuration;
+# a configured chain with no table here has wrapped-token watching disabled
+# (startup WARN).
 [wrapped_tokens.base]
 RKLB = "0x..."
 
@@ -5003,6 +5011,12 @@ RKLB = "0x..."
 RKLB = "0x..."
 
 [wrapped_tokens.hyperevm]
+RKLB = "0x..."
+
+[wrapped_tokens.robinhood]
+RKLB = "0x..."
+
+[wrapped_tokens.binance]
 RKLB = "0x..."
 ```
 
@@ -5065,14 +5079,14 @@ Alpaca calls a single issuer URL; payload `network` selects the runtime.
 `CHAIN_<NETWORK>_BACKFILL_START_BLOCK`. Supplying any field requires all three,
 so partial chain configuration fails at startup. An absent additional-network
 group keeps that chain disabled. `CHAIN_<NETWORK>_CHAIN_ID` must be the
-network's canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`); a mismatch
-fails at startup, because the receipt inventory is keyed by chain id and a
-mislabeled network orphans every existing aggregate. The legacy flat `CHAIN_ID`
-is exempt so local development can point Base at Anvil. `CHAIN_BASE_*` overrides
-the legacy flat Base values; when it is absent, `RPC_URL`, `CHAIN_ID`, and
-`BACKFILL_START_BLOCK` continue to produce the single Base entry unchanged. This
-lets one deployed artifact start Base-only and later activate another chain
-through a config update and restart.
+network's canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`, Robinhood
+Chain `4663`, BNB Smart Chain `56`); a mismatch fails at startup, because the
+receipt inventory is keyed by chain id and a mislabeled network orphans every
+existing aggregate. The legacy flat `CHAIN_ID` is exempt so local development
+can point Base at Anvil. `CHAIN_BASE_*` overrides the legacy flat Base values;
+when it is absent, `RPC_URL`, `CHAIN_ID`, and `BACKFILL_START_BLOCK` continue to
+produce the single Base entry unchanged. This lets one deployed artifact start
+Base-only and later activate another chain through a config update and restart.
 
 Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
@@ -5141,18 +5155,23 @@ chain added to the `ChainRegistry` is covered without further wiring.
 ### Gas balance monitoring
 
 Signed transactions (mints, burns, receipt moves) spend the chain's native token
-from the single issuer wallet: ETH on Base and Ethereum, HYPE on HyperEVM. An
-empty wallet halts issuance on that chain, so the bot polls `eth_getBalance` for
-the issuer wallet on every configured chain and alerts before the wallet runs
-dry. This complements the move receipts CLI's transfer gas ceiling check, which
-gates one CLI invocation rather than watching the running service.
+from the single issuer wallet: ETH on Base, Ethereum, and Robinhood Chain (an
+Arbitrum Orbit L2 that pays gas in ETH), HYPE on HyperEVM, BNB on BNB Smart
+Chain. An empty wallet halts issuance on that chain, so the bot polls
+`eth_getBalance` for the issuer wallet on every configured chain and alerts
+before the wallet runs dry. This complements the move receipts CLI's transfer
+gas ceiling check, which gates one CLI invocation rather than watching the
+running service.
 
 **Configuration:** each chain group takes a low gas threshold denominated in the
 chain's native token with 18 decimals (`"0.05"` = 0.05 ETH):
 
 - `CHAIN_BASE_LOW_GAS_THRESHOLD`, `CHAIN_ETHEREUM_LOW_GAS_THRESHOLD`,
-  `CHAIN_HYPEREVM_LOW_GAS_THRESHOLD` for the grouped chain config, each
-  requiring its group's `CHAIN_<NETWORK>_RPC_URL`.
+  `CHAIN_HYPEREVM_LOW_GAS_THRESHOLD`, `CHAIN_ROBINHOOD_LOW_GAS_THRESHOLD`,
+  `CHAIN_BINANCE_LOW_GAS_THRESHOLD` for the grouped chain config, each requiring
+  its group's `CHAIN_<NETWORK>_RPC_URL`. The group prefix is the network's wire
+  name throughout, which is why BNB Smart Chain's variables read
+  `CHAIN_BINANCE_*`.
 - `LOW_GAS_THRESHOLD` for the legacy flat Base group, mirroring how the flat
   `CHAIN_ID` and `BACKFILL_START_BLOCK` map to the single Base entry.
 

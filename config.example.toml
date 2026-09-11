@@ -16,7 +16,9 @@
 default_vault_mode = "vault_direct"
 
 # ST0xOrchestrator contract addresses, one per network — each chain carries
-# its own deployment. Keys are network wire names: base | ethereum | hyperevm.
+# its own deployment. Keys are network wire names: base | ethereum | hyperevm |
+# robinhood | binance (BNB Smart Chain is spelled "binance", matching Alpaca's
+# published TokenizationNetwork value).
 # Required when any asset resolves to orchestrator mode: at startup every
 # configured chain must have an entry (a missing, malformed, zero-address, or
 # unknown-network entry is a startup error).
@@ -24,6 +26,8 @@ default_vault_mode = "vault_direct"
 base = "0x1234567890abcdef1234567890abcdef12345678"
 ethereum = "0x2222222222222222222222222222222222222222"
 hyperevm = "0x3333333333333333333333333333333333333333"
+robinhood = "0x4444444444444444444444444444444444444444"
+binance = "0x5555555555555555555555555555555555555555"
 
 # Per-asset override, keyed by underlying symbol. The mode is keyed by symbol
 # alone — it applies on every network the asset is listed on; the address is
@@ -33,15 +37,16 @@ hyperevm = "0x3333333333333333333333333333333333333333"
 vault_mode = "orchestrator"
 
 # Wrapped-token (ERC-4626 wrapper) contract addresses, one table per network
-# (base | ethereum | hyperevm), keyed by underlying symbol. Inbound transfers
-# of these tokens to the issuer wallet cannot be redeemed, so the per network
-# watcher records them and alerts the operator (see SPEC.md "Per network
-# monitoring"). Every listed network must have a chain configuration; a
-# configured chain with no table here has wrapped-token watching disabled
-# (startup WARN). Unknown networks, invalid symbols, malformed or zero
-# addresses, and one address bound to two symbols on a chain are startup
-# errors. This example lists every chain the bot can run; remove the table for
-# any chain this deployment does not configure, or startup fails.
+# (base | ethereum | hyperevm | robinhood | binance), keyed by underlying
+# symbol. Inbound transfers of these tokens to the issuer wallet cannot be
+# redeemed, so the per network watcher records them and alerts the operator
+# (see SPEC.md "Per network monitoring"). Every listed network must have a
+# chain configuration; a configured chain with no table here has wrapped-token
+# watching disabled (startup WARN). Unknown networks, invalid symbols,
+# malformed or zero addresses, and one address bound to two symbols on a chain
+# are startup errors. This example lists every chain the bot can run; remove
+# the table for any chain this deployment does not configure, or startup
+# fails.
 [wrapped_tokens.base]
 RKLB = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
@@ -50,3 +55,9 @@ RKLB = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [wrapped_tokens.hyperevm]
 RKLB = "0xcccccccccccccccccccccccccccccccccccccccc"
+
+[wrapped_tokens.robinhood]
+RKLB = "0xdddddddddddddddddddddddddddddddddddddddd"
+
+[wrapped_tokens.binance]
+RKLB = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
