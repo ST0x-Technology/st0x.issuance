@@ -47,6 +47,7 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
+use crate::tokenized_asset::api::UnderlyingParam;
 use crate::tokenized_asset::cli::{
     AssetAdmin, AssetAdminError, AssetStatusReport, FreezeOutcome,
     UnfreezeOutcome,
@@ -3871,17 +3872,6 @@ pub(crate) struct FreezeOutcomeResponse {
     outcome: &'static str,
 }
 
-/// Parses the path segment into a validated underlying symbol; a malformed one
-/// is a 422.
-fn parse_underlying(underlying: &str) -> Result<UnderlyingSymbol, Status> {
-    UnderlyingSymbol::new(underlying.to_ascii_uppercase()).map_err(|error| {
-        warn!(target: "admin", underlying, error = %error,
-            "Invalid underlying symbol"
-        );
-        Status::UnprocessableEntity
-    })
-}
-
 /// Maps an asset-admin failure to an HTTP status. An unknown underlying is a
 /// client 404; everything else is an internal failure.
 const fn map_asset_admin_error(error: &AssetAdminError) -> Status {
@@ -3917,16 +3907,16 @@ pub(crate) async fn asset_status_ops(
     _auth: ReadOps,
     store: &rocket::State<Arc<Store<Underlying>>>,
     pool: &rocket::State<Pool<Sqlite>>,
-    underlying: &str,
+    underlying: UnderlyingParam,
 ) -> Result<Json<AssetStatusResponse>, Status> {
-    let symbol = parse_underlying(underlying)?;
+    let UnderlyingParam(symbol) = underlying;
     let admin =
         AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
     match admin.status(&symbol).await {
         Ok(Some(report)) => Ok(Json(report.into())),
         Ok(None) => Err(Status::NotFound),
         Err(error) => {
-            error!(target: "admin", underlying, error = %error,
+            error!(target: "admin", underlying = %symbol, error = %error,
                 "Failed to read asset status"
             );
             Err(map_asset_admin_error(&error))
@@ -3941,14 +3931,14 @@ pub(crate) async fn freeze_underlying_ops(
     _auth: CapitalOps,
     store: &rocket::State<Arc<Store<Underlying>>>,
     pool: &rocket::State<Pool<Sqlite>>,
-    underlying: &str,
+    underlying: UnderlyingParam,
 ) -> Result<Json<FreezeOutcomeResponse>, Status> {
-    let symbol = parse_underlying(underlying)?;
+    let UnderlyingParam(symbol) = underlying;
     let admin =
         AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
     ensure_listed(&admin, &symbol).await?;
     let outcome = admin.freeze(&symbol).await.map_err(|error| {
-        error!(target: "admin", underlying, error = %error,
+        error!(target: "admin", underlying = %symbol, error = %error,
             "Failed to freeze underlying"
         );
         map_asset_admin_error(&error)
@@ -3968,14 +3958,14 @@ pub(crate) async fn unfreeze_underlying_ops(
     _auth: CapitalOps,
     store: &rocket::State<Arc<Store<Underlying>>>,
     pool: &rocket::State<Pool<Sqlite>>,
-    underlying: &str,
+    underlying: UnderlyingParam,
 ) -> Result<Json<FreezeOutcomeResponse>, Status> {
-    let symbol = parse_underlying(underlying)?;
+    let UnderlyingParam(symbol) = underlying;
     let admin =
         AssetAdmin::from_managed(store.inner().clone(), pool.inner().clone());
     ensure_listed(&admin, &symbol).await?;
     let outcome = admin.unfreeze(&symbol).await.map_err(|error| {
-        error!(target: "admin", underlying, error = %error,
+        error!(target: "admin", underlying = %symbol, error = %error,
             "Failed to unfreeze underlying"
         );
         map_asset_admin_error(&error)

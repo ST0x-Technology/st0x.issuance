@@ -7,6 +7,7 @@
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
+use rocket::request::FromParam;
 use rocket::serde::json::Json;
 use rocket::{State, get, post};
 use serde::Serialize;
@@ -15,6 +16,7 @@ use std::str::FromStr;
 use tracing::{error, info, warn};
 use url::Url;
 
+use super::api::UnderlyingParam;
 use super::cli::preflight_assets;
 use super::view::find_vault;
 use super::{Network, UnderlyingSymbol};
@@ -93,10 +95,10 @@ pub(crate) async fn orchestrator_verify_signing_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     network: &str,
-    underlying: &str,
+    underlying: UnderlyingParam,
 ) -> Result<Json<VerifySigningResponse>, Status> {
     let network = parse_network(network)?;
-    let symbol = parse_underlying(underlying)?;
+    let UnderlyingParam(symbol) = underlying;
     let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
 
@@ -166,10 +168,10 @@ pub(crate) async fn orchestrator_approve_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     network: &str,
-    underlying: &str,
+    underlying: UnderlyingParam,
 ) -> Result<Json<ApproveResponse>, Status> {
     let network = parse_network(network)?;
-    let symbol = parse_underlying(underlying)?;
+    let UnderlyingParam(symbol) = underlying;
     let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
 
@@ -393,15 +395,17 @@ fn parse_network(network: &str) -> Result<Network, Status> {
     })
 }
 
-fn parse_underlying(underlying: &str) -> Result<UnderlyingSymbol, Status> {
-    UnderlyingSymbol::new(underlying.to_ascii_uppercase()).map_err(|error| {
-        warn!(target: "asset", underlying, %error, "Invalid underlying symbol");
-        Status::UnprocessableEntity
-    })
-}
-
+/// The `?asset=` filter values are operator-supplied symbols like the path
+/// segment, so they take the same normalisation; a malformed one is a 422.
 fn parse_assets(assets: &[String]) -> Result<Vec<UnderlyingSymbol>, Status> {
-    assets.iter().map(|asset| parse_underlying(asset)).collect()
+    assets
+        .iter()
+        .map(|asset| {
+            UnderlyingParam::from_param(asset)
+                .map(|UnderlyingParam(symbol)| symbol)
+                .map_err(|_| Status::UnprocessableEntity)
+        })
+        .collect()
 }
 
 /// Maps an onboarding failure to an HTTP status. A Turnkey policy denial is a
