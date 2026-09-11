@@ -1,0 +1,57 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            last_sequence,\n            payload as \"payload!: String\",\n            timestamp,\n            snapshot_version\n        FROM snapshots\n        WHERE aggregate_type = ?\n        AND aggregate_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_sequence",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "snapshots",
+            "name": "last_sequence"
+          }
+        }
+      },
+      {
+        "name": "payload!: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "snapshots",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "name": "timestamp",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "snapshots",
+            "name": "timestamp"
+          }
+        }
+      },
+      {
+        "name": "snapshot_version",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "snapshots",
+            "name": "snapshot_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [false, false, false, false]
+  },
+  "hash": "48fa4e1e38ebee041ab0b72c19d79e2f9c049b3709f0edb2402d417e15b796b8"
+}
