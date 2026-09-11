@@ -8,6 +8,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use chrono::{DateTime, Utc};
 use event_sorcery::{Store, StoreBuilder};
+use serde::Serialize;
 use sqlx::{Pool, Sqlite};
 use std::io;
 use std::sync::Arc;
@@ -275,7 +276,7 @@ pub(crate) async fn run_burn_excess<P: Provider>(
     issuer_wallet: Address,
     request: BurnExcessRequest,
     confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
-) -> Result<(), BurnExcessEngineError> {
+) -> Result<BurnExcessOutcome, BurnExcessEngineError> {
     let aggregate_id = BurnExcessId::new(request.deposit_tx_hash);
     let store = burn_excess_store(pool.clone()).await?;
 
@@ -284,12 +285,11 @@ pub(crate) async fn run_burn_excess<P: Provider>(
 
     match path_resolution {
         PathResolution::ReportOnly(path) => {
-            print_terminal_report(path, state.as_ref());
-            Ok(())
+            Ok(BurnExcessOutcome::Terminal(terminal_view(path, state.as_ref())))
         }
         PathResolution::Start(path) | PathResolution::Resume(path) => {
             if request.close {
-                return close_stream(
+                let view = close_stream(
                     &store,
                     &aggregate_id,
                     state.as_ref(),
@@ -298,7 +298,8 @@ pub(crate) async fn run_burn_excess<P: Provider>(
                     request.execute,
                     &confirm,
                 )
-                .await;
+                .await?;
+                return Ok(BurnExcessOutcome::Close(view));
             }
 
             let plan = prove_plan(
@@ -312,10 +313,10 @@ pub(crate) async fn run_burn_excess<P: Provider>(
             )
             .await?;
 
-            print_plan(&plan, request.execute);
+            let view = plan_view(&plan, request.execute);
 
             if !request.execute {
-                return Ok(());
+                return Ok(BurnExcessOutcome::Plan(Box::new(view)));
             }
 
             execute_plan(
@@ -331,7 +332,9 @@ pub(crate) async fn run_burn_excess<P: Provider>(
                 state.as_ref(),
                 &confirm,
             )
-            .await
+            .await?;
+
+            Ok(BurnExcessOutcome::Plan(Box::new(view)))
         }
     }
 }
@@ -348,6 +351,78 @@ struct ProvenPlan {
     underlying: UnderlyingSymbol,
     freeze_advisory: Option<&'static str>,
     resume_note: Option<&'static str>,
+}
+
+/// Serializable outcome of a burn-excess run: the structured plan or terminal
+/// report the engine used to only print. Returned to the CLI (which renders it)
+/// and the breakglass HTTP route (which serializes it into the response), so a
+/// dry-run shows exactly what would burn instead of only logging it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BurnExcessOutcome {
+    /// A proven start/resume plan (a dry-run, or the plan that was executed).
+    Plan(Box<BurnExcessPlanView>),
+    /// A stream already in a terminal state; report only.
+    Terminal(BurnExcessTerminalView),
+    /// A close of a dead intended/submitted stream.
+    Close(BurnExcessCloseView),
+}
+
+/// Serializable view of a proven [`ProvenPlan`]: the exact effect an operator
+/// reviews before committing with `execute=true`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BurnExcessPlanView {
+    pub(crate) path: BurnExcessPath,
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) bind: ExcessBurnBind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) funding_log: Option<FundingTransferId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) freeze_advisory: Option<String>,
+    /// Path B only: the issuer service must be stopped so a running transfer
+    /// poller cannot open a Redemption for the funding Transfer first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) precondition: Option<String>,
+    /// A dry-run proves and returns this plan without writing events, signing,
+    /// or recording an exclusion.
+    pub(crate) dry_run: bool,
+}
+
+/// Serializable view of a terminal [`BurnExcess`] stream for the report-only
+/// path.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum BurnExcessTerminalView {
+    Completed {
+        path: BurnExcessPath,
+        burn_tx_hash: B256,
+        block_number: u64,
+        completed_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funding_log: Option<FundingTransferId>,
+    },
+    Closed {
+        path: BurnExcessPath,
+        reason: String,
+        closed_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funding_log: Option<FundingTransferId>,
+    },
+    Other {
+        path: BurnExcessPath,
+        state: String,
+    },
+}
+
+/// Serializable view of a close plan for a dead intended/submitted stream.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BurnExcessCloseView {
+    pub(crate) path: BurnExcessPath,
+    pub(crate) state: String,
+    pub(crate) reason: String,
+    pub(crate) dry_run: bool,
 }
 
 async fn prove_plan<P: Provider>(
@@ -551,134 +626,63 @@ async fn prove_plan<P: Provider>(
     })
 }
 
-fn print_plan(plan: &ProvenPlan, execute: bool) {
-    let mode = match plan.path {
-        BurnExcessPath::Internal => "internal",
-        BurnExcessPath::External => "external",
-    };
-    let path_letter = match plan.path {
-        BurnExcessPath::Internal => "A",
-        BurnExcessPath::External => "B",
+fn plan_view(plan: &ProvenPlan, execute: bool) -> BurnExcessPlanView {
+    let precondition = match plan.path {
+        BurnExcessPath::External => Some(
+            "the issuer service must be STOPPED; a running transfer poller can \
+             open a Redemption for the funding Transfer first and steer this \
+             recovery onto the Alpaca path"
+                .to_string(),
+        ),
+        BurnExcessPath::Internal => None,
     };
 
-    match plan.path {
-        BurnExcessPath::Internal => {
-            if let Some(note) = plan.resume_note {
-                println!(
-                    "mode={mode} path={path_letter} ({note}; issuer holds exact \
-                     shares; no funding exclusion)"
-                );
-            } else {
-                println!(
-                    "mode={mode} path={path_letter} (issuer must hold exact shares; \
-                     no funding exclusion)"
-                );
-            }
-        }
-        BurnExcessPath::External => {
-            let funding = plan.funding_log_id.as_ref().map_or_else(
-                || "unknown".into(),
-                |log| format!("{:#x}", log.tx_hash),
-            );
-            if let Some(note) = plan.resume_note {
-                let log_index = plan.funding_log_id.as_ref().map_or_else(
-                    || "?".into(),
-                    |log| log.log_index.to_string(),
-                );
-                println!(
-                    "mode={mode} path={path_letter} ({note}; funding_tx_hash={funding}; \
-                     log_index={log_index})"
-                );
-            } else {
-                println!(
-                    "mode={mode} path={path_letter} (funding_tx_hash={funding}; will \
-                     exclude that Transfer log then burn)"
-                );
-            }
-        }
-    }
-
-    println!(
-        "bind: underlying={} network={} vault={:#x} issuer_request={} \
-         deposit={:#x} receipt_id={} shares={} original_recipient={:#x} \
-         issuer_wallet={:#x}",
-        plan.underlying,
-        plan.bind.network,
-        plan.bind.vault,
-        plan.bind.issuer_request_id,
-        plan.bind.deposit_tx_hash,
-        plan.bind.receipt_id,
-        plan.bind.shares,
-        plan.bind.original_recipient,
-        plan.bind.issuer_wallet,
-    );
-    if let Some(funding) = &plan.funding_log_id {
-        println!(
-            "funding_log: tx={:#x} log_index={} from={:#x} to={:#x} amount={}",
-            funding.tx_hash,
-            funding.log_index,
-            funding.from,
-            funding.to,
-            funding.amount,
-        );
-    }
-    if let Some(advisory) = plan.freeze_advisory {
-        println!("{advisory}");
-    }
-    // The exclusion write only beats the transfer poller to the funding log if
-    // the poller is not running. `redemption_exists_for_tx` re-checks right
-    // before the write, but it is a check, not a lock across processes.
-    if plan.path == BurnExcessPath::External {
-        println!(
-            "precondition: the issuer service must be STOPPED; a running \
-             transfer poller can open a Redemption for the funding Transfer \
-             first and steer this recovery onto the Alpaca path"
-        );
-    }
-    if execute {
-        println!("mode=execute (mutations will run after confirmation)");
-    } else {
-        println!("mode=dry-run (no events, no sign, no exclusion write)");
+    BurnExcessPlanView {
+        path: plan.path,
+        underlying: plan.underlying.clone(),
+        bind: plan.bind.clone(),
+        funding_log: plan.funding_log_id.clone(),
+        resume_note: plan.resume_note.map(str::to_string),
+        freeze_advisory: plan.freeze_advisory.map(str::to_string),
+        precondition,
+        dry_run: !execute,
     }
 }
 
-fn print_terminal_report(path: BurnExcessPath, state: Option<&BurnExcess>) {
+fn terminal_view(
+    path: BurnExcessPath,
+    state: Option<&BurnExcess>,
+) -> BurnExcessTerminalView {
     match state {
         Some(
-            state @ BurnExcess::Completed {
+            terminal @ BurnExcess::Completed {
                 burn_tx_hash,
                 block_number,
                 completed_at,
                 ..
             },
-        ) => {
-            println!(
-                "stream completed path={} burn_tx={burn_tx_hash:#x} \
-                 block={block_number} at={completed_at}",
-                state.path()
-            );
-            if let Some(funding) = state.funding_log_id() {
-                println!(
-                    "funding exclusion remains permanent: tx={:#x} log_index={}",
-                    funding.tx_hash, funding.log_index
-                );
+        ) => BurnExcessTerminalView::Completed {
+            path: terminal.path(),
+            burn_tx_hash: *burn_tx_hash,
+            block_number: *block_number,
+            completed_at: *completed_at,
+            funding_log: terminal.funding_log_id().cloned(),
+        },
+        Some(terminal @ BurnExcess::Closed { reason, closed_at, .. }) => {
+            BurnExcessTerminalView::Closed {
+                path: terminal.path(),
+                reason: reason.clone(),
+                closed_at: *closed_at,
+                funding_log: terminal.funding_log_id().cloned(),
             }
         }
-        Some(state @ BurnExcess::Closed { reason, closed_at, .. }) => {
-            println!(
-                "stream closed path={} reason={reason} at={closed_at}",
-                state.path()
-            );
-            if let Some(funding) = state.funding_log_id() {
-                println!(
-                    "funding exclusion remains permanent: tx={:#x} log_index={}",
-                    funding.tx_hash, funding.log_index
-                );
-            }
-        }
-        other => {
-            println!("stream terminal path={path} state={other:?}");
-        }
+        other => BurnExcessTerminalView::Other {
+            path,
+            state: other.map_or_else(
+                || "Uninitialized".to_string(),
+                |stream| stream.state_name().to_string(),
+            ),
+        },
     }
 }
 
@@ -690,7 +694,7 @@ async fn close_stream(
     reason: &str,
     execute: bool,
     confirm: &(impl Fn(&str) -> io::Result<bool> + Send + Sync),
-) -> Result<(), BurnExcessEngineError> {
+) -> Result<BurnExcessCloseView, BurnExcessEngineError> {
     let state = state.ok_or_else(|| super::BurnExcessError::InvalidState {
         expected: "FundingExcluded, Intended, or Submitted".to_string(),
         found: "Uninitialized".to_string(),
@@ -709,14 +713,13 @@ async fn close_stream(
         }
     }
 
-    println!(
-        "close plan: path={path} state={} reason={reason} \
-         (clears wallet nonce gate only; Closed is report-only for this deposit)",
-        state.state_name()
-    );
     if !execute {
-        println!("mode=dry-run (no close event)");
-        return Ok(());
+        return Ok(BurnExcessCloseView {
+            path,
+            state: state.state_name().to_string(),
+            reason: reason.to_string(),
+            dry_run: true,
+        });
     }
 
     if !confirm(&format!(
@@ -732,11 +735,14 @@ async fn close_stream(
             BurnExcessCommand::CloseExcessBurn { reason: reason.to_string() },
         )
         .await?;
-    println!(
-        "Closed excess-burn stream {aggregate_id} (wallet gate cleared; stream \
-         is report-only terminal)"
-    );
-    Ok(())
+
+    // The stream is now `Closed`; report that rather than the pre-close state.
+    Ok(BurnExcessCloseView {
+        path,
+        state: "Closed".to_string(),
+        reason: reason.to_string(),
+        dry_run: false,
+    })
 }
 
 /// Shared handles for burn-excess mutation steps (avoids long arg lists).
@@ -1829,7 +1835,7 @@ mod tests {
             .await
             .unwrap();
 
-        run_burn_excess(
+        let outcome = run_burn_excess(
             &pool,
             &service,
             &provider,
@@ -1857,6 +1863,21 @@ mod tests {
         assert!(
             store.load(&BurnExcessId::new(deposit_tx)).await.unwrap().is_none()
         );
+
+        // The deliverable: a dry-run returns the structured plan (what the
+        // breakglass response serializes) instead of only logging it.
+        let plan = match outcome {
+            BurnExcessOutcome::Plan(plan) => plan,
+            other => panic!("expected a dry-run plan, got: {other:?}"),
+        };
+        assert_eq!(plan.path, BurnExcessPath::Internal);
+        assert!(plan.dry_run);
+        assert_eq!(plan.bind.receipt_id, receipt_id);
+        assert!(plan.funding_log.is_none());
+
+        let body = serde_json::to_value(BurnExcessOutcome::Plan(plan)).unwrap();
+        assert_eq!(body["plan"]["path"], "internal");
+        assert_eq!(body["plan"]["dry_run"], true);
     }
 
     #[tokio::test]
@@ -2792,7 +2813,8 @@ mod tests {
         provider: &(impl Provider + Clone + 'static),
         issuer_wallet: Address,
         request: BurnExcessRequest,
-    ) -> tokio::task::JoinHandle<Result<(), BurnExcessEngineError>> {
+    ) -> tokio::task::JoinHandle<Result<BurnExcessOutcome, BurnExcessEngineError>>
+    {
         let pool = pool.clone();
         let mock = Arc::clone(mock);
         let provider = provider.clone();
@@ -3182,7 +3204,7 @@ mod tests {
         let store =
             seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
 
-        run_burn_excess(
+        let dry_run_outcome = run_burn_excess(
             &pool,
             &MockVaultService::new_success(),
             &offline_provider(),
@@ -3199,6 +3221,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let dry_run_close = match dry_run_outcome {
+            BurnExcessOutcome::Close(close) => close,
+            other => panic!("expected a close outcome, got: {other:?}"),
+        };
+        assert!(dry_run_close.dry_run);
+        assert_eq!(dry_run_close.state, "FundingExcluded");
 
         assert!(
             matches!(
@@ -3225,7 +3254,7 @@ mod tests {
             "an abandoned Path B recovery must hold the gate before close"
         );
 
-        run_burn_excess(
+        let execute_outcome = run_burn_excess(
             &pool,
             &MockVaultService::new_success(),
             &offline_provider(),
@@ -3242,6 +3271,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let execute_close = match execute_outcome {
+            BurnExcessOutcome::Close(close) => close,
+            other => panic!("expected a close outcome, got: {other:?}"),
+        };
+        assert!(!execute_close.dry_run);
+        assert_eq!(execute_close.state, "Closed");
 
         assert!(matches!(
             store.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
