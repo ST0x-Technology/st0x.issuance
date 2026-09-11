@@ -4730,7 +4730,14 @@ transfer poller would otherwise read as an AP redemption, so for both a dry-run
 and an execute it quiesces that network's poller (the current tick finished, no
 new one started) for the run and resumes it on every exit path; it returns 422
 when the request's `chain_id` does not match its network or no poller runs for
-that network.
+that network. Two further failures follow from the quiescence design and differ
+in what the operator does next: 503 when the poller does not confirm it parked
+within 30 seconds, meaning nothing happened (no exclusion written, nothing
+signed) and the request can simply be retried; 504 when the run exceeds 120
+seconds, meaning the poller has resumed but the outcome is unknown (the burn may
+be excluded, intended, or submitted), so the operator re-invokes the route for
+the same deposit to read the persisted stream and resume it from wherever it
+stopped.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
