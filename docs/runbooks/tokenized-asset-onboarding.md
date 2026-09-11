@@ -6,8 +6,10 @@ How a newly deployed token becomes mintable and redeemable by the bot.
 restart.** It is runtime state in the `TokenizedAsset` aggregate (SPEC
 "TokenizedAsset Aggregate"), written by one `POST /tokenized-assets` call
 against the running service; no symbol or vault address is compiled in or baked
-into `config.prod.toml`. Ship nothing; call the endpoint. The one part of
-onboarding that *is* a deploy is the optional wrapper watch — last section.
+into `config.prod.toml`. Ship nothing to this service; call the endpoint. The
+only change that *does* need a deploy and restart here is the optional wrapper
+watch (last section). That is about this service only — the prerequisites below
+are still required, and two of them are changes to other systems.
 
 This runbook covers a network that is **already configured** — the ordered
 procedure for standing up a *new* network is
@@ -58,11 +60,15 @@ an error — it emits `VaultAddressUpdated` and silently repoints the listing. A
 `404` here is the proof that this is a new listing:
 
 ```bash
-curl -sS --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' \
+curl -sS --connect-timeout 5 --max-time 10 -w '\n%{http_code}\n' \
   -H "X-API-KEY: $ISSUER_API_KEY" \
   "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING?network=$NETWORK"
-# expect 404 (200 means it is already listed — stop and compare the vault)
 ```
+
+Expect `404`. A `200` means the underlying is already listed on this network:
+the body printed above carries the registered `token` and `vault` — compare them
+against `$TOKEN` and `$VAULT` and stop. Do not "fix" a mismatch by re-POSTing
+(see below); take a mismatch to whoever owns the deploy.
 
 Then register:
 
