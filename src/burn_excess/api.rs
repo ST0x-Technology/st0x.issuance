@@ -89,8 +89,14 @@ pub(crate) struct BurnExcessResponse {
     format = "json",
     data = "<body>"
 )]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
 pub(crate) async fn burn_excess_internal_ops(
-    _auth: BreakglassOps,
+    auth: BreakglassOps,
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     vault_services: &State<NetworkVaultServices>,
