@@ -3385,8 +3385,10 @@ deterministic ordering.
 }
 ```
 
-**Response:** `201 Created` for new assets, `200 OK` if asset already exists
-(idempotent).
+**Response:** `201 Created`. Idempotent, and deliberately `201` on the repeat
+too: `Add` is accepted for an existing asset (a re-add with a different vault
+updates it, one with the same vault is a no-op), so the handler has no
+"already existed" branch to report a different status from.
 
 ```json
 {
