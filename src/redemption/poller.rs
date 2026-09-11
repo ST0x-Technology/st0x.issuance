@@ -14,6 +14,7 @@ use super::{
     IssuerRedemptionRequestId, Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
+    poller_pause::PollerPause,
     redeem_call_manager::RedeemCallManager,
     transfer::{
         RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
@@ -154,7 +155,7 @@ where
     ///
     /// On error, logs the failure and retries after `RETRY_INTERVAL`. Each
     /// vault's cursor is persisted, so no blocks are re-scanned unnecessarily.
-    pub(crate) async fn run(&self) {
+    pub(crate) async fn run(&self, mut pause: PollerPause) {
         // One-time migration from the legacy global checkpoint to per-vault
         // checkpoints. Non-fatal: without it a vault simply re-scans from
         // `backfill_start_block`, which is safe (redemption detection is
@@ -175,12 +176,14 @@ where
         // outage is indistinguishable from a single blip in the logs.
         let mut consecutive_failures = 0_usize;
         loop {
+            pause.wait_while_paused().await;
+
             match self.poll_once().await {
                 Err(error) => {
                     consecutive_failures += 1;
                     log_poll_failure(&error, consecutive_failures);
                     self.telemetry.record_transfer_poll_failure(self.network);
-                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    pause.interruptible_sleep(RETRY_INTERVAL).await;
                     continue;
                 }
                 Ok(lag_blocks) => {
@@ -190,7 +193,7 @@ where
             }
 
             consecutive_failures = 0;
-            tokio::time::sleep(POLL_INTERVAL).await;
+            pause.interruptible_sleep(POLL_INTERVAL).await;
         }
     }
 
