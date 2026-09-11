@@ -2,11 +2,12 @@
 
 How a newly deployed token becomes mintable and redeemable by the bot.
 
-**There is no code or configuration change.** A listing is runtime state in the
-`TokenizedAsset` aggregate (SPEC "TokenizedAsset Aggregate"), written by one
-`POST /tokenized-assets` call against the running service. No symbol, vault, or
-wrapper address is compiled in or baked into `config.prod.toml`. Ship nothing;
-call the endpoint.
+**The listing itself is neither a code nor a configuration change, and needs no
+restart.** It is runtime state in the `TokenizedAsset` aggregate (SPEC
+"TokenizedAsset Aggregate"), written by one `POST /tokenized-assets` call
+against the running service; no symbol or vault address is compiled in or baked
+into `config.prod.toml`. Ship nothing; call the endpoint. The one part of
+onboarding that *is* a deploy is the optional wrapper watch — last section.
 
 This runbook covers a network that is **already configured** — the ordered
 procedure for standing up a *new* network is
@@ -57,7 +58,7 @@ an error — it emits `VaultAddressUpdated` and silently repoints the listing. A
 `404` here is the proof that this is a new listing:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' \
+curl -sS --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' \
   -H "X-API-KEY: $ISSUER_API_KEY" \
   "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING?network=$NETWORK"
 # expect 404 (200 means it is already listed — stop and compare the vault)
@@ -66,7 +67,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 Then register:
 
 ```bash
-curl -sS -X POST \
+curl -sS -X POST --connect-timeout 5 --max-time 15 \
   -H "X-API-KEY: $ISSUER_API_KEY" \
   -H 'Content-Type: application/json' \
   -d "{\"underlying\":\"$UNDERLYING\",\"token\":\"$TOKEN\",\"network\":\"$NETWORK\",\"vault\":\"$VAULT\"}" \
@@ -77,10 +78,14 @@ curl -sS -X POST \
 `422` means one of: an unconfigured network, an empty or invalid symbol, or that
 vault address already serving another underlying on this network.
 
+If the POST times out rather than answering, **do not retry blind** — the
+command is persisted before the response is written, so the listing may already
+exist. Run the verification GET below and only re-POST on a `404`.
+
 ## Verify
 
 ```bash
-curl -sS -H "X-API-KEY: $ISSUER_API_KEY" \
+curl -fsS --connect-timeout 5 --max-time 10 -H "X-API-KEY: $ISSUER_API_KEY" \
   "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING?network=$NETWORK"
 # 200, and token/network/vault match exactly what was posted
 ```
@@ -101,7 +106,9 @@ job.
 The inbound wrapped-token backstop is configured separately, per deployment, by
 the `[wrapped_tokens.<network>]` tables in the TOML config
 (`config.example.toml`); it takes the `wrapper` address, not the `sft`. It is
-off for any chain with no table (startup WARN). If this deployment runs the
-watcher, add the new token's `wrapper` to that chain's table in the same change
-that ships the listing — an unwatched wrapper means a wrapped-token transfer to
-the issuer wallet is lost silently (SPEC "Per network monitoring").
+off for any chain with no table (startup WARN). Unlike the listing, this **is** a
+deploy: the tables are read once at startup and the watchers are spawned from
+that snapshot, so a wrapper added to the config takes effect only on the next
+restart. If this deployment runs the watcher, ship the new token's `wrapper` into
+that chain's table and restart — an unwatched wrapper means a wrapped-token
+transfer to the issuer wallet is lost silently (SPEC "Per network monitoring").
