@@ -11,7 +11,7 @@ use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Sqlite};
 use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -4004,16 +4004,20 @@ pub(crate) async fn aggregate_snapshot_ops(
     aggregate_type: &str,
     aggregate_id: &str,
 ) -> Result<Json<SnapshotResponse>, Status> {
-    let row = sqlx::query(
-        "
-        SELECT last_sequence, payload, timestamp, snapshot_version
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            last_sequence,
+            payload as "payload!: String",
+            timestamp,
+            snapshot_version
         FROM snapshots
         WHERE aggregate_type = ?
         AND aggregate_id = ?
-        ",
+        "#,
+        aggregate_type,
+        aggregate_id
     )
-    .bind(aggregate_type)
-    .bind(aggregate_id)
     .fetch_optional(pool.inner())
     .await
     .map_err(|error| {
@@ -4024,9 +4028,7 @@ pub(crate) async fn aggregate_snapshot_ops(
     })?
     .ok_or(Status::NotFound)?;
 
-    let payload_json: String =
-        row.try_get("payload").map_err(|error| snapshot_row_error(&error))?;
-    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+    let payload = serde_json::from_str(&row.payload).map_err(|error| {
         error!(target: "admin", aggregate_type, aggregate_id, error = %error,
             "Snapshot payload is not valid JSON"
         );
@@ -4036,22 +4038,11 @@ pub(crate) async fn aggregate_snapshot_ops(
     Ok(Json(SnapshotResponse {
         aggregate_type: aggregate_type.to_string(),
         aggregate_id: aggregate_id.to_string(),
-        last_sequence: row
-            .try_get("last_sequence")
-            .map_err(|error| snapshot_row_error(&error))?,
-        snapshot_version: row
-            .try_get("snapshot_version")
-            .map_err(|error| snapshot_row_error(&error))?,
-        timestamp: row
-            .try_get("timestamp")
-            .map_err(|error| snapshot_row_error(&error))?,
+        last_sequence: row.last_sequence,
+        snapshot_version: row.snapshot_version,
+        timestamp: row.timestamp,
         payload,
     }))
-}
-
-fn snapshot_row_error(error: &sqlx::Error) -> Status {
-    error!(target: "admin", error = %error, "Failed to decode snapshot row");
-    Status::InternalServerError
 }
 
 #[cfg(test)]
