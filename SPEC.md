@@ -1226,7 +1226,9 @@ tokenization. The aggregate id is the `AssetKey` — `{underlying}:{network}`
 (e.g. `AAPL:base`) — so the same underlying can be listed per network. See the
 [Multi-chain](#multi-chain) section for the identity model, and
 `docs/runbooks/tokenized-asset-aggregate-rekey.md` for migrating a
-pre-multichain store keyed by bare `UnderlyingSymbol`.
+pre-multichain store keyed by bare `UnderlyingSymbol`. Listing a newly deployed
+token on an already-configured chain is an ops call, not a deploy: see
+`docs/runbooks/tokenized-asset-onboarding.md`.
 
 **Aggregate State:**
 
