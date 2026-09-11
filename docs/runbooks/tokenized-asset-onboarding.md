@@ -6,11 +6,13 @@ How a newly deployed token becomes mintable and redeemable by the bot.
 restart.** It is runtime state in the `TokenizedAsset` aggregate (SPEC
 "TokenizedAsset Aggregate"), written by one `POST /tokenized-assets` call
 against the running service; no symbol or vault address is compiled in or baked
-into `config.prod.toml`. Ship nothing; call the endpoint. The one part of
-onboarding that *is* a deploy is the optional wrapper watch — last section.
+into `config.prod.toml`. Ship nothing to this service; call the endpoint. The
+only change that _does_ need a deploy and restart here is the optional wrapper
+watch (last section). That is about this service only — the prerequisites below
+are still required, and two of them are changes to other systems.
 
 This runbook covers a network that is **already configured** — the ordered
-procedure for standing up a *new* network is
+procedure for standing up a _new_ network is
 `docs/runbooks/multichain-staging-validation.md`, and the orchestrator cutover
 for an already-listed asset is `docs/runbooks/orchestrator-onboarding.md`.
 
@@ -24,12 +26,12 @@ for an already-listed asset is `docs/runbooks/orchestrator-onboarding.md`.
 2. **The bot wallet can move the vault.** The vault's authorizer must grant the
    bot wallet `DEPOSIT` and `WITHDRAW` (a deploy-side grant).
 3. **The Turnkey policy lists the vault.** Mint is
-   `multicall([deposit, transfer])` and redemption is `multicall([redeem × N])`
-   (`src/vault/service.rs`), and the policies that match that outer selector
-   carry an explicit per-chain receipt-vault list. A vault missing from that
-   list is refused at signing with 403 on every mint and burn — see
-   ST0x-Technology/turnkey-policy-spec#32. Get the policy change applied and
-   verified **before** the first mint.
+   `multicall([deposit, transfer])` and redemption is
+   `multicall([redeem × N] + optional dust transfer)` (`src/vault/service.rs`),
+   and the policies that match that outer selector carry an explicit per-chain
+   receipt-vault list. A vault missing from that list is refused at signing with
+   403 on every mint and burn — see ST0x-Technology/turnkey-policy-spec#32. Get
+   the policy change applied and verified **before** the first mint.
 4. **The network is configured on this deployment.** Registration is rejected
    with 422 before any event is written when the network has no
    `CHAIN_<NETWORK>_*` group, because an asset on an unconfigured network aborts
@@ -53,27 +55,38 @@ export NETWORK=base
 export VAULT=0x…                   # launches.json `sft` for this chain
 ```
 
-**Pre-check first.** Re-adding an existing asset with a *different* vault is not
-an error — it emits `VaultAddressUpdated` and silently repoints the listing. A
-`404` here is the proof that this is a new listing:
+**Pre-check first.** Re-adding an existing asset with a _different_ vault is not
+an error — it emits `VaultAddressUpdated` and silently repoints the listing.
+That update path is outside this new-listing runbook. A `404` here is the proof
+that this is a new listing:
 
 ```bash
-curl -sS --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' \
+curl -sS --connect-timeout 5 --max-time 10 -w '\n%{http_code}\n' \
   -H "X-API-KEY: $ISSUER_API_KEY" \
   "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING?network=$NETWORK"
-# expect 404 (200 means it is already listed — stop and compare the vault)
 ```
+
+Proceed only when the command succeeds and prints an exact `404`. A `200` means
+the underlying is already listed on this network: the body printed above carries
+the registered `token`, `network`, and `vault` — compare the token and network
+exactly, compare the vault after normalizing both addresses to lowercase, and
+stop. For any other status, a curl failure, or a missing status, stop and
+investigate. Do not use the update path to resolve a mismatch; take it to
+whoever owns the deploy.
 
 Then register:
 
 ```bash
-curl -sS -X POST --connect-timeout 5 --max-time 15 \
+curl -sS -X POST --connect-timeout 5 --max-time 15 -w '\n%{http_code}\n' \
   -H "X-API-KEY: $ISSUER_API_KEY" \
   -H 'Content-Type: application/json' \
   -d "{\"underlying\":\"$UNDERLYING\",\"token\":\"$TOKEN\",\"network\":\"$NETWORK\",\"vault\":\"$VAULT\"}" \
   "$ISSUER_BASE_URL/tokenized-assets"
-# expect 201 and {"underlying":"BIRD"}
 ```
+
+Continue only when the command succeeds and prints `201` after
+`{"underlying":"BIRD"}`. For any other status or a curl failure, stop and
+investigate.
 
 `422` means one of: an unconfigured network, an empty or invalid symbol, or that
 vault address already serving another underlying on this network.
@@ -85,30 +98,36 @@ exist. Run the verification GET below and only re-POST on a `404`.
 ## Verify
 
 ```bash
-curl -fsS --connect-timeout 5 --max-time 10 -H "X-API-KEY: $ISSUER_API_KEY" \
+curl -sS --connect-timeout 5 --max-time 10 -w '\n%{http_code}\n' \
+  -H "X-API-KEY: $ISSUER_API_KEY" \
   "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING?network=$NETWORK"
-# 200, and token/network/vault match exactly what was posted
 ```
+
+For normal verification, continue only when the command succeeds and prints an
+exact `200`. Require exact token and network matches. Normalize the returned
+vault and `$VAULT` to lowercase before comparing them; address casing is not
+significant. During timeout recovery, re-POST only when this command succeeds
+and prints an exact `404`. For any other status or a curl failure, stop and
+investigate without retrying.
 
 From an Alpaca-whitelisted source IP, `GET /tokenized-assets` must now carry a
 row for `(underlying, token)` with the network in `networks[]`.
 
 **No restart is required on an already-running chain.** The transfer poller
-re-reads the enabled-asset set every pass
-(`list_enabled_assets`, `src/redemption/poller.rs`) and the periodic receipt
-backfill re-reads it every tick (`src/lib.rs`), so the new vault is picked up
-within one poll interval. A restart is only needed when the listing is the first
-one on a newly configured network, which is the multichain-validation runbook's
-job.
+re-reads the enabled-asset set every pass (`list_enabled_assets`,
+`src/redemption/poller.rs`) and the periodic receipt backfill re-reads it every
+tick (`src/lib.rs`), so the new vault is picked up within one poll interval. A
+restart is only needed when the listing is the first one on a newly configured
+network, which is the multichain-validation runbook's job.
 
 ## Optional: watch the wrapper
 
 The inbound wrapped-token backstop is configured separately, per deployment, by
 the `[wrapped_tokens.<network>]` tables in the TOML config
 (`config.example.toml`); it takes the `wrapper` address, not the `sft`. It is
-off for any chain with no table (startup WARN). Unlike the listing, this **is** a
-deploy: the tables are read once at startup and the watchers are spawned from
+off for any chain with no table (startup WARN). Unlike the listing, this **is**
+a deploy: the tables are read once at startup and the watchers are spawned from
 that snapshot, so a wrapper added to the config takes effect only on the next
-restart. If this deployment runs the watcher, ship the new token's `wrapper` into
-that chain's table and restart — an unwatched wrapper means a wrapped-token
+restart. If this deployment runs the watcher, ship the new token's `wrapper`
+into that chain's table and restart — an unwatched wrapper means a wrapped-token
 transfer to the issuer wallet is lost silently (SPEC "Per network monitoring").
