@@ -249,7 +249,7 @@ Bug fixes and improvements that don't fit into the original phases.
       [RAI-2289](https://linear.app/makeitrain/issue/RAI-2289).
   - **PR:** [#396](https://github.com/ST0x-Technology/st0x.issuance/pull/396)
   - **PR:** [#397](https://github.com/ST0x-Technology/st0x.issuance/pull/397) -
-    Robinhood orchestrator address and all 41 wrapped-token addresses in the
+    Robinhood orchestrator address and all 56 wrapped-token addresses in the
     prod/staging deploy configs, plus the vault-registration runbook. Requires
     the `CHAIN_ROBINHOOD_*` deployment secrets to roll first.
 
