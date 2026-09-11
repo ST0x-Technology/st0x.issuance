@@ -1356,15 +1356,17 @@ async fn a_debug_token_onboards_an_account_and_lists_an_asset() {
         .header(rocket::http::ContentType::JSON)
         .header(debug_token())
         .body(format!(
-            r#"{{"underlying":"AAPL","token":"tAAPL","network":"base","vault":"{vault}"}}"#
+            r#"{{"underlying":"MSFT","token":"tMSFT","network":"base","vault":"{vault}"}}"#
         ))
         .dispatch()
         .await;
     assert_eq!(added.status(), Status::Created);
 
-    // The listing persisted and the detail contract carries every field.
+    // MSFT is not among the seeded assets, so this is a new listing rather
+    // than a vault update of an existing one; the detail read proves it
+    // persisted and carries every field.
     let detail = client
-        .get("/ops/debug/tokenized-assets/AAPL?network=base")
+        .get("/ops/debug/tokenized-assets/MSFT?network=base")
         .header(debug_token())
         .dispatch()
         .await;
@@ -1373,8 +1375,8 @@ async fn a_debug_token_onboards_an_account_and_lists_an_asset() {
         .into_json::<TokenizedAssetDetailResponse>()
         .await
         .expect("detail response body");
-    assert_eq!(detail.underlying, UnderlyingSymbol::new("AAPL").unwrap());
-    assert_eq!(detail.token, TokenSymbol::new("tAAPL"));
+    assert_eq!(detail.underlying, UnderlyingSymbol::new("MSFT").unwrap());
+    assert_eq!(detail.token, TokenSymbol::new("tMSFT"));
     assert_eq!(detail.network, Network::Base);
     assert_eq!(detail.vault, vault);
     assert_eq!(detail.status, TokenizedAssetStatus::Enabled);
