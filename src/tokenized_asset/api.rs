@@ -18,7 +18,7 @@ use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol, VAULT_CLAIM_CONFLICT_TOKEN, view::TokenizedAssetView,
 };
-use crate::auth::{InternalAuth, IssuerAuth};
+use crate::auth::{DebugOps, InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
 use crate::config::{Config, VaultModeKind};
 use crate::underlying::load_freeze_status;
@@ -107,12 +107,38 @@ fn merge_token_listing(
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets/<underlying>?<network>")]
 pub(crate) async fn get_tokenized_asset(
     underlying: &str,
     network: Option<&str>,
     _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    get_tokenized_asset_logic(underlying, network, pool).await
+}
+
+/// Debug-tier operator route mirroring [`get_tokenized_asset`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[get("/ops/debug/tokenized-assets/<underlying>?<network>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn get_tokenized_asset_ops(
+    underlying: &str,
+    network: Option<&str>,
+    auth: DebugOps,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    get_tokenized_asset_logic(underlying, network, pool).await
+}
+
+#[tracing::instrument(skip(pool))]
+async fn get_tokenized_asset_logic(
+    underlying: &str,
+    network: Option<&str>,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
     let Some(network) = network else {
@@ -256,15 +282,43 @@ pub(crate) async fn list_tokenized_assets(
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool, configured_networks), fields(
+#[post("/tokenized-assets", format = "json", data = "<request>")]
+pub(crate) async fn add_tokenized_asset(
+    _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<TokenizedAsset>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    configured_networks: &rocket::State<ConfiguredNetworks>,
+    request: Json<AddTokenizedAssetRequest>,
+) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
+    add_tokenized_asset_logic(store, pool, configured_networks, request).await
+}
+
+/// Debug-tier operator route mirroring [`add_tokenized_asset`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/tokenized-assets", format = "json", data = "<request>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn add_tokenized_asset_ops(
+    auth: DebugOps,
+    store: &rocket::State<Arc<Store<TokenizedAsset>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    configured_networks: &rocket::State<ConfiguredNetworks>,
+    request: Json<AddTokenizedAssetRequest>,
+) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
+    add_tokenized_asset_logic(store, pool, configured_networks, request).await
+}
+
+#[tracing::instrument(skip(store, pool, configured_networks), fields(
     underlying = %request.underlying,
     token = %request.token,
     network = %request.network,
     vault = ?request.vault
 ))]
-#[post("/tokenized-assets", format = "json", data = "<request>")]
-pub(crate) async fn add_tokenized_asset(
-    _auth: InternalAuth,
+async fn add_tokenized_asset_logic(
     store: &rocket::State<Arc<Store<TokenizedAsset>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     configured_networks: &rocket::State<ConfiguredNetworks>,

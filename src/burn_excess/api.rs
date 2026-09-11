@@ -28,7 +28,7 @@ use super::engine::{
 };
 use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
-use crate::config::{Config, configured_rpc_url, wss_to_http};
+use crate::config::{Config, wss_to_http};
 use crate::mint::IssuerMintRequestId;
 use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
@@ -140,9 +140,14 @@ pub(crate) struct BurnExcessResponse {
 
 /// Runs the engine request for both routes through the running service's
 /// per-network vault service, so the burn takes the same wallet lock and nonce
-/// manager as every live mint and redemption burn, with a read provider on the
-/// network's configured RPC, and maps its outcome or error onto the HTTP
-/// response. `path` names the route for the failure log.
+/// manager as every live mint and redemption burn, and maps its outcome or
+/// error onto the HTTP response. `path` names the route for the failure log.
+///
+/// The read provider's RPC endpoint comes from the service's startup-verified
+/// chain configuration, never from a request-time environment read, so a
+/// deployment that supplies its RPC as a flag rather than an env var serves
+/// these routes too. That configuration was RPC-verified when the service
+/// started, so no per-request chain-id round trip is needed either.
 async fn run_burn_excess_ops(
     pool: &Pool<Sqlite>,
     config: &Config,
@@ -159,11 +164,17 @@ async fn run_burn_excess_ops(
         error!(target: "admin", %error, path, "burn-excess signer address unavailable");
         Status::InternalServerError
     })?;
-    let rpc_url = configured_rpc_url(request.network).map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess RPC unavailable");
-        Status::InternalServerError
-    })?;
-    let http_url = wss_to_http(&rpc_url).map_err(|error| {
+    let chain = config
+        .chains
+        .iter()
+        .find(|candidate| candidate.network == request.network)
+        .ok_or_else(|| {
+            error!(target: "admin", network = %request.network, path,
+                "No chain configuration for network"
+            );
+            Status::InternalServerError
+        })?;
+    let http_url = wss_to_http(&chain.rpc_url).map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess RPC unavailable");
         Status::InternalServerError
     })?;
