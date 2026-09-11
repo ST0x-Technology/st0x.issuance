@@ -1,10 +1,88 @@
 # Production TOML configuration, baked into the st0x-issuance systemd unit as
 # `CONFIG=<nix store path>` (see nix/upgradeable-services.nix).
 #
-# Deliberately dark: no [orchestrator] section and no [assets.<SYM>] overrides
-# means every asset runs vault-direct. See config.example.toml for the full
-# schema and the per-asset orchestrator rollout knobs.
+# Deliberately dark: `default_vault_mode = "vault_direct"` and no
+# [assets.<SYM>] overrides means every asset runs vault-direct on every chain.
+# See config.example.toml for the full schema and the per-asset orchestrator
+# rollout knobs.
 #
 # Parsing is strict — unknown keys and invalid vault_mode strings are startup
 # errors, and any asset resolving to orchestrator mode while
 # [orchestrator.addresses] is missing or malformed is a startup error.
+
+[orchestrator]
+# Restates the implicit default so the [orchestrator] section below cannot be
+# misread as an enablement: nothing here moves an asset off the vault-direct
+# mint/burn path.
+default_vault_mode = "vault_direct"
+
+# ST0xOrchestrator, one deployment per chain at the same pinned address. Only
+# Robinhood Chain (4663) is recorded so far; the other chains' entries land
+# with their own cutovers.
+#
+# Verified live on Robinhood: eip712Domain() answers name "ST0xOrchestrator",
+# version "1", chainId 4663, verifyingContract equal to this address, and the
+# deployed code hashes equal to Base's instance.
+#
+# Recording the address stays inert until an asset resolves to orchestrator
+# mode (`VaultModeConfig::mode_for` is the only reader), so this is the
+# onboarding tooling's source of truth ahead of the first cutover, not a live
+# dependency of the mint/burn path.
+[orchestrator.addresses]
+robinhood = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
+
+# Wrapped-token (ERC-4626 wrapper) contracts watched for inbound transfers to
+# the issuer wallet, which cannot be redeemed and so are alerted on instead
+# (SPEC.md "Per network monitoring"). Observe-only: watching a wrapper changes
+# nothing about how the underlying is minted or burned.
+#
+# Every address below was read on-chain against
+# https://rpc.mainnet.chain.robinhood.com and returned
+# `symbol() == "wt<UNDERLYING>"`.
+#
+# ORDERING CONSTRAINT: startup rejects a [wrapped_tokens.<network>] table for a
+# chain with no chain configuration, so this table is only valid once the
+# CHAIN_ROBINHOOD_* group is in the deployment secrets. Roll the secrets first;
+# see docs/runbooks/robinhood-vault-registration.md.
+[wrapped_tokens.robinhood]
+AAPL = "0x1B2A2C8c3621642c64cf1245016488fA0f76da78"
+AMAT = "0x44DE27A07B33CD708A49fa79629fAC1df03C56d3"
+AMD = "0xb904955bC71FE6c8e6aBE676ACca640Abc771622"
+AMZN = "0x4404E24629a33b85FC1E2D7beA673Cd283054594"
+ARKK = "0x5D80cAcaABCe0ab4C1541493ceB25D97970D250a"
+ASML = "0xb8605a64B57E7A8631c87F3187c783493231bdD9"
+AVGO = "0xCee4981Fc273C105e2b9eA1fD19031Aa9a6cf113"
+BABA = "0xAbb2641950C7dE9D3ec9AA05668e112E1DB701F6"
+BMNR = "0x35e1D3d3Fa6D43438641d2b8f63cBf84C84435c0"
+CEG = "0xc842fC56Dd39B62357d027a0F3B3266353cac991"
+COIN = "0xa3d1be1Ab9F4E72309Cb9Bfeaa14aFe46D012e36"
+CRCL = "0x25Ab6926BA171e1618b214cda774104B2f6ec884"
+DRAM = "0x7e1263f1e1EeF7eCe7fA7e568842f213a6CEa956"
+FTF = "0x710A14a41a8Ea2e25376124C48bf9cAdc1E69be5"
+GOOGL = "0x3209384FB852E7D0510aFa896236f3f866c3876f"
+HOOD = "0xca678d0d69F9E815d1A4f4dF05C904b2DDE017f8"
+IAU = "0x33f3a6401ce08f705eE4B8a03fc37F298395b720"
+IBHG = "0x03bBb4148ba82d63993D32fB8E6Eff8Cc51A56f2"
+INTC = "0x4E3600f48C61eF4513c72923ab50851bD546FFA9"
+LLY = "0x908266E3C3bFBb603d2EdF295deBE37C88985239"
+LRCX = "0xD1c1D974837d3f79A92E14048993AD28a6228831"
+MSFT = "0x8DdAEC53399E5324BbC60a368eA853c713629B1d"
+MSTR = "0xd9fE7488B86D3aEaf457b181C744BD1A5a120833"
+MU = "0xF01523C4ca52dF88f07938D4Fb32FCBb6b159867"
+NVDA = "0xa3947d2A74F5a3A7135A9d0c66B28fC7315f30Da"
+ORCL = "0xd702276d50fdCf58b0E41b3f1f9651faBC1141f4"
+PPLT = "0xCbD06C802BFe993de94d0d635AB5B1fa764519D8"
+PTY = "0x04eE4ED5FF6643eA955503f966012b684f479966"
+QQQM = "0x63fDfe9cf53cB1FD5d98fE7537B881B86aE04A31"
+RKLB = "0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3"
+SGOV = "0x06b17E431a957Dd8522Bf106653BAc6B39F437E6"
+SIVR = "0x2B310218001C38cf82816c2098AedDCE22D3Df27"
+SKHY = "0xD13bBc46C4582246656868d32227A99A538D97E1"
+SMCI = "0xa6890e89D99Fd4F275c016d89A28ec24A428846D"
+SPCX = "0xC32C8166164E2cA18BB5fbf3E82CB776943d97FB"
+SPYM = "0x7dF3ad1ECC10DBF0296D05F91a697e4A059771c2"
+TQQQ = "0xc80730995D2C53114BAaFd2736E02f4E274D5B83"
+TSLA = "0x550499e28A3CE8cb1dB3e3Db23fDD0357eD3ff48"
+TSM = "0x050dB961D36DC2047c779798694AeE455CD40BE6"
+TTWO = "0x1D6F0763e58FA6d472d470Eaaef0a4C08080d208"
+VWO = "0x01EE8b582147D1Aa8A8f2Adc2EBB91fA60082AB0"

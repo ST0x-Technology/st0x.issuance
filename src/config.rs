@@ -2155,29 +2155,98 @@ mod tests {
         assert_eq!(cfg.orchestrator_address_for(Network::Base), None);
     }
 
+    /// The `ST0xOrchestrator` instance address the deploy configs pin for
+    /// Robinhood Chain — the same instance address on every chain. Pinned
+    /// here because the onboarding tooling reads it from the config file,
+    /// and a silent drift between the file and the approved contract would
+    /// only surface at an asset's cutover.
+    const ROBINHOOD_ORCHESTRATOR: &str =
+        "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2";
+
+    /// Robinhood Chain's full tokenized-asset listing: one ERC-4626 wrapper
+    /// per underlying, all 41 of which the deploy configs must watch. A
+    /// dropped row is a wrapper whose inbound transfers go unalerted, which
+    /// is exactly the gap `[wrapped_tokens]` exists to close.
+    const ROBINHOOD_WRAPPER_COUNT: usize = 41;
+
     // Pins the committed per-environment deploy configs (baked into the
     // systemd unit as CONFIG=<store path>, see nix/upgradeable-services.nix)
     // to the strict parser: they must always parse, and while the rollout is
     // dark they must resolve every asset to vault-direct.
     #[test]
     fn deploy_config_files_parse_and_stay_dark() {
-        for (name, content) in [
-            ("config.prod.toml", include_str!("../config.prod.toml")),
-            ("config.staging.toml", include_str!("../config.staging.toml")),
-        ] {
+        let load = |name: &str, content: &str| {
             let toml_file: TomlFile = toml::from_str(content)
                 .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
-
-            let cfg = resolve_vault_modes(&toml_file)
+            let modes = resolve_vault_modes(&toml_file)
                 .unwrap_or_else(|error| panic!("{name} must resolve: {error}"));
+            let wrapped =
+                resolve_wrapped_tokens(&toml_file).unwrap_or_else(|error| {
+                    panic!("{name} wrappers must resolve: {error}")
+                });
+            (modes, wrapped)
+        };
 
+        let prod =
+            load("config.prod.toml", include_str!("../config.prod.toml"));
+        let staging =
+            load("config.staging.toml", include_str!("../config.staging.toml"));
+
+        for (name, (cfg, wrapped)) in
+            [("config.prod.toml", &prod), ("config.staging.toml", &staging)]
+        {
             assert_eq!(
                 cfg.default,
                 VaultModeKind::VaultDirect,
                 "{name} not dark"
             );
             assert!(cfg.per_asset.is_empty(), "{name} has asset overrides");
+
+            // Recording the address neither enables the orchestrator nor
+            // requires it to exist on-chain, but it must name the instance
+            // the onboarding tooling will approve roles on.
+            assert_eq!(
+                cfg.orchestrator_address_for(Network::Robinhood),
+                Some(ROBINHOOD_ORCHESTRATOR.parse().unwrap()),
+                "{name} must pin the Robinhood orchestrator address"
+            );
+            for network in [
+                Network::Base,
+                Network::Ethereum,
+                Network::HyperEvm,
+                Network::BnbSmartChain,
+            ] {
+                assert_eq!(
+                    cfg.orchestrator_address_for(network),
+                    None,
+                    "{name} carries an orchestrator address for {network}, \
+                     which has not cut over"
+                );
+            }
+
+            // A table for a chain with no `CHAIN_<NETWORK>_*` group aborts
+            // startup (`WrappedTokensForUnconfiguredNetwork`), so the deploy
+            // configs must not reach past Robinhood.
+            assert_eq!(
+                wrapped.networks().collect::<Vec<_>>(),
+                vec![Network::Robinhood],
+                "{name} must watch wrappers on Robinhood alone"
+            );
+            assert_eq!(
+                wrapped.watched_on(Network::Robinhood).len(),
+                ROBINHOOD_WRAPPER_COUNT,
+                "{name} must list every Robinhood wrapper"
+            );
         }
+
+        // Both environments issue against the same Robinhood mainnet
+        // contracts, so a wrapper present in one file and not the other is a
+        // transcription slip rather than an environment difference.
+        assert_eq!(
+            prod.1.watched_on(Network::Robinhood),
+            staging.1.watched_on(Network::Robinhood),
+            "prod and staging disagree on the Robinhood wrappers"
+        );
     }
 
     // Pins config.example.toml to the strict parser so the committed example
