@@ -7,12 +7,12 @@ use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
-use event_sorcery::StoreBuilder;
+use event_sorcery::{Store, StoreBuilder};
 use httpmock::prelude::*;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
-use rocket::http::Status;
+use rocket::http::{ContentType, Method, Status};
 use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -22,11 +22,18 @@ use tracing::Level;
 use tracing_test::traced_test;
 
 use super::iap::ASSERTION_HEADER;
-use super::{BreakglassOps, CapitalOps, DebugOps, OpsApiVerifiers, ReadOps};
+use super::{
+    BreakglassOps, CapitalOps, DebugOps, FailedAuthRateLimiter,
+    OpsApiVerifiers, ReadOps,
+};
+use crate::account::Account;
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
 use crate::alpaca::mock::MockAlpacaService;
-use crate::config::OpsApiConfig;
+use crate::chain::ConfiguredNetworks;
+use crate::config::{Config, OpsApiConfig};
+use crate::mint::Mint;
+use crate::network_telemetry::NetworkTelemetry;
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptInventory, ReceiptService,
 };
@@ -36,7 +43,7 @@ use crate::redemption::burn_manager::{
 use crate::redemption::{
     IssuerRedemptionRequestId, Redemption, RedemptionServices,
 };
-use crate::test_utils::{logs_contain_at, setup_test_rocket};
+use crate::test_utils::{logs_contain_at, setup_test_rocket, test_config};
 use crate::tokenized_asset::schedule::FreezeScheduler;
 use crate::tokenized_asset::{
     AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -414,16 +421,123 @@ async fn a_debug_token_cannot_burn_excess() {
     ));
 }
 
+/// One representative route per tier. Each request matches its route's method
+/// and format but carries no assertion, so 401 versus 404 is decided by
+/// whether the tier is mounted and gated, nothing else.
+const TIER_ROUTES: [(Method, &str); 4] = [
+    (Method::Get, "/ops/read/stuck"),
+    (Method::Post, "/ops/debug/recover/redemption/some-id"),
+    (Method::Post, "/ops/capital/freeze/AAPL"),
+    (Method::Post, "/ops/breakglass/close/mint/some-id"),
+];
+
+async fn probe_tier_route(
+    client: &Client,
+    method: Method,
+    path: &str,
+) -> Status {
+    client.req(method, path).header(ContentType::JSON).dispatch().await.status()
+}
+
+/// The application rocket built by the same `build_rocket` production uses,
+/// with `config` deciding whether the `/ops/*` routes are mounted. Every
+/// managed state the ops routes declare is supplied (Rocket refuses to ignite
+/// a route whose `State` is unmanaged); the gate refuses before any handler
+/// runs, so none of it is exercised.
+async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
+    let base = setup_test_rocket().await.expect("test rocket builds");
+    let pool = base.state::<Pool<Sqlite>>().expect("pool managed").clone();
+    let apalis_pool =
+        base.state::<ApalisSqlitePool>().expect("apalis pool managed").clone();
+    let vault_services = base
+        .state::<NetworkVaultServices>()
+        .expect("vault services managed")
+        .clone();
+    let account_store =
+        base.state::<Arc<Store<Account>>>().expect("account store").clone();
+    let tokenized_asset_store = base
+        .state::<Arc<Store<TokenizedAsset>>>()
+        .expect("tokenized asset store")
+        .clone();
+    let mint_store =
+        base.state::<Arc<Store<Mint>>>().expect("mint store").clone();
+    let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
+        .build(RedemptionServices::new(vault_services.clone()))
+        .await
+        .expect("redemption store builds");
+    let receipt_inventory = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+        .build(())
+        .await
+        .expect("receipt inventory store builds");
+    let (underlying_store, _projection) =
+        StoreBuilder::<Underlying>::new(pool.clone())
+            .build(())
+            .await
+            .expect("underlying store builds");
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+
+    crate::build_rocket(crate::RocketState {
+        ops_verifiers: crate::build_ops_verifiers(&config)
+            .expect("JWKS client builds"),
+        freeze_scheduler: FreezeScheduler::new(&apalis_pool, pool.clone()),
+        rate_limiter: FailedAuthRateLimiter::new().expect("rate limiter"),
+        config,
+        pool,
+        apalis_pool,
+        account_store,
+        tokenized_asset_store,
+        mint_store,
+        redemption_store,
+        alpaca_service: Arc::new(MockAlpacaService::new_success()),
+        burn_recovery: Arc::new(UnreachableBurnRecovery),
+        vault_services,
+        configured_networks: ConfiguredNetworks::from_iter([Network::Base]),
+        receipts: Arc::new(CqrsReceiptService::new(receipt_inventory)),
+        network_telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
+        underlying_store,
+        background_tasks: crate::BackgroundTasks {
+            shutdown,
+            handles: Vec::new(),
+        },
+    })
+}
+
+/// With audiences configured the application mounts every tier under its
+/// role prefix and gates it: a bare request reaches the guard and is refused
+/// with 401, not 404. This drives the real mounting branch in `build_rocket`,
+/// so a tier dropped from the route table or moved off its prefix fails here.
+#[tokio::test]
+async fn role_prefixes_are_mounted_and_gated_with_ops_api_config() {
+    let config = Config {
+        ops_api: Some(ops_config()),
+        ..test_config().expect("test config builds")
+    };
+    let client = Client::tracked(app_rocket(config).await).await.unwrap();
+
+    for (method, path) in TIER_ROUTES {
+        assert_eq!(
+            probe_tier_route(&client, method, path).await,
+            Status::Unauthorized,
+            "{path} must be mounted and gated"
+        );
+    }
+}
+
 /// Without configured audiences the `/ops/*` routes are not mounted at all: a
 /// deployment with no load balancer serves 404, never a 401 that suggests the
 /// path exists and wants credentials.
 #[tokio::test]
 async fn role_prefixes_are_absent_without_ops_api_config() {
-    let rocket = setup_test_rocket().await.expect("test rocket builds");
-    let client = Client::tracked(rocket).await.unwrap();
+    let config = test_config().expect("test config builds");
+    let client = Client::tracked(app_rocket(config).await).await.unwrap();
 
-    let response = client.get("/ops/read/stuck").dispatch().await;
-    assert_eq!(response.status(), Status::NotFound);
+    for (method, path) in TIER_ROUTES {
+        assert_eq!(
+            probe_tier_route(&client, method, path).await,
+            Status::NotFound,
+            "{path} must be absent"
+        );
+    }
 }
 
 async fn migrated_pool() -> Pool<Sqlite> {
