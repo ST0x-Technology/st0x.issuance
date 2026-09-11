@@ -257,3 +257,56 @@ fn partial_ethereum_environment_group_fails_closed() {
         command_stderr(&output)
     );
 }
+
+/// The committed deploy configs, at the binary boundary the deployment unit
+/// gates a restart on. `[wrapped_tokens.robinhood]` makes the Robinhood chain
+/// group a hard startup requirement, so these two tests pin both sides of
+/// that: valid with the group, rejected without it.
+const DEPLOY_CONFIGS: [&str; 2] = ["config.prod.toml", "config.staging.toml"];
+
+fn robinhood_command(config: &str) -> Command {
+    let mut command = legacy_base_command();
+    command
+        .args(["--config", config])
+        .env("CHAIN_ROBINHOOD_RPC_URL", "http://127.0.0.1:10545")
+        .env("CHAIN_ROBINHOOD_CHAIN_ID", "4663")
+        .env("CHAIN_ROBINHOOD_BACKFILL_START_BLOCK", "0");
+
+    command
+}
+
+#[test]
+fn deploy_configs_validate_with_the_robinhood_chain_group() {
+    for config in DEPLOY_CONFIGS {
+        let output = robinhood_command(config).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "{config}: {}",
+            command_stderr(&output)
+        );
+    }
+}
+
+/// Rolling the config out ahead of the `CHAIN_ROBINHOOD_*` deployment secrets
+/// must abort the start rather than leave the listed wrappers unwatched,
+/// which is the failure the watcher exists to prevent.
+#[test]
+fn deploy_configs_are_rejected_without_the_robinhood_chain_group() {
+    for config in DEPLOY_CONFIGS {
+        let output =
+            legacy_base_command().args(["--config", config]).output().unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{config} must not validate without CHAIN_ROBINHOOD_*"
+        );
+        let stderr = command_stderr(&output);
+        assert!(
+            stderr.contains("[wrapped_tokens.robinhood] is configured")
+                && stderr.contains("add the CHAIN_ROBINHOOD_* group"),
+            "{config}: the error must name the missing chain group, got: \
+             {stderr}"
+        );
+    }
+}
