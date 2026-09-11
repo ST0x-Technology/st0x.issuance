@@ -2164,10 +2164,17 @@ mod tests {
         "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2";
 
     /// Robinhood Chain's full tokenized-asset listing: one ERC-4626 wrapper
-    /// per underlying, all 41 of which the deploy configs must watch. A
+    /// per underlying, all 56 of which the deploy configs must watch. A
     /// dropped row is a wrapper whose inbound transfers go unalerted, which
     /// is exactly the gap `[wrapped_tokens]` exists to close.
-    const ROBINHOOD_WRAPPER_COUNT: usize = 41;
+    const ROBINHOOD_WRAPPER_COUNT: usize = 56;
+
+    /// An EU listing whose underlying contains a dot. TOML bare keys cannot,
+    /// so the deploy configs quote these keys; unquoted, `AIR.PA = "0x..."`
+    /// parses as a nested table and the address fails to deserialize. The dot
+    /// is part of the on-chain symbol, so it must survive into the parsed
+    /// config rather than being split or normalized away.
+    const DOTTED_UNDERLYING: &str = "AIR.PA";
 
     // Pins the committed per-environment deploy configs (baked into the
     // systemd unit as CONFIG=<store path>, see nix/upgradeable-services.nix)
@@ -2232,10 +2239,20 @@ mod tests {
                 vec![Network::Robinhood],
                 "{name} must watch wrappers on Robinhood alone"
             );
+            let watched = wrapped.watched_on(Network::Robinhood);
             assert_eq!(
-                wrapped.watched_on(Network::Robinhood).len(),
+                watched.len(),
                 ROBINHOOD_WRAPPER_COUNT,
                 "{name} must list every Robinhood wrapper"
+            );
+
+            // Guards the quoted-key requirement: a bare dotted key would
+            // either fail to parse or land as a nested table, so seeing the
+            // symbol intact here is what proves the quoting is correct.
+            let dotted = UnderlyingSymbol::new(DOTTED_UNDERLYING).unwrap();
+            assert!(
+                watched.iter().any(|entry| entry.underlying == dotted),
+                "{name} must keep {DOTTED_UNDERLYING} intact as one symbol"
             );
         }
 
