@@ -102,18 +102,19 @@ fn merge_token_listing(
         (status = 200, description = "Asset detail including freeze status",
             body = TokenizedAssetDetailResponse),
         (status = 404, description = "Unknown asset"),
-        (status = 422, description = "Missing or unsupported `network` query parameter"),
+        (status = 422, description = "Empty/invalid `underlying` symbol, or missing/unsupported `network` query parameter"),
         (status = 500, description = "View load or deserialization failure")
     ),
     security(("internal_api_key" = []))
 )]
 #[get("/tokenized-assets/<underlying>?<network>")]
 pub(crate) async fn get_tokenized_asset(
-    underlying: UnderlyingParam,
+    underlying: Result<UnderlyingParam, UnderlyingSymbolError>,
     network: Option<&str>,
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    let underlying = underlying.map_err(|_| Status::UnprocessableEntity)?;
     get_tokenized_asset_logic(underlying.0, network, pool).await
 }
 
@@ -127,11 +128,12 @@ pub(crate) async fn get_tokenized_asset(
     fields(subject = %auth.0)
 )]
 pub(crate) async fn get_tokenized_asset_ops(
-    underlying: UnderlyingParam,
+    underlying: Result<UnderlyingParam, UnderlyingSymbolError>,
     network: Option<&str>,
     auth: DebugOps,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    let underlying = underlying.map_err(|_| Status::UnprocessableEntity)?;
     get_tokenized_asset_logic(underlying.0, network, pool).await
 }
 
@@ -1609,6 +1611,37 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
         let body: Value = response.into_json().await.expect("valid JSON");
         assert_eq!(body["underlying"], "AAPL");
+    }
+
+    /// A whitespace-only underlying fails `UnderlyingParam` parsing. The detail
+    /// route must surface that as 422 (matching the `/status` route and the
+    /// missing-network case), not forward it to a 404.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_detail_invalid_symbol_returns_422() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset]);
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/%20?network=base")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Invalid underlying symbol"]
+        ));
     }
 
     /// Under a mixed config the status endpoint reports each asset's own
