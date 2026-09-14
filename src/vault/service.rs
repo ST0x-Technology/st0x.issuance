@@ -569,6 +569,8 @@ const fn is_definitive_broadcast_rejection(code: i64) -> bool {
 
 #[async_trait]
 impl VaultService for RealBlockchainService {
+    /// Builds and signs the vault-direct mint multicall with a limit derived
+    /// from its deposit and transfer legs, without RPC gas estimation.
     async fn prepare_mint_tx(
         &self,
         vault: Address,
@@ -1144,6 +1146,8 @@ impl VaultService for RealBlockchainService {
         Ok(status)
     }
 
+    /// Re-signs a persisted burn with a gas limit recalculated from vault
+    /// multicall calldata, preserving the original limit for other calls.
     async fn prepare_replacement_burn_tx(
         &self,
         owner: Address,
@@ -2153,6 +2157,8 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verifies vault-direct mint preparation produces a persisted signed
+    /// transaction with the two-leg mint gas limit.
     async fn test_submit_and_confirm_mint_success() {
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
@@ -3807,6 +3813,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that calculated burn limits retain headroom for observed
+    /// receipt counts.
     fn burn_gas_limit_covers_observed_burns() {
         // A 4-receipt burn was observed at ~421k gas used; keep real headroom.
         assert!(burn_gas_limit(4) >= 630_000);
@@ -3816,6 +3824,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies multicall calldata yields its leg count while other calldata
+    /// is rejected.
     fn burn_call_count_decodes_multicall_and_rejects_other_input() {
         let input = OffchainAssetReceiptVault::multicallCall {
             data: vec![Bytes::from_static(&[0xab]); 16],
@@ -3826,6 +3836,8 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verifies a prepared burn uses the gas limit for all redeem and dust
+    /// transfer legs.
     async fn prepare_tx_gas_limit_scales_with_leg_count() {
         // 16 receipts + 1 dust transfer = 17 legs: exactly the shape the
         // old fixed 1M cap starved (2026-09-14 COIN burn).
@@ -3868,6 +3880,8 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    /// Verifies a replacement recalculates gas from persisted multicall
+    /// calldata.
     async fn replacement_recomputes_gas_from_persisted_multicall() {
         // Persisted bytes carry a starved 100k limit (the pre-fix shape):
         // the replacement must resize from the calldata's leg count
@@ -3906,6 +3920,8 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    /// Verifies a replacement preserves the signed limit for non-multicall
+    /// calldata.
     async fn replacement_keeps_envelope_gas_for_non_multicall_input() {
         let persisted = persisted_burn_tx(7);
         let owner = persisted.signer_for_test();
