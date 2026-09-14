@@ -4713,6 +4713,21 @@ Tiers and routes:
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
+The `burn-excess/internal` route responds with `{ executed, outcome }`:
+`executed` echoes whether a mutation was requested, and `outcome` is a tagged
+`plan`, `terminal`, or `close` view. A dry-run (`execute=false`) returns a
+`plan` so an operator reviews the exact effect over HTTP before committing with
+`execute=true` rather than reading the process log. In `outcome.plan`, `path` is
+`internal` or `external` and `underlying` is the equity symbol, so an operator
+can identify the target burn; the `bind` object carries the receipt id, shares,
+vault, original recipient, and issuer wallet; and `dry_run` is `true` when
+`execute=false`, marking the request non-mutating (no events, no signing, no
+exclusion write), and `false` for an executed plan. The optional `funding_log`,
+`resume_note`, `freeze_advisory`, and `precondition` fields appear only when
+they apply (an internal plan omits `funding_log`) and are omitted rather than
+sent as null. An already-terminal stream returns a `terminal` view and a close
+returns a `close` view.
+
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
 validated at startup as all-or-none, non-blank, unpadded, and pairwise distinct.
