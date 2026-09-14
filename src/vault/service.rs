@@ -381,8 +381,16 @@ impl RealBlockchainService {
                 chosen
             }
             Err(error) => {
+                // Distinguish "the simulation says this burn reverts" from
+                // transport noise for the operator reading the log; both
+                // fall back to the formula on purpose (see above).
+                let estimate_reverted = error
+                    .as_error_resp()
+                    .and_then(ErrorPayload::as_revert_data)
+                    .is_some();
                 warn!(target: "vault",
                     floor,
+                    estimate_reverted,
                     error = %error,
                     "Burn gas estimate against latest failed; using the formula limit"
                 );
