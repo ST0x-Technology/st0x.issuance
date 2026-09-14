@@ -446,7 +446,7 @@ impl SendableTxWithHash {
         destination: Address,
         input: Bytes,
     ) -> Self {
-        Self::valid_for_test_with_chain_id(nonce, destination, input, 1)
+        Self::valid_for_test_with(nonce, destination, input, 1, 100_000)
     }
 
     #[cfg(test)]
@@ -456,11 +456,32 @@ impl SendableTxWithHash {
         input: Bytes,
         chain_id: u64,
     ) -> Self {
+        Self::valid_for_test_with(nonce, destination, input, chain_id, 100_000)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test_with_gas(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+        gas_limit: u64,
+    ) -> Self {
+        Self::valid_for_test_with(nonce, destination, input, 1, gas_limit)
+    }
+
+    #[cfg(test)]
+    fn valid_for_test_with(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+        chain_id: u64,
+        gas_limit: u64,
+    ) -> Self {
         let transaction = TxLegacy {
             chain_id: Some(chain_id),
             nonce,
             gas_price: 1,
-            gas_limit: 100_000,
+            gas_limit,
             to: TxKind::Call(destination),
             value: U256::ZERO,
             input,

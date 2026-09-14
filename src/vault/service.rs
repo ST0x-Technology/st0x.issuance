@@ -1153,15 +1153,16 @@ impl VaultService for RealBlockchainService {
         // Computed limit instead of re-estimating against `pending` (see
         // `burn_gas_limit`): recount the legs from the persisted calldata so
         // a replacement signed after a limit-sizing fix benefits from it
-        // instead of inheriting a starved limit forever. Non-multicall
-        // calldata (an orchestrator `burnCall`) may carry a raw original
-        // estimate, and the orchestrator's internal receipt walk can change
-        // before a dead transaction is replaced, so honor a larger signed
-        // limit but never go below the proven floor.
-        let replacement_gas = burn_call_count(envelope.input()).map_or_else(
-            || envelope.gas_limit().max(BURN_GAS_FLOOR),
-            burn_gas_limit,
-        );
+        // instead of inheriting a starved limit forever. The signed limit
+        // is a lower bound throughout: a replacement may only ever raise a
+        // limit, never shrink one that was already known to work - per-leg
+        // sizing under-counts a `redeem` carrying large `receiptInformation`
+        // bytes, an orchestrator `burnCall` walks receipts internally, and
+        // either may have been signed via a higher estimate before the
+        // fixed limits existed. Never below `BURN_GAS_FLOOR` in any case.
+        let computed = burn_call_count(envelope.input())
+            .map_or(BURN_GAS_FLOOR, burn_gas_limit);
+        let replacement_gas = envelope.gas_limit().max(computed);
         let mut transaction = TransactionRequest::from_transaction(envelope);
         transaction.from = Some(owner);
         let pending =
@@ -3965,6 +3966,51 @@ mod tests {
         let envelope =
             replacement.validate().expect("replacement should decode");
         assert_eq!(envelope.gas_limit(), BURN_GAS_FLOOR);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies a replacement never shrinks a signed multicall limit that
+    /// exceeds the computed one.
+    async fn replacement_keeps_larger_signed_multicall_limit() {
+        // A burn with two legs computes to the 1M floor, but this one was
+        // signed at 5M (a higher estimate from before fixed limits, or
+        // large `receiptInformation` bytes the leg count cannot see): the
+        // replacement must keep the limit that was already known to work.
+        let input = Bytes::from(
+            OffchainAssetReceiptVault::multicallCall {
+                data: vec![Bytes::from_static(&[0xab]); 2],
+            }
+            .abi_encode(),
+        );
+        let persisted = SendableTxWithHash::valid_for_test_with_gas(
+            7,
+            test_vault_address(),
+            input,
+            5_000_000,
+        );
+        let owner = persisted.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_success(&11u64);
+        asserter.push_success(&12u64);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&1u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, 7);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should prepare");
+
+        let envelope =
+            replacement.validate().expect("replacement should decode");
+        assert_eq!(envelope.gas_limit(), 5_000_000);
     }
 
     fn test_orchestrator_address() -> Address {
