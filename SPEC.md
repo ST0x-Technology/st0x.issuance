@@ -569,9 +569,12 @@ time. The 1:1 index outliving its metadata row counts as a conflict, not as
 "nothing tracked" — that is the one shape in which this gate could fail open.
 There is no admin health endpoint listing historical duplicates yet — operators
 read the event (or the ERROR log) plus on-chain Deposit history, then remediate
-excess supply with `issuer burn-excess` (never by forcing another mint). Do not
-manually force a second deposit when confirm is uncertain; leave `TxSubmitted`
-and wait for re-observe or restart.
+excess supply through the internal burn-excess path — the offline
+`issuer burn-excess internal` CLI or the live
+`/ops/breakglass/burn-excess/internal` route, neither of which touches the
+redemption transfer poller (only the external path quiesces it) — never by
+forcing another mint. Do not manually force a second deposit when confirm is
+uncertain; leave `TxSubmitted` and wait for re-observe or restart.
 
 **Vault-direct vs orchestrator:** vault-direct mints confirm via vault `Deposit`
 logs and receipt inventory. Orchestrator mints (when enabled) use the
@@ -4738,13 +4741,15 @@ read as an AP redemption, so for both a dry-run and an execute it quiesces that
 network's poller (the current tick finished, no new one started) for the run and
 resumes it on every exit path; it returns 422 when the request's `chain_id` does
 not match its network or no poller runs for that network. Two further failures
-follow from the quiescence design and differ in what the operator does next: 503
-when the poller does not confirm it parked within 30 seconds, meaning nothing
-happened (no exclusion written, nothing signed) and the request can simply be
-retried; 504 when the run exceeds 120 seconds, meaning the poller has resumed
-but the outcome is unknown (the burn may be excluded, intended, or submitted),
-so the operator re-invokes the route for the same deposit to read the persisted
-stream and resume it from wherever it stopped.
+follow from the quiescence design and differ in what the operator does next. 503
+when the poller does not confirm it parked within 30 seconds: nothing happened
+(no exclusion written, nothing signed) and the request can simply be retried.
+504 when the run exceeds 120 seconds, where the safe next step depends on the
+mode: a dry-run wrote nothing either — no events, exclusion, or signed intent —
+so it is likewise safe to retry, while an execute leaves the outcome unknown
+(the burn may be excluded, intended, or submitted), so the operator re-invokes
+the route for the same deposit to read the persisted stream and resume it from
+wherever it stopped.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),

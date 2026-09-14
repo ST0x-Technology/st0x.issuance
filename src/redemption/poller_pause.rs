@@ -84,7 +84,8 @@ impl PollerPauseControl {
         let permit = Arc::clone(&self.serialize).lock_owned().await;
 
         let mut parked = self.parked.clone();
-        let confirmed = tokio::time::timeout(POLLER_PARK_TIMEOUT, async {
+        let pause = self.pause.clone();
+        let confirmed = tokio::time::timeout(POLLER_PARK_TIMEOUT, async move {
             // The previous guard's resume may not have reached the poller
             // yet, so `parked` can still hold that request's stale `true`.
             // Wait for the poller to report itself running before asking
@@ -96,22 +97,18 @@ impl PollerPauseControl {
                 parked.changed().await.map_err(|_| ())?;
             }
 
-            let _ = self.pause.send(true);
+            pause.send(true).map_err(|_| ())?;
+            let guard = PollerPauseGuard { pause, _permit: permit };
             while !*parked.borrow_and_update() {
                 parked.changed().await.map_err(|_| ())?;
             }
-            Ok::<(), ()>(())
+            Ok::<PollerPauseGuard, ()>(guard)
         })
         .await;
 
-        if matches!(confirmed, Ok(Ok(()))) {
-            Ok(PollerPauseGuard { pause: self.pause.clone(), _permit: permit })
-        } else {
-            // Not confirmed parked: undo the pause request so the poller is not
-            // left stopped without a guard, then report failure. The permit
-            // drops here, freeing the next pauser.
-            let _ = self.pause.send(false);
-            Err(PollerNotParked)
+        match confirmed {
+            Ok(Ok(guard)) => Ok(guard),
+            _ => Err(PollerNotParked),
         }
     }
 
@@ -270,6 +267,34 @@ mod tests {
         // parked; the wait must elapse rather than block forever.
         let (control, _pause) = poller_pause();
         assert!(control.pause().await.is_err());
+    }
+
+    /// Cancelling a pause after its request is sent must withdraw that request,
+    /// or the poller would park forever without a guard that can resume it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_pause_while_waiting_for_park_resumes_the_poller() {
+        let (control, mut pause) = poller_pause();
+        {
+            let pause_request = control.pause();
+            tokio::pin!(pause_request);
+            tokio::select! {
+                changed = pause.pause.changed() => changed.unwrap(),
+                result = &mut pause_request => panic!(
+                    "pause unexpectedly completed before cancellation: {}",
+                    result.is_ok()
+                ),
+            }
+            assert!(
+                *pause.pause.borrow_and_update(),
+                "pause must be requested"
+            );
+        }
+
+        pause.pause.changed().await.unwrap();
+        assert!(
+            !*pause.pause.borrow_and_update(),
+            "cancelling pause must withdraw the request"
+        );
     }
 
     /// Pausers serialize: while one guard is held a second pause cannot acquire;

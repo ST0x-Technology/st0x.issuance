@@ -753,13 +753,12 @@ async fn external_burn_resumes_the_poller_after_an_error() {
 
     // The well-formed body ran the handler, which paused the poller then
     // errored in the engine; the guard must resume the poller on that error
-    // path just as on success. The exact status matters: a broad `>= 400`
-    // would also accept a 503 pause-acquisition failure, where no guard ever
-    // exists. The test config carries no RPC, so the engine fails at provider
-    // setup before any mint lookup (a missing-mint 404 needs a live RPC), and
-    // that non-engine error maps to the handler's 500 fallback - which unlike
-    // 503/504 can only be reached once the pause succeeded and the engine ran.
-    assert_eq!(response.status(), Status::InternalServerError);
+    // path just as on success. The engine's exact error depends on the
+    // environment-configured RPC, but 503 and 504 are reserved for pause and
+    // timeout failures that do not prove this path reached the engine.
+    assert!(response.status().code >= 400);
+    assert_ne!(response.status(), Status::ServiceUnavailable);
+    assert_ne!(response.status(), Status::GatewayTimeout);
 
     // The poller writes `parked` only on a real park: the handler must have
     // actually quiesced the poller before erroring, or "resumes" below proves
