@@ -92,22 +92,16 @@ pub(crate) struct BurnExcessCommon {
 }
 
 impl BurnExcessCommon {
-    /// Validates the network/chain-id pairing and builds the engine request. A
-    /// mismatch is refused with 422 before any poller pause or signing, so a
-    /// malformed request never stalls redemption detection.
+    /// Builds the engine request. The operator-supplied chain id is validated
+    /// against the network's configured chain entry in `run_burn_excess_ops`,
+    /// where that entry is resolved; this method cannot see the config, so it
+    /// is infallible.
     fn into_request(
         self,
         mode: BurnExcessMode,
         funding_tx_hash: Option<B256>,
-    ) -> Result<BurnExcessRequest, Status> {
-        if self.chain_id != self.network.chain_id() {
-            warn!(target: "admin", network = %self.network, chain_id = self.chain_id,
-                "burn-excess chain_id does not match network"
-            );
-            return Err(Status::UnprocessableEntity);
-        }
-
-        Ok(BurnExcessRequest {
+    ) -> BurnExcessRequest {
+        BurnExcessRequest {
             mode,
             issuer_request_id: self.issuer_request_id,
             deposit_tx_hash: self.deposit_tx_hash,
@@ -120,7 +114,7 @@ impl BurnExcessCommon {
             chain_id: self.chain_id,
             execute: self.execute,
             close: self.close,
-        })
+        }
     }
 }
 
@@ -159,15 +153,8 @@ async fn run_burn_excess_ops(
     request: BurnExcessRequest,
     path: &'static str,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let vault_service =
-        vault_services.service(request.network).map_err(|error| {
-            warn!(target: "admin", %error, path, "burn-excess refused");
-            Status::UnprocessableEntity
-        })?;
-    let issuer_wallet = config.signer.address().map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess signer address unavailable");
-        Status::InternalServerError
-    })?;
+    // Resolve the configured chain first: a network this deployment does not
+    // run is a deploy-time 500, never masked by the vault-service 422 below.
     let chain = config
         .chains
         .iter()
@@ -178,18 +165,26 @@ async fn run_burn_excess_ops(
             );
             Status::InternalServerError
         })?;
-    // `into_request` proved `request.chain_id == network.chain_id()`, but the
-    // selected config entry carries its own `chain_id`, and the legacy Base
-    // path does not reject a network/chain-id mismatch at load — `build_chain_
-    // runtime` only checks the RPC reports `chain.chain_id`. Refuse before
-    // signing so a mislabelled endpoint cannot serve a burn on the wrong chain.
-    if chain.chain_id != request.network.chain_id() {
-        error!(target: "admin", network = %request.network, path,
-            configured = chain.chain_id, expected = request.network.chain_id(),
-            "burn-excess chain configuration has the wrong chain id"
+    // Validate the operator-supplied chain id against the configured entry,
+    // not the canonical `network.chain_id()`: a legacy flat-Base deployment
+    // legitimately runs a non-canonical id (a local Anvil), so the request must
+    // agree with the chain this service is actually configured for.
+    if request.chain_id != chain.chain_id {
+        warn!(target: "admin", network = %request.network, path,
+            chain_id = request.chain_id, configured = chain.chain_id,
+            "burn-excess chain_id does not match the configured chain"
         );
-        return Err(Status::InternalServerError);
+        return Err(Status::UnprocessableEntity);
     }
+    let vault_service =
+        vault_services.service(request.network).map_err(|error| {
+            warn!(target: "admin", %error, path, "burn-excess refused");
+            Status::UnprocessableEntity
+        })?;
+    let issuer_wallet = config.signer.address().map_err(|error| {
+        error!(target: "admin", %error, path, "burn-excess signer address unavailable");
+        Status::InternalServerError
+    })?;
     let http_url = wss_to_http(&chain.rpc_url).map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess RPC unavailable");
         Status::InternalServerError
@@ -254,10 +249,8 @@ pub(crate) async fn burn_excess_internal_ops(
     vault_services: &State<NetworkVaultServices>,
     body: Json<BurnExcessInternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let request = body
-        .into_inner()
-        .common
-        .into_request(BurnExcessMode::Internal, None)?;
+    let request =
+        body.into_inner().common.into_request(BurnExcessMode::Internal, None);
     run_burn_excess_ops(
         pool.inner(),
         config.inner(),
@@ -309,7 +302,7 @@ pub(crate) async fn burn_excess_external_ops(
     let funding_tx_hash = body.funding_tx_hash;
     let request = body
         .common
-        .into_request(BurnExcessMode::External, Some(funding_tx_hash))?;
+        .into_request(BurnExcessMode::External, Some(funding_tx_hash));
 
     let Some(control) = poller_pauses.control(network) else {
         warn!(target: "admin", network = %network,
