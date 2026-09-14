@@ -569,9 +569,12 @@ time. The 1:1 index outliving its metadata row counts as a conflict, not as
 "nothing tracked" — that is the one shape in which this gate could fail open.
 There is no admin health endpoint listing historical duplicates yet — operators
 read the event (or the ERROR log) plus on-chain Deposit history, then remediate
-excess supply with `issuer burn-excess` (never by forcing another mint). Do not
-manually force a second deposit when confirm is uncertain; leave `TxSubmitted`
-and wait for re-observe or restart.
+excess supply through the internal burn-excess path — the offline
+`issuer burn-excess internal` CLI or the live
+`/ops/breakglass/burn-excess/internal` route, neither of which touches the
+redemption transfer poller (only the external path quiesces it) — never by
+forcing another mint. Do not manually force a second deposit when confirm is
+uncertain; leave `TxSubmitted` and wait for re-observe or restart.
 
 **Vault-direct vs orchestrator:** vault-direct mints confirm via vault `Deposit`
 logs and receipt inventory. Orchestrator mints (when enabled) use the
@@ -1550,13 +1553,16 @@ operator confirm prompt blocks for an unbounded time, so balances proven at plan
 time are re-read immediately before `prepare_burn_tx` signs. Deposit and funding
 proofs are mined history and are not re-read.
 
-**The issuer service must be stopped for Path B.** `FundingAlreadyRedeemed` is
+**The poller must be quiesced for Path B.** `FundingAlreadyRedeemed` is
 re-checked immediately before the exclusion write, but that is a check, not a
 cross-process lock: a running transfer poller can open a `Redemption` for the
 funding Transfer first and steer incident remediation onto the ordinary Alpaca
-path. Poller quiescence is therefore an operator precondition, in the same
-family as the `migrate-receipts` sequence, and the Path B plan output states it
-before the confirmation prompt.
+path. The offline `issuer burn-excess external` CLI meets this by running with
+the whole issuer service (and poller) stopped, in the same family as the
+`migrate-receipts` sequence, and the Path B plan output states the precondition
+before the confirmation prompt. The `POST /ops/breakglass/burn-excess/external`
+route instead pauses the network's poller for the run and resumes it on every
+exit path, so it needs no service stop.
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -4708,15 +4714,16 @@ Tiers and routes:
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
 - **breakglass** (`/ops/breakglass/*`): `force-complete/redemption/<id>`,
-  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`.
+  `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
+  `burn-excess/external`.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
-The `burn-excess/internal` route responds with `{ executed, outcome }`:
-`executed` echoes whether a mutation was requested, and `outcome` is a tagged
-`plan`, `terminal`, or `close` view. A dry-run (`execute=false`) returns a
-`plan` so an operator reviews the exact effect over HTTP before committing with
+Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
+echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
+`terminal`, or `close` view. A dry-run (`execute=false`) returns a `plan` so an
+operator reviews the exact effect over HTTP before committing with
 `execute=true` rather than reading the process log. In `outcome.plan`, `path` is
 `internal` or `external` and `underlying` is the equity symbol, so an operator
 can identify the target burn; the `bind` object carries the receipt id, shares,
@@ -4724,9 +4731,23 @@ vault, original recipient, and issuer wallet; and `dry_run` is `true` when
 `execute=false`, marking the request non-mutating (no events, no signing, no
 exclusion write), and `false` for an executed plan. The optional `funding_log`,
 `resume_note`, `freeze_advisory`, and `precondition` fields appear only when
-they apply (an internal plan omits `funding_log`) and are omitted rather than
-sent as null. An already-terminal stream returns a `terminal` view and a close
-returns a `close` view.
+they apply (an internal plan omits `funding_log`; an external plan includes it)
+and are omitted rather than sent as null. An already-terminal stream returns a
+`terminal` view and a close returns a `close` view. `burn-excess/external`
+records a funding-Transfer exclusion the live redemption transfer poller would
+otherwise read as an AP redemption, so for both a dry-run and an execute it
+quiesces that network's poller (the current tick finished, no new one started)
+for the run and resumes it on every exit path; it returns 422 when the request's
+`chain_id` does not match its network or no poller runs for that network. Two
+further failures follow from the quiescence design and differ in what the
+operator does next. 503 when the poller does not confirm it parked within 30
+seconds: nothing happened (no exclusion written, nothing signed) and the request
+can simply be retried. 504 when the run exceeds 120 seconds, where the safe next
+step depends on the mode: a dry-run wrote nothing either — no events, exclusion,
+or signed intent — so it is likewise safe to retry, while an execute leaves the
+outcome unknown (the burn may be excluded, intended, or submitted), so the
+operator re-invokes the route for the same deposit to read the persisted stream
+and resume it from wherever it stopped.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
@@ -4746,8 +4767,8 @@ stale Google key is still Google's, and a refresh prompted by an unrecognized
 key id is throttled to one outbound fetch per minute per tier. Only when the
 endpoint is unreachable and no usable key is retained does that tier's
 verification fail with a retryable 503, so a transient JWKS outage never becomes
-a wrong-audience or forged-token acceptance. `burn-excess external`,
-`move-receipts`, and `confirm-custody` stay offline `issuer` CLI verbs.
+a wrong-audience or forged-token acceptance. `move-receipts` and
+`confirm-custody` stay offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 
