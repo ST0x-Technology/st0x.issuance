@@ -267,6 +267,12 @@ const BURN_GAS_PER_CALL: u64 = 120_000;
 /// charges gas used, not the limit).
 const BURN_GAS_FLOOR: u64 = 1_000_000;
 
+/// Bound on the best-effort `eth_estimateGas` in burn sizing. The
+/// production HTTP transport has no request timeout and burn preparation
+/// sits on the signing path, so a hung estimate must fall back to the
+/// formula instead of blocking every later signature.
+const BURN_GAS_ESTIMATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Gas limit for a burn multicall with `call_count` legs, computed from
 /// the transaction's own shape instead of estimating (same reason as
 /// `MINT_GAS_LIMIT`: the provider default estimates against `pending`
@@ -342,8 +348,12 @@ impl RealBlockchainService {
     /// limits were introduced for. `latest` has no such self conflict.
     /// Any estimate failure falls back to `floor` alone, so preparing a
     /// burn never depends on the estimate answering; the estimate can
-    /// only ever raise the limit. Logs floor, estimate and the chosen
-    /// limit so the constants can be retuned from data.
+    /// only ever raise the limit. The await is bounded by
+    /// [`BURN_GAS_ESTIMATE_TIMEOUT`]: the production HTTP transport has
+    /// no request timeout and burn preparation sits on the signing path,
+    /// so a hung estimate must degrade to the formula, not block. Logs
+    /// floor, estimate and the chosen limit so the constants can be
+    /// retuned from data.
     async fn sized_burn_gas(
         &self,
         tx: &TransactionRequest,
@@ -362,13 +372,15 @@ impl RealBlockchainService {
         estimate_tx.max_priority_fee_per_gas = None;
         estimate_tx.max_fee_per_blob_gas = None;
         estimate_tx.nonce = None;
-        match self
-            .provider
-            .estimate_gas(estimate_tx)
-            .block(BlockNumberOrTag::Latest.into())
-            .await
-        {
-            Ok(estimate) => {
+        let estimate = tokio::time::timeout(
+            BURN_GAS_ESTIMATE_TIMEOUT,
+            self.provider
+                .estimate_gas(estimate_tx)
+                .block(BlockNumberOrTag::Latest.into()),
+        )
+        .await;
+        match estimate {
+            Ok(Ok(estimate)) => {
                 let padded = estimate.saturating_mul(13) / 10;
                 let chosen = floor.max(padded);
                 info!(target: "vault",
@@ -380,7 +392,7 @@ impl RealBlockchainService {
                 );
                 chosen
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 // Distinguish "the simulation says this burn reverts" from
                 // transport noise for the operator reading the log; both
                 // fall back to the formula on purpose (see above).
@@ -393,6 +405,14 @@ impl RealBlockchainService {
                     estimate_reverted,
                     error = %error,
                     "Burn gas estimate against latest failed; using the formula limit"
+                );
+                floor
+            }
+            Err(_elapsed) => {
+                warn!(target: "vault",
+                    floor,
+                    timeout_secs = BURN_GAS_ESTIMATE_TIMEOUT.as_secs(),
+                    "Burn gas estimate against latest timed out; using the formula limit"
                 );
                 floor
             }
@@ -2105,6 +2125,56 @@ mod tests {
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
         RealBlockchainService::new(provider, nonce_manager)
+    }
+
+    #[tokio::test(start_paused = true)]
+    /// Verifies a hung estimate transport falls back to the formula floor
+    /// instead of blocking burn preparation on the unbounded HTTP client.
+    async fn sized_burn_gas_times_out_to_floor_on_pending_transport() {
+        use tokio::io::AsyncReadExt;
+
+        // An HTTP server that accepts, reads the request, and never
+        // responds - the paused clock auto-advances past
+        // BURN_GAS_ESTIMATE_TIMEOUT while the response stays pending.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let nonce_manager = ResyncNonceManager::default();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .filler(NonceFiller::new(nonce_manager.clone()))
+            .filler(ChainIdFiller::default())
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+                    .expect("test private key should be valid"),
+            ))
+            .connect_http(format!("http://{addr}").parse().unwrap());
+        let service = RealBlockchainService::new(provider, nonce_manager);
+
+        let gas = service
+            .sized_burn_gas(
+                &TransactionRequest::default(),
+                BURN_GAS_FLOOR,
+                Address::repeat_byte(1),
+            )
+            .await;
+
+        assert_eq!(gas, BURN_GAS_FLOOR);
     }
 
     async fn sign_test_transaction(
