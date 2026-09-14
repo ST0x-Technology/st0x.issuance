@@ -310,6 +310,50 @@ async fn a_read_tier_assertion_cannot_reach_the_debug_tier() {
     assert_eq!(response.status(), Status::Unauthorized);
 }
 
+/// Aggregate snapshots can contain prepared transaction bytes and
+/// authorization nonces, so the diagnostic is debug-tier rather than a
+/// general read-tier route.
+#[traced_test]
+#[tokio::test]
+async fn aggregate_snapshots_require_the_debug_tier() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let rocket = setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .mount("/", rocket::routes![crate::admin::aggregate_snapshot_ops]);
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let read = client
+        .get("/ops/debug/snapshots/Mint/some-id")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, READ_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(read.status(), Status::Unauthorized);
+
+    let debug = client
+        .get("/ops/debug/snapshots/Mint/some-id")
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, DEBUG_AUDIENCE),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(debug.status(), Status::NotFound);
+
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+}
+
 /// The real read- and debug-tier handlers, mounted on the full app state, are
 /// refused without an IAP assertion: the gate is on the production routes, not
 /// only on the probes.
@@ -374,7 +418,7 @@ async fn real_ops_routes_require_an_iap_assertion() {
     assert_eq!(approve.status(), Status::Unauthorized);
 
     let snapshot =
-        client.get("/ops/read/snapshots/Mint/some-id").dispatch().await;
+        client.get("/ops/debug/snapshots/Mint/some-id").dispatch().await;
     assert_eq!(snapshot.status(), Status::Unauthorized);
 
     assert!(logs_contain_at!(

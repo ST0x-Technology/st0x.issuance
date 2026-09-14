@@ -1304,7 +1304,7 @@ pub(crate) async fn preflight_assets(
 /// meant; disagreement means the vault address, the inventory key, or the
 /// endpoint is wrong — and a deterministic deployment can put the same vault
 /// address on both chains, so reaching the contract proves nothing.
-pub(crate) async fn verified_chain_id(
+async fn verified_chain_id(
     rpc_url: &Url,
     expected_chain_id: u64,
 ) -> anyhow::Result<u64> {

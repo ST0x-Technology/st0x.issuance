@@ -4700,10 +4700,10 @@ verify on another.
 Tiers and routes:
 
 - **read** (`/ops/read/*`): `stuck`, `orchestrator-health`,
-  `status/<underlying>`, `orchestrator-preflight/<network>`,
-  `snapshots/<aggregate_type>/<aggregate_id>`.
+  `status/<underlying>`, `orchestrator-preflight/<network>`.
 - **debug** (`/ops/debug/*`): `recover/redemption/<id>`, `reprocess/mint/<id>`,
-  `orchestrator-verify-signing/<network>/<underlying>`.
+  `orchestrator-verify-signing/<network>/<underlying>`,
+  `snapshots/<aggregate_type>/<aggregate_id>`.
 - **capital** (`/ops/capital/*`): `freeze/<underlying>`,
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
@@ -4723,15 +4723,19 @@ implies the path exists and wants credentials).
 The IAP layer is a second gate. It refuses a request that reached the VM from
 inside the VPC without passing IAP, rather than trusting the network; it does
 not itself decide who may do what, which is group membership evaluated by IAP
-against each backend's IAM policy. Verification depends on Google's JWKS: the
-app caches the key set and keeps verifying with the retained keys (a stale set
-included) through a fetch outage, since a stale Google key is still Google's,
-and a refresh prompted by an unrecognized key id is throttled to one outbound
-fetch per minute. Only when the endpoint is unreachable and no usable key is
-retained does verification fail with a retryable 503, so a transient JWKS outage
-never becomes a wrong-audience or forged-token acceptance.
-`burn-excess external`, `move-receipts`, and `confirm-custody` stay offline
-`issuer` CLI verbs.
+against each backend's IAM policy. Verification depends on Google's JWKS. The
+four per-tier verifiers share one HTTP connection pool but each caches its own
+audience-scoped key set and keeps its own refresh floor; a verifier keeps
+serving its retained keys (a stale set included) through a fetch outage, since a
+stale Google key is still Google's, and a refresh prompted by an unrecognized
+key id is throttled to one outbound fetch per minute per tier. Verification
+fails with a retryable 503 when the endpoint is unreachable and no usable key is
+retained. It also returns 503 when another request holds the refresh slot inside
+that throttle interval and the retained set does not contain the token's key id,
+including during a cold-cache request or key rotation. These failures never
+become a wrong-audience or forged-token acceptance. `burn-excess
+external`,
+`move-receipts`, and `confirm-custody` stay offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 

@@ -4036,7 +4036,7 @@ pub(crate) async fn unfreeze_underlying_ops(
     }))
 }
 
-/// Cached snapshot state of one aggregate, for the read-tier database
+/// Cached snapshot state of one aggregate, for the debug-tier database
 /// diagnostics. The snapshot is the framework's performance cache at
 /// `last_sequence`; it can lag the event log if events were appended without a
 /// re-snapshot, and is rebuilt from events after a schema change (see SPEC).
@@ -4050,12 +4050,12 @@ pub(crate) struct SnapshotResponse {
     payload: serde_json::Value,
 }
 
-/// Read-tier database diagnostic: the cached snapshot for one aggregate. After
+/// Debug-tier database diagnostic: the cached snapshot for one aggregate. After
 /// SSH removal this is how an operator inspects an aggregate's stored state; a
 /// 404 means no snapshot is cached (not that the aggregate has no events).
-#[get("/ops/read/snapshots/<aggregate_type>/<aggregate_id>")]
+#[get("/ops/debug/snapshots/<aggregate_type>/<aggregate_id>")]
 pub(crate) async fn aggregate_snapshot_ops(
-    _auth: ReadOps,
+    _auth: DebugOps,
     pool: &rocket::State<Pool<Sqlite>>,
     aggregate_type: &str,
     aggregate_id: &str,
