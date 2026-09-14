@@ -1535,6 +1535,9 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::ContradictoryDeathSignals { .. }
         | VaultError::BroadcastHashMismatch { .. } => true,
         VaultError::InvalidReceipt
+        // Prepare-time refusal (the burn cannot fit a block); nothing was
+        // broadcast, so there is no node-side uncertainty to preserve.
+        | VaultError::BurnExceedsBlockGasLimit { .. }
         | VaultError::MissingBlockNumber { .. }
         | VaultError::EventNotFound { .. }
         | VaultError::Reverted { .. }
@@ -1580,6 +1583,9 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         | VaultError::InvalidReceipt
         | VaultError::MissingBlockNumber { .. } => true,
         VaultError::EventNotFound { .. }
+        // Burn-prepare-only variant, unreachable on the mint confirm
+        // paths; definitive by construction.
+        | VaultError::BurnExceedsBlockGasLimit { .. }
         | VaultError::Reverted { .. }
         | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }

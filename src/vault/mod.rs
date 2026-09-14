@@ -989,6 +989,15 @@ pub(crate) enum ReceiptEncodeError {
 /// Errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultError {
+    /// The burn's estimated gas exceeds the latest block gas limit: no
+    /// limit we could sign makes it mineable, so preparation fails
+    /// instead of persisting a transaction that can never be included
+    /// (the burn needs batching).
+    #[error(
+        "burn needs {required} gas but the latest block limit is \
+         {block_limit}; the burn cannot fit a block and needs batching"
+    )]
+    BurnExceedsBlockGasLimit { required: u64, block_limit: u64 },
     /// Transaction receipt is missing required data
     #[error("Invalid receipt")]
     InvalidReceipt,

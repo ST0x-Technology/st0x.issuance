@@ -351,15 +351,23 @@ impl RealBlockchainService {
     /// only ever raise the limit. The await is bounded by
     /// [`BURN_GAS_ESTIMATE_TIMEOUT`]: the production HTTP transport has
     /// no request timeout and burn preparation sits on the signing path,
-    /// so a hung estimate must degrade to the formula, not block. Logs
-    /// floor, estimate and the chosen limit so the constants can be
-    /// retuned from data.
+    /// so a hung estimate must degrade to the formula, not block.
+    ///
+    /// A successful estimate is also checked against the latest block gas
+    /// limit: an estimate that cannot fit any block fails preparation
+    /// ([`VaultError::BurnExceedsBlockGasLimit`] - the burn needs
+    /// batching, and persisting it would retry an unmineable transaction
+    /// forever), while a limit where only the padding or the floor
+    /// crosses is capped at the block limit. Without an estimate no fit
+    /// verdict is possible, so the fallback stays uncapped and the chain
+    /// arbitrates. Logs floor, estimate and the chosen limit so the
+    /// constants can be retuned from data.
     async fn sized_burn_gas(
         &self,
         tx: &TransactionRequest,
         floor: u64,
         owner: Address,
-    ) -> u64 {
+    ) -> Result<u64, VaultError> {
         let mut estimate_tx = tx.clone();
         estimate_tx.from = Some(owner);
         // Strip everything but the call itself: a replacement's clone
@@ -372,25 +380,56 @@ impl RealBlockchainService {
         estimate_tx.max_priority_fee_per_gas = None;
         estimate_tx.max_fee_per_blob_gas = None;
         estimate_tx.nonce = None;
-        let estimate = tokio::time::timeout(
-            BURN_GAS_ESTIMATE_TIMEOUT,
-            self.provider
+        let sized = tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
+            let estimate = self
+                .provider
                 .estimate_gas(estimate_tx)
-                .block(BlockNumberOrTag::Latest.into()),
-        )
+                .block(BlockNumberOrTag::Latest.into())
+                .await?;
+            // Best effort, same bound: without the header the estimate is
+            // still useful, just uncheckable against the block limit.
+            let block_limit = self
+                .provider
+                .get_block_by_number(BlockNumberOrTag::Latest)
+                .await
+                .ok()
+                .flatten()
+                .map(|block| block.header.gas_limit);
+            Ok::<
+                _,
+                alloy::transports::RpcError<
+                    alloy::transports::TransportErrorKind,
+                >,
+            >((estimate, block_limit))
+        })
         .await;
-        match estimate {
-            Ok(Ok(estimate)) => {
+        match sized {
+            Ok(Ok((estimate, block_limit))) => {
+                if let Some(block_limit) = block_limit {
+                    if estimate > block_limit {
+                        return Err(VaultError::BurnExceedsBlockGasLimit {
+                            required: estimate,
+                            block_limit,
+                        });
+                    }
+                }
                 let padded = estimate.saturating_mul(13) / 10;
-                let chosen = floor.max(padded);
+                let mut chosen = floor.max(padded);
+                if let Some(block_limit) = block_limit {
+                    // Only the padding or the floor crosses the block
+                    // limit: cap instead of failing, the estimate itself
+                    // fits.
+                    chosen = chosen.min(block_limit);
+                }
                 info!(target: "vault",
                     floor,
                     estimate,
                     padded,
                     chosen,
+                    block_limit,
                     "Sized burn gas limit against latest"
                 );
-                chosen
+                Ok(chosen)
             }
             Ok(Err(error)) => {
                 // Distinguish "the simulation says this burn reverts" from
@@ -406,7 +445,7 @@ impl RealBlockchainService {
                     error = %error,
                     "Burn gas estimate against latest failed; using the formula limit"
                 );
-                floor
+                Ok(floor)
             }
             Err(_elapsed) => {
                 warn!(target: "vault",
@@ -414,7 +453,7 @@ impl RealBlockchainService {
                     timeout_secs = BURN_GAS_ESTIMATE_TIMEOUT.as_secs(),
                     "Burn gas estimate against latest timed out; using the formula limit"
                 );
-                floor
+                Ok(floor)
             }
         }
     }
@@ -1142,7 +1181,7 @@ impl VaultService for RealBlockchainService {
         // raised by a live estimate against `latest` when one is available
         // (see `sized_burn_gas`) - never lowered by it.
         let floor = burn_gas_limit(leg_count);
-        tx.gas = Some(self.sized_burn_gas(&tx, floor, params.owner).await);
+        tx.gas = Some(self.sized_burn_gas(&tx, floor, params.owner).await?);
 
         // Fill nonce, gas price, gas limit, chain_id from the provider
         let envelop =
@@ -1265,7 +1304,7 @@ impl VaultService for RealBlockchainService {
         // `latest` (see `sized_burn_gas`) may raise it further, never
         // lower it.
         let replacement_gas =
-            self.sized_burn_gas(&transaction, floor, owner).await;
+            self.sized_burn_gas(&transaction, floor, owner).await?;
         let pending =
             self.provider.get_transaction_count(owner).pending().await?;
         self.nonce_manager.observe_pending(owner, pending);
@@ -2105,6 +2144,16 @@ mod tests {
         asserter.push_success(&1u64); // eth_chainId (WalletFiller, for EIP-155 signing)
     }
 
+    /// A latest block whose header carries `gas_limit`, for the block
+    /// limit check in `sized_burn_gas`.
+    fn block_with_gas_limit(
+        gas_limit: u64,
+    ) -> Block<alloy::rpc::types::Transaction> {
+        let mut block: Block<alloy::rpc::types::Transaction> = Block::default();
+        block.header.inner.gas_limit = gas_limit;
+        block
+    }
+
     fn create_service_with_asserter(
         asserter: Asserter,
     ) -> RealBlockchainService {
@@ -2172,7 +2221,8 @@ mod tests {
                 BURN_GAS_FLOOR,
                 Address::repeat_byte(1),
             )
-            .await;
+            .await
+            .expect("a hung estimate must fall back, not error");
 
         assert_eq!(gas, BURN_GAS_FLOOR);
     }
@@ -4056,6 +4106,7 @@ mod tests {
         // eth_estimateGas against latest: 2M, padded by 30% to 2.6M,
         // above the one leg floor of 1M.
         asserter.push_success(&2_000_000u64);
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         setup_asserter_for_fill_with_gas(&asserter, 3);
         let service = create_service_with_asserter(asserter);
 
@@ -4094,6 +4145,7 @@ mod tests {
         let asserter = Asserter::new();
         // 100k padded to 130k, far below the one leg floor of 1M.
         asserter.push_success(&100_000u64);
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         setup_asserter_for_fill_with_gas(&asserter, 3);
         let service = create_service_with_asserter(asserter);
 
@@ -4122,6 +4174,86 @@ mod tests {
 
         let envelope = sendable.validate().expect("prepared tx should decode");
         assert_eq!(envelope.gas_limit(), BURN_GAS_FLOOR);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies preparation fails when the estimate itself cannot fit the
+    /// latest block: no signable limit makes the burn mineable, so
+    /// persisting it would retry an unmineable transaction forever.
+    async fn prepare_tx_fails_when_estimate_exceeds_block_limit() {
+        let asserter = Asserter::new();
+        asserter.push_success(&150_000_000u64);
+        asserter.push_success(&block_with_gas_limit(100_000_000));
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: test_vault_address(),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"r".to_vec())),
+            }],
+            dust_shares: U256::ZERO,
+            owner: test_receiver(),
+            user: address!("0x3333333333333333333333333333333333333333"),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        };
+
+        let result = service.prepare_burn_tx(&params).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::BurnExceedsBlockGasLimit {
+                required: 150_000_000,
+                block_limit: 100_000_000,
+            })
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies the cap policy when only the padding crosses the block
+    /// limit: the estimate fits, so the limit is capped at the block
+    /// limit instead of failing.
+    async fn prepare_tx_caps_padded_limit_at_block_limit() {
+        let asserter = Asserter::new();
+        // Estimate 90M fits the 100M block; padded 117M does not - cap.
+        asserter.push_success(&90_000_000u64);
+        asserter.push_success(&block_with_gas_limit(100_000_000));
+        setup_asserter_for_fill_with_gas(&asserter, 3);
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: test_vault_address(),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"r".to_vec())),
+            }],
+            dust_shares: U256::ZERO,
+            owner: test_receiver(),
+            user: address!("0x3333333333333333333333333333333333333333"),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        };
+
+        let sendable = service
+            .prepare_burn_tx(&params)
+            .await
+            .expect("expected SendableTxWithHash");
+
+        let envelope = sendable.validate().expect("prepared tx should decode");
+        assert_eq!(envelope.gas_limit(), 100_000_000);
     }
 
     #[traced_test]
