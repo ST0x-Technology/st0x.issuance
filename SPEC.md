@@ -4752,12 +4752,14 @@ outcome unknown (the burn may be excluded, intended, or submitted), so the
 operator re-invokes the route for the same deposit to read the persisted stream
 and resume it from wherever it stopped.
 
-Both `burn-excess` routes take the network's RPC endpoint and chain id from the
-service's startup-verified chain configuration, never from a request-time
-environment read, so a deployment that supplies its RPC as a flag rather than an
-env var serves them too; a network with no chain configuration is a 500. The
-offline `issuer burn-excess` CLI keeps resolving from the environment and
-proving the chain id against the RPC, since nothing verified that endpoint at
+Both `burn-excess` routes take the network's RPC endpoint from the service's
+startup-verified chain configuration, never from a request-time environment
+read, so a deployment that supplies its RPC as a flag rather than an env var
+serves them too; a network with no chain configuration is a 500. The chain id is
+operator-supplied in the request and validated against the selected network's
+known chain id (a mismatch is a 422), not taken from configuration. The offline
+`issuer burn-excess` CLI keeps resolving the RPC from the environment and
+proving the chain id against it, since nothing verified that endpoint at
 startup.
 
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
