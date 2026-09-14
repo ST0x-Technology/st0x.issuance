@@ -259,6 +259,14 @@ const BURN_GAS_BASE: u64 = 250_000;
 /// observed marginal cost.
 const BURN_GAS_PER_CALL: u64 = 120_000;
 
+/// Floor under the per-leg formula: the fixed limit that served every
+/// small burn before per-leg sizing existed. A redeem leg is not
+/// fixed-cost - receipt information is dynamically sized and forwarded
+/// through the vault burn - so the per-leg estimate must never lower a
+/// small burn below the proven limit; over-sizing costs nothing (the EVM
+/// charges gas used, not the limit).
+const BURN_GAS_FLOOR: u64 = 1_000_000;
+
 /// Gas limit for a burn multicall with `call_count` legs, computed from
 /// the transaction's own shape instead of estimating (same reason as
 /// `MINT_GAS_LIMIT`: the provider default estimates against `pending`
@@ -266,9 +274,11 @@ const BURN_GAS_PER_CALL: u64 = 120_000;
 /// returndata and fails an otherwise valid burn). Burns scale with
 /// receipt count and the burn is built locally, so its leg count is
 /// always known; a limit derived from it stays deterministic without
-/// starving fragmented burns the way a fixed cap did.
+/// starving fragmented burns the way a fixed cap did. Never below
+/// [`BURN_GAS_FLOOR`].
 const fn burn_gas_limit(call_count: usize) -> u64 {
-    BURN_GAS_BASE + BURN_GAS_PER_CALL * call_count as u64
+    let scaled = BURN_GAS_BASE + BURN_GAS_PER_CALL * call_count as u64;
+    if scaled > BURN_GAS_FLOOR { scaled } else { BURN_GAS_FLOOR }
 }
 
 /// Leg count of a persisted burn multicall, decoded from its calldata.
@@ -3798,11 +3808,18 @@ mod tests {
     /// Verifies that calculated burn limits retain headroom for observed
     /// receipt counts.
     fn burn_gas_limit_covers_observed_burns() {
-        // A 4-receipt burn was observed at ~421k gas used; keep real headroom.
-        assert!(burn_gas_limit(4) >= 630_000);
-        // The 16-receipt COIN burn of 2026-09-14 measured 1,398,097 gas
-        // needed and was starved by the old fixed 1M limit.
-        assert!(burn_gas_limit(16) >= 1_398_097);
+        // Small burns must never drop below the proven 1M floor: a redeem
+        // leg's cost varies with its dynamically sized receipt info, and
+        // the floor is the limit that served every small burn before
+        // per-leg sizing existed.
+        assert_eq!(burn_gas_limit(1), 1_000_000);
+        assert_eq!(burn_gas_limit(4), 1_000_000);
+        assert_eq!(burn_gas_limit(6), 1_000_000);
+        // Past the floor the limit scales with leg count.
+        assert!(burn_gas_limit(7) > 1_000_000);
+        // The 16-receipt (17-leg) COIN burn of 2026-09-14 measured
+        // 1,398,097 gas needed and was starved by the old fixed 1M limit.
+        assert!(burn_gas_limit(17) >= 1_398_097);
     }
 
     #[test]
