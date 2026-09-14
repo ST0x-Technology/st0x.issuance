@@ -352,7 +352,16 @@ impl RealBlockchainService {
     ) -> u64 {
         let mut estimate_tx = tx.clone();
         estimate_tx.from = Some(owner);
+        // Strip everything but the call itself: a replacement's clone
+        // carries the persisted gas and fee fields, and a stale
+        // `gas_price` or EIP-1559 fee can fail the estimate on balance
+        // or fee validation - the fill assigns fresh fees later anyway.
         estimate_tx.gas = None;
+        estimate_tx.gas_price = None;
+        estimate_tx.max_fee_per_gas = None;
+        estimate_tx.max_priority_fee_per_gas = None;
+        estimate_tx.max_fee_per_blob_gas = None;
+        estimate_tx.nonce = None;
         match self
             .provider
             .estimate_gas(estimate_tx)
