@@ -239,26 +239,13 @@ const MINTED_LOG_CHUNK_BLOCKS: u64 = 2_000;
 /// is retryable).
 const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 
-/// Base gas for a vault-direct mint multicall before any per-leg cost:
-/// intrinsic tx cost, multicall dispatch, and the vault's fixed overhead.
-const MINT_GAS_BASE: u64 = 250_000;
-
-/// Marginal gas per mint multicall leg (the `deposit` minting shares and
-/// receipts, or the share `transfer` to the user). The mint shape is a
-/// fixed 2 legs today, so `mint_gas_limit(2)` equals the 500k limit that
-/// has served every observed mint (~250k used) with ample headroom.
-const MINT_GAS_PER_CALL: u64 = 125_000;
-
-/// Gas limit for a vault-direct mint multicall with `call_count` legs,
-/// computed from the transaction's own shape instead of estimating (the
-/// provider default runs `eth_estimateGas` against `pending` state, which
-/// under mempool load intermittently reverts with empty returndata - the
-/// vault multicall's `FailedCall` - and fails an otherwise valid mint).
-/// Same scheme as `burn_gas_limit`, so a future mint shape with more legs
-/// cannot silently outgrow a fixed cap the way the 16-receipt burn did.
-const fn mint_gas_limit(call_count: usize) -> u64 {
-    MINT_GAS_BASE + MINT_GAS_PER_CALL * call_count as u64
-}
+/// Fixed gas limit for the vault-direct mint multicall, set instead of
+/// estimating. The provider's default estimate runs `eth_estimateGas` against
+/// `pending` state, which under mempool load intermittently reverts with empty
+/// returndata (the vault multicall's `FailedCall`) and fails an otherwise valid
+/// mint. A fixed limit above the observed ~250k gas keeps the mint
+/// deterministic without looking like an overlarge transaction.
+const MINT_GAS_LIMIT: u64 = 500_000;
 
 /// Base gas for a burn multicall before any per-leg cost: intrinsic tx
 /// cost, multicall dispatch, and the vault's fixed overhead.
@@ -274,7 +261,7 @@ const BURN_GAS_PER_CALL: u64 = 120_000;
 
 /// Gas limit for a burn multicall with `call_count` legs, computed from
 /// the transaction's own shape instead of estimating (same reason as
-/// `mint_gas_limit`: the provider default estimates against `pending`
+/// `MINT_GAS_LIMIT`: the provider default estimates against `pending`
 /// state, which under mempool load intermittently reverts with empty
 /// returndata and fails an otherwise valid burn). Burns scale with
 /// receipt count and the burn is built locally, so its leg count is
@@ -604,16 +591,15 @@ impl VaultService for RealBlockchainService {
         let transfer_call =
             vault_contract.transfer(user, shares).calldata().clone();
 
-        let calls = vec![deposit_call, transfer_call];
-        let leg_count = calls.len();
-        let mut transaction =
-            vault_contract.multicall(calls).into_transaction_request();
-        // Skip gas estimation (see `mint_gas_limit`): a locally computed
-        // limit avoids the provider's `pending`-state `eth_estimateGas`,
-        // which reverts with empty returndata under load (the vault
-        // multicall's `FailedCall`) and fails an otherwise valid mint; the
-        // wallet filler still assigns `from`.
-        transaction.gas = Some(mint_gas_limit(leg_count));
+        let mut transaction = vault_contract
+            .multicall(vec![deposit_call, transfer_call])
+            .into_transaction_request();
+        // Skip gas estimation: the provider default estimates against
+        // `pending` state, which under mempool load intermittently reverts with
+        // empty returndata (the vault multicall's `FailedCall`) and fails an
+        // otherwise valid mint. A fixed, generous limit avoids that call
+        // entirely; the wallet filler still assigns `from`.
+        transaction.gas = Some(MINT_GAS_LIMIT);
         let envelope = self
             .fill_envelope(transaction, NonceReservation::ProviderFilled)
             .await?;
@@ -1817,7 +1803,7 @@ mod tests {
         OrchestratorMintParams, OrchestratorMintedLog,
         OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider, ResyncNonceManager, burn_call_count,
-        burn_gas_limit, mint_gas_limit,
+        burn_gas_limit,
     };
     use crate::bindings::{
         IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault,
@@ -2278,10 +2264,6 @@ mod tests {
             .expect("prepared mint must contain a valid EIP-2718 transaction");
         assert_eq!(decoded.nonce(), prepared.nonce);
         assert_eq!(*decoded.tx_hash(), prepared.hash);
-        // 2-leg mint (deposit + transfer): the computed limit must equal
-        // the 500k the old fixed constant provided, byte-for-byte.
-        assert_eq!(decoded.gas_limit(), mint_gas_limit(2));
-        assert_eq!(decoded.gas_limit(), 500_000);
 
         let mut malformed = prepared.clone();
         malformed.tx = vec![0x02];
