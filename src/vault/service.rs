@@ -1,6 +1,6 @@
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::consensus::{Transaction, TxEnvelope};
-use alloy::eips::Encodable2718;
+use alloy::eips::{BlockNumberOrTag, Encodable2718};
 use alloy::network::{EthereumWallet, Network, TransactionResponse};
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::fillers::{
@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::{
     BurnRange, BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
@@ -329,6 +329,56 @@ impl RealBlockchainService {
             provider,
             wallet_nonce_lock: Arc::new(Mutex::new(())),
             nonce_manager,
+        }
+    }
+
+    /// Hybrid burn gas sizing: the larger of the deterministic `floor`
+    /// and a live `eth_estimateGas` against `latest` padded by 30%.
+    ///
+    /// `latest`, never `pending`: a replacement's own stuck transaction
+    /// sits in the pending state, so a pending estimate simulates
+    /// receipts that appear already burned and reverts with the vault
+    /// multicall's `FailedCall` - the intermittent failure the fixed
+    /// limits were introduced for. `latest` has no such self conflict.
+    /// Any estimate failure falls back to `floor` alone, so preparing a
+    /// burn never depends on the estimate answering; the estimate can
+    /// only ever raise the limit. Logs floor, estimate and the chosen
+    /// limit so the constants can be retuned from data.
+    async fn sized_burn_gas(
+        &self,
+        tx: &TransactionRequest,
+        floor: u64,
+        owner: Address,
+    ) -> u64 {
+        let mut estimate_tx = tx.clone();
+        estimate_tx.from = Some(owner);
+        estimate_tx.gas = None;
+        match self
+            .provider
+            .estimate_gas(estimate_tx)
+            .block(BlockNumberOrTag::Latest.into())
+            .await
+        {
+            Ok(estimate) => {
+                let padded = estimate.saturating_mul(13) / 10;
+                let chosen = floor.max(padded);
+                info!(target: "vault",
+                    floor,
+                    estimate,
+                    padded,
+                    chosen,
+                    "Sized burn gas limit against latest"
+                );
+                chosen
+            }
+            Err(error) => {
+                warn!(target: "vault",
+                    floor,
+                    error = %error,
+                    "Burn gas estimate against latest failed; using the formula limit"
+                );
+                floor
+            }
         }
     }
 
@@ -1051,11 +1101,11 @@ impl VaultService for RealBlockchainService {
 
         let leg_count = calls.len();
         let mut tx = vault_contract.multicall(calls).into_transaction_request();
-        // Skip gas estimation (see `burn_gas_limit`): a locally computed
-        // limit avoids the provider's `pending`-state `eth_estimateGas`,
-        // which reverts with empty returndata under load and fails an
-        // otherwise valid burn, while still scaling with receipt count.
-        tx.gas = Some(burn_gas_limit(leg_count));
+        // Deterministic floor from the leg count (see `burn_gas_limit`),
+        // raised by a live estimate against `latest` when one is available
+        // (see `sized_burn_gas`) - never lowered by it.
+        let floor = burn_gas_limit(leg_count);
+        tx.gas = Some(self.sized_burn_gas(&tx, floor, params.owner).await);
 
         // Fill nonce, gas price, gas limit, chain_id from the provider
         let envelop =
@@ -1089,6 +1139,15 @@ impl VaultService for RealBlockchainService {
             }
 
             if receipt.status() {
+                // Telemetry for retuning the sizing constants from data:
+                // how much of the granted limit a mined burn actually used.
+                if let Ok(envelope) = sendable_tx.validate() {
+                    info!(target: "vault",
+                        gas_used = receipt.gas_used,
+                        gas_limit = envelope.gas_limit(),
+                        "Burn gas utilization"
+                    );
+                }
                 BurnTxStatus::Mined
             } else {
                 BurnTxStatus::Reverted
@@ -1162,9 +1221,14 @@ impl VaultService for RealBlockchainService {
         // fixed limits existed. Never below `BURN_GAS_FLOOR` in any case.
         let computed = burn_call_count(envelope.input())
             .map_or(BURN_GAS_FLOOR, burn_gas_limit);
-        let replacement_gas = envelope.gas_limit().max(computed);
+        let floor = envelope.gas_limit().max(computed);
         let mut transaction = TransactionRequest::from_transaction(envelope);
         transaction.from = Some(owner);
+        // The floor above is deterministic; a live estimate against
+        // `latest` (see `sized_burn_gas`) may raise it further, never
+        // lower it.
+        let replacement_gas =
+            self.sized_burn_gas(&transaction, floor, owner).await;
         let pending =
             self.provider.get_transaction_count(owner).pending().await?;
         self.nonce_manager.observe_pending(owner, pending);
@@ -2950,6 +3014,8 @@ mod tests {
         let first_pending_nonce = 11u64;
         let refreshed_pending_nonce = 12u64;
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&refreshed_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3002,6 +3068,8 @@ mod tests {
         let refreshed_pending_nonce = 12u64;
         let cached_nonce = 13u64;
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&refreshed_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3037,6 +3105,8 @@ mod tests {
         let first_pending_nonce = 12u64;
         let lagging_pending_nonce = 11u64;
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&lagging_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3062,6 +3132,8 @@ mod tests {
         let owner = persisted.signer_for_test();
         let pending_nonce = 11u64;
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&pending_nonce);
         asserter.push_success(&pending_nonce);
         asserter.push_failure_msg("fee lookup failed");
@@ -3734,6 +3806,8 @@ mod tests {
         let dust_shares = U256::from(500);
 
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         setup_asserter_for_fill_with_gas(&asserter, expected_nonce);
 
         let service = create_service_with_asserter(asserter);
@@ -3779,6 +3853,8 @@ mod tests {
         );
 
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         setup_asserter_for_fill_with_gas(&asserter, 0);
 
         let service = create_service_with_asserter(asserter);
@@ -3845,6 +3921,8 @@ mod tests {
         // 16 receipts + 1 dust transfer = 17 legs: exactly the shape the
         // old fixed 1M cap starved (2026-09-14 COIN burn).
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         setup_asserter_for_fill_with_gas(&asserter, 3);
         let service = create_service_with_asserter(asserter);
 
@@ -3883,6 +3961,83 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    /// Verifies a live estimate against `latest` raises the limit above
+    /// the formula floor when the padded estimate is larger.
+    async fn prepare_tx_estimate_raises_limit_above_floor() {
+        let asserter = Asserter::new();
+        // eth_estimateGas against latest: 2M, padded by 30% to 2.6M,
+        // above the one leg floor of 1M.
+        asserter.push_success(&2_000_000u64);
+        setup_asserter_for_fill_with_gas(&asserter, 3);
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: test_vault_address(),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"r".to_vec())),
+            }],
+            dust_shares: U256::ZERO,
+            owner: test_receiver(),
+            user: address!("0x3333333333333333333333333333333333333333"),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        };
+
+        let sendable = service
+            .prepare_burn_tx(&params)
+            .await
+            .expect("expected SendableTxWithHash");
+
+        let envelope = sendable.validate().expect("prepared tx should decode");
+        assert_eq!(envelope.gas_limit(), 2_600_000);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies a low estimate can never lower the limit below the
+    /// formula floor.
+    async fn prepare_tx_low_estimate_keeps_floor() {
+        let asserter = Asserter::new();
+        // 100k padded to 130k, far below the one leg floor of 1M.
+        asserter.push_success(&100_000u64);
+        setup_asserter_for_fill_with_gas(&asserter, 3);
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: test_vault_address(),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"r".to_vec())),
+            }],
+            dust_shares: U256::ZERO,
+            owner: test_receiver(),
+            user: address!("0x3333333333333333333333333333333333333333"),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        };
+
+        let sendable = service
+            .prepare_burn_tx(&params)
+            .await
+            .expect("expected SendableTxWithHash");
+
+        let envelope = sendable.validate().expect("prepared tx should decode");
+        assert_eq!(envelope.gas_limit(), BURN_GAS_FLOOR);
+    }
+
+    #[traced_test]
+    #[tokio::test]
     /// Verifies a replacement recalculates gas from persisted multicall
     /// calldata.
     async fn replacement_recomputes_gas_from_persisted_multicall() {
@@ -3899,6 +4054,8 @@ mod tests {
             SendableTxWithHash::valid_for_test(7, test_vault_address(), input);
         let owner = persisted.signer_for_test();
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
@@ -3946,6 +4103,8 @@ mod tests {
         );
         let owner = persisted.signer_for_test();
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
@@ -3991,6 +4150,8 @@ mod tests {
         );
         let owner = persisted.signer_for_test();
         let asserter = Asserter::new();
+        asserter
+            .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
