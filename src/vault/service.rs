@@ -1154,11 +1154,14 @@ impl VaultService for RealBlockchainService {
         // `burn_gas_limit`): recount the legs from the persisted calldata so
         // a replacement signed after a limit-sizing fix benefits from it
         // instead of inheriting a starved limit forever. Non-multicall
-        // calldata (an orchestrator `burnCall`, whose shape does not scale
-        // with receipt count) keeps the limit the original tx was signed
-        // with.
-        let replacement_gas = burn_call_count(envelope.input())
-            .map_or_else(|| envelope.gas_limit(), burn_gas_limit);
+        // calldata (an orchestrator `burnCall`) may carry a raw original
+        // estimate, and the orchestrator's internal receipt walk can change
+        // before a dead transaction is replaced, so honor a larger signed
+        // limit but never go below the proven floor.
+        let replacement_gas = burn_call_count(envelope.input()).map_or_else(
+            || envelope.gas_limit().max(BURN_GAS_FLOOR),
+            burn_gas_limit,
+        );
         let mut transaction = TransactionRequest::from_transaction(envelope);
         transaction.from = Some(owner);
         let pending =
@@ -1808,8 +1811,8 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnRange, MintAuthorization, MintedLogQuery, NonceState,
-        OrchestratorBurnParams, OrchestratorBurnReadiness,
+        BURN_GAS_FLOOR, BurnRange, MintAuthorization, MintedLogQuery,
+        NonceState, OrchestratorBurnParams, OrchestratorBurnReadiness,
         OrchestratorMintParams, OrchestratorMintedLog,
         OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider, ResyncNonceManager, burn_call_count,
@@ -3919,10 +3922,27 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    /// Verifies a replacement preserves the signed limit for non-multicall
-    /// calldata.
-    async fn replacement_keeps_envelope_gas_for_non_multicall_input() {
-        let persisted = persisted_burn_tx(7);
+    /// Verifies a replacement floors an orchestrator burnCall's stale
+    /// signed estimate at `BURN_GAS_FLOOR`.
+    async fn replacement_floors_orchestrator_burn_gas() {
+        // Real orchestrator burnCall calldata signed with a raw 100k
+        // estimate (below the old fixed 1M replacement limit): the
+        // orchestrator's receipt walk can change before a dead tx is
+        // replaced, so the replacement must come out at the floor, never
+        // at the stale estimate.
+        let input = Bytes::from(
+            IST0xOrchestratorV1::burnCall {
+                token: test_vault_address(),
+                amount: U256::from(1_000_000u64),
+                burnInfo: Bytes::new(),
+            }
+            .abi_encode(),
+        );
+        let persisted = SendableTxWithHash::valid_for_test(
+            7,
+            test_orchestrator_address(),
+            input,
+        );
         let owner = persisted.signer_for_test();
         let asserter = Asserter::new();
         asserter.push_success(&11u64);
@@ -3944,7 +3964,7 @@ mod tests {
 
         let envelope =
             replacement.validate().expect("replacement should decode");
-        assert_eq!(envelope.gas_limit(), 100_000);
+        assert_eq!(envelope.gas_limit(), BURN_GAS_FLOOR);
     }
 
     fn test_orchestrator_address() -> Address {
