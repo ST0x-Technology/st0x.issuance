@@ -931,7 +931,7 @@ async fn record_exclusion(
         log_index = funding_log_id.log_index,
         "Recorded funding exclusion"
     );
-    println!(
+    eprintln!(
         "Recorded funding exclusion tx={:#x} log_index={}",
         funding_log_id.tx_hash, funding_log_id.log_index
     );
@@ -1066,7 +1066,7 @@ async fn intend_submit_confirm<P: Provider>(
             },
         )
         .await?;
-    println!(
+    eprintln!(
         "Persisted IntendExcessBurn hash={:#x} nonce={}",
         sendable_tx.hash, sendable_tx.nonce
     );
@@ -1082,7 +1082,7 @@ async fn intend_submit_confirm<P: Provider>(
             },
         )
         .await?;
-    println!("Submitted excess burn tx={:#x}", sendable_tx.hash);
+    eprintln!("Submitted excess burn tx={:#x}", sendable_tx.hash);
     drop(wallet_guard);
 
     confirm_and_complete(&ConfirmCtx {
@@ -1238,7 +1238,7 @@ async fn confirm_and_complete<P: Provider>(
         )
         .await?;
 
-    println!(
+    eprintln!(
         "Completed excess burn tx={:#x} block={} receipt_id={} shares={}",
         result.tx_hash, result.block_number, ctx.receipt_id, ctx.shares
     );
@@ -1248,7 +1248,7 @@ async fn confirm_and_complete<P: Provider>(
     // persisted, inventory read model now stale.
     let share_balance =
         ctx.vault_service.get_share_balance(ctx.bind.vault, ctx.owner).await?;
-    println!(
+    eprintln!(
         "post-burn: issuer_share_balance={share_balance} (delta expected -{})",
         ctx.shares
     );
@@ -1295,7 +1295,7 @@ async fn reconcile_inventory_after_burn<P: Provider>(
         .any(|row| row.receipt_id.inner() == receipt_id);
 
     if !tracked {
-        println!(
+        eprintln!(
             "inventory: receipt {receipt_id} not tracked; skipping reconcile \
              (no Discover / no ReserveBurn)"
         );
@@ -1332,7 +1332,7 @@ async fn reconcile_inventory_after_burn<P: Provider>(
         });
     }
 
-    println!(
+    eprintln!(
         "inventory: reconciled receipt {receipt_id} to on-chain balance \
          {on_chain}"
     );
