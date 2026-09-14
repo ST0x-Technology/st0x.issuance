@@ -4723,8 +4723,15 @@ implies the path exists and wants credentials).
 The IAP layer is a second gate. It refuses a request that reached the VM from
 inside the VPC without passing IAP, rather than trusting the network; it does
 not itself decide who may do what, which is group membership evaluated by IAP
-against each backend's IAM policy. `burn-excess external`, `move-receipts`, and
-`confirm-custody` stay offline `issuer` CLI verbs.
+against each backend's IAM policy. Verification depends on Google's JWKS: the
+app caches the key set and keeps verifying with the retained keys (a stale set
+included) through a fetch outage, since a stale Google key is still Google's,
+and a refresh prompted by an unrecognized key id is throttled to one outbound
+fetch per minute. Only when the endpoint is unreachable and no usable key is
+retained does verification fail with a retryable 503, so a transient JWKS outage
+never becomes a wrong-audience or forged-token acceptance.
+`burn-excess external`, `move-receipts`, and `confirm-custody` stay offline
+`issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 
