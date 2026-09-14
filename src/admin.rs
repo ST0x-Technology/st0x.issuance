@@ -606,6 +606,7 @@ pub(crate) async fn recover_redemption_ops(
     .await
 }
 
+/// Runs redemption recovery for both the internal-admin and IAP-gated routes.
 #[tracing::instrument(skip(
     store,
     pool,
@@ -1555,6 +1556,7 @@ pub(crate) async fn close_redemption_ops(
     close_redemption_logic(store, pool, issuer_request_id, body).await
 }
 
+/// Closes a redemption after applying the shared safety checks and audit data.
 #[tracing::instrument(skip(store, pool))]
 async fn close_redemption_logic(
     store: &rocket::State<Arc<Store<Redemption>>>,
@@ -1702,6 +1704,7 @@ pub(crate) async fn force_complete_redemption_ops(
     .await
 }
 
+/// Verifies and records an on-chain burn for either force-complete route.
 #[tracing::instrument(skip(pool, burn_recovery))]
 async fn force_complete_redemption_logic(
     pool: &rocket::State<Pool<Sqlite>>,
@@ -1897,6 +1900,7 @@ pub(crate) async fn reprocess_mint_ops(
         .await
 }
 
+/// Drives manual mint recovery for both authenticated HTTP entry points.
 #[tracing::instrument(skip(pool, apalis_pool, store, vault_services))]
 async fn reprocess_mint_logic(
     pool: &rocket::State<Pool<Sqlite>>,
@@ -2196,6 +2200,7 @@ pub(crate) async fn close_mint_ops(
         .await
 }
 
+/// Closes a mint through the safety checks shared by both close routes.
 #[tracing::instrument(skip(store, pool, vault_services, receipts))]
 async fn close_mint_logic(
     store: &rocket::State<Arc<Store<Mint>>>,
@@ -2713,6 +2718,7 @@ pub(crate) async fn list_stuck_ops(
     list_stuck_logic(pool).await
 }
 
+/// Builds the stuck-operation response shared by the admin and read routes.
 #[tracing::instrument(skip(pool))]
 async fn list_stuck_logic(
     pool: &rocket::State<Pool<Sqlite>>,
@@ -2888,6 +2894,7 @@ pub(crate) async fn orchestrator_health_ops(
     orchestrator_health_logic(pool, config, vault_services).await
 }
 
+/// Collects orchestrator health for both authenticated route variants.
 #[tracing::instrument(skip(pool, config, vault_services))]
 async fn orchestrator_health_logic(
     pool: &rocket::State<Pool<Sqlite>>,
@@ -3824,6 +3831,7 @@ pub(crate) async fn schedule_freeze_window_ops(
     schedule_freeze_window_logic(scheduler, body).await
 }
 
+/// Validates and schedules the freeze window requested through either route.
 #[tracing::instrument(skip(scheduler))]
 async fn schedule_freeze_window_logic(
     scheduler: &rocket::State<FreezeScheduler>,

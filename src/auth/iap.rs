@@ -295,6 +295,7 @@ struct JwkSet {
 }
 
 impl IapVerifier {
+    /// Creates a tier-specific verifier pinned to one expected IAP audience.
     fn new(audience: &str, tier: OpsTier, http: reqwest::Client) -> Self {
         let mut validation = Validation::new(Algorithm::ES256);
         validation.set_audience(&[audience]);
@@ -319,6 +320,7 @@ impl IapVerifier {
     }
 
     #[cfg(test)]
+    /// Creates a verifier that fetches keys from a test-controlled endpoint.
     fn with_jwks_url(audience: &str, tier: OpsTier, jwks_url: String) -> Self {
         Self { jwks_url, ..Self::new(audience, tier, reqwest::Client::new()) }
     }
@@ -382,6 +384,7 @@ impl IapVerifier {
         Ok(OpsPrincipal { subject: sub })
     }
 
+    /// Resolves a token's key from cache, refreshing the JWKS when necessary.
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapError> {
         if let Some(key) = self.cached_key(kid, false).await {
             return Ok(key);
@@ -401,6 +404,7 @@ impl IapVerifier {
         })
     }
 
+    /// Returns a cached key when its set is fresh or stale use is permitted.
     async fn cached_key(
         &self,
         kid: &str,
@@ -429,6 +433,7 @@ impl IapVerifier {
         key
     }
 
+    /// Refreshes the shared key set subject to the configured request throttle.
     async fn refresh(&self, kid: &str) -> Result<(), IapError> {
         // Another task may have refreshed while this one was on its way here.
         // Read whether the retained set already holds this kid in the same
@@ -522,6 +527,7 @@ impl IapVerifier {
         }
     }
 
+    /// Fetches and parses the usable EC signing keys from Google's JWKS.
     async fn fetch_keys(
         &self,
     ) -> Result<Vec<(String, DecodingKey)>, reqwest::Error> {
