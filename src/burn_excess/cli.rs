@@ -69,7 +69,7 @@ pub(crate) struct BurnExcessSharedArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// Chain id; must match `--network` and the configured RPC-reported chain.
+    /// Chain id; must match the configured RPC-reported chain.
     #[arg(long)]
     chain_id: u64,
 
@@ -135,15 +135,6 @@ pub(crate) async fn run_burn_excess_cli(
             Some(external.funding_tx_hash),
         ),
     };
-
-    if shared.chain_id != shared.network.chain_id() {
-        anyhow::bail!(
-            "--network {} is chain {} but --chain-id is {}",
-            shared.network,
-            shared.network.chain_id(),
-            shared.chain_id
-        );
-    }
 
     let signer_config = shared.signer.into_config()?;
 

@@ -4790,8 +4790,8 @@ retained. It also returns 503 when another request holds the refresh slot inside
 that throttle interval and the retained set does not contain the token's key id,
 including during a cold-cache request or key rotation. These failures never
 become a wrong-audience or forged-token acceptance. Every `InternalAuth`
-operator route now has an `/ops` twin; `move-receipts` and `confirm-custody` stay
-offline `issuer` CLI verbs.
+operator route now has an `/ops` twin; `move-receipts` and `confirm-custody`
+stay offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 

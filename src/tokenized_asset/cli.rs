@@ -2040,6 +2040,43 @@ mod tests {
         );
     }
 
+    /// Legacy flat-Base deployments can intentionally point `base` at a
+    /// non-canonical chain such as Anvil. Burn-excess accepts that operator
+    /// chain id and leaves the resolved RPC endpoint as the authority.
+    #[tokio::test]
+    async fn burn_excess_accepts_a_noncanonical_configured_chain_id() {
+        let cli = IssuerCli::try_parse_from([
+            "issuer",
+            "burn-excess",
+            "internal",
+            "--issuer-request-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--deposit-tx-hash",
+            &format!("0x{}", "00".repeat(32)),
+            "--receipt-id",
+            "1",
+            "--shares",
+            "1",
+            "--reason",
+            "test noncanonical configured chain",
+            "--network",
+            "base",
+            "--chain-id",
+            "31337",
+            "--evm-private-key",
+            TEST_SIGNER_KEY,
+            "--database-url",
+            "sqlite::memory:",
+        ])
+        .expect("arguments parse");
+
+        let error = cli.dispatch().await.unwrap_err();
+        assert!(
+            error.to_string().contains("existing on-disk issuance database"),
+            "the noncanonical chain id must pass CLI validation and reach the database guard, got: {error}"
+        );
+    }
+
     /// Seeds a listing into a file-backed store for commands that open their
     /// own pool from the URL and therefore cannot share an in-memory one.
     async fn seed_listing_at(database_url: &str, underlying: &str) {

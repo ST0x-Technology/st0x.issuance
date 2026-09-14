@@ -674,7 +674,15 @@ async fn external_burn_without_a_pause_control_is_refused() {
     let mut controls = HashMap::new();
     controls.insert(Network::Ethereum, ethereum_control);
 
-    let rocket = setup_test_rocket()
+    let mut config = test_config().expect("test config builds");
+    config.chains = vec![ChainConfig {
+        network: Network::Base,
+        chain_id: Network::Base.chain_id(),
+        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        backfill_start_block: 0,
+        low_gas_threshold: None,
+    }];
+    let rocket = setup_test_rocket_with_config(config)
         .await
         .expect("test rocket builds")
         .manage(verifiers)
@@ -713,6 +721,61 @@ async fn external_burn_without_a_pause_control_is_refused() {
         "a burn for another network must never park this poller"
     );
 
+    poller.abort();
+}
+
+/// A request for the wrong configured chain is rejected before the external
+/// route pauses redemption detection.
+#[traced_test]
+#[tokio::test]
+async fn external_burn_validates_chain_id_before_pausing_the_poller() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+
+    let (control, pause) = poller_pause();
+    let base_parked = control.parked_signal();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let poller = spawn_counting_poller(pause, ticks);
+    let mut controls = HashMap::new();
+    controls.insert(Network::Base, control);
+
+    let mut config = test_config().expect("test config builds");
+    config.chains = vec![ChainConfig {
+        network: Network::Base,
+        chain_id: 31337,
+        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        backfill_start_block: 0,
+        low_gas_threshold: None,
+    }];
+    let rocket = setup_test_rocket_with_config(config)
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(PollerPauses::new(controls))
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let response = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(external_body(Network::Base))
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::UnprocessableEntity);
+    assert!(
+        !base_parked.has_changed().expect("Base poller still running"),
+        "an invalid chain id must be rejected before parking the poller"
+    );
     poller.abort();
 }
 
@@ -801,6 +864,87 @@ async fn external_burn_resumes_the_poller_after_an_error() {
     );
 
     poller.abort();
+}
+
+/// A legacy flat-Base deployment runs a non-canonical chain id (a local Anvil
+/// here), so burn-excess validates the operator-supplied `chain_id` against the
+/// configured chain entry, not the hardcoded `Network::chain_id()`. The request
+/// matching the configured id reaches the engine (404 on the absent mint); the
+/// one sending the canonical 8453, which the old canonical check accepted, is
+/// now refused with 422.
+#[traced_test]
+#[tokio::test]
+async fn internal_burn_validates_chain_id_against_the_configured_chain() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+
+    let anvil_chain_id = 31337u64;
+    let mut config = test_config().expect("test config builds");
+    config.chains = vec![ChainConfig {
+        network: Network::Base,
+        chain_id: anvil_chain_id,
+        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        backfill_start_block: 0,
+        low_gas_threshold: None,
+    }];
+    config.signer = SignerConfig::Local(B256::repeat_byte(7));
+    let rocket = setup_test_rocket_with_config(config)
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(PollerPauses::new(HashMap::new()))
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_internal_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let internal_body = |chain_id: u64| {
+        serde_json::json!({
+            "issuer_request_id": "00000000-0000-0000-0000-000000000000",
+            "deposit_tx_hash": format!("0x{}", "00".repeat(32)),
+            "receipt_id": "0x1",
+            "shares": "1.0",
+            "reason": "chain id validation test",
+            "network": Network::Base,
+            "chain_id": chain_id,
+        })
+        .to_string()
+    };
+
+    // Matches the configured (Anvil) chain id: passes the chain gate and
+    // reaches the engine, which 404s on the absent mint (no node listens).
+    let matched = client
+        .post("/ops/breakglass/burn-excess/internal")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(internal_body(anvil_chain_id))
+        .dispatch()
+        .await;
+    assert_eq!(
+        matched.status(),
+        Status::NotFound,
+        "a chain_id matching the configured chain must reach the engine"
+    );
+
+    // The canonical 8453 disagrees with the configured Anvil id, so it is
+    // refused with 422; the old canonical check would have accepted it.
+    let mismatched = client
+        .post("/ops/breakglass/burn-excess/internal")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(internal_body(Network::Base.chain_id()))
+        .dispatch()
+        .await;
+    assert_eq!(mismatched.status(), Status::UnprocessableEntity);
 }
 
 async fn migrated_pool() -> Pool<Sqlite> {
