@@ -616,8 +616,8 @@ const fn is_definitive_broadcast_rejection(code: i64) -> bool {
 
 #[async_trait]
 impl VaultService for RealBlockchainService {
-    /// Builds and signs the vault-direct mint multicall with a limit derived
-    /// from its deposit and transfer legs, without RPC gas estimation.
+    /// Builds and signs the vault-direct mint multicall with the fixed
+    /// `MINT_GAS_LIMIT`, without RPC gas estimation.
     async fn prepare_mint_tx(
         &self,
         vault: Address,
@@ -1876,10 +1876,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BURN_GAS_FLOOR, BurnRange, MintAuthorization, MintedLogQuery,
-        NonceState, OrchestratorBurnParams, OrchestratorBurnReadiness,
-        OrchestratorMintParams, OrchestratorMintedLog,
-        OrchestratorRevertReason, RealBlockchainService,
+        BURN_GAS_FLOOR, BurnRange, MINT_GAS_LIMIT, MintAuthorization,
+        MintedLogQuery, NonceState, OrchestratorBurnParams,
+        OrchestratorBurnReadiness, OrchestratorMintParams,
+        OrchestratorMintedLog, OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider, ResyncNonceManager, burn_call_count,
         burn_gas_limit,
     };
@@ -2222,7 +2222,7 @@ mod tests {
 
     #[tokio::test]
     /// Verifies vault-direct mint preparation produces a persisted signed
-    /// transaction with the two-leg mint gas limit.
+    /// transaction with the fixed `MINT_GAS_LIMIT`.
     async fn test_submit_and_confirm_mint_success() {
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
@@ -2342,6 +2342,7 @@ mod tests {
             .expect("prepared mint must contain a valid EIP-2718 transaction");
         assert_eq!(decoded.nonce(), prepared.nonce);
         assert_eq!(*decoded.tx_hash(), prepared.hash);
+        assert_eq!(decoded.gas_limit(), MINT_GAS_LIMIT);
 
         let mut malformed = prepared.clone();
         malformed.tx = vec![0x02];
