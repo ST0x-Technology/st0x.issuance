@@ -4709,10 +4709,12 @@ Tiers and routes:
   `status/<underlying>`, `orchestrator-preflight/<network>`,
   `snapshots/<aggregate_type>/<aggregate_id>`, `network-telemetry`,
   `wrapped-transfers`.
-- **debug** (`/ops/debug/*`): `recover/redemption/<id>`, `reprocess/mint/<id>`,
-  `orchestrator-verify-signing/<network>/<underlying>`, `accounts`,
+- **debug** (`/ops/debug/*`): `POST recover/redemption/<id>`,
+  `POST reprocess/mint/<id>`,
+  `POST orchestrator-verify-signing/<network>/<underlying>`, `POST accounts`,
   `accounts/<client_id>/wallets` (`POST` and `DELETE .../<wallet>`),
-  `tokenized-assets/<underlying>?<network>`, `tokenized-assets`.
+  `GET tokenized-assets/<underlying>?network=<network>`,
+  `POST tokenized-assets`.
 - **capital** (`/ops/capital/*`): `freeze/<underlying>`,
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
