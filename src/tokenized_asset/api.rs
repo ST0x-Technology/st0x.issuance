@@ -109,12 +109,12 @@ fn merge_token_listing(
 )]
 #[get("/tokenized-assets/<underlying>?<network>")]
 pub(crate) async fn get_tokenized_asset(
-    underlying: &str,
+    underlying: UnderlyingParam,
     network: Option<&str>,
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
-    get_tokenized_asset_logic(underlying, network, pool).await
+    get_tokenized_asset_logic(underlying.0, network, pool).await
 }
 
 /// Debug-tier operator route mirroring [`get_tokenized_asset`], gated by IAP
@@ -127,17 +127,17 @@ pub(crate) async fn get_tokenized_asset(
     fields(subject = %auth.0)
 )]
 pub(crate) async fn get_tokenized_asset_ops(
-    underlying: &str,
+    underlying: UnderlyingParam,
     network: Option<&str>,
     auth: DebugOps,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
-    get_tokenized_asset_logic(underlying, network, pool).await
+    get_tokenized_asset_logic(underlying.0, network, pool).await
 }
 
 #[tracing::instrument(skip(pool))]
 async fn get_tokenized_asset_logic(
-    underlying: &str,
+    underlying: UnderlyingSymbol,
     network: Option<&str>,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
@@ -146,8 +146,6 @@ async fn get_tokenized_asset_logic(
     };
     let network =
         network.parse::<Network>().map_err(|_| Status::UnprocessableEntity)?;
-    let underlying = UnderlyingSymbol::new(underlying)
-        .map_err(|_| Status::UnprocessableEntity)?;
 
     let view = super::view::load_asset_by_network(
         pool.inner(),
@@ -1565,6 +1563,52 @@ mod tests {
                 "status": "frozen"
             })
         );
+    }
+
+    /// The detail route uppercases the path symbol (via `UnderlyingParam`)
+    /// before the lookup, so a lowercase request resolves the uppercase-keyed
+    /// asset instead of 404ing on a case-mismatched `AssetKey`.
+    #[tokio::test]
+    async fn test_get_detail_normalizes_a_lowercase_symbol() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+        store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to add asset");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool.clone())
+            .mount("/", routes![get_tokenized_asset]);
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/aapl?network=base")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: Value = response.into_json().await.expect("valid JSON");
+        assert_eq!(body["underlying"], "AAPL");
     }
 
     /// Under a mixed config the status endpoint reports each asset's own

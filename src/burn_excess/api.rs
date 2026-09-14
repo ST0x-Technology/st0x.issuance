@@ -178,6 +178,18 @@ async fn run_burn_excess_ops(
             );
             Status::InternalServerError
         })?;
+    // `into_request` proved `request.chain_id == network.chain_id()`, but the
+    // selected config entry carries its own `chain_id`, and the legacy Base
+    // path does not reject a network/chain-id mismatch at load — `build_chain_
+    // runtime` only checks the RPC reports `chain.chain_id`. Refuse before
+    // signing so a mislabelled endpoint cannot serve a burn on the wrong chain.
+    if chain.chain_id != request.network.chain_id() {
+        error!(target: "admin", network = %request.network, path,
+            configured = chain.chain_id, expected = request.network.chain_id(),
+            "burn-excess chain configuration has the wrong chain id"
+        );
+        return Err(Status::InternalServerError);
+    }
     let http_url = wss_to_http(&chain.rpc_url).map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess RPC unavailable");
         Status::InternalServerError
