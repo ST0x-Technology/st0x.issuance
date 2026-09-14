@@ -247,13 +247,38 @@ const MINTED_LOG_CONFIRMATION_BLOCKS: u64 = 32;
 /// deterministic without looking like an overlarge transaction.
 const MINT_GAS_LIMIT: u64 = 500_000;
 
-/// Fixed gas limit for burn multicalls, set instead of estimating (same reason
-/// as `MINT_GAS_LIMIT`: the provider default estimates against `pending` state,
-/// which under mempool load intermittently reverts with empty returndata and
-/// fails an otherwise valid burn). Burns are heavier and scale with receipt
-/// count (~421k observed on a 4-receipt burn); this limit keeps headroom
-/// without looking like an overlarge transaction.
-const BURN_GAS_LIMIT: u64 = 1_000_000;
+/// Base gas for a burn multicall before any per-leg cost: intrinsic tx
+/// cost, multicall dispatch, and the vault's fixed overhead.
+const BURN_GAS_BASE: u64 = 250_000;
+
+/// Marginal gas per multicall leg (a `redeem` against one receipt, or the
+/// dust `transfer`). Observed: a 4-receipt burn used ~421k total
+/// (~80k/leg); a 16-receipt COIN burn needed ~1.4M (~87k/leg) and was
+/// starved by the old fixed 1M limit, reverting out-of-gas on every
+/// recovery retry (2026-09-14). 120k keeps ~40% headroom over the worst
+/// observed marginal cost.
+const BURN_GAS_PER_CALL: u64 = 120_000;
+
+/// Gas limit for a burn multicall with `call_count` legs, computed from
+/// the transaction's own shape instead of estimating (same reason as
+/// `MINT_GAS_LIMIT`: the provider default estimates against `pending`
+/// state, which under mempool load intermittently reverts with empty
+/// returndata and fails an otherwise valid burn). Burns scale with
+/// receipt count and the burn is built locally, so its leg count is
+/// always known; a limit derived from it stays deterministic without
+/// starving fragmented burns the way a fixed cap did.
+const fn burn_gas_limit(call_count: usize) -> u64 {
+    BURN_GAS_BASE + BURN_GAS_PER_CALL * call_count as u64
+}
+
+/// Leg count of a persisted burn multicall, decoded from its calldata.
+/// `None` when the input is not a vault `multicall` (never the case for
+/// burns prepared by this service; defensive for legacy persisted bytes).
+fn burn_call_count(input: &[u8]) -> Option<usize> {
+    OffchainAssetReceiptVault::multicallCall::abi_decode(input)
+        .ok()
+        .map(|call| call.data.len())
+}
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -1012,11 +1037,13 @@ impl VaultService for RealBlockchainService {
             redeem_calls
         };
 
+        let leg_count = calls.len();
         let mut tx = vault_contract.multicall(calls).into_transaction_request();
-        // Skip gas estimation (see `BURN_GAS_LIMIT`): a fixed limit avoids the
-        // provider's `pending`-state `eth_estimateGas`, which reverts with empty
-        // returndata under load and fails an otherwise valid burn.
-        tx.gas = Some(BURN_GAS_LIMIT);
+        // Skip gas estimation (see `burn_gas_limit`): a locally computed
+        // limit avoids the provider's `pending`-state `eth_estimateGas`,
+        // which reverts with empty returndata under load and fails an
+        // otherwise valid burn, while still scaling with receipt count.
+        tx.gas = Some(burn_gas_limit(leg_count));
 
         // Fill nonce, gas price, gas limit, chain_id from the provider
         let envelop =
@@ -1109,15 +1136,23 @@ impl VaultService for RealBlockchainService {
         sendable_tx: &SendableTxWithHash,
     ) -> Result<SendableTxWithHash, VaultError> {
         let envelope = sendable_tx.validate_for_owner(owner)?;
+        // Computed limit instead of re-estimating against `pending` (see
+        // `burn_gas_limit`): recount the legs from the persisted calldata so
+        // a replacement signed after a limit-sizing fix benefits from it
+        // instead of inheriting a starved limit forever. Non-multicall
+        // calldata (an orchestrator `burnCall`, whose shape does not scale
+        // with receipt count) keeps the limit the original tx was signed
+        // with.
+        let replacement_gas = burn_call_count(envelope.input())
+            .map_or_else(|| envelope.gas_limit(), burn_gas_limit);
         let mut transaction = TransactionRequest::from_transaction(envelope);
         transaction.from = Some(owner);
         let pending =
             self.provider.get_transaction_count(owner).pending().await?;
         self.nonce_manager.observe_pending(owner, pending);
-        // Fixed limit instead of re-estimating against `pending` (see
-        // `BURN_GAS_LIMIT`); fee fields stay `None` so the replacement still
-        // re-prices for the fee bump.
-        transaction.gas = Some(BURN_GAS_LIMIT);
+        // Fee fields stay `None` so the replacement still re-prices for the
+        // fee bump.
+        transaction.gas = Some(replacement_gas);
         transaction.gas_price = None;
         transaction.max_fee_per_gas = None;
         transaction.max_priority_fee_per_gas = None;
@@ -1763,7 +1798,8 @@ mod tests {
         OrchestratorBurnParams, OrchestratorBurnReadiness,
         OrchestratorMintParams, OrchestratorMintedLog,
         OrchestratorRevertReason, RealBlockchainService,
-        RealBlockchainServiceProvider, ResyncNonceManager,
+        RealBlockchainServiceProvider, ResyncNonceManager, burn_call_count,
+        burn_gas_limit,
     };
     use crate::bindings::{
         IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault,
@@ -3750,6 +3786,132 @@ mod tests {
 
         assert_eq!(sendable.dust_shares, U256::ZERO);
         assert!(!sendable.tx.is_empty());
+    }
+
+    #[test]
+    fn burn_gas_limit_covers_observed_burns() {
+        // A 4-receipt burn was observed at ~421k gas used; keep real headroom.
+        assert!(burn_gas_limit(4) >= 630_000);
+        // The 16-receipt COIN burn of 2026-09-14 measured 1,398,097 gas
+        // needed and was starved by the old fixed 1M limit.
+        assert!(burn_gas_limit(16) >= 1_398_097);
+    }
+
+    #[test]
+    fn burn_call_count_decodes_multicall_and_rejects_other_input() {
+        let input = OffchainAssetReceiptVault::multicallCall {
+            data: vec![Bytes::from_static(&[0xab]); 16],
+        }
+        .abi_encode();
+        assert_eq!(burn_call_count(&input), Some(16));
+        assert_eq!(burn_call_count(&[0xde, 0xad]), None);
+    }
+
+    #[tokio::test]
+    async fn prepare_tx_gas_limit_scales_with_leg_count() {
+        // 16 receipts + 1 dust transfer = 17 legs: exactly the shape the
+        // old fixed 1M cap starved (2026-09-14 COIN burn).
+        let asserter = Asserter::new();
+        setup_asserter_for_fill_with_gas(&asserter, 3);
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: test_vault_address(),
+            burns: (1..=16u64)
+                .map(|i| MultiBurnEntry {
+                    receipt_id: U256::from(i),
+                    burn_shares: U256::from(100),
+                    receipt_info: None,
+                    receipt_info_bytes: Some(Bytes::from(b"r".to_vec())),
+                })
+                .collect(),
+            dust_shares: U256::from(5),
+            owner: test_receiver(),
+            user: address!("0x3333333333333333333333333333333333333333"),
+            origin: BurnRequestOrigin::Redemption(test_issuer_redemption_id()),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        };
+
+        let sendable = service
+            .prepare_burn_tx(&params)
+            .await
+            .expect("expected SendableTxWithHash");
+
+        let envelope = sendable.validate().expect("prepared tx should decode");
+        assert_eq!(envelope.gas_limit(), burn_gas_limit(17));
+        assert!(
+            envelope.gas_limit() > 1_398_097,
+            "limit must cover the measured 16-receipt burn"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn replacement_recomputes_gas_from_persisted_multicall() {
+        // Persisted bytes carry a starved 100k limit (the pre-fix shape):
+        // the replacement must resize from the calldata's leg count
+        // instead of inheriting the starved limit forever.
+        let input = Bytes::from(
+            OffchainAssetReceiptVault::multicallCall {
+                data: vec![Bytes::from_static(&[0xab]); 16],
+            }
+            .abi_encode(),
+        );
+        let persisted =
+            SendableTxWithHash::valid_for_test(7, test_vault_address(), input);
+        let owner = persisted.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_success(&11u64);
+        asserter.push_success(&12u64);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&1u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, 7);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should prepare");
+
+        let envelope =
+            replacement.validate().expect("replacement should decode");
+        assert_eq!(envelope.gas_limit(), burn_gas_limit(16));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn replacement_keeps_envelope_gas_for_non_multicall_input() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let asserter = Asserter::new();
+        asserter.push_success(&11u64);
+        asserter.push_success(&12u64);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&1u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.observe_pending(owner, 7);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should prepare");
+
+        let envelope =
+            replacement.validate().expect("replacement should decode");
+        assert_eq!(envelope.gas_limit(), 100_000);
     }
 
     fn test_orchestrator_address() -> Address {
