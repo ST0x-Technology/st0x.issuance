@@ -34,11 +34,14 @@ use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
 use crate::vault::NetworkVaultServices;
 
-/// Caps how long the external burn holds the network's transfer poller paused.
-/// A hung provider or vault call must not stop redemption detection until the
-/// process restarts; on elapse the guard drops and the poller resumes. Chosen
-/// above the expected broadcast-and-confirm window.
-const BURN_EXCESS_EXTERNAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Caps how long either burn-excess route runs the engine. Both hold the
+/// network's wallet lock across signing, and the external route additionally
+/// holds its transfer poller paused; a hung provider or vault call must not
+/// block live signing (or stop redemption detection) until the process
+/// restarts. On elapse the run is abandoned — releasing the wallet lock, and
+/// for the external route dropping the guard so the poller resumes — and the
+/// route returns 504. Chosen above the expected broadcast-and-confirm window.
+const BURN_EXCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An 18-decimal fixed-point share amount parsed from its decimal-string wire
 /// form at deserialize time, so an invalid or over-precise quantity is refused
@@ -182,23 +185,34 @@ async fn run_burn_excess_ops(
     let read_provider = ProviderBuilder::new().connect_http(http_url);
     let executed = request.execute;
 
-    let outcome = run_burn_excess(
-        pool,
-        vault_service.as_ref(),
-        &read_provider,
-        issuer_wallet,
-        request,
-        |plan: &str| {
-            // The CLI operator reads this plan before authorizing the burn;
-            // here the request's `execute` stood in for that answer, so the
-            // plan is recorded instead, next to the reason and incident.
-            warn!(target: "admin", plan, path,
-                "burn-excess auto-approving operator-confirmed plan"
-            );
-            Ok::<bool, std::io::Error>(true)
-        },
+    // Bound the run so a hung provider or vault call cannot hold the wallet
+    // lock (and, for the external route, the paused poller) indefinitely.
+    // On elapse the future is dropped, releasing the wallet lock; the burn
+    // stream is persisted before broadcast, so a re-invocation resumes it.
+    let outcome = tokio::time::timeout(
+        BURN_EXCESS_TIMEOUT,
+        run_burn_excess(
+            pool,
+            vault_service.as_ref(),
+            &read_provider,
+            issuer_wallet,
+            request,
+            |plan: &str| {
+                // The CLI operator reads this plan before authorizing the
+                // burn; here the request's `execute` stood in for that answer,
+                // so the plan is recorded instead, next to reason and incident.
+                warn!(target: "admin", plan, path,
+                    "burn-excess auto-approving operator-confirmed plan"
+                );
+                Ok::<bool, std::io::Error>(true)
+            },
+        ),
     )
     .await
+    .map_err(|_| {
+        error!(target: "admin", path, "burn-excess timed out");
+        Status::GatewayTimeout
+    })?
     .map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess failed");
         map_burn_excess_error(&error)
@@ -303,25 +317,17 @@ pub(crate) async fn burn_excess_external_ops(
         Status::ServiceUnavailable
     })?;
 
-    // Bound the paused window: a hung provider/vault call must not keep the
-    // poller stopped indefinitely. On elapse the guard drops and resumes it.
-    tokio::time::timeout(
-        BURN_EXCESS_EXTERNAL_TIMEOUT,
-        run_burn_excess_ops(
-            pool.inner(),
-            config.inner(),
-            vault_services,
-            request,
-            "external",
-        ),
+    // `run_burn_excess_ops` bounds the run and returns 504 on elapse; the
+    // guard resumes the poller when this handler returns on any path (success,
+    // error, timeout, panic).
+    run_burn_excess_ops(
+        pool.inner(),
+        config.inner(),
+        vault_services,
+        request,
+        "external",
     )
     .await
-    .map_err(|_| {
-        error!(target: "admin", network = %network,
-            "burn-excess (external) timed out; poller resumed"
-        );
-        Status::GatewayTimeout
-    })?
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a

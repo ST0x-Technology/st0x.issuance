@@ -4752,6 +4752,10 @@ outcome unknown (the burn may be excluded, intended, or submitted), so the
 operator re-invokes the route for the same deposit to read the persisted stream
 and resume it from wherever it stopped.
 
+The internal route holds the wallet lock across signing but pauses no poller, so
+it has no 503; it is bounded the same way, returning 504 when its run exceeds
+120 seconds, with the same dry-run-versus-execute distinction above.
+
 Both `burn-excess` routes take the network's RPC endpoint from the service's
 startup-verified chain configuration, never from a request-time environment
 read, so a deployment that supplies its RPC as a flag rather than an env var
