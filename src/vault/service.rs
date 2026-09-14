@@ -2176,6 +2176,7 @@ mod tests {
         RealBlockchainService::new(provider, nonce_manager)
     }
 
+    #[traced_test]
     #[tokio::test(start_paused = true)]
     /// Verifies a hung estimate transport falls back to the formula floor
     /// instead of blocking burn preparation on the unbounded HTTP client.
@@ -2225,6 +2226,13 @@ mod tests {
             .expect("a hung estimate must fall back, not error");
 
         assert_eq!(gas, BURN_GAS_FLOOR);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Burn gas estimate against latest timed out; using the formula limit",
+                "floor=1000000"
+            ]
+        ));
     }
 
     async fn sign_test_transaction(
@@ -4256,6 +4264,155 @@ mod tests {
         assert_eq!(envelope.gas_limit(), 100_000_000);
     }
 
+    /// A one-connection HTTP JSON-RPC stub that records every request
+    /// body and answers from a queue, so a test can assert the exact
+    /// wire shape of a request (the mock `Asserter` never looks at it).
+    async fn spawn_capturing_rpc(
+        responses: Vec<&'static str>,
+    ) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>)
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let captured: std::sync::Arc<
+            parking_lot::Mutex<Vec<serde_json::Value>>,
+        > = std::sync::Arc::default();
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = captured.clone();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            for canned in responses {
+                // Read one HTTP request: headers, then Content-Length body.
+                let (body, consumed) = loop {
+                    if let Some(header_end) =
+                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let headers =
+                            String::from_utf8_lossy(&buf[..header_end])
+                                .to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let body_start = header_end + 4;
+                        if buf.len() >= body_start + length {
+                            let body =
+                                buf[body_start..body_start + length].to_vec();
+                            break (body, body_start + length);
+                        }
+                    }
+                    let mut chunk = [0u8; 4096];
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+                buf.drain(..consumed);
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap();
+                let id = request["id"].clone();
+                capture.lock().push(request);
+                let payload = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{canned}}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                    payload.len()
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies the exact wire shape of the sizing estimate, which the
+    /// mock `Asserter` never checks: the block tag is `latest`, `from`,
+    /// destination and calldata are carried, and the persisted gas,
+    /// nonce and fee fields are stripped. Also asserts the structured
+    /// success log.
+    async fn sized_burn_gas_sends_stripped_estimate_against_latest() {
+        // 0x1e8480 = 2,000,000; the block query answers null so the
+        // limit check is skipped (covered by its own tests).
+        let (url, captured) =
+            spawn_capturing_rpc(vec![r#""0x1e8480""#, "null"]).await;
+        let nonce_manager = ResyncNonceManager::default();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .filler(NonceFiller::new(nonce_manager.clone()))
+            .filler(ChainIdFiller::default())
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+                    .expect("test private key should be valid"),
+            ))
+            .connect_http(url.parse().unwrap());
+        let service = RealBlockchainService::new(provider, nonce_manager);
+        let owner = Address::repeat_byte(0x11);
+        let mut tx = TransactionRequest::default();
+        tx.to = Some(test_vault_address().into());
+        tx.input = Bytes::from_static(&[0xac, 0x96, 0x50, 0xd8]).into();
+        // Persisted fields the estimate must strip.
+        tx.gas = Some(100_000);
+        tx.nonce = Some(7);
+        tx.gas_price = Some(1);
+
+        let gas = service
+            .sized_burn_gas(&tx, BURN_GAS_FLOOR, owner)
+            .await
+            .expect("estimate should size the burn");
+
+        assert_eq!(gas, 2_600_000);
+        let captured = std::mem::take(&mut *captured.lock());
+        let estimate = &captured[0];
+        assert_eq!(estimate["method"], "eth_estimateGas");
+        assert_eq!(estimate["params"][1], "latest");
+        let call = &estimate["params"][0];
+        assert_eq!(
+            call["from"].as_str().unwrap().to_ascii_lowercase(),
+            format!("{owner:#x}")
+        );
+        assert_eq!(
+            call["to"].as_str().unwrap().to_ascii_lowercase(),
+            format!("{:#x}", test_vault_address())
+        );
+        assert_eq!(call["input"], "0xac9650d8");
+        for stripped in [
+            "gas",
+            "nonce",
+            "gasPrice",
+            "maxFeePerGas",
+            "maxPriorityFeePerGas",
+            "maxFeePerBlobGas",
+        ] {
+            assert!(
+                call.get(stripped).is_none(),
+                "estimate must not carry `{stripped}`"
+            );
+        }
+        assert_eq!(captured[1]["method"], "eth_getBlockByNumber");
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Sized burn gas limit against latest",
+                "estimate=2000000",
+                "padded=2600000",
+                "chosen=2600000"
+            ]
+        ));
+    }
     #[traced_test]
     #[tokio::test]
     /// Verifies a replacement recalculates gas from persisted multicall
@@ -4345,6 +4502,13 @@ mod tests {
         let envelope =
             replacement.validate().expect("replacement should decode");
         assert_eq!(envelope.gas_limit(), BURN_GAS_FLOOR);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Burn gas estimate against latest failed; using the formula limit",
+                "estimate_reverted=false"
+            ]
+        ));
     }
 
     #[traced_test]
