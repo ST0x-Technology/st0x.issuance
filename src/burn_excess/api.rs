@@ -37,6 +37,7 @@ use crate::vault::NetworkVaultServices;
 pub(crate) struct Shares(U256);
 
 impl Shares {
+    /// Returns the validated fixed-point amount for the burn engine.
     const fn into_u256(self) -> U256 {
         self.0
     }
