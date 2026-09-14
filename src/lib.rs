@@ -371,6 +371,12 @@ pub async fn initialize_rocket(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut background_task_handles = Vec::new();
 
+    // Build the per-tier IAP verifiers before spawning any background worker:
+    // this is the last fallible step, and a failure here must propagate before
+    // a task is spawned, since dropping the handles on the error path detaches
+    // rather than aborts them.
+    let ops_verifiers = build_ops_verifiers(&config)?;
+
     background_task_handles.extend(spawn_mint_background_tasks(
         MintJobWorkers {
             pool: pool.clone(),
@@ -453,7 +459,7 @@ pub async fn initialize_rocket(
             &apalis_pool,
             pool.clone(),
         ),
-        ops_verifiers: build_ops_verifiers(&config)?,
+        ops_verifiers,
         underlying_store,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,

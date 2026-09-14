@@ -120,7 +120,8 @@ impl std::fmt::Display for OpsPrincipal {
     }
 }
 
-/// One IAP verifier per tier, sharing a single HTTP client and JWKS document.
+/// One IAP verifier per tier, sharing a single HTTP client but each keeping
+/// its own JWKS key cache and refresh floor.
 ///
 /// Held in Rocket managed state and read by the per-tier request guards. Absent
 /// from state means the role-gated routes were not mounted, which is the
@@ -136,7 +137,9 @@ impl OpsApiVerifiers {
     /// Builds the four per-tier verifiers from the configured audiences. The
     /// `http` client MUST carry timeouts (see [`build_jwks_client`]); it is
     /// cloned per verifier, which for `reqwest::Client` is a cheap `Arc` clone
-    /// so all four share one connection pool and one JWKS document.
+    /// so all four share one connection pool. The JWKS key cache and the
+    /// refresh floor are NOT shared: each verifier fetches and caches its
+    /// tier's audience-scoped key set independently.
     pub(crate) fn new(config: &OpsApiConfig, http: &reqwest::Client) -> Self {
         Self {
             read: IapVerifier::new(config.read(), OpsTier::Read, http.clone()),
@@ -269,9 +272,6 @@ struct CachedKeys {
 struct IapClaims {
     /// Stable, unique, never reused: the right key for correlating actions.
     sub: String,
-    /// Present for human callers. Absent for service accounts on some paths,
-    /// which is why it is optional and used only for logging.
-    email: Option<String>,
     /// Issued-at, seconds since the epoch. Required: `jsonwebtoken` checks
     /// only `exp`, so a future-issued token would otherwise pass. Checked in
     /// [`IapVerifier::verify`] against the skew and the maximum lifetime.
@@ -350,7 +350,7 @@ impl IapVerifier {
                 IapError::Rejected
             })?;
 
-        let IapClaims { sub, email, iat, exp } = claims.claims;
+        let IapClaims { sub, iat, exp } = claims.claims;
 
         // `jsonwebtoken` validates `exp` but never reads `iat`. Google requires
         // both: an assertion must have been issued in the past (within skew),
@@ -377,7 +377,6 @@ impl IapVerifier {
             target: "auth",
             tier = self.tier.as_str(),
             subject = %sub,
-            email = email.as_deref().unwrap_or("<none>"),
             "IAP assertion accepted"
         );
 
