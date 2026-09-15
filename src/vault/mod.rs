@@ -446,7 +446,7 @@ impl SendableTxWithHash {
         destination: Address,
         input: Bytes,
     ) -> Self {
-        Self::valid_for_test_with_chain_id(nonce, destination, input, 1)
+        Self::valid_for_test_with(nonce, destination, input, 1, 100_000)
     }
 
     #[cfg(test)]
@@ -456,11 +456,32 @@ impl SendableTxWithHash {
         input: Bytes,
         chain_id: u64,
     ) -> Self {
+        Self::valid_for_test_with(nonce, destination, input, chain_id, 100_000)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test_with_gas(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+        gas_limit: u64,
+    ) -> Self {
+        Self::valid_for_test_with(nonce, destination, input, 1, gas_limit)
+    }
+
+    #[cfg(test)]
+    fn valid_for_test_with(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+        chain_id: u64,
+        gas_limit: u64,
+    ) -> Self {
         let transaction = TxLegacy {
             chain_id: Some(chain_id),
             nonce,
             gas_price: 1,
-            gas_limit: 100_000,
+            gas_limit,
             to: TxKind::Call(destination),
             value: U256::ZERO,
             input,
@@ -968,6 +989,24 @@ pub(crate) enum ReceiptEncodeError {
 /// Errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultError {
+    /// The burn's estimated gas exceeds the latest block gas limit: no
+    /// limit we could sign makes it mineable, so preparation fails
+    /// instead of persisting a transaction that can never be included
+    /// (the burn needs batching).
+    #[error(
+        "burn needs {required} gas but the latest block limit is \
+         {block_limit}; the burn cannot fit a block and needs batching"
+    )]
+    BurnExceedsBlockGasLimit { required: u64, block_limit: u64 },
+    /// Padding the burn gas estimate by 30% overflows `u64`. An estimate
+    /// that large is not a credible node answer, and silently saturating
+    /// it would let the padded value fall below the estimate - failing
+    /// preparation keeps the estimate-only-raises guarantee fail-fast.
+    #[error(
+        "padding the burn gas estimate {estimate} by 30% overflows u64; \
+         the estimate is not credible"
+    )]
+    BurnGasPaddingOverflow { estimate: u64 },
     /// Transaction receipt is missing required data
     #[error("Invalid receipt")]
     InvalidReceipt,
