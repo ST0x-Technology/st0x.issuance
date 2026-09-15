@@ -358,10 +358,13 @@ impl RealBlockchainService {
     /// ([`VaultError::BurnExceedsBlockGasLimit`] - the burn needs
     /// batching, and persisting it would retry an unmineable transaction
     /// forever), while a limit where only the padding or the floor
-    /// crosses is capped at the block limit. Without an estimate no fit
-    /// verdict is possible, so the fallback stays uncapped and the chain
-    /// arbitrates. Logs floor, estimate and the chosen limit so the
-    /// constants can be retuned from data.
+    /// crosses is capped at the block limit. The formula fallback gets
+    /// the same verdict: the floor itself grows with leg count and can
+    /// cross the block limit, so every branch checks what it returns
+    /// against the latest header and only an unavailable header leaves
+    /// the limit uncapped for the chain to arbitrate. Logs floor,
+    /// estimate and the chosen limit so the constants can be retuned
+    /// from data.
     async fn sized_burn_gas(
         &self,
         tx: &TransactionRequest,
@@ -389,22 +392,7 @@ impl RealBlockchainService {
         .await;
         match estimate {
             Ok(Ok(estimate)) => {
-                // Bounded separately so a hung block query can neither
-                // block signing nor discard the estimate. Queried only
-                // with an estimate in hand: without one no fit verdict is
-                // possible and the fallback is uncapped by design, and a
-                // best-effort failure just skips the limit check.
-                let block_limit =
-                    tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
-                        self.provider
-                            .get_block_by_number(BlockNumberOrTag::Latest)
-                            .await
-                    })
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .flatten()
-                    .map(|block| block.header.gas_limit);
+                let block_limit = self.latest_block_limit().await;
                 if let Some(block_limit) = block_limit
                     && estimate > block_limit
                 {
@@ -445,7 +433,7 @@ impl RealBlockchainService {
                     error = %error,
                     "Burn gas estimate against latest failed; using the formula limit"
                 );
-                Ok(floor)
+                self.floor_checked_against_block_limit(floor).await
             }
             Err(_elapsed) => {
                 warn!(target: "vault",
@@ -453,9 +441,47 @@ impl RealBlockchainService {
                     timeout_secs = BURN_GAS_ESTIMATE_TIMEOUT.as_secs(),
                     "Burn gas estimate against latest timed out; using the formula limit"
                 );
-                Ok(floor)
+                self.floor_checked_against_block_limit(floor).await
             }
         }
+    }
+
+    /// The latest block gas limit, best effort and bounded separately
+    /// from the estimate so a hung block query can neither block signing
+    /// nor discard a good estimate. `None` when the header is
+    /// unavailable: no fit verdict is possible then.
+    async fn latest_block_limit(&self) -> Option<u64> {
+        tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
+            self.provider.get_block_by_number(BlockNumberOrTag::Latest).await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .map(|block| block.header.gas_limit)
+    }
+
+    /// Verdict for the formula floor when no estimate answered: the floor
+    /// grows with leg count (it crosses a 30M block around 248 legs), and
+    /// estimates fail most under the same stress that has big burns
+    /// retrying, so an unchecked fallback would persist an unmineable
+    /// transaction that recovery re-signs forever - the exact failure
+    /// [`VaultError::BurnExceedsBlockGasLimit`] exists to prevent. With
+    /// no header there is genuinely no verdict; the next recovery cycle
+    /// re-prepares with fresh lookups.
+    async fn floor_checked_against_block_limit(
+        &self,
+        floor: u64,
+    ) -> Result<u64, VaultError> {
+        if let Some(block_limit) = self.latest_block_limit().await
+            && floor > block_limit
+        {
+            return Err(VaultError::BurnExceedsBlockGasLimit {
+                required: floor,
+                block_limit,
+            });
+        }
+        Ok(floor)
     }
 
     /// Fills and signs `transaction`, restoring only this fill's nonce state on
@@ -2242,6 +2268,61 @@ mod tests {
         ));
     }
 
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies the formula floor gets the same block-limit verdict as an
+    /// estimate: a heavily fragmented burn whose floor cannot fit any
+    /// block must fail preparation on the estimate-failure path too,
+    /// instead of persisting an unmineable transaction that recovery
+    /// re-signs forever.
+    async fn sized_burn_gas_fails_when_floor_exceeds_block_limit() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("estimate unavailable (test)");
+        asserter.push_success(&block_with_gas_limit(30_000_000));
+        let service = create_service_with_asserter(asserter);
+
+        let error = service
+            .sized_burn_gas(
+                &TransactionRequest::default(),
+                40_000_000,
+                Address::repeat_byte(1),
+            )
+            .await
+            .expect_err("an over-block floor must fail preparation");
+
+        assert!(matches!(
+            error,
+            VaultError::BurnExceedsBlockGasLimit {
+                required: 40_000_000,
+                block_limit: 30_000_000,
+            }
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies the floor stays uncapped when neither the estimate nor
+    /// the block header is available: no fit verdict is possible, and
+    /// blocking every burn on a second unavailable lookup would defeat
+    /// the fallback.
+    async fn sized_burn_gas_keeps_floor_when_block_header_unavailable() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("estimate unavailable (test)");
+        asserter.push_failure_msg("header unavailable (test)");
+        let service = create_service_with_asserter(asserter);
+
+        let gas = service
+            .sized_burn_gas(
+                &TransactionRequest::default(),
+                40_000_000,
+                Address::repeat_byte(1),
+            )
+            .await
+            .expect("no header means no verdict; keep the floor");
+
+        assert_eq!(gas, 40_000_000);
+    }
+
     async fn sign_test_transaction(
         provider: &RealBlockchainServiceProvider,
         transaction: TransactionRequest,
@@ -3176,6 +3257,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&refreshed_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3230,6 +3312,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&refreshed_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3267,6 +3350,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&first_pending_nonce);
         asserter.push_success(&lagging_pending_nonce);
         asserter.push_success(&test_fee_history());
@@ -3294,6 +3378,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&pending_nonce);
         asserter.push_success(&pending_nonce);
         asserter.push_failure_msg("fee lookup failed");
@@ -3968,6 +4053,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         setup_asserter_for_fill_with_gas(&asserter, expected_nonce);
 
         let service = create_service_with_asserter(asserter);
@@ -4015,6 +4101,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         setup_asserter_for_fill_with_gas(&asserter, 0);
 
         let service = create_service_with_asserter(asserter);
@@ -4083,6 +4170,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         setup_asserter_for_fill_with_gas(&asserter, 3);
         let service = create_service_with_asserter(asserter);
 
@@ -4482,6 +4570,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
@@ -4531,6 +4620,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
@@ -4585,6 +4675,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter
             .push_failure_msg("no gas estimate queued; hybrid sizing falls back to the formula (test)");
+        asserter.push_success(&block_with_gas_limit(200_000_000));
         asserter.push_success(&11u64);
         asserter.push_success(&12u64);
         asserter.push_success(&test_fee_history());
