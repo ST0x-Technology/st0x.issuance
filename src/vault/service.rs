@@ -401,7 +401,13 @@ impl RealBlockchainService {
                         block_limit,
                     });
                 }
-                let padded = estimate.saturating_mul(13) / 10;
+                // Wider intermediate so overflow cannot silently produce
+                // a padded value below the estimate (fail-fast arithmetic:
+                // saturation would hide it).
+                let padded = u64::try_from(u128::from(estimate) * 13 / 10)
+                    .map_err(|_| VaultError::BurnGasPaddingOverflow {
+                        estimate,
+                    })?;
                 let mut chosen = floor.max(padded);
                 if let Some(block_limit) = block_limit {
                     // Only the padding or the floor crosses the block
@@ -2321,6 +2327,34 @@ mod tests {
             .expect("no header means no verdict; keep the floor");
 
         assert_eq!(gas, 40_000_000);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    /// Verifies an estimate whose 30% padding cannot be represented fails
+    /// preparation instead of silently saturating below the estimate,
+    /// which would break the estimate-only-raises guarantee. Reachable
+    /// only with no block header (any real header would already have
+    /// failed the fit check), so the header lookup answers nothing.
+    async fn sized_burn_gas_fails_when_padding_overflows() {
+        let asserter = Asserter::new();
+        asserter.push_success(&u64::MAX);
+        asserter.push_failure_msg("header unavailable (test)");
+        let service = create_service_with_asserter(asserter);
+
+        let error = service
+            .sized_burn_gas(
+                &TransactionRequest::default(),
+                BURN_GAS_FLOOR,
+                Address::repeat_byte(1),
+            )
+            .await
+            .expect_err("unrepresentable padding must fail preparation");
+
+        assert!(matches!(
+            error,
+            VaultError::BurnGasPaddingOverflow { estimate: u64::MAX }
+        ));
     }
 
     async fn sign_test_transaction(

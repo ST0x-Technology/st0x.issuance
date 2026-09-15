@@ -998,6 +998,15 @@ pub(crate) enum VaultError {
          {block_limit}; the burn cannot fit a block and needs batching"
     )]
     BurnExceedsBlockGasLimit { required: u64, block_limit: u64 },
+    /// Padding the burn gas estimate by 30% overflows `u64`. An estimate
+    /// that large is not a credible node answer, and silently saturating
+    /// it would let the padded value fall below the estimate - failing
+    /// preparation keeps the estimate-only-raises guarantee fail-fast.
+    #[error(
+        "padding the burn gas estimate {estimate} by 30% overflows u64; \
+         the estimate is not credible"
+    )]
+    BurnGasPaddingOverflow { estimate: u64 },
     /// Transaction receipt is missing required data
     #[error("Invalid receipt")]
     InvalidReceipt,
