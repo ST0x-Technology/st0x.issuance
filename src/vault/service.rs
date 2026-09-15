@@ -4525,13 +4525,15 @@ mod tests {
             .connect_http(url.parse().unwrap());
         let service = RealBlockchainService::new(provider, nonce_manager);
         let owner = Address::repeat_byte(0x11);
-        let mut tx = TransactionRequest::default();
-        tx.to = Some(test_vault_address().into());
-        tx.input = Bytes::from_static(&[0xac, 0x96, 0x50, 0xd8]).into();
-        // Persisted fields the estimate must strip.
-        tx.gas = Some(100_000);
-        tx.nonce = Some(7);
-        tx.gas_price = Some(1);
+        let tx = TransactionRequest {
+            to: Some(test_vault_address().into()),
+            input: Bytes::from_static(&[0xac, 0x96, 0x50, 0xd8]).into(),
+            // Persisted fields the estimate must strip.
+            gas: Some(100_000),
+            nonce: Some(7),
+            gas_price: Some(1),
+            ..Default::default()
+        };
 
         let gas = service
             .sized_burn_gas(&tx, BURN_GAS_FLOOR, owner)
