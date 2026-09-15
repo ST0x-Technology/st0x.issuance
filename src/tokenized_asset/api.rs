@@ -1,12 +1,14 @@
 use event_sorcery::{AggregateError, Store};
 use rocket::http::Status;
+use rocket::request::FromParam;
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{
     AddTokenizedAssetRequest, AddTokenizedAssetResponse, AssetKey,
     TokenizedAssetDetailResponse, TokenizedAssetResponse,
-    TokenizedAssetStatusResponse, TokenizedAssetsListResponse, VaultModeTag,
+    TokenizedAssetStatusResponse, TokenizedAssetsListResponse,
+    UnderlyingSymbolError, VaultModeTag,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,6 +22,27 @@ use crate::auth::{InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
 use crate::config::{Config, VaultModeKind};
 use crate::underlying::load_freeze_status;
+
+/// An operator-supplied underlying symbol in a route path, uppercased and
+/// validated at the routing layer: a malformed segment forwards with 422
+/// before the handler runs. `UnderlyingSymbol` lives in the DTO crate, so the
+/// `FromParam` impl needs this local wrapper.
+pub(crate) struct UnderlyingParam(pub(crate) UnderlyingSymbol);
+
+impl<'a> FromParam<'a> for UnderlyingParam {
+    type Error = UnderlyingSymbolError;
+
+    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
+        UnderlyingSymbol::new(param.to_ascii_uppercase()).map(Self).map_err(
+            |error| {
+                warn!(target: "asset", underlying = param, %error,
+                    "Invalid underlying symbol"
+                );
+                error
+            },
+        )
+    }
+}
 
 impl From<VaultModeKind> for VaultModeTag {
     fn from(kind: VaultModeKind) -> Self {

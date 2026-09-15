@@ -4,6 +4,7 @@
 //! already holds the excess; Path B (`external`) records a funding-transfer
 //! exclusion then burns. Never Alpaca; never a `Redemption` aggregate.
 
+pub(crate) mod api;
 pub(crate) mod cli;
 mod cmd;
 pub(crate) mod engine;
