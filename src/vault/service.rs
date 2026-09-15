@@ -405,13 +405,13 @@ impl RealBlockchainService {
         .await;
         match sized {
             Ok(Ok((estimate, block_limit))) => {
-                if let Some(block_limit) = block_limit {
-                    if estimate > block_limit {
-                        return Err(VaultError::BurnExceedsBlockGasLimit {
-                            required: estimate,
-                            block_limit,
-                        });
-                    }
+                if let Some(block_limit) = block_limit
+                    && estimate > block_limit
+                {
+                    return Err(VaultError::BurnExceedsBlockGasLimit {
+                        required: estimate,
+                        block_limit,
+                    });
                 }
                 let padded = estimate.saturating_mul(13) / 10;
                 let mut chosen = floor.max(padded);
@@ -2149,9 +2149,16 @@ mod tests {
     fn block_with_gas_limit(
         gas_limit: u64,
     ) -> Block<alloy::rpc::types::Transaction> {
-        let mut block: Block<alloy::rpc::types::Transaction> = Block::default();
-        block.header.inner.gas_limit = gas_limit;
-        block
+        Block {
+            header: alloy::rpc::types::Header {
+                inner: alloy::consensus::Header {
+                    gas_limit,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn create_service_with_asserter(
