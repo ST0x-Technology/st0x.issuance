@@ -380,31 +380,31 @@ impl RealBlockchainService {
         estimate_tx.max_priority_fee_per_gas = None;
         estimate_tx.max_fee_per_blob_gas = None;
         estimate_tx.nonce = None;
-        let sized = tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
-            let estimate = self
-                .provider
+        let estimate = tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
+            self.provider
                 .estimate_gas(estimate_tx)
                 .block(BlockNumberOrTag::Latest.into())
-                .await?;
-            // Best effort, same bound: without the header the estimate is
-            // still useful, just uncheckable against the block limit.
-            let block_limit = self
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Latest)
                 .await
-                .ok()
-                .flatten()
-                .map(|block| block.header.gas_limit);
-            Ok::<
-                _,
-                alloy::transports::RpcError<
-                    alloy::transports::TransportErrorKind,
-                >,
-            >((estimate, block_limit))
         })
         .await;
-        match sized {
-            Ok(Ok((estimate, block_limit))) => {
+        match estimate {
+            Ok(Ok(estimate)) => {
+                // Bounded separately so a hung block query can neither
+                // block signing nor discard the estimate. Queried only
+                // with an estimate in hand: without one no fit verdict is
+                // possible and the fallback is uncapped by design, and a
+                // best-effort failure just skips the limit check.
+                let block_limit =
+                    tokio::time::timeout(BURN_GAS_ESTIMATE_TIMEOUT, async {
+                        self.provider
+                            .get_block_by_number(BlockNumberOrTag::Latest)
+                            .await
+                    })
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
+                    .map(|block| block.header.gas_limit);
                 if let Some(block_limit) = block_limit
                     && estimate > block_limit
                 {
@@ -3064,6 +3064,7 @@ mod tests {
         )
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn classify_burn_tx_reports_mined_and_reverted_receipts() {
         for (succeeded, expected) in
@@ -3091,6 +3092,12 @@ mod tests {
                 .expect("receipt should classify");
 
             assert_eq!(status, expected);
+            if succeeded {
+                assert!(logs_contain_at!(
+                    Level::INFO,
+                    &["Burn gas utilization", "gas_used=", "gas_limit=100000"]
+                ));
+            }
         }
     }
 
@@ -4271,15 +4278,14 @@ mod tests {
         assert_eq!(envelope.gas_limit(), 100_000_000);
     }
 
-    /// A one-connection HTTP JSON-RPC stub that records every request
-    /// body and answers from a queue, so a test can assert the exact
-    /// wire shape of a request (the mock `Asserter` never looks at it).
+    /// A request-recording HTTP JSON-RPC stub that answers by method, so
+    /// a test can assert the exact wire shape of a request (the mock
+    /// `Asserter` never looks at it). Serves any number of connections:
+    /// the concurrent sizing lookups may arrive on separate sockets.
     async fn spawn_capturing_rpc(
-        responses: Vec<&'static str>,
+        responses: Vec<(&'static str, &'static str)>,
     ) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>)
     {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let captured: std::sync::Arc<
             parking_lot::Mutex<Vec<serde_json::Value>>,
         > = std::sync::Arc::default();
@@ -4288,58 +4294,84 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let capture = captured.clone();
         tokio::spawn(async move {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = Vec::new();
-            for canned in responses {
-                // Read one HTTP request: headers, then Content-Length body.
-                let (body, consumed) = loop {
-                    if let Some(header_end) =
-                        buf.windows(4).position(|w| w == b"\r\n\r\n")
-                    {
-                        let headers =
-                            String::from_utf8_lossy(&buf[..header_end])
-                                .to_ascii_lowercase();
-                        let length: usize = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let body_start = header_end + 4;
-                        if buf.len() >= body_start + length {
-                            let body =
-                                buf[body_start..body_start + length].to_vec();
-                            break (body, body_start + length);
-                        }
-                    }
-                    let mut chunk = [0u8; 4096];
-                    let Ok(n) = socket.read(&mut chunk).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                };
-                buf.drain(..consumed);
-                let request: serde_json::Value =
-                    serde_json::from_slice(&body).unwrap();
-                let id = request["id"].clone();
-                capture.lock().push(request);
-                let payload = format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{canned}}}"#
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
-                    payload.len()
-                );
-                if socket.write_all(response.as_bytes()).await.is_err() {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
                     return;
-                }
+                };
+                let capture = capture.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    serve_capturing_connection(
+                        &mut socket,
+                        &capture,
+                        &responses,
+                    )
+                    .await;
+                });
             }
         });
         (format!("http://{addr}"), captured)
+    }
+
+    /// One connection's request/response loop for `spawn_capturing_rpc`.
+    async fn serve_capturing_connection(
+        socket: &mut tokio::net::TcpStream,
+        capture: &parking_lot::Mutex<Vec<serde_json::Value>>,
+        responses: &[(&'static str, &'static str)],
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = Vec::new();
+        loop {
+            // Read one HTTP request: headers, then Content-Length body.
+            let (body, consumed) = loop {
+                if let Some(header_end) =
+                    buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&buf[..header_end])
+                        .to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buf.len() >= body_start + length {
+                        let body =
+                            buf[body_start..body_start + length].to_vec();
+                        break (body, body_start + length);
+                    }
+                }
+                let mut chunk = [0u8; 4096];
+                let Ok(n) = socket.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            buf.drain(..consumed);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap();
+            let id = request["id"].clone();
+            let method =
+                request["method"].as_str().unwrap_or_default().to_owned();
+            capture.lock().push(request);
+            let canned = responses
+                .iter()
+                .find(|(name, _)| *name == method)
+                .map_or("null", |(_, canned)| *canned);
+            let payload =
+                format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{canned}}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                payload.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
     }
 
     #[traced_test]
@@ -4352,8 +4384,11 @@ mod tests {
     async fn sized_burn_gas_sends_stripped_estimate_against_latest() {
         // 0x1e8480 = 2,000,000; the block query answers null so the
         // limit check is skipped (covered by its own tests).
-        let (url, captured) =
-            spawn_capturing_rpc(vec![r#""0x1e8480""#, "null"]).await;
+        let (url, captured) = spawn_capturing_rpc(vec![
+            ("eth_estimateGas", r#""0x1e8480""#),
+            ("eth_getBlockByNumber", "null"),
+        ])
+        .await;
         let nonce_manager = ResyncNonceManager::default();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -4383,8 +4418,10 @@ mod tests {
 
         assert_eq!(gas, 2_600_000);
         let captured = std::mem::take(&mut *captured.lock());
-        let estimate = &captured[0];
-        assert_eq!(estimate["method"], "eth_estimateGas");
+        let estimate = captured
+            .iter()
+            .find(|request| request["method"] == "eth_estimateGas")
+            .expect("estimate request should be sent");
         assert_eq!(estimate["params"][1], "latest");
         let call = &estimate["params"][0];
         assert_eq!(
@@ -4409,7 +4446,12 @@ mod tests {
                 "estimate must not carry `{stripped}`"
             );
         }
-        assert_eq!(captured[1]["method"], "eth_getBlockByNumber");
+        assert!(
+            captured
+                .iter()
+                .any(|request| request["method"] == "eth_getBlockByNumber"),
+            "block limit should be queried"
+        );
         assert!(logs_contain_at!(
             Level::INFO,
             &[
