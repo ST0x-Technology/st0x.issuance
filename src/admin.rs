@@ -2372,8 +2372,8 @@ impl<'r> Responder<'r, 'static> for CloseMintError {
 ///
 /// Three layers, all read-only:
 /// 1. Every persisted signed transaction with no recorded terminal outcome
-///    must be provably unable to land — a confirmed revert, or the signing
-///    wallet's finalized nonce past it. A still-mineable transaction (or a
+///    must be provably unable to land — a finalized confirmed revert, or the
+///    signing wallet's finalized nonce past it. A still-mineable transaction (or a
 ///    legacy submission that persisted no bytes to prove anything about)
 ///    refuses the close: the absence read is one instant, and a later
 ///    landing would go unobserved once the mint leaves recovery and stuck
@@ -2475,9 +2475,7 @@ async fn refuse_unsafe_close(
             })?;
         match vault_service.classify_burn_tx(signer, &sendable).await {
             Ok(
-                BurnTxStatus::Reverted
-                | BurnTxStatus::FinalizedReverted
-                | BurnTxStatus::ProvablyDead,
+                BurnTxStatus::FinalizedReverted | BurnTxStatus::ProvablyDead,
             ) => {}
             Ok(BurnTxStatus::Mined) => {
                 warn!(target: "admin", issuer_request_id = %issuer_request_id,
@@ -2487,7 +2485,7 @@ async fn refuse_unsafe_close(
                 );
                 return Err(CloseMintError::MintLanded);
             }
-            Ok(BurnTxStatus::StillMineable) => {
+            Ok(BurnTxStatus::Reverted | BurnTxStatus::StillMineable) => {
                 warn!(target: "admin", issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable.hash,
                     "Refusing to close: the persisted transaction could \
@@ -9460,12 +9458,13 @@ mod tests {
                 .expect("mint must advance to the classified failure");
         }
 
-        // The persisted transaction is the NonceReplayed revert — provably
-        // unable to land — and the consumed nonce has no full-matching log.
+        // The persisted transaction is the finalized NonceReplayed revert —
+        // provably unable to land — and the consumed nonce has no
+        // full-matching log.
         let vault_mock = Arc::new(
             MockVaultService::new_success()
                 .with_nonce_used(true)
-                .with_burn_tx_status(BurnTxStatus::Reverted),
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
         );
         let (status, _body) = dispatch_close_mint(
             close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
@@ -9638,12 +9637,12 @@ mod tests {
             .await
             .expect("mint must park unresolved");
 
-        // The persisted transaction is the NonceReplayed revert (provably
-        // dead); the nonce is consumed with no full-matching log.
+        // The persisted transaction is the finalized NonceReplayed revert
+        // (provably dead); the nonce is consumed with no full-matching log.
         let vault_mock = Arc::new(
             MockVaultService::new_success()
                 .with_nonce_used(true)
-                .with_burn_tx_status(BurnTxStatus::Reverted),
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
         );
 
         let (status, _body) = dispatch_close_mint(
@@ -9735,6 +9734,52 @@ mod tests {
             body.contains("could still land"),
             "the refusal body must explain the pending transaction, got: \
              {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(!matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "persisted transaction could still land"
+            ]
+        ));
+    }
+
+    /// A failed receipt can disappear in a reorganization until its exact
+    /// block is finalized, so it cannot prove a persisted transaction dead.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_unfinalized_reverted_persisted_tx() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+        advance_close_test_mint_to_submitted(&mint_store, &issuer_request_id)
+            .await;
+
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Reverted),
+        );
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "an unfinalized reverted transaction must refuse the close"
+        );
+        assert!(
+            body.contains("could still land"),
+            "the refusal body must explain the reorg risk, got: {body}"
         );
         let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(!matches!(mint, Mint::Closed { .. }));
