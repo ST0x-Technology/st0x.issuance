@@ -164,6 +164,8 @@ enum ManualBurnReplacementCode {
     ConfirmationQueued,
     #[serde(rename = "burn_replacement_existing_burn_recovered")]
     ExistingBurnRecovered,
+    #[serde(rename = "burn_replacement_existing_burn_recovery_deferred")]
+    ExistingBurnRecoveryDeferred,
     #[serde(rename = "burn_replacement_dispatch_deferred")]
     DispatchDeferred,
 }
@@ -656,7 +658,7 @@ async fn recover_redemption_logic(
             ManualBurnReplacementDisposition::Enqueued => (
                 ManualBurnReplacementCode::Queued,
                 QueueDispatch::Queued,
-                "Provably-dead burn replacement authorized and queued",
+                "Burn replacement authorized and queued after definitive prior-transaction classification",
             ),
             ManualBurnReplacementDisposition::Reenqueued => (
                 ManualBurnReplacementCode::Reenqueued,
@@ -672,6 +674,11 @@ async fn recover_redemption_logic(
                 ManualBurnReplacementCode::ExistingBurnRecovered,
                 QueueDispatch::NotRequired,
                 "Landed authorized burn replacement recorded as completed",
+            ),
+            ManualBurnReplacementDisposition::ExistingBurnRecoveryDeferred => (
+                ManualBurnReplacementCode::ExistingBurnRecoveryDeferred,
+                QueueDispatch::NotRequired,
+                "Authorized burn replacement confirmation deferred; retry recovery",
             ),
             ManualBurnReplacementDisposition::DispatchDeferred => (
                 ManualBurnReplacementCode::DispatchDeferred,

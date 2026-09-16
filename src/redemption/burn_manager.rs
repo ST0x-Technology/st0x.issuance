@@ -158,6 +158,12 @@ struct DefinitiveConfirmFailure<'failure> {
     expected_tx_hash: Option<B256>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingBurnRecoveryOutcome {
+    Recovered,
+    Deferred,
+}
+
 /// The persisted-burn recovery inputs pulled from a `BurnSubmitted` /
 /// `BurnIntended` aggregate state, grouped for
 /// [`BurnManager::recover_persisted_burn`].
@@ -216,6 +222,7 @@ pub(crate) enum ManualBurnReplacementDisposition {
     Reenqueued,
     ConfirmationEnqueued,
     ExistingBurnRecovered,
+    ExistingBurnRecoveryDeferred,
     DispatchDeferred,
 }
 
@@ -860,7 +867,7 @@ impl BurnManager {
                     candidate.sendable_tx,
                 )?;
                 let tx_id = candidate.sendable_tx.hash.into();
-                match candidate.metadata.burn_mode {
+                let recovery = match candidate.metadata.burn_mode {
                     VaultMode::VaultDirect => {
                         self.recover_burn_failed_with_existing_tx(
                             issuer_request_id,
@@ -869,7 +876,7 @@ impl BurnManager {
                             &tx_id,
                             candidate.dust_quantity,
                         )
-                        .await?;
+                        .await?
                     }
                     VaultMode::Orchestrator { .. } => {
                         self.recover_orchestrator_burn_failed_with_existing_tx(
@@ -879,16 +886,23 @@ impl BurnManager {
                             candidate.alpaca_quantity,
                             candidate.dust_quantity,
                         )
-                        .await?;
+                        .await?
                     }
-                }
+                };
+                let disposition = match recovery {
+                    ExistingBurnRecoveryOutcome::Recovered => {
+                        ManualBurnReplacementDisposition::ExistingBurnRecovered
+                    }
+                    ExistingBurnRecoveryOutcome::Deferred => {
+                        ManualBurnReplacementDisposition::ExistingBurnRecoveryDeferred
+                    }
+                };
                 Ok(Some(ManualBurnReplacementOutcome {
                     recovery_id: authorization.recovery_id,
                     previous_state: candidate.previous_state,
                     previous: authorization.previous,
                     replacement: authorization.replacement,
-                    disposition:
-                        ManualBurnReplacementDisposition::ExistingBurnRecovered,
+                    disposition,
                 }))
             }
             BurnTxStatus::Reverted
@@ -1418,7 +1432,7 @@ impl BurnManager {
         // confirm path is mode-scoped: each mode confirms via its own
         // on-chain shape and records its own success event.
         let retry_external_tx_id = if let Some(persisted_tx_id) = tx_id {
-            return match burn_mode {
+            match burn_mode {
                 VaultMode::VaultDirect => {
                     self.recover_burn_failed_with_existing_tx(
                         issuer_request_id,
@@ -1427,7 +1441,7 @@ impl BurnManager {
                         persisted_tx_id,
                         dust_quantity,
                     )
-                    .await
+                    .await?;
                 }
                 VaultMode::Orchestrator { .. } => {
                     self.recover_orchestrator_burn_failed_with_existing_tx(
@@ -1437,9 +1451,10 @@ impl BurnManager {
                         alpaca_quantity,
                         dust_quantity,
                     )
-                    .await
+                    .await?;
                 }
-            };
+            }
+            return Ok(());
         } else {
             self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
                 .await?
@@ -1631,7 +1646,7 @@ impl BurnManager {
         vault: Address,
         tx_id: &TxId,
         dust_quantity: &Quantity,
-    ) -> Result<(), BurnManagerError> {
+    ) -> Result<ExistingBurnRecoveryOutcome, BurnManagerError> {
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -1679,7 +1694,7 @@ impl BurnManager {
                 self.settle_reserved_burn(chain_id, vault, issuer_request_id)
                     .await;
 
-                Ok(())
+                Ok(ExistingBurnRecoveryOutcome::Recovered)
             }
             Err(err) => {
                 if should_release_reserved_burn(&err) {
@@ -1721,7 +1736,7 @@ impl BurnManager {
                     error = %err,
                     "Failed to confirm previously submitted burn"
                 );
-                Ok(())
+                Ok(ExistingBurnRecoveryOutcome::Deferred)
             }
         }
     }
@@ -1738,7 +1753,7 @@ impl BurnManager {
         tx_id: &TxId,
         alpaca_quantity: &Quantity,
         dust_quantity: &Quantity,
-    ) -> Result<(), BurnManagerError> {
+    ) -> Result<ExistingBurnRecoveryOutcome, BurnManagerError> {
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             %tx_id,
             "BurnFailed recovery — confirming previously submitted orchestrator burn"
@@ -1808,7 +1823,7 @@ impl BurnManager {
                     )
                     .await?;
 
-                Ok(())
+                Ok(ExistingBurnRecoveryOutcome::Recovered)
             }
             Err(err) => {
                 if should_release_reserved_burn(&err) {
@@ -1842,7 +1857,7 @@ impl BurnManager {
                     error = %err,
                     "Failed to confirm previously submitted orchestrator burn"
                 );
-                Ok(())
+                Ok(ExistingBurnRecoveryOutcome::Deferred)
             }
         }
     }
@@ -9511,6 +9526,58 @@ mod tests {
             .expect("terminal failure should persist");
     }
 
+    async fn fail_submitted_orchestrator_burn(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        transaction: &SendableTxWithHash,
+    ) {
+        let external_tx_id =
+            match load_aggregate(store, issuer_request_id).await {
+                Redemption::BurnIntended {
+                    external_tx_id, metadata, ..
+                } => external_tx_id.unwrap_or_else(|| {
+                    BurnExternalTxId::base(&metadata.detected_tx_hash)
+                }),
+                other => panic!("expected intended burn, got {other:?}"),
+            };
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_tx_hash: transaction.hash,
+                    external_tx_id,
+                    tx_id: transaction.hash.into(),
+                },
+            )
+            .await
+            .expect("orchestrator submission should persist");
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_tx_hash: Some(transaction.hash),
+                    error: "orchestrator confirmation pending".to_string(),
+                    tx_id: Some(transaction.hash.into()),
+                    planned_burns: vec![],
+                    classification: BurnFailureClassification::Unclassified,
+                },
+            )
+            .await
+            .expect("orchestrator burn failure should persist");
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "automatic burn recovery exhausted".to_string(),
+                },
+            )
+            .await
+            .expect("terminal failure should persist");
+    }
+
     #[tokio::test]
     async fn manual_replacement_rearms_exhausted_dead_burn_and_repairs_queue() {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -10280,6 +10347,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mined_authorized_vault_replacement_in_failed_defers_pending_confirmation()
+     {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_confirm_pending()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::Mined,
+                ])
+                .with_prepared_tx(old_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            owner,
+        )
+        .await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("replacement should be authorized");
+        let replacement_execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        fail_submitted_burn(
+            &harness.store,
+            &issuer_request_id,
+            &replacement_tx,
+            replacement_execution.planned_burns,
+        )
+        .await;
+
+        let outcome = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("pending confirmation should defer without false success");
+
+        assert_eq!(
+            outcome.disposition,
+            ManualBurnReplacementDisposition::ExistingBurnRecoveryDeferred
+        );
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn reverted_authorized_replacement_in_failed_can_be_replaced() {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
@@ -10972,6 +11128,113 @@ mod tests {
         assert!(matches!(metadata.burn_mode, VaultMode::Orchestrator { .. }));
         assert!(planned_burns.is_empty());
         assert_eq!(sendable_tx.hash, replacement_tx.hash);
+    }
+
+    #[tokio::test]
+    async fn mined_authorized_orchestrator_replacement_in_failed_defers_pending_confirmation()
+     {
+        let token = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let calldata = IST0xOrchestratorV1::burnCall {
+            token,
+            amount: uint!(100_000000000000000000_U256),
+            burnInfo: Bytes::default(),
+        }
+        .abi_encode();
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            test_orchestrator_address(),
+            calldata.clone().into(),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            test_orchestrator_address(),
+            calldata.into(),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_confirm_pending()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::Mined,
+                ])
+                .with_prepared_tx(old_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), token).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_orchestrator_burning_with_amounts(
+            &harness.store,
+            &issuer_request_id,
+            Quantity::new(Decimal::from(100)),
+            Quantity::new(Decimal::ZERO),
+        )
+        .await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token,
+                        amount: uint!(100_000000000000000000_U256),
+                        owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("orchestrator burn intent should persist");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+        let manager = BurnManager::new_for_tests(
+            vault_mock,
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("orchestrator replacement should be authorized");
+        fail_submitted_orchestrator_burn(
+            &harness.store,
+            &issuer_request_id,
+            &replacement_tx,
+        )
+        .await;
+
+        let outcome = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("pending orchestrator confirmation should defer");
+
+        assert_eq!(
+            outcome.disposition,
+            ManualBurnReplacementDisposition::ExistingBurnRecoveryDeferred
+        );
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
     }
 
     #[tokio::test]
