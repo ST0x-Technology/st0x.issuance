@@ -7139,7 +7139,7 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn endpoint_replaces_only_confirmed_reverted_prior_burn() {
+    async fn endpoint_replaces_only_finalized_reverted_prior_burn() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
         let tx_id = TxId::random();
@@ -7208,6 +7208,65 @@ mod tests {
             Level::INFO,
             &[&aggregate_id, "Transaction reverted onchain", "ResumeBurn"]
         ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_preserves_unfinalized_reverted_prior_burn() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let (receipt_inventory_store, vault) =
+            seed_receipt_reservation(&pool, &metadata.issuer_request_id).await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_unfinalized_reverted_checked_tx(),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(body.contains("prior_burn_unverifiable"));
+        assert_eq!(burn_recovery.calls(), 0);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(redemption, Redemption::Failed { .. }),
+            "ambiguous prior burn must remain failed: {redemption:?}"
+        );
+        let inventory = receipt_inventory_store
+            .load(&ReceiptVaultKey::new(
+                crate::test_utils::ANVIL_CHAIN_ID,
+                vault,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inventory.reserved_redemptions(),
+            vec![metadata.issuer_request_id],
+            "an unfinalized revert must preserve the receipt reservation"
+        );
     }
 
     #[traced_test]
@@ -8716,6 +8775,7 @@ mod tests {
                 issuer_request_id: IssuerRedemptionRequestId::random(),
                 sendable_tx: sendable_tx.clone(),
                 planned_burns: vec![],
+                external_tx_id: None,
             },
         ]);
 

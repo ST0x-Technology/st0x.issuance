@@ -463,14 +463,17 @@ or recovering work.
 
 `ConfirmMintJob` observes the submitted `tx_id` via bounded
 `get_transaction_receipt` polling and records `TokensMinted` only on a mined
-success with a valid `Deposit`. It may record `MintingFailed` only for a mined
-revert (`status=0`) when the job's `tx_id` matches the mint's current
-submission. Uncertain observations (no receipt within the poll budget,
-RPC/transport errors, invalid receipt shape, or a mined success body missing
-`Deposit` logs) leave the aggregate in `TxSubmitted` — or `MintIntended` if it
-was never submitted — with **no** event, never auto-replace. A missing `Deposit`
-on a successful receipt is anomalous and requires operator intervention, not a
-second deposit.
+success with a valid `Deposit`. It may record `MintingFailed` for a failed
+receipt (`status=0`) only when that receipt's exact block hash is canonical at
+or below the finalized head and the job's `tx_id` matches the mint's current
+submission. Uncertain observations (an unfinalized or non-canonical failed
+receipt, no receipt within the poll budget, RPC/transport errors, invalid
+receipt shape, or a mined success body missing `Deposit` logs) leave the
+aggregate in `TxSubmitted` — or `MintIntended` if it was never submitted — with
+**no** event, never auto-replace. A missing `Deposit` on a successful receipt is
+anomalous and requires operator intervention, not a second deposit. The same
+finality and canonical-block requirement applies before an orchestrator mint
+revert is decoded and recorded.
 
 Vault-direct mint recovery uses the same observation predicate as burn recovery
 for a persisted signed identity `(H, N)` of wallet `W` (the signing bot):
@@ -478,7 +481,9 @@ for a persisted signed identity `(H, N)` of wallet `W` (the signing bot):
 ```
 observe(H, N, W):
   receipt(H) with block + status=1 + Deposit → MinedSuccess
-  receipt(H) with block + status=0           → MinedReverted
+  receipt(H) with block + status=0
+    + exact block canonical and finalized    → MinedReverted
+  receipt(H) with block + status=0 otherwise → Uncertain (fail closed; Err)
   receipt None + finalized_nonce(W) ≤ N      → StillMineable
   receipt None + finalized_nonce(W) > N
     then recheck receipt(H):

@@ -128,7 +128,10 @@ enum MockVerifyBurn {
 #[cfg(test)]
 #[derive(Clone, Default)]
 enum MockCheckTxOutcome {
+    /// A receipt result; a failed receipt is treated as canonical and finalized.
     Receipt(Box<TransactionReceipt>),
+    /// A failed receipt exists, but its block is not finalized.
+    UnfinalizedRevert,
     /// The prior tx is still pending.
     Pending,
     /// The prior tx lookup failed at the RPC boundary.
@@ -441,6 +444,7 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    /// Simulates a failed receipt that is canonical at the finalized head.
     pub(crate) fn new_confirm_revert() -> Self {
         let mut service = Self::new_success();
         service.behavior = MockBehavior::ConfirmRevert;
@@ -795,6 +799,13 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_unfinalized_reverted_checked_tx(self) -> Self {
+        *self.checked_tx_outcome.lock().unwrap() =
+            MockCheckTxOutcome::UnfinalizedRevert;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_rpc_checked_tx_error(self) -> Self {
         *self.checked_tx_outcome.lock().unwrap() = MockCheckTxOutcome::Rpc;
         self
@@ -820,6 +831,7 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    /// Configures a receipt result; failed receipts represent finalized reverts.
     pub(crate) fn with_checked_tx_receipt(
         self,
         receipt: TransactionReceipt,
@@ -925,7 +937,7 @@ impl MockVaultService {
         self
     }
 
-    /// Configures `confirm_orchestrator_burn` to fail with
+    /// Configures `confirm_orchestrator_burn` to fail with a finalized
     /// `VaultError::OrchestratorReverted` carrying the given typed reason.
     #[cfg(test)]
     pub(crate) fn with_orchestrator_confirm_revert(
@@ -1724,6 +1736,16 @@ impl VaultService for MockVaultService {
                         WatchTxError::Timeout,
                     )
                     .into());
+                }
+                MockCheckTxOutcome::UnfinalizedRevert => {
+                    let tx_hash =
+                        _tx_id.to_hash().ok_or(VaultError::InvalidReceipt)?;
+                    return Err(VaultError::ConfirmationPending {
+                        tx_id: TxId::Hash(tx_hash),
+                        message:
+                            "failed receipt block is not finalized and may be reorganized out"
+                                .to_string(),
+                    });
                 }
                 MockCheckTxOutcome::Rpc => {
                     return Err(VaultError::Rpc(

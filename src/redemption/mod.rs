@@ -495,6 +495,15 @@ enum BurnReplacementBasis {
     SubmitRejected(BurnSubmitRejectedProof),
 }
 
+struct BurnReplacementInput<'transaction> {
+    issuer_request_id: IssuerRedemptionRequestId,
+    owner: Address,
+    basis: BurnReplacementBasis,
+    network: Network,
+    sendable_tx: &'transaction SendableTxWithHash,
+    external_tx_id: Option<BurnExternalTxId>,
+}
+
 /// Input parameters for the `IntendBurn` command handler.
 ///
 /// Groups burn-related parameters to reduce argument count. The `user` field
@@ -1622,7 +1631,7 @@ impl Redemption {
                         issuer_request_id.clone(),
                     ),
                     detected_tx_hash: metadata.detected_tx_hash,
-                    external_tx_id: input.external_tx_id,
+                    external_tx_id: input.external_tx_id.clone(),
                 };
 
                 let sendable_tx = services
@@ -1639,6 +1648,7 @@ impl Redemption {
                     issuer_request_id,
                     sendable_tx,
                     planned_burns,
+                    external_tx_id: input.external_tx_id,
                 }])
             }
             BurnParams::Orchestrator { token, amount, owner } => {
@@ -1683,7 +1693,7 @@ impl Redemption {
                     owner,
                     issuer_request_id: issuer_request_id.clone(),
                     detected_tx_hash: metadata.detected_tx_hash,
-                    external_tx_id: input.external_tx_id,
+                    external_tx_id: input.external_tx_id.clone(),
                 };
 
                 let sendable_tx = services
@@ -1702,6 +1712,7 @@ impl Redemption {
                     issuer_request_id,
                     sendable_tx,
                     planned_burns: vec![],
+                    external_tx_id: input.external_tx_id,
                 }])
             }
         }
@@ -1936,14 +1947,51 @@ impl Redemption {
 
     fn exhausted_burn_replacement_context(
         &self,
-    ) -> Result<(Network, &SendableTxWithHash), RedemptionError> {
+    ) -> Result<
+        (Network, &SendableTxWithHash, B256, BurnExternalTxId),
+        RedemptionError,
+    > {
         match self {
+            Self::BurnIntended {
+                metadata,
+                sendable_tx,
+                external_tx_id,
+                ..
+            } => Ok((
+                metadata.network,
+                sendable_tx,
+                metadata.detected_tx_hash,
+                external_tx_id.clone().unwrap_or_else(|| {
+                    BurnExternalTxId::base(&metadata.detected_tx_hash)
+                }),
+            )),
+            Self::BurnSubmitted {
+                metadata,
+                sendable_tx,
+                external_tx_id,
+                ..
+            } => Ok((
+                metadata.network,
+                sendable_tx,
+                metadata.detected_tx_hash,
+                external_tx_id.clone(),
+            )),
             Self::Failed {
                 unresolved_burn_tx: Some(sendable_tx),
                 burn_context: Some(context),
                 ..
-            } => Ok((context.metadata.network, sendable_tx)),
-            _ => self.burn_replacement_context(),
+            } => Ok((
+                context.metadata.network,
+                sendable_tx,
+                context.metadata.detected_tx_hash,
+                context.external_tx_id.clone().unwrap_or_else(|| {
+                    BurnExternalTxId::base(&context.metadata.detected_tx_hash)
+                }),
+            )),
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended, BurnSubmitted, or Failed".to_string(),
+                found: self.state_name().to_string(),
+            }),
         }
     }
 
@@ -1957,11 +2005,14 @@ impl Redemption {
         let (network, sendable_tx) = self.burn_replacement_context()?;
         self.replace_burn_transaction(
             services,
-            issuer_request_id,
-            owner,
-            basis,
-            network,
-            sendable_tx,
+            BurnReplacementInput {
+                issuer_request_id,
+                owner,
+                basis,
+                network,
+                sendable_tx,
+                external_tx_id: None,
+            },
         )
         .await
     }
@@ -1970,12 +2021,16 @@ impl Redemption {
     async fn replace_burn_transaction(
         &self,
         services: &RedemptionServices,
-        issuer_request_id: IssuerRedemptionRequestId,
-        owner: Address,
-        basis: BurnReplacementBasis,
-        network: Network,
-        sendable_tx: &SendableTxWithHash,
+        input: BurnReplacementInput<'_>,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let BurnReplacementInput {
+            issuer_request_id,
+            owner,
+            basis,
+            network,
+            sendable_tx,
+            external_tx_id,
+        } = input;
         let vault_service = services.vault_for(network)?;
         match basis {
             BurnReplacementBasis::NonceTooLow(proof) => {
@@ -2088,6 +2143,7 @@ impl Redemption {
             issuer_request_id,
             sendable_tx: replacement,
             planned_burns,
+            external_tx_id,
         }])
     }
 }
@@ -2773,7 +2829,8 @@ impl Redemption {
         previous_nonce: u64,
         owner: Address,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let (network, previous) = self.exhausted_burn_replacement_context()?;
+        let (network, previous, detected_tx_hash, latest_external_tx_id) =
+            self.exhausted_burn_replacement_context()?;
         if previous.hash != previous_tx_hash || previous.nonce != previous_nonce
         {
             return Err(RedemptionError::RecoveryTransactionMismatch {
@@ -2800,15 +2857,23 @@ impl Redemption {
                 found_chain_id: previous_chain_id,
             });
         }
+        let replacement_external_tx_id = Self::next_burn_retry_external_tx_id(
+            &detected_tx_hash,
+            &latest_external_tx_id,
+        )?;
 
         let mut replacement_events = self
             .replace_burn_transaction(
                 services,
-                issuer_request_id.clone(),
-                owner,
-                BurnReplacementBasis::ExhaustedTerminalClassification,
-                network,
-                previous,
+                BurnReplacementInput {
+                    issuer_request_id: issuer_request_id.clone(),
+                    owner,
+                    basis:
+                        BurnReplacementBasis::ExhaustedTerminalClassification,
+                    network,
+                    sendable_tx: previous,
+                    external_tx_id: Some(replacement_external_tx_id),
+                },
             )
             .await?;
         let Some(RedemptionEvent::BurnIntended {
@@ -3263,7 +3328,10 @@ impl Redemption {
 
     fn apply_burn_intended_event(&mut self, event: RedemptionEvent) {
         let RedemptionEvent::BurnIntended {
-            sendable_tx, planned_burns, ..
+            sendable_tx,
+            planned_burns,
+            external_tx_id: intended_external_tx_id,
+            ..
         } = event
         else {
             return;
@@ -3334,7 +3402,7 @@ impl Redemption {
             dust_quantity,
             called_at,
             alpaca_journal_completed_at,
-            external_tx_id,
+            previous_external_tx_id,
         )) = transition
         else {
             return;
@@ -3347,8 +3415,8 @@ impl Redemption {
             dust_quantity,
             called_at,
             alpaca_journal_completed_at,
+            external_tx_id: intended_external_tx_id.or(previous_external_tx_id),
             planned_burns,
-            external_tx_id,
             sendable_tx,
         };
     }
@@ -5116,6 +5184,7 @@ mod tests {
                     receipt_id: uint!(42_U256),
                     shares_burned: uint!(100_000000000000000000_U256),
                 }],
+                external_tx_id: None,
             },
         ]
     }
@@ -5496,6 +5565,9 @@ mod tests {
     #[tokio::test]
     async fn exhausted_finalized_revert_is_accepted_from_failed() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
+        let detected_tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
         let destination =
             address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
@@ -5511,8 +5583,22 @@ mod tests {
             ANVIL_CHAIN_ID,
         );
         let owner = old_tx.signer_for_test();
+        let previous_external_tx_id =
+            Redemption::retry_burn_external_tx_id_typed(&detected_tx_hash, 2);
+        let replacement_external_tx_id =
+            Redemption::retry_burn_external_tx_id_typed(&detected_tx_hash, 3);
         let mut failed =
             intended_burn_history(&issuer_request_id, old_tx.clone());
+        failed.push(RedemptionEvent::BurnTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: previous_external_tx_id,
+            tx_id: old_tx.hash.into(),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            submitted_at: Utc::now(),
+        });
         failed.push(RedemptionEvent::BurningFailed {
             issuer_request_id: issuer_request_id.clone(),
             error: "burn transaction reverted".to_string(),
@@ -5549,8 +5635,13 @@ mod tests {
             events.as_slice(),
             [
                 RedemptionEvent::ManualBurnReplacementAuthorized { .. },
-                RedemptionEvent::BurnIntended { sendable_tx, .. }
+                RedemptionEvent::BurnIntended {
+                    sendable_tx,
+                    external_tx_id: Some(external_tx_id),
+                    ..
+                }
             ] if sendable_tx == &replacement_tx
+                && external_tx_id == &replacement_external_tx_id
         ));
         assert_eq!(vault.replacement_preparation_call_count(), 1);
     }
@@ -6061,6 +6152,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 sendable_tx: SendableTxWithHash::default(),
                 planned_burns: planned_burns.clone(),
+                external_tx_id: None,
             },
         ])
         .unwrap()
@@ -6135,6 +6227,7 @@ mod tests {
                         receipt_id,
                         shares_burned: burn_shares,
                     }],
+                    external_tx_id: None,
                 },
             ])
             .when(RedemptionCommand::RecordBurnTxSubmitted {
@@ -6430,6 +6523,7 @@ mod tests {
                 dust_shares: U256::ZERO,
             },
             planned_burns: vec![],
+            external_tx_id: None,
         });
         events
     }
@@ -6486,6 +6580,7 @@ mod tests {
                 dust_shares: U256::ZERO,
             },
             planned_burns: vec![],
+            external_tx_id: None,
         });
         events
     }

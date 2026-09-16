@@ -4222,10 +4222,10 @@ pub(crate) const fn extract_tx_hash(error: &VaultError) -> Option<B256> {
     }
 }
 
-/// Whether a failed burn confirmation definitively consumed no receipts, so its
-/// inventory reservation must be released. Ambiguous pending tx statuses
-/// keep the reservation (the transaction may still land on-chain). A decoded
-/// orchestrator revert is definitive like a plain revert.
+/// Whether a failed burn confirmation has a canonical receipt at or below the
+/// finalized head and therefore definitively consumed no receipts. Unfinalized
+/// reverts remain `ConfirmationPending`, preserving the reservation while the
+/// receipt can still be reorganized out.
 pub(crate) const fn should_release_reserved_burn(error: &VaultError) -> bool {
     matches!(
         error,
@@ -7615,12 +7615,11 @@ mod tests {
         );
     }
 
-    /// A confirmation that fails with a DEFINITIVE on-chain revert
-    /// (`VaultError::Reverted`) consumed no receipts, so the reservation must be
-    /// RELEASED (exercises the `should_release_reserved_burn`-gated release in
-    /// the confirm-failure path).
+    /// A confirmation with a canonical failed receipt at or below the finalized
+    /// head (`VaultError::Reverted`) consumed no receipts, so the reservation
+    /// must be released.
     #[tokio::test]
-    async fn test_confirm_revert_releases_reservation() {
+    async fn test_finalized_confirm_revert_releases_reservation() {
         let vault_mock = Arc::new(MockVaultService::new_confirm_revert());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
@@ -9705,6 +9704,31 @@ mod tests {
 
         let replacement_execution =
             intended_execution(&harness.store, &issuer_request_id, vault).await;
+        let replacement_aggregate =
+            load_aggregate(&harness.store, &issuer_request_id).await;
+        let Redemption::BurnIntended {
+            metadata,
+            external_tx_id: Some(replacement_external_tx_id),
+            ..
+        } = replacement_aggregate
+        else {
+            panic!(
+                "expected replacement BurnIntended with an external id, got \
+                 {replacement_aggregate:?}"
+            );
+        };
+        assert_eq!(
+            replacement_external_tx_id,
+            Redemption::retry_burn_external_tx_id_typed(
+                &metadata.detected_tx_hash,
+                1,
+            )
+        );
+        assert_eq!(
+            replacement_execution.external_tx_id,
+            Some(replacement_external_tx_id),
+            "manual replacement dispatch must receive the fresh external id"
+        );
         assert!(
             manager
                 .submit_intended_burn_for_job(
@@ -13237,7 +13261,8 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn reverted_persisted_burn_is_retried_by_the_failed_recovery_pass() {
+    async fn finalized_reverted_persisted_burn_reestablishes_recovery_reservation()
+     {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let persisted_tx = SendableTxWithHash::valid_for_test(
             4,
@@ -13247,7 +13272,7 @@ mod tests {
         let owner = persisted_tx.signer_for_test();
         let vault_mock = Arc::new(
             MockVaultService::new_confirm_revert()
-                .with_burn_tx_status(BurnTxStatus::Reverted)
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted)
                 .with_prepared_tx(persisted_tx.clone()),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
@@ -13331,10 +13356,9 @@ mod tests {
         // confirming/broadcasting inline; drive each enqueued step to
         // reproduce the full failed-recovery retry.
         //
-        // Pass 1: the reverted persisted burn is routed to a ConfirmBurnJob.
-        manager.recover_unresolved_burns().await;
-        // Drive the confirm: the revert reserves the fifth (final) recovery
-        // attempt as a Replace and releases the reservation.
+        // Pass 1: the finalized-reverted persisted burn is routed to a
+        // ConfirmBurnJob. Driving it reserves the fifth (final) recovery
+        // attempt as a Replace and releases the old reservation.
         let reverted_confirm = BurnExecutionPlan {
             network: Network::Base,
             vault,
@@ -13364,6 +13388,14 @@ mod tests {
         manager.recover_unresolved_burns().await;
         let replacement_execution =
             intended_execution(store, &issuer_request_id, vault).await;
+        assert_eq!(
+            receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
+            vec![issuer_request_id.clone()],
+            "replacement recovery must re-establish the receipt reservation"
+        );
         manager
             .submit_intended_burn(&issuer_request_id, &replacement_execution)
             .await
@@ -13527,24 +13559,25 @@ mod tests {
         ));
     }
 
-    /// A receipt timeout does not prove that a broadcast transaction failed.
-    /// The submitted identity and reservation must remain recoverable so a
-    /// later pass confirms the same transaction instead of signing a replacement.
+    /// An unfinalized failed receipt is still reorgable. The submitted identity
+    /// and reservation must remain recoverable so a later pass confirms the
+    /// same transaction instead of signing a replacement.
     #[tokio::test]
-    async fn test_confirmation_timeout_keeps_submitted_burn_and_reservation() {
+    async fn test_unfinalized_revert_keeps_submitted_burn_and_reservation() {
         let prepared_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         );
-        let vault_mock =
-            Arc::new(MockVaultService::new_confirm_pending().with_prepared_tx(
-                SendableTxWithHash {
+        let vault_mock = Arc::new(
+            MockVaultService::new_confirm_pending()
+                .with_burn_tx_status(BurnTxStatus::Reverted)
+                .with_prepared_tx(SendableTxWithHash {
                     tx: vec![1, 2, 3],
                     hash: prepared_hash,
                     nonce: 7,
                     signed_at: Utc::now(),
                     dust_shares: U256::ZERO,
-                },
-            ));
+                }),
+        );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -13612,6 +13645,11 @@ mod tests {
                 .unwrap(),
             vec![issuer_request_id],
             "ambiguous confirmation must retain the receipt reservation"
+        );
+        assert_eq!(
+            vault_mock.replacement_preparation_call_count(),
+            0,
+            "an unfinalized revert must not sign a replacement"
         );
     }
 

@@ -684,10 +684,14 @@ impl RealBlockchainService {
         }
     }
 
-    async fn classify_reverted_burn_receipt(
+    async fn reverted_receipt_is_finalized(
         &self,
+        tx_hash: B256,
         receipt: &TransactionReceipt,
-    ) -> Result<BurnTxStatus, VaultError> {
+    ) -> Result<bool, VaultError> {
+        if receipt.transaction_hash != tx_hash {
+            return Err(VaultError::InvalidReceipt);
+        }
         let receipt_block =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
         let receipt_block_hash =
@@ -698,7 +702,7 @@ impl RealBlockchainService {
             .await?
             .ok_or(VaultError::InvalidReceipt)?;
         if finalized_block.header.number < receipt_block {
-            return Ok(BurnTxStatus::Reverted);
+            return Ok(false);
         }
 
         let canonical_block = self
@@ -710,7 +714,36 @@ impl RealBlockchainService {
             return Err(VaultError::InvalidReceipt);
         }
 
-        Ok(BurnTxStatus::FinalizedReverted)
+        Ok(true)
+    }
+
+    async fn classify_reverted_burn_receipt(
+        &self,
+        tx_hash: B256,
+        receipt: &TransactionReceipt,
+    ) -> Result<BurnTxStatus, VaultError> {
+        if self.reverted_receipt_is_finalized(tx_hash, receipt).await? {
+            Ok(BurnTxStatus::FinalizedReverted)
+        } else {
+            Ok(BurnTxStatus::Reverted)
+        }
+    }
+
+    async fn require_finalized_reverted_receipt(
+        &self,
+        tx_hash: B256,
+        receipt: &TransactionReceipt,
+    ) -> Result<(), VaultError> {
+        if self.reverted_receipt_is_finalized(tx_hash, receipt).await? {
+            Ok(())
+        } else {
+            Err(VaultError::ConfirmationPending {
+                tx_id: TxId::Hash(tx_hash),
+                message:
+                    "failed receipt block is not finalized and may be reorganized out"
+                        .to_string(),
+            })
+        }
     }
 }
 
@@ -894,6 +927,8 @@ impl VaultService for RealBlockchainService {
                         tx_hash = %tx_hash,
                         "Mint transaction mined with status=0"
                     );
+                    self.require_finalized_reverted_receipt(tx_hash, &receipt)
+                        .await?;
                     return Err(VaultError::Reverted { tx_hash });
                 }
 
@@ -966,6 +1001,11 @@ impl VaultService for RealBlockchainService {
             if receipt.status() {
                 MintTxStatus::MinedSuccess
             } else {
+                self.require_finalized_reverted_receipt(
+                    prepared_tx.hash,
+                    &receipt,
+                )
+                .await?;
                 MintTxStatus::MinedReverted
             }
         } else {
@@ -988,6 +1028,11 @@ impl VaultService for RealBlockchainService {
                         if receipt.status() {
                             MintTxStatus::MinedSuccess
                         } else {
+                            self.require_finalized_reverted_receipt(
+                                prepared_tx.hash,
+                                &receipt,
+                            )
+                            .await?;
                             MintTxStatus::MinedReverted
                         }
                     }
@@ -1107,9 +1152,11 @@ impl VaultService for RealBlockchainService {
             message: error.to_string(),
         })?;
 
-        // A mined-but-reverted burn consumes no receipts, so it is a definitive
-        // failure distinct from an anomalous missing-Withdraw parse error.
+        // A reverted burn is destructive only after its exact receipt block is
+        // canonical at or below the finalized head. Until then the signed
+        // transaction can become live again after a reorganization.
         if !receipt.status() {
+            self.require_finalized_reverted_receipt(tx_hash, &receipt).await?;
             return Err(VaultError::Reverted { tx_hash });
         }
 
@@ -1287,7 +1334,8 @@ impl VaultService for RealBlockchainService {
                 }
                 BurnTxStatus::Mined
             } else {
-                self.classify_reverted_burn_receipt(&receipt).await?
+                self.classify_reverted_burn_receipt(sendable_tx.hash, &receipt)
+                    .await?
             }
         } else {
             let latest_nonce =
@@ -1309,8 +1357,11 @@ impl VaultService for RealBlockchainService {
                         if receipt.status() {
                             BurnTxStatus::Mined
                         } else {
-                            self.classify_reverted_burn_receipt(&receipt)
-                                .await?
+                            self.classify_reverted_burn_receipt(
+                                sendable_tx.hash,
+                                &receipt,
+                            )
+                            .await?
                         }
                     }
                     None => BurnTxStatus::ProvablyDead,
@@ -1413,6 +1464,9 @@ impl VaultService for RealBlockchainService {
         .get_receipt()
         .await?;
 
+        if !receipt.status() {
+            self.require_finalized_reverted_receipt(tx_hash, &receipt).await?;
+        }
         classify_checked_receipt(tx_hash, receipt)
     }
 
@@ -1574,10 +1628,11 @@ impl VaultService for RealBlockchainService {
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        // A mined-but-reverted orchestrator burn is a definitive failure;
-        // decode its typed reason so the aggregate records the right
-        // classification.
+        // Decode and expose a revert only after its exact block is finalized.
+        // Before then a reorganization can make the persisted transaction live
+        // again, so recovery must keep its identity and defer.
         if !receipt.status() {
+            self.require_finalized_reverted_receipt(tx_hash, &receipt).await?;
             let reason = self
                 .decode_orchestrator_revert(
                     tx_hash,
@@ -1721,6 +1776,7 @@ impl VaultService for RealBlockchainService {
         // decode its typed reason so the aggregate records the right
         // classification (NonceReplayed routes into the full-match recovery).
         if !receipt.status() {
+            self.require_finalized_reverted_receipt(tx_hash, &receipt).await?;
             let reason = self
                 .decode_orchestrator_revert(
                     tx_hash,
@@ -2798,7 +2854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classify_mint_tx_reports_mined_and_reverted_receipts() {
+    async fn classify_mint_tx_reports_mined_and_finalized_reverted_receipts() {
         for (succeeded, expected) in [
             (true, MintTxStatus::MinedSuccess),
             (false, MintTxStatus::MinedReverted),
@@ -2817,6 +2873,14 @@ mod tests {
             ));
             let asserter = Asserter::new();
             asserter.push_success(&receipt);
+            if !succeeded {
+                let canonical_block = block_with_number_and_hash(
+                    receipt.block_number.unwrap(),
+                    receipt.block_hash.unwrap(),
+                );
+                asserter.push_success(&canonical_block);
+                asserter.push_success(&canonical_block);
+            }
             let service = create_service_with_asserter(asserter);
 
             let status = service
@@ -2826,6 +2890,29 @@ mod tests {
 
             assert_eq!(status, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn classify_mint_tx_defers_unfinalized_revert() {
+        let persisted = persisted_mint_tx(7);
+        let owner = persisted.signer_for_test();
+        let receipt =
+            create_reverted_receipt(test_vault_address(), persisted.hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.classify_mint_tx(owner, &persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(persisted.hash)
+        ));
     }
 
     #[traced_test]
@@ -2970,20 +3057,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_mint_status_zero_is_reverted() {
+    async fn confirm_mint_finalized_status_zero_is_reverted() {
         let persisted = persisted_mint_tx(3);
-        let mut receipt =
-            create_empty_receipt(test_vault_address(), persisted.hash);
-        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
-            Receipt {
-                status: Eip658Value::Eip658(false),
-                cumulative_gas_used: 0x6100,
-                logs: vec![],
-            },
-            Bloom::default(),
-        ));
+        let receipt =
+            create_reverted_receipt(test_vault_address(), persisted.hash);
+        let canonical_block = block_with_number_and_hash(
+            receipt.block_number.unwrap(),
+            receipt.block_hash.unwrap(),
+        );
         let asserter = Asserter::new();
         asserter.push_success(&Some(receipt));
+        asserter.push_success(&canonical_block);
+        asserter.push_success(&canonical_block);
         let service = create_service_with_asserter(asserter);
 
         let result = service.confirm_mint(&TxId::from(persisted.hash)).await;
@@ -2991,6 +3076,28 @@ mod tests {
         assert!(matches!(
             result,
             Err(VaultError::Reverted { tx_hash }) if tx_hash == persisted.hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_mint_defers_unfinalized_revert() {
+        let persisted = persisted_mint_tx(3);
+        let receipt =
+            create_reverted_receipt(test_vault_address(), persisted.hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(receipt.clone()));
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.confirm_mint(&TxId::from(persisted.hash)).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(persisted.hash)
         ));
     }
 
@@ -3066,6 +3173,22 @@ mod tests {
                 Bloom::default(),
             )),
         }
+    }
+
+    fn create_reverted_receipt(
+        vault_address: Address,
+        tx_hash: B256,
+    ) -> TransactionReceipt {
+        let mut receipt = create_empty_receipt(vault_address, tx_hash);
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(false),
+                cumulative_gas_used: 0x6100,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        receipt
     }
 
     fn rpc_transaction(
@@ -3625,6 +3748,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_burn_defers_unfinalized_revert() {
+        let tx_hash = B256::random();
+        let receipt = create_reverted_receipt(test_vault_address(), tx_hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_burn(&TxId::Hash(tx_hash), U256::ZERO).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(tx_hash)
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_burn_reports_finalized_revert() {
+        let tx_hash = B256::random();
+        let receipt = create_reverted_receipt(test_vault_address(), tx_hash);
+        let canonical_block = block_with_number_and_hash(
+            receipt.block_number.unwrap(),
+            receipt.block_hash.unwrap(),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        asserter.push_success(&canonical_block);
+        asserter.push_success(&canonical_block);
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_burn(&TxId::Hash(tx_hash), U256::ZERO).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::Reverted { tx_hash: hash }) if hash == tx_hash
+        ));
+    }
+
+    #[tokio::test]
     async fn check_tx_rejects_reverted_receipt_without_block_number() {
         let vault_address = test_vault_address();
         let tx_hash = fixed_bytes!(
@@ -3677,23 +3847,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_tx_reports_mined_revert() {
-        let vault_address = test_vault_address();
+    async fn check_tx_reports_finalized_revert() {
         let tx_hash = fixed_bytes!(
             "0x7171717171717171717171717171717171717171717171717171717171717171"
         );
-        let mut receipt = create_empty_receipt(vault_address, tx_hash);
-        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
-            Receipt {
-                status: Eip658Value::Eip658(false),
-                cumulative_gas_used: 0x6100,
-                logs: vec![],
-            },
-            Bloom::default(),
-        ));
+        let receipt = create_reverted_receipt(test_vault_address(), tx_hash);
+        let canonical_block = block_with_number_and_hash(
+            receipt.block_number.unwrap(),
+            receipt.block_hash.unwrap(),
+        );
         let asserter = Asserter::new();
         asserter.push_success(&receipt);
         asserter.push_success(&receipt);
+        asserter.push_success(&canonical_block);
+        asserter.push_success(&canonical_block);
         let service = create_service_with_asserter(asserter);
 
         let result = service.check_tx(&TxId::Hash(tx_hash)).await;
@@ -3702,6 +3869,28 @@ mod tests {
             matches!(result, Err(VaultError::Reverted { tx_hash: hash }) if hash == tx_hash),
             "unexpected check result: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn check_tx_defers_unfinalized_revert() {
+        let tx_hash = B256::random();
+        let receipt = create_reverted_receipt(test_vault_address(), tx_hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.check_tx(&TxId::Hash(tx_hash)).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(tx_hash)
+        ));
     }
 
     #[tokio::test]
@@ -5175,6 +5364,12 @@ mod tests {
             let asserter = Asserter::new();
             asserter.push_success(&receipt); // eth_getTransactionReceipt
             asserter.push_success(&receipt); // eth_getTransactionReceipt (polling)
+            let canonical_block = block_with_number_and_hash(
+                receipt.block_number.unwrap(),
+                receipt.block_hash.unwrap(),
+            );
+            asserter.push_success(&canonical_block); // finalized head
+            asserter.push_success(&canonical_block); // canonical receipt block
             asserter.push_success(&transaction); // eth_getTransactionByHash
             asserter.push_failure(ErrorPayload {
                 code: 3,
@@ -5200,6 +5395,40 @@ mod tests {
                 "expected {expected_reason:?}, got {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn confirm_orchestrator_burn_defers_unfinalized_revert() {
+        let persisted = SendableTxWithHash::valid_for_test(
+            17,
+            test_orchestrator_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let receipt = create_burned_receipt(
+            persisted.hash,
+            persisted.signer_for_test(),
+            U256::ZERO,
+            (U256::ZERO, U256::ZERO),
+            false,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_burn(&TxId::Hash(persisted.hash))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(persisted.hash)
+        ));
     }
 
     /// The allowance gate is evaluated before the orchestrator health gate,
@@ -5628,9 +5857,43 @@ mod tests {
         ));
     }
 
-    /// A mined-but-reverted orchestrator mint replays the transaction as an
-    /// `eth_call` at its mined block and decodes the mint-side typed revert
-    /// reasons.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_defers_unfinalized_revert() {
+        let persisted = SendableTxWithHash::valid_for_test(
+            17,
+            test_orchestrator_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let receipt = create_minted_receipt(
+            persisted.hash,
+            persisted.signer_for_test(),
+            U256::ZERO,
+            B256::ZERO,
+            false,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        asserter.push_success(&block_with_number_and_hash(
+            receipt.block_number.unwrap() - 1,
+            B256::random(),
+        ));
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_mint(&TxId::Hash(persisted.hash))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::ConfirmationPending { tx_id, .. })
+                if tx_id == TxId::Hash(persisted.hash)
+        ));
+    }
+
+    /// A finalized, canonical orchestrator mint revert replays the transaction
+    /// as an `eth_call` at its mined block and decodes the mint-side typed
+    /// revert reasons.
     #[tokio::test]
     async fn confirm_orchestrator_mint_decodes_typed_revert_reasons() {
         let recipient = test_receiver();
@@ -5697,6 +5960,12 @@ mod tests {
             let asserter = Asserter::new();
             asserter.push_success(&receipt); // eth_getTransactionReceipt
             asserter.push_success(&receipt); // eth_getTransactionReceipt (polling)
+            let canonical_block = block_with_number_and_hash(
+                receipt.block_number.unwrap(),
+                receipt.block_hash.unwrap(),
+            );
+            asserter.push_success(&canonical_block); // finalized head
+            asserter.push_success(&canonical_block); // canonical receipt block
             asserter.push_success(&transaction); // eth_getTransactionByHash
             asserter.push_failure(ErrorPayload {
                 code: 3,
