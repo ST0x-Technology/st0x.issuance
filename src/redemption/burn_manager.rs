@@ -543,7 +543,7 @@ impl BurnManager {
         }
         if status != BurnTxStatus::ProvablyDead
             && !(candidate.previous_state == RedemptionState::Failed
-                && status == BurnTxStatus::Reverted)
+                && status == BurnTxStatus::FinalizedReverted)
         {
             return Err(ManualBurnReplacementRefusal::NotProvablyDead {
                 tx_hash: previous.tx_hash,
@@ -905,7 +905,7 @@ impl BurnManager {
                     disposition,
                 }))
             }
-            BurnTxStatus::Reverted
+            BurnTxStatus::FinalizedReverted
                 if candidate.previous_state == RedemptionState::Failed =>
             {
                 self.store
@@ -914,7 +914,7 @@ impl BurnManager {
                         RedemptionCommand::MarkFailed {
                             issuer_request_id: issuer_request_id.clone(),
                             reason: format!(
-                                "Authorized burn replacement transaction {} reverted on-chain",
+                                "Authorized burn replacement transaction {} reverted in a finalized block",
                                 candidate.sendable_tx.hash
                             ),
                         },
@@ -922,7 +922,14 @@ impl BurnManager {
                     .await?;
                 Ok(None)
             }
-            BurnTxStatus::Mined | BurnTxStatus::Reverted => {
+            BurnTxStatus::Reverted
+                if candidate.previous_state == RedemptionState::Failed =>
+            {
+                Ok(None)
+            }
+            BurnTxStatus::Mined
+            | BurnTxStatus::Reverted
+            | BurnTxStatus::FinalizedReverted => {
                 let vault = self.persisted_burn_target(
                     candidate.metadata.burn_mode,
                     candidate.sendable_tx,
@@ -1949,7 +1956,12 @@ impl BurnManager {
         let tx_id = sendable_tx.hash.into();
         let vault =
             self.persisted_burn_target(metadata.burn_mode, sendable_tx)?;
-        if matches!(status, BurnTxStatus::Mined | BurnTxStatus::Reverted) {
+        if matches!(
+            status,
+            BurnTxStatus::Mined
+                | BurnTxStatus::Reverted
+                | BurnTxStatus::FinalizedReverted
+        ) {
             return self
                 .recover_single_burning_shared_inner(
                     issuer_request_id,
@@ -2026,7 +2038,9 @@ impl BurnManager {
         let action = match status {
             BurnTxStatus::StillMineable => BurnRecoveryAction::Rebroadcast,
             BurnTxStatus::ProvablyDead => BurnRecoveryAction::Replace,
-            BurnTxStatus::Mined | BurnTxStatus::Reverted => {
+            BurnTxStatus::Mined
+            | BurnTxStatus::Reverted
+            | BurnTxStatus::FinalizedReverted => {
                 return Err(BurnManagerError::InvalidAggregateState {
                     current_state: "terminal burn classification".to_string(),
                 });
@@ -2099,7 +2113,9 @@ impl BurnManager {
                 )
                 .await?;
             }
-            BurnTxStatus::Mined | BurnTxStatus::Reverted => {
+            BurnTxStatus::Mined
+            | BurnTxStatus::Reverted
+            | BurnTxStatus::FinalizedReverted => {
                 return Err(BurnManagerError::InvalidAggregateState {
                     current_state: "terminal burn classification".to_string(),
                 });
@@ -10464,8 +10480,8 @@ mod tests {
                 .with_burn_tx_status_sequence(vec![
                     BurnTxStatus::ProvablyDead,
                     BurnTxStatus::ProvablyDead,
-                    BurnTxStatus::Reverted,
-                    BurnTxStatus::Reverted,
+                    BurnTxStatus::FinalizedReverted,
+                    BurnTxStatus::FinalizedReverted,
                 ])
                 .with_prepared_tx(old_tx.clone()),
         );
@@ -10562,6 +10578,113 @@ mod tests {
             terminal_failures, 2,
             "the confirmed revert must be recorded before replacement"
         );
+    }
+    #[tokio::test]
+    async fn unfinalized_reverted_failed_replacement_prepares_no_new_signature()
+    {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let first_replacement =
+            SendableTxWithHash::valid_for_test_with_chain_id(
+                8,
+                vault,
+                Bytes::from_static(&[0xde, 0xad]),
+                ANVIL_CHAIN_ID,
+            );
+        let second_replacement =
+            SendableTxWithHash::valid_for_test_with_chain_id(
+                9,
+                vault,
+                Bytes::from_static(&[0xde, 0xad]),
+                ANVIL_CHAIN_ID,
+            );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::Reverted,
+                ])
+                .with_prepared_tx(old_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            owner,
+        )
+        .await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        vault_mock.set_prepared_tx(first_replacement.clone());
+        manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("first replacement should be authorized");
+        let first_execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        fail_submitted_burn(
+            &harness.store,
+            &issuer_request_id,
+            &first_replacement,
+            first_execution.planned_burns,
+        )
+        .await;
+        vault_mock.set_prepared_tx(second_replacement);
+
+        let error = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect_err("an unfinalized revert must not authorize a signature");
+
+        assert!(matches!(
+            error,
+            BurnManagerError::ManualReplacementRefused(
+                super::ManualBurnReplacementRefusal::NotProvablyDead {
+                    status: BurnTxStatus::Reverted,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(
+            vault_mock.replacement_preparation_call_count(),
+            1,
+            "the only prepared replacement must be the first authorization"
+        );
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
     }
 
     #[tokio::test]

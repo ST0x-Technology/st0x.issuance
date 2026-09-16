@@ -2474,7 +2474,11 @@ async fn refuse_unsafe_close(
                 Status::InternalServerError
             })?;
         match vault_service.classify_burn_tx(signer, &sendable).await {
-            Ok(BurnTxStatus::Reverted | BurnTxStatus::ProvablyDead) => {}
+            Ok(
+                BurnTxStatus::Reverted
+                | BurnTxStatus::FinalizedReverted
+                | BurnTxStatus::ProvablyDead,
+            ) => {}
             Ok(BurnTxStatus::Mined) => {
                 warn!(target: "admin", issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable.hash,

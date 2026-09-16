@@ -488,7 +488,8 @@ impl BurnSubmitRejectedProof {
 enum BurnReplacementBasis {
     LiveClassification,
     /// Manual exhausted recovery may replace either a transaction proven
-    /// absent from the chain or one whose receipt proves it reverted.
+    /// absent from the chain or, only from `Failed`, one whose failed receipt
+    /// is canonical at or below the finalized head.
     ExhaustedTerminalClassification,
     NonceTooLow(BurnNonceTooLowProof),
     SubmitRejected(BurnSubmitRejectedProof),
@@ -2029,10 +2030,16 @@ impl Redemption {
                             nonce: sendable_tx.nonce,
                         }
                     })?;
-                if !matches!(
-                    status,
-                    BurnTxStatus::ProvablyDead | BurnTxStatus::Reverted
-                ) {
+                let replacement_safe = match status {
+                    BurnTxStatus::ProvablyDead => true,
+                    BurnTxStatus::FinalizedReverted => {
+                        matches!(self, Self::Failed { .. })
+                    }
+                    BurnTxStatus::Mined
+                    | BurnTxStatus::Reverted
+                    | BurnTxStatus::StillMineable => false,
+                };
+                if !replacement_safe {
                     return Err(RedemptionError::BurnReplacementNotSafe {
                         tx_hash: sendable_tx.hash,
                         nonce: sendable_tx.nonce,
@@ -5412,6 +5419,201 @@ mod tests {
                 && *replacement_nonce == replacement_tx.nonce
                 && sendable_tx == &replacement_tx
         ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_finalized_revert_is_rejected_before_failed_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let intended =
+            intended_burn_history(&issuer_request_id, old_tx.clone());
+        let mut submitted = intended.clone();
+        submitted.push(RedemptionEvent::BurnTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&B256::random()),
+            tx_id: old_tx.hash.into(),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            submitted_at: Utc::now(),
+        });
+
+        for (state, history) in
+            [("BurnIntended", intended), ("BurnSubmitted", submitted)]
+        {
+            let vault = Arc::new(
+                MockVaultService::new_success()
+                    .with_burn_tx_status(BurnTxStatus::FinalizedReverted)
+                    .with_prepared_tx(replacement_tx.clone()),
+            );
+            let services: Arc<dyn VaultService> = vault.clone();
+            let error = TestHarness::<Redemption>::with(
+                RedemptionServices::with_single_vault(Network::Base, services),
+            )
+            .given(history)
+            .when(RedemptionCommand::ReplaceExhaustedDeadBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                recovery_id: Uuid::new_v4(),
+                previous_tx_hash: old_tx.hash,
+                previous_nonce: old_tx.nonce,
+                owner,
+            })
+            .await
+            .then_expect_error();
+
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(
+                        RedemptionError::BurnReplacementNotSafe { .. }
+                    )
+                ),
+                "{state} must reject the Failed-only finalized-revert basis"
+            );
+            assert_eq!(
+                vault.replacement_preparation_call_count(),
+                0,
+                "{state} must reject before preparing a replacement"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_finalized_revert_is_accepted_from_failed() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let mut failed =
+            intended_burn_history(&issuer_request_id, old_tx.clone());
+        failed.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "burn transaction reverted".to_string(),
+            failed_at: Utc::now(),
+            tx_id: Some(old_tx.hash.into()),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            classification: BurnFailureClassification::Unclassified,
+        });
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted)
+                .with_prepared_tx(replacement_tx.clone()),
+        );
+        let services: Arc<dyn VaultService> = vault.clone();
+
+        let events = TestHarness::<Redemption>::with(
+            RedemptionServices::with_single_vault(Network::Base, services),
+        )
+        .given(failed)
+        .when(RedemptionCommand::ReplaceExhaustedDeadBurn {
+            issuer_request_id: issuer_request_id.clone(),
+            recovery_id: Uuid::new_v4(),
+            previous_tx_hash: old_tx.hash,
+            previous_nonce: old_tx.nonce,
+            owner,
+        })
+        .await
+        .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RedemptionEvent::ManualBurnReplacementAuthorized { .. },
+                RedemptionEvent::BurnIntended { sendable_tx, .. }
+            ] if sendable_tx == &replacement_tx
+        ));
+        assert_eq!(vault.replacement_preparation_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_unfinalized_revert_is_rejected_from_failed() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let mut failed =
+            intended_burn_history(&issuer_request_id, old_tx.clone());
+        failed.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "burn transaction reverted".to_string(),
+            failed_at: Utc::now(),
+            tx_id: Some(old_tx.hash.into()),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            classification: BurnFailureClassification::Unclassified,
+        });
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Reverted)
+                .with_prepared_tx(replacement_tx),
+        );
+        let services: Arc<dyn VaultService> = vault.clone();
+
+        let error = TestHarness::<Redemption>::with(
+            RedemptionServices::with_single_vault(Network::Base, services),
+        )
+        .given(failed)
+        .when(RedemptionCommand::ReplaceExhaustedDeadBurn {
+            issuer_request_id: issuer_request_id.clone(),
+            recovery_id: Uuid::new_v4(),
+            previous_tx_hash: old_tx.hash,
+            previous_nonce: old_tx.nonce,
+            owner,
+        })
+        .await
+        .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::BurnReplacementNotSafe { .. }
+            )
+        ));
+        assert_eq!(vault.replacement_preparation_call_count(), 0);
     }
 
     #[tokio::test]

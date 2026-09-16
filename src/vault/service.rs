@@ -683,6 +683,35 @@ impl RealBlockchainService {
             }
         }
     }
+
+    async fn classify_reverted_burn_receipt(
+        &self,
+        receipt: &TransactionReceipt,
+    ) -> Result<BurnTxStatus, VaultError> {
+        let receipt_block =
+            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+        let receipt_block_hash =
+            receipt.block_hash.ok_or(VaultError::InvalidReceipt)?;
+        let finalized_block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+        if finalized_block.header.number < receipt_block {
+            return Ok(BurnTxStatus::Reverted);
+        }
+
+        let canonical_block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(receipt_block))
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+        if canonical_block.header.hash != receipt_block_hash {
+            return Err(VaultError::InvalidReceipt);
+        }
+
+        Ok(BurnTxStatus::FinalizedReverted)
+    }
 }
 
 fn classify_burn_broadcast_error(
@@ -1258,7 +1287,7 @@ impl VaultService for RealBlockchainService {
                 }
                 BurnTxStatus::Mined
             } else {
-                BurnTxStatus::Reverted
+                self.classify_reverted_burn_receipt(&receipt).await?
             }
         } else {
             let latest_nonce =
@@ -1280,7 +1309,8 @@ impl VaultService for RealBlockchainService {
                         if receipt.status() {
                             BurnTxStatus::Mined
                         } else {
-                            BurnTxStatus::Reverted
+                            self.classify_reverted_burn_receipt(&receipt)
+                                .await?
                         }
                     }
                     None => BurnTxStatus::ProvablyDead,
@@ -2185,6 +2215,23 @@ mod tests {
             header: alloy::rpc::types::Header {
                 inner: alloy::consensus::Header {
                     gas_limit,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn block_with_number_and_hash(
+        number: u64,
+        hash: B256,
+    ) -> Block<alloy::rpc::types::Transaction> {
+        Block {
+            header: alloy::rpc::types::Header {
+                hash,
+                inner: alloy::consensus::Header {
+                    number,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3181,7 +3228,8 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn classify_burn_tx_reports_mined_and_reverted_receipts() {
+    async fn classify_burn_tx_reports_mined_and_unfinalized_reverted_receipts()
+    {
         for (succeeded, expected) in
             [(true, BurnTxStatus::Mined), (false, BurnTxStatus::Reverted)]
         {
@@ -3199,6 +3247,12 @@ mod tests {
             ));
             let asserter = Asserter::new();
             asserter.push_success(&receipt);
+            if !succeeded {
+                asserter.push_success(&block_with_number_and_hash(
+                    receipt.block_number.unwrap() - 1,
+                    B256::random(),
+                ));
+            }
             let service = create_service_with_asserter(asserter);
 
             let status = service
@@ -3214,6 +3268,38 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn classify_burn_tx_requires_canonical_finalized_revert() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let mut receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(false),
+                cumulative_gas_used: 0x6100,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let receipt_block = receipt.block_number.unwrap();
+        let receipt_block_hash = receipt.block_hash.unwrap();
+        let canonical_block =
+            block_with_number_and_hash(receipt_block, receipt_block_hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&canonical_block);
+        asserter.push_success(&canonical_block);
+        let service = create_service_with_asserter(asserter);
+
+        let status = service
+            .classify_burn_tx(owner, &persisted)
+            .await
+            .expect("canonical finalized failed receipt should classify");
+
+        assert_eq!(status, BurnTxStatus::FinalizedReverted);
     }
 
     #[traced_test]

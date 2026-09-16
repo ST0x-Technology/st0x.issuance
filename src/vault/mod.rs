@@ -181,8 +181,10 @@ pub(crate) trait VaultService: Send + Sync {
     /// Classifies whether a persisted signed burn transaction can still land.
     ///
     /// Implementations must check the exact hash receipt before comparing the
-    /// owner's finalized nonce. Any provider uncertainty returns an error so
-    /// callers fail closed and keep the persisted transaction live.
+    /// owner's finalized nonce. A failed receipt is `FinalizedReverted` only
+    /// after its exact block is canonical at or below the finalized head. Any
+    /// provider uncertainty returns an error so callers fail closed and keep
+    /// the persisted transaction live.
     async fn classify_burn_tx(
         &self,
         _owner: Address,
@@ -359,7 +361,10 @@ pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BurnTxStatus {
     Mined,
+    /// A failed receipt exists, but its block is not finalized.
     Reverted,
+    /// A failed receipt is canonical at or below the finalized head.
+    FinalizedReverted,
     StillMineable,
     ProvablyDead,
 }
