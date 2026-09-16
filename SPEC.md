@@ -4251,6 +4251,7 @@ stateDiagram-v2
     Failed --> Failed: MarkFailed (re-classify failure)
     Failed --> Detected: Reprocess (pre-Alpaca)
     Failed --> Burning: ResumeBurn (post-Alpaca)
+    Failed --> BurnIntended: ReplaceExhaustedDeadBurn
     Failed --> Completed: ForceCompleteBurn (admin, verified on-chain)
     Failed --> Closed: CloseRedemption (admin)
     Failed --> [*]

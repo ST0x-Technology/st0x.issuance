@@ -199,16 +199,19 @@ restart needed. The endpoint first re-verifies the journal status with Alpaca
 (to avoid burning without backing), then resumes the redemption to `Burning` and
 submits the burn, waiting for on-chain confirmation before responding.
 
-For an exhausted `BurnIntended` or `BurnSubmitted` redemption, the endpoint
-reloads the aggregate while holding the network wallet lock and verifies the
-exact persisted signed transaction. It signs a fresh-nonce replacement only when
-that transaction is `ProvablyDead`; pending, mined, unknown, invalid, and
-RPC-failure results fail closed without signing. The authorization and
-replacement intent commit atomically before queue dispatch. A successful JSON
-response includes `manual_replacement` with stable `code`, `recovery_id`, old
-and new transaction hashes and nonces, and `queue_dispatch`. A deferred dispatch
-is safe: the reconciler reconstructs the job from the committed replacement
-intent after restart without signing another transaction.
+For an exhausted `BurnIntended`, `BurnSubmitted`, or retained burn in `Failed`,
+the endpoint reloads the aggregate while holding the network wallet lock and
+verifies the exact persisted signed transaction. It signs a fresh-nonce
+replacement only when that transaction is `ProvablyDead`, or when a retained
+authorized replacement in `Failed` has definitively reverted. A mined authorized
+replacement in `Failed` is recorded as the existing completed burn. Pending,
+unknown, invalid, and RPC-failure results fail closed without signing. The
+authorization and replacement intent commit atomically, then vault-direct
+receipts are reserved before queue dispatch. A successful JSON response includes
+`manual_replacement` with stable `code`, `recovery_id`, old and new transaction
+hashes and nonces, and `queue_dispatch`. A deferred dispatch is safe: the
+reconciler reconstructs the job from the committed replacement intent after
+restart without signing another transaction.
 
 Successful response messages:
 
@@ -225,6 +228,7 @@ Error and manual-replacement responses use the exact code and action below:
 | `burn_replacement_queued`                        | 200    | The replacement is authorized and its submit job is queued.                                                                                                      |
 | `burn_replacement_reenqueued`                    | 200    | An authorized replacement was re-enqueued. Do not request another signature.                                                                                     |
 | `burn_replacement_confirmation_queued`           | 200    | The replacement landed and its confirmation job is queued.                                                                                                       |
+| `burn_replacement_existing_burn_recovered`       | 200    | The authorized replacement landed while the redemption was `Failed`; recovery recorded it as completed and no queue dispatch was required.                       |
 | `burn_replacement_dispatch_deferred`             | 200    | The queue write failed after authorization. Leave the service running or restart it so the reconciler repairs dispatch.                                          |
 | `burn_replacement_committed_inspection_required` | 200    | Inspect events using `recovery_id` and the old transaction identity, then repair dispatch without another signature.                                             |
 | `redemption_not_found`                           | 404    | No aggregate history exists. Verify the ID against `/admin/stuck`.                                                                                               |

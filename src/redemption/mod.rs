@@ -487,6 +487,9 @@ impl BurnSubmitRejectedProof {
 
 enum BurnReplacementBasis {
     LiveClassification,
+    /// Manual exhausted recovery may replace either a transaction proven
+    /// absent from the chain or one whose receipt proves it reverted.
+    ExhaustedTerminalClassification,
     NonceTooLow(BurnNonceTooLowProof),
     SubmitRejected(BurnSubmitRejectedProof),
 }
@@ -2016,6 +2019,26 @@ impl Redemption {
                     });
                 }
             }
+            BurnReplacementBasis::ExhaustedTerminalClassification => {
+                let status = vault_service
+                    .classify_burn_tx(owner, sendable_tx)
+                    .await
+                    .map_err(|_| {
+                        RedemptionError::BurnRecoveryClassificationFailed {
+                            tx_hash: sendable_tx.hash,
+                            nonce: sendable_tx.nonce,
+                        }
+                    })?;
+                if !matches!(
+                    status,
+                    BurnTxStatus::ProvablyDead | BurnTxStatus::Reverted
+                ) {
+                    return Err(RedemptionError::BurnReplacementNotSafe {
+                        tx_hash: sendable_tx.hash,
+                        nonce: sendable_tx.nonce,
+                    });
+                }
+            }
         }
 
         let planned_burns = match self {
@@ -2776,7 +2799,7 @@ impl Redemption {
                 services,
                 issuer_request_id.clone(),
                 owner,
-                BurnReplacementBasis::LiveClassification,
+                BurnReplacementBasis::ExhaustedTerminalClassification,
                 network,
                 previous,
             )

@@ -162,6 +162,8 @@ enum ManualBurnReplacementCode {
     Reenqueued,
     #[serde(rename = "burn_replacement_confirmation_queued")]
     ConfirmationQueued,
+    #[serde(rename = "burn_replacement_existing_burn_recovered")]
+    ExistingBurnRecovered,
     #[serde(rename = "burn_replacement_dispatch_deferred")]
     DispatchDeferred,
 }
@@ -171,6 +173,7 @@ enum ManualBurnReplacementCode {
 enum QueueDispatch {
     Queued,
     Deferred,
+    NotRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
@@ -664,6 +667,11 @@ async fn recover_redemption_logic(
                 ManualBurnReplacementCode::ConfirmationQueued,
                 QueueDispatch::Queued,
                 "Landed authorized burn replacement queued for confirmation",
+            ),
+            ManualBurnReplacementDisposition::ExistingBurnRecovered => (
+                ManualBurnReplacementCode::ExistingBurnRecovered,
+                QueueDispatch::NotRequired,
+                "Landed authorized burn replacement recorded as completed",
             ),
             ManualBurnReplacementDisposition::DispatchDeferred => (
                 ManualBurnReplacementCode::DispatchDeferred,
