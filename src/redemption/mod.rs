@@ -365,6 +365,11 @@ pub(crate) enum Redemption {
         /// while a reserved replacement is prepared.
         #[serde(default)]
         prior_burn_tx: Option<SendableTxWithHash>,
+        /// Full burn context paired with `prior_burn_tx`, retained while a
+        /// failed redemption is resumed so another preparation failure cannot
+        /// erase the persisted receipt plan.
+        #[serde(default)]
+        prior_burn_context: Option<FailedBurnContext>,
     },
     /// Burn transaction submitted to signing backend, awaiting on-chain confirmation.
     BurnSubmitted {
@@ -649,6 +654,9 @@ impl Redemption {
                 planned_burns: planned_burns.clone(),
                 has_submitted: false,
             }),
+            Self::Burning { prior_burn_context, .. } => {
+                prior_burn_context.clone()
+            }
             Self::BurnSubmitted {
                 metadata,
                 tokenization_request_id,
@@ -1560,6 +1568,7 @@ impl Redemption {
             alpaca_journal_completed_at,
             external_tx_id: None,
             prior_burn_tx: None,
+            prior_burn_context: None,
         };
     }
 
@@ -3094,11 +3103,11 @@ impl Redemption {
     }
 
     fn apply_burn_resumed_event(&mut self, event: RedemptionEvent) {
-        let prior_burn_tx = match self {
-            Self::Failed { unresolved_burn_tx, .. } => {
-                unresolved_burn_tx.clone()
+        let (prior_burn_tx, prior_burn_context) = match self {
+            Self::Failed { unresolved_burn_tx, burn_context, .. } => {
+                (unresolved_burn_tx.clone(), burn_context.clone())
             }
-            _ => None,
+            _ => (None, None),
         };
         let RedemptionEvent::BurnResumed {
             issuer_request_id,
@@ -3143,6 +3152,7 @@ impl Redemption {
             alpaca_journal_completed_at,
             external_tx_id,
             prior_burn_tx,
+            prior_burn_context,
         };
     }
 
@@ -4851,6 +4861,7 @@ mod tests {
                 alpaca_journal_completed_at,
                 external_tx_id: None,
                 prior_burn_tx: None,
+                prior_burn_context: None,
             }
         );
     }
@@ -9112,7 +9123,7 @@ mod tests {
     }
 
     #[test]
-    fn prior_burn_transaction_survives_failure_resume_and_snapshot_roundtrip() {
+    fn burn_context_survives_failure_resume_failure_and_snapshot_roundtrip() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let persisted_tx = SendableTxWithHash::valid_for_test(
             7,
@@ -9142,7 +9153,7 @@ mod tests {
 
         history.push(RedemptionEvent::BurnResumed {
             burn_mode: VaultMode::VaultDirect,
-            issuer_request_id,
+            issuer_request_id: issuer_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::Base,
@@ -9163,7 +9174,7 @@ mod tests {
             external_tx_id: None,
             resumed_at: Utc::now(),
         });
-        let burning = replay::<Redemption>(history)
+        let burning = replay::<Redemption>(history.clone())
             .expect("resumed history should replay")
             .expect("redemption should exist");
         let snapshot = serde_json::to_string(&burning)
@@ -9176,6 +9187,34 @@ mod tests {
                 prior_burn_tx: Some(prior_burn_tx),
                 ..
             } if prior_burn_tx == &persisted_tx
+        ));
+        history.push(RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
+            issuer_request_id: issuer_request_id.clone(),
+            error: "resumed preparation failed".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+        history.push(RedemptionEvent::RedemptionFailed {
+            issuer_request_id,
+            reason: "automatic burn recovery exhausted".to_string(),
+            failed_at: Utc::now(),
+        });
+        let refailed = replay::<Redemption>(history)
+            .expect("refailed history should replay")
+            .expect("redemption should exist");
+        assert!(matches!(
+            refailed,
+            Redemption::Failed {
+                unresolved_burn_tx: Some(prior_burn_tx),
+                burn_context: Some(context),
+                ..
+            } if prior_burn_tx == persisted_tx
+                && context.planned_burns == vec![BurnRecord {
+                    receipt_id: uint!(42_U256),
+                    shares_burned: uint!(100_000000000000000000_U256),
+                }]
         ));
 
         let mut old_failed_snapshot =
@@ -9206,12 +9245,21 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("burning snapshot should exist")
             .remove("prior_burn_tx");
+        old_burning_snapshot
+            .pointer_mut("/Burning")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("burning snapshot should exist")
+            .remove("prior_burn_context");
         let restored_burning: Redemption =
             serde_json::from_value(old_burning_snapshot)
                 .expect("old burning snapshot should deserialize");
         assert!(matches!(
             restored_burning,
-            Redemption::Burning { prior_burn_tx: None, .. }
+            Redemption::Burning {
+                prior_burn_tx: None,
+                prior_burn_context: None,
+                ..
+            }
         ));
     }
 

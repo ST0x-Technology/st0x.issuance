@@ -662,7 +662,9 @@ on-chain transfer through calling Alpaca to burning tokens.
 - A `Failed` state reached from `BurnIntended` or `BurnSubmitted` retains the
   transaction's full burn lifecycle context and persisted receipt plan. This
   lets `ReplaceExhaustedDeadBurn` reopen the exact plan without repeating the
-  Alpaca call. Pre-Alpaca failures carry no burn context.
+  Alpaca call. `BurnResumed` carries that retained context through `Burning`
+  until replacement succeeds or another terminal failure records it again.
+  Pre-Alpaca failures carry no burn context.
 
 **Commands:**
 
