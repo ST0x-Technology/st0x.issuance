@@ -489,66 +489,14 @@ impl BurnManager {
     ) -> Result<ManualBurnReplacementOutcome, BurnManagerError> {
         let initial =
             self.load_manual_replacement_state(issuer_request_id).await?;
-        let network = initial
-            .metadata()
-            .map(|metadata| metadata.network)
-            .ok_or(BurnManagerError::ManualReplacementRefused(match initial
-                .state()
-            {
-                RedemptionState::Completed | RedemptionState::Closed => {
-                    ManualBurnReplacementRefusal::TerminalState {
-                        state: initial.state(),
-                    }
-                }
-                state => ManualBurnReplacementRefusal::InvalidState { state },
-            }))?;
+        let network =
+            Self::manual_replacement_candidate(&initial)?.metadata.network;
         let vault_service = self.vault_for(network)?;
         let _wallet_guard = vault_service.lock_wallet().await;
 
         let current =
             self.load_manual_replacement_state(issuer_request_id).await?;
-        let candidate = match &current {
-            Redemption::BurnIntended {
-                metadata,
-                planned_burns,
-                sendable_tx,
-                alpaca_quantity,
-                ..
-            } => ManualBurnCandidate {
-                metadata,
-                planned_burns,
-                sendable_tx,
-                previous_state: RedemptionState::BurnIntended,
-                has_submitted: false,
-                alpaca_quantity,
-            },
-            Redemption::BurnSubmitted {
-                metadata,
-                planned_burns,
-                sendable_tx,
-                alpaca_quantity,
-                ..
-            } => ManualBurnCandidate {
-                metadata,
-                planned_burns,
-                sendable_tx,
-                previous_state: RedemptionState::BurnSubmitted,
-                has_submitted: true,
-                alpaca_quantity,
-            },
-            Redemption::Completed { .. } | Redemption::Closed { .. } => {
-                return Err(ManualBurnReplacementRefusal::TerminalState {
-                    state: current.state(),
-                }
-                .into());
-            }
-            _ => {
-                return Err(ManualBurnReplacementRefusal::InvalidState {
-                    state: current.state(),
-                }
-                .into());
-            }
-        };
+        let candidate = Self::manual_replacement_candidate(&current)?;
         let previous = BurnTransactionIdentity::from(candidate.sendable_tx);
         let budget = self.burn_recovery_budget(issuer_request_id).await?;
         if !budget.is_exhausted() {
@@ -688,6 +636,61 @@ impl BurnManager {
             replacement: authorization.replacement,
             disposition,
         })
+    }
+
+    fn manual_replacement_candidate(
+        redemption: &Redemption,
+    ) -> Result<ManualBurnCandidate<'_>, ManualBurnReplacementRefusal> {
+        match redemption {
+            Redemption::BurnIntended {
+                metadata,
+                planned_burns,
+                sendable_tx,
+                alpaca_quantity,
+                ..
+            } => Ok(ManualBurnCandidate {
+                metadata,
+                planned_burns,
+                sendable_tx,
+                previous_state: RedemptionState::BurnIntended,
+                has_submitted: false,
+                alpaca_quantity,
+            }),
+            Redemption::BurnSubmitted {
+                metadata,
+                planned_burns,
+                sendable_tx,
+                alpaca_quantity,
+                ..
+            } => Ok(ManualBurnCandidate {
+                metadata,
+                planned_burns,
+                sendable_tx,
+                previous_state: RedemptionState::BurnSubmitted,
+                has_submitted: true,
+                alpaca_quantity,
+            }),
+            Redemption::Failed {
+                unresolved_burn_tx: Some(sendable_tx),
+                burn_context: Some(context),
+                ..
+            } => Ok(ManualBurnCandidate {
+                metadata: &context.metadata,
+                planned_burns: &context.planned_burns,
+                sendable_tx,
+                previous_state: RedemptionState::Failed,
+                has_submitted: context.has_submitted,
+                alpaca_quantity: &context.alpaca_quantity,
+            }),
+            Redemption::Completed { .. } | Redemption::Closed { .. } => {
+                Err(ManualBurnReplacementRefusal::TerminalState {
+                    state: redemption.state(),
+                })
+            }
+            _ => Err(ManualBurnReplacementRefusal::InvalidState {
+                state: redemption.state(),
+            }),
+        }
     }
 
     async fn load_manual_replacement_state(
@@ -4205,8 +4208,9 @@ mod tests {
     use super::{
         BurnConfirmPlan, BurnExecutionPlan, BurnManager, BurnManagerError,
         DefinitiveConfirmFailure, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
-        ManualBurnReplacementDisposition, RecoveryOutcome, Redemption,
-        RedemptionCommand, should_release_reserved_burn,
+        ManualBurnReplacementDisposition, ManualBurnReplacementRefusal,
+        RecoveryOutcome, Redemption, RedemptionCommand,
+        should_release_reserved_burn,
     };
     use crate::bindings::IST0xOrchestratorV1;
     use crate::burn_excess::BurnExcessEvent;
@@ -4231,7 +4235,7 @@ mod tests {
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, RedemptionError, RedemptionEvent,
-        RedemptionView,
+        RedemptionState, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
@@ -9491,6 +9495,239 @@ mod tests {
             "restart repair must classify the authorized transaction before re-enqueueing"
         );
         assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_replacement_recovers_terminal_failed_exhausted_burn() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                ])
+                .with_prepared_tx(old_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            owner,
+        )
+        .await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let old_execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        let old_tx_id = manager
+            .submit_intended_burn_for_job(
+                &issuer_request_id,
+                &old_execution,
+                old_tx.hash,
+            )
+            .await
+            .expect("old burn submission should succeed")
+            .expect("old burn should be submitted");
+        manager
+            .enqueue_confirm_burn(
+                &issuer_request_id,
+                old_execution.confirm_plan(),
+                old_tx_id,
+            )
+            .await
+            .expect("old confirmation job should enqueue");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryAttempt {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    action: BurnRecoveryAction::Rebroadcast,
+                },
+            )
+            .await
+            .expect("recovery attempt should persist");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_tx_hash: Some(old_tx.hash),
+                    error: "burn transaction reverted".to_string(),
+                    tx_id: Some(old_tx.hash.into()),
+                    planned_burns: old_execution.planned_burns.clone(),
+                    classification: BurnFailureClassification::Unclassified,
+                },
+            )
+            .await
+            .expect("burn failure should persist");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "automatic burn recovery exhausted".to_string(),
+                },
+            )
+            .await
+            .expect("terminal failure should persist");
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+
+        let outcome = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("terminal failed exhausted burn should be replaced");
+
+        assert_eq!(outcome.previous_state, RedemptionState::Failed);
+        assert_eq!(outcome.previous.tx_hash, old_tx.hash);
+        assert_eq!(outcome.replacement.tx_hash, replacement_tx.hash);
+        let replacement_execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        assert_eq!(
+            outcome.disposition,
+            ManualBurnReplacementDisposition::Enqueued
+        );
+        let replacement_tx_id = manager
+            .submit_intended_burn_for_job(
+                &issuer_request_id,
+                &replacement_execution,
+                replacement_tx.hash,
+            )
+            .await
+            .expect("replacement submission should succeed")
+            .expect("replacement should be submitted");
+        manager
+            .enqueue_confirm_burn(
+                &issuer_request_id,
+                replacement_execution.confirm_plan(),
+                replacement_tx_id,
+            )
+            .await
+            .expect("replacement confirmation job should enqueue");
+        let confirm_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<ConfirmBurnJob>())
+                .fetch_one(&harness.pool)
+                .await
+                .expect("confirm job count should load");
+        assert_eq!(
+            confirm_jobs, 2,
+            "the replacement must enqueue a distinct confirmation job"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_replacement_refuses_completed_and_closed_redemptions() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let prepared_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = prepared_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_prepared_tx(prepared_tx),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+
+        let completed_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(&harness, &vault_mock, vault, &completed_id, owner)
+            .await;
+        drive_intended_burn_to_completion(
+            &manager,
+            &harness.store,
+            &completed_id,
+            vault,
+        )
+        .await;
+
+        let closed_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(&harness.store, &closed_id)
+            .await;
+        harness
+            .store
+            .send(
+                &closed_id,
+                RedemptionCommand::CloseRedemption {
+                    issuer_request_id: closed_id.clone(),
+                    reason: "operator closed".to_string(),
+                    acknowledged_unresolved_burn_tx_hash: None,
+                },
+            )
+            .await
+            .expect("close should succeed");
+
+        for (issuer_request_id, expected_state) in [
+            (completed_id, RedemptionState::Completed),
+            (closed_id, RedemptionState::Closed),
+        ] {
+            let error = manager
+                .replace_exhausted_dead_burn(&issuer_request_id)
+                .await
+                .expect_err("terminal redemption should refuse replacement");
+            assert!(matches!(
+                error,
+                BurnManagerError::ManualReplacementRefused(
+                    ManualBurnReplacementRefusal::TerminalState { state }
+                ) if state == expected_state
+            ));
+        }
     }
 
     #[tokio::test]

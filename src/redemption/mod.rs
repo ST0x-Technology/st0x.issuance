@@ -269,6 +269,19 @@ pub(crate) struct RedemptionMetadata {
     pub(crate) burn_mode: VaultMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FailedBurnContext {
+    metadata: RedemptionMetadata,
+    tokenization_request_id: TokenizationRequestId,
+    alpaca_quantity: Quantity,
+    dust_quantity: Quantity,
+    called_at: DateTime<Utc>,
+    alpaca_journal_completed_at: DateTime<Utc>,
+    external_tx_id: Option<BurnExternalTxId>,
+    planned_burns: Vec<BurnRecord>,
+    has_submitted: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RedemptionState {
     Detected,
@@ -393,6 +406,11 @@ pub(crate) enum Redemption {
         /// the prior state.
         #[serde(default)]
         alpaca_quantity: Option<Quantity>,
+        /// Full lifecycle context retained from a failed signed burn so an
+        /// exhausted, provably dead transaction can be replaced without
+        /// repeating the Alpaca call or rebuilding its receipt plan.
+        #[serde(default)]
+        burn_context: Option<FailedBurnContext>,
     },
     Closed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -606,6 +624,55 @@ impl Redemption {
                     latest_external_tx_id: latest_external_tx_id.clone(),
                 })?;
         Ok(Self::retry_burn_external_tx_id_typed(detected_tx_hash, attempt))
+    }
+
+    fn failed_burn_context(&self) -> Option<FailedBurnContext> {
+        match self {
+            Self::BurnIntended {
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                planned_burns,
+                external_tx_id,
+                ..
+            } => Some(FailedBurnContext {
+                metadata: metadata.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: alpaca_quantity.clone(),
+                dust_quantity: dust_quantity.clone(),
+                called_at: *called_at,
+                alpaca_journal_completed_at: *alpaca_journal_completed_at,
+                external_tx_id: external_tx_id.clone(),
+                planned_burns: planned_burns.clone(),
+                has_submitted: false,
+            }),
+            Self::BurnSubmitted {
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id,
+                planned_burns,
+                ..
+            } => Some(FailedBurnContext {
+                metadata: metadata.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: alpaca_quantity.clone(),
+                dust_quantity: dust_quantity.clone(),
+                called_at: *called_at,
+                alpaca_journal_completed_at: *alpaca_journal_completed_at,
+                external_tx_id: Some(external_tx_id.clone()),
+                planned_burns: planned_burns.clone(),
+                has_submitted: true,
+            }),
+            Self::Failed { burn_context, .. } => burn_context.clone(),
+            _ => None,
+        }
     }
 
     pub(crate) const fn metadata(&self) -> Option<&RedemptionMetadata> {
@@ -1842,21 +1909,29 @@ impl Redemption {
     fn burn_replacement_context(
         &self,
     ) -> Result<(Network, &SendableTxWithHash), RedemptionError> {
-        let network = self
-            .metadata()
-            .map(|metadata| metadata.network)
-            .ok_or_else(|| RedemptionError::InvalidState {
-                expected: "BurnIntended or BurnSubmitted".to_string(),
-                found: self.state_name().to_string(),
-            })?;
-        let sendable_tx = self.current_sendable_tx().ok_or_else(|| {
-            RedemptionError::InvalidState {
-                expected: "BurnIntended or BurnSubmitted".to_string(),
-                found: self.state_name().to_string(),
+        match self {
+            Self::BurnIntended { metadata, sendable_tx, .. }
+            | Self::BurnSubmitted { metadata, sendable_tx, .. } => {
+                Ok((metadata.network, sendable_tx))
             }
-        })?;
+            _ => Err(RedemptionError::InvalidState {
+                expected: "BurnIntended or BurnSubmitted".to_string(),
+                found: self.state_name().to_string(),
+            }),
+        }
+    }
 
-        Ok((network, sendable_tx))
+    fn exhausted_burn_replacement_context(
+        &self,
+    ) -> Result<(Network, &SendableTxWithHash), RedemptionError> {
+        match self {
+            Self::Failed {
+                unresolved_burn_tx: Some(sendable_tx),
+                burn_context: Some(context),
+                ..
+            } => Ok((context.metadata.network, sendable_tx)),
+            _ => self.burn_replacement_context(),
+        }
     }
 
     async fn replace_burn(
@@ -1938,6 +2013,9 @@ impl Redemption {
             Self::BurnIntended { planned_burns, .. }
             | Self::BurnSubmitted { planned_burns, .. } => {
                 planned_burns.clone()
+            }
+            Self::Failed { burn_context: Some(context), .. } => {
+                context.planned_burns.clone()
             }
             _ => Vec::new(),
         };
@@ -2173,10 +2251,10 @@ impl EventSourced for Redemption {
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    // 7: `AlpacaCallClaimed` adds a pre-call aggregate state. Clearing older
-    // snapshots ensures replay observes any durable claim event rather than
-    // reconstructing the redemption as merely Detected or Held.
-    const SCHEMA_VERSION: u64 = 7;
+    // 8: failed burns retain the full lifecycle context needed to replace an
+    // exhausted signed transaction. Clearing older snapshots rebuilds that
+    // context from BurnIntended/BurnSubmitted before the failure events.
+    const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -2656,7 +2734,7 @@ impl Redemption {
         previous_nonce: u64,
         owner: Address,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let (network, previous) = self.burn_replacement_context()?;
+        let (network, previous) = self.exhausted_burn_replacement_context()?;
         if previous.hash != previous_tx_hash || previous.nonce != previous_nonce
         {
             return Err(RedemptionError::RecoveryTransactionMismatch {
@@ -2861,6 +2939,7 @@ impl Redemption {
             .persisted_unresolved_burn_tx()
             .filter(|sendable_tx| !sendable_tx.tx.is_empty())
             .cloned();
+        let burn_context = self.failed_burn_context();
         // Anchor the mode from the failing state's own metadata before the
         // transition drops it, so existing-burn recovery can reject a
         // cross-mode proof. A `Failed -> Failed` reclassification (via
@@ -2906,6 +2985,7 @@ impl Redemption {
             unresolved_burn_tx,
             burn_mode,
             alpaca_quantity,
+            burn_context,
         };
     }
 
@@ -3195,6 +3275,15 @@ impl Redemption {
                 called_at,
                 alpaca_journal_completed_at,
                 Some(external_tx_id),
+            )),
+            Self::Failed { burn_context: Some(context), .. } => Some((
+                context.metadata,
+                context.tokenization_request_id,
+                context.alpaca_quantity,
+                context.dust_quantity,
+                context.called_at,
+                context.alpaca_journal_completed_at,
+                context.external_tx_id,
             )),
             _ => None,
         };
@@ -8297,6 +8386,7 @@ mod tests {
                 unresolved_burn_tx: None,
                 burn_mode: VaultMode::VaultDirect,
                 alpaca_quantity: Some(Quantity::new(Decimal::from(150))),
+                burn_context: None,
             }
         );
     }
@@ -9096,6 +9186,7 @@ mod tests {
             .expect("failed snapshot should exist");
         failed_fields.remove("unresolved_burn_tx");
         failed_fields.remove("burn_mode");
+        failed_fields.remove("burn_context");
         let restored_failed: Redemption =
             serde_json::from_value(old_failed_snapshot)
                 .expect("old failed snapshot should deserialize");
