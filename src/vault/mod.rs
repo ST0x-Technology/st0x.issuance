@@ -85,9 +85,11 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// Bounded-polls `eth_getTransactionReceipt` as `Option` (never uses
     /// `PendingTransactionBuilder::get_receipt` as the terminal classifier).
-    /// Terminal outcomes: mined success with a `Deposit` log, mined revert
-    /// (`status=0`), or [`VaultError::ConfirmationPending`] when the poll
-    /// budget is exhausted with no receipt. Provider uncertainty fails closed.
+    /// Terminal outcomes: mined success with a `Deposit` log, or a failed
+    /// receipt whose exact block is canonical at or below the finalized head.
+    /// An unfinalized failed receipt and a poll budget exhausted with no
+    /// receipt return [`VaultError::ConfirmationPending`]. Provider uncertainty
+    /// fails closed.
     ///
     /// # Arguments
     ///
@@ -100,9 +102,11 @@ pub(crate) trait VaultService: Send + Sync {
     /// Classifies whether a persisted signed mint transaction can still land.
     ///
     /// Implementations must check the exact hash receipt before comparing the
-    /// owner's finalized nonce. Any provider uncertainty returns an error so
-    /// callers fail closed and keep the persisted transaction live. `Uncertain`
-    /// is expressed as `Err`, never as a success variant.
+    /// owner's finalized nonce. A failed receipt is `MinedReverted` only after
+    /// its exact block is canonical at or below the finalized head. Any
+    /// provider uncertainty returns an error so callers fail closed and keep
+    /// the persisted transaction live. `Uncertain` is expressed as `Err`, never
+    /// as a success variant.
     async fn classify_mint_tx(
         &self,
         _owner: Address,
@@ -181,8 +185,10 @@ pub(crate) trait VaultService: Send + Sync {
     /// Classifies whether a persisted signed burn transaction can still land.
     ///
     /// Implementations must check the exact hash receipt before comparing the
-    /// owner's finalized nonce. Any provider uncertainty returns an error so
-    /// callers fail closed and keep the persisted transaction live.
+    /// owner's finalized nonce. A failed receipt is `FinalizedReverted` only
+    /// after its exact block is canonical at or below the finalized head. Any
+    /// provider uncertainty returns an error so callers fail closed and keep
+    /// the persisted transaction live.
     async fn classify_burn_tx(
         &self,
         _owner: Address,
@@ -206,8 +212,10 @@ pub(crate) trait VaultService: Send + Sync {
         Err(VaultError::InvalidReceipt)
     }
 
-    /// Fetches the on-chain receipt for `tx_hash`, returning an error if the
-    /// transaction reverted.
+    /// Fetches the on-chain receipt for `tx_hash`. A failed receipt returns
+    /// [`VaultError::Reverted`] only after its exact block is canonical at or
+    /// below the finalized head; an unfinalized failed receipt returns
+    /// [`VaultError::ConfirmationPending`].
     async fn check_tx(
         &self,
         _tx_id: &TxId,
@@ -301,9 +309,10 @@ pub(crate) trait VaultService: Send + Sync {
     ) -> Result<PreparedMintTx, VaultError>;
 
     /// Confirms a previously submitted orchestrator mint, parsing the
-    /// orchestrator's `Minted` event. A mined-but-reverted mint fails with
-    /// [`VaultError::OrchestratorReverted`] carrying the decoded typed reason
-    /// (`NonceReplayed`, `VaultLogicMismatch`, ...).
+    /// orchestrator's `Minted` event. A failed receipt returns
+    /// [`VaultError::OrchestratorReverted`] with its decoded typed reason only
+    /// after its exact block is canonical at or below the finalized head;
+    /// otherwise it returns [`VaultError::ConfirmationPending`].
     async fn confirm_orchestrator_mint(
         &self,
         tx_id: &TxId,
@@ -359,7 +368,10 @@ pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BurnTxStatus {
     Mined,
+    /// A failed receipt exists, but its block is not finalized.
     Reverted,
+    /// A failed receipt is canonical at or below the finalized head.
+    FinalizedReverted,
     StillMineable,
     ProvablyDead,
 }
@@ -1013,14 +1025,15 @@ pub(crate) enum VaultError {
     /// A transaction receipt was returned without proof of block inclusion.
     #[error("Transaction receipt is missing a block number: {tx_hash:?}")]
     MissingBlockNumber { tx_hash: B256 },
-    /// Expected event (e.g., Deposit) not found in transaction logs
+    /// Expected event (e.g., Deposit) not found in transaction logs.
     #[error("Event not found in transaction: {tx_hash:?}")]
     EventNotFound { tx_hash: B256 },
-    /// Transaction was mined but reverted on-chain (status == 0).
+    /// Transaction was finalized on-chain with status zero.
     ///
-    /// A reverted burn consumes no receipts, so any inventory reservation
-    /// held for it must be released.
-    #[error("Transaction reverted on-chain: {tx_hash:?}")]
+    /// A finalized reverted burn consumes no receipts, so any inventory
+    /// reservation held for it must be released. Unfinalized failed receipts
+    /// surface as [`VaultError::ConfirmationPending`] instead.
+    #[error("Transaction reverted in a finalized block: {tx_hash:?}")]
     Reverted { tx_hash: B256 },
     /// The node's own answers contradict each other: the sender's finalized
     /// nonce is past this transaction's, so the nonce is permanently spent,
@@ -1032,11 +1045,11 @@ pub(crate) enum VaultError {
          transaction {tx_hash:?}"
     )]
     ContradictoryDeathSignals { tx_hash: B256, nonce: u64 },
-    /// An orchestrator transaction was mined but reverted, with the revert
-    /// data decoded into a typed reason. Like [`VaultError::Reverted`], this
-    /// is a definitive on-chain failure.
+    /// An orchestrator transaction reverted in a finalized block, with the
+    /// revert data decoded into a typed reason. Unfinalized failed receipts
+    /// surface as [`VaultError::ConfirmationPending`] instead.
     #[error(
-        "Orchestrator transaction reverted on-chain: {tx_hash:?} ({reason:?})"
+        "Orchestrator transaction reverted in a finalized block: {tx_hash:?} ({reason:?})"
     )]
     OrchestratorReverted { tx_hash: B256, reason: OrchestratorRevertReason },
     /// Transaction was mined and succeeded but does not prove the expected

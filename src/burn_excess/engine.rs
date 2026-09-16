@@ -1165,7 +1165,9 @@ async fn resume_from_intended<P: Provider>(
             })
             .await
         }
-        BurnTxStatus::Reverted | BurnTxStatus::ProvablyDead => {
+        BurnTxStatus::Reverted
+        | BurnTxStatus::FinalizedReverted
+        | BurnTxStatus::ProvablyDead => {
             Err(BurnExcessEngineError::DeadBurnIntent { status })
         }
     }
@@ -1200,7 +1202,9 @@ async fn resume_from_submitted<P: Provider>(
             })
             .await
         }
-        BurnTxStatus::Reverted | BurnTxStatus::ProvablyDead => {
+        BurnTxStatus::Reverted
+        | BurnTxStatus::FinalizedReverted
+        | BurnTxStatus::ProvablyDead => {
             Err(BurnExcessEngineError::DeadBurnIntent { status })
         }
     }

@@ -162,6 +162,10 @@ enum ManualBurnReplacementCode {
     Reenqueued,
     #[serde(rename = "burn_replacement_confirmation_queued")]
     ConfirmationQueued,
+    #[serde(rename = "burn_replacement_existing_burn_recovered")]
+    ExistingBurnRecovered,
+    #[serde(rename = "burn_replacement_existing_burn_recovery_deferred")]
+    ExistingBurnRecoveryDeferred,
     #[serde(rename = "burn_replacement_dispatch_deferred")]
     DispatchDeferred,
 }
@@ -171,6 +175,7 @@ enum ManualBurnReplacementCode {
 enum QueueDispatch {
     Queued,
     Deferred,
+    NotRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
@@ -653,7 +658,7 @@ async fn recover_redemption_logic(
             ManualBurnReplacementDisposition::Enqueued => (
                 ManualBurnReplacementCode::Queued,
                 QueueDispatch::Queued,
-                "Provably-dead burn replacement authorized and queued",
+                "Burn replacement authorized and queued after definitive prior-transaction classification",
             ),
             ManualBurnReplacementDisposition::Reenqueued => (
                 ManualBurnReplacementCode::Reenqueued,
@@ -664,6 +669,16 @@ async fn recover_redemption_logic(
                 ManualBurnReplacementCode::ConfirmationQueued,
                 QueueDispatch::Queued,
                 "Landed authorized burn replacement queued for confirmation",
+            ),
+            ManualBurnReplacementDisposition::ExistingBurnRecovered => (
+                ManualBurnReplacementCode::ExistingBurnRecovered,
+                QueueDispatch::NotRequired,
+                "Landed authorized burn replacement recorded as completed",
+            ),
+            ManualBurnReplacementDisposition::ExistingBurnRecoveryDeferred => (
+                ManualBurnReplacementCode::ExistingBurnRecoveryDeferred,
+                QueueDispatch::NotRequired,
+                "Authorized burn replacement confirmation deferred; retry recovery",
             ),
             ManualBurnReplacementDisposition::DispatchDeferred => (
                 ManualBurnReplacementCode::DispatchDeferred,
@@ -2357,8 +2372,8 @@ impl<'r> Responder<'r, 'static> for CloseMintError {
 ///
 /// Three layers, all read-only:
 /// 1. Every persisted signed transaction with no recorded terminal outcome
-///    must be provably unable to land — a confirmed revert, or the signing
-///    wallet's finalized nonce past it. A still-mineable transaction (or a
+///    must be provably unable to land — a finalized confirmed revert, or the
+///    signing wallet's finalized nonce past it. A still-mineable transaction (or a
 ///    legacy submission that persisted no bytes to prove anything about)
 ///    refuses the close: the absence read is one instant, and a later
 ///    landing would go unobserved once the mint leaves recovery and stuck
@@ -2459,7 +2474,9 @@ async fn refuse_unsafe_close(
                 Status::InternalServerError
             })?;
         match vault_service.classify_burn_tx(signer, &sendable).await {
-            Ok(BurnTxStatus::Reverted | BurnTxStatus::ProvablyDead) => {}
+            Ok(
+                BurnTxStatus::FinalizedReverted | BurnTxStatus::ProvablyDead,
+            ) => {}
             Ok(BurnTxStatus::Mined) => {
                 warn!(target: "admin", issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable.hash,
@@ -2468,7 +2485,7 @@ async fn refuse_unsafe_close(
                 );
                 return Err(CloseMintError::MintLanded);
             }
-            Ok(BurnTxStatus::StillMineable) => {
+            Ok(BurnTxStatus::Reverted | BurnTxStatus::StillMineable) => {
                 warn!(target: "admin", issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable.hash,
                     "Refusing to close: the persisted transaction could \
@@ -4196,6 +4213,7 @@ mod tests {
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
     use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
+    use crate::jobs::job_type;
     use crate::mint::test_utils::{
         TestHarness, network_vault_services, test_config,
     };
@@ -4210,6 +4228,8 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
+    use crate::redemption::burn_manager::BurnManager;
+    use crate::redemption::job::SubmitBurnJob;
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
@@ -6551,6 +6571,199 @@ mod tests {
         assert_endpoint_recovers_exhausted_burn(false).await;
     }
 
+    #[tokio::test]
+    async fn endpoint_recovers_terminal_failed_exhausted_burn_with_real_manager()
+     {
+        let harness = TestHarness::new().await;
+        let pool = harness.pool.clone();
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                ])
+                .with_prepared_tx(old_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burning(&store).await;
+        let planned_burns = vec![BurnRecord {
+            receipt_id: U256::from(99),
+            shares_burned: U256::from(100),
+        }];
+        let (receipt_inventory_store, reserved_vault) =
+            seed_receipt_reservation(&pool, &metadata.issuer_request_id).await;
+        assert_eq!(reserved_vault, vault);
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(99),
+                            burn_shares: U256::from(100),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner,
+                    },
+                    external_tx_id: Some(BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    )),
+                },
+            )
+            .await
+            .expect("burn intent should persist");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnTxSubmitted {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: old_tx.hash,
+                    external_tx_id: BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    ),
+                    tx_id: old_tx.hash.into(),
+                    planned_burns: planned_burns.clone(),
+                },
+            )
+            .await
+            .expect("burn submission should persist");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryAttempt {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    action: BurnRecoveryAction::Rebroadcast,
+                },
+            )
+            .await
+            .expect("recovery attempt should persist");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    expected_tx_hash: Some(old_tx.hash),
+                    error: "burn transaction reverted".to_string(),
+                    tx_id: Some(old_tx.hash.into()),
+                    planned_burns: planned_burns.clone(),
+                    classification: BurnFailureClassification::Unclassified,
+                },
+            )
+            .await
+            .expect("burn failure should persist");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "automatic burn recovery exhausted".to_string(),
+                },
+            )
+            .await
+            .expect("terminal failure should persist");
+        assert!(matches!(
+            store
+                .load(&metadata.issuer_request_id)
+                .await
+                .expect("terminal aggregate should load"),
+            Some(Redemption::Failed { .. })
+        ));
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+
+        let receipt_service: Arc<dyn ReceiptService> =
+            Arc::new(CqrsReceiptService::new(receipt_inventory_store));
+        let burn_manager = Arc::new(BurnManager::new_for_tests(
+            vault_service.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service,
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        ));
+        let burn_recovery: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_manager;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &test_alpaca_data(),
+            )),
+        });
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            response["manual_replacement"]["code"],
+            "burn_replacement_queued"
+        );
+        let idempotency_key = BurnManager::submit_burn_idempotency_key(
+            &metadata.issuer_request_id,
+            replacement_tx.hash,
+        );
+        let queued_job: Vec<u8> = sqlx::query_scalar(
+            "
+            SELECT job
+            FROM Jobs
+            WHERE job_type = ? AND idempotency_key = ?
+            ",
+        )
+        .bind(job_type::<SubmitBurnJob>())
+        .bind(idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("replacement submit job should be queued");
+        let queued_job: SubmitBurnJob = serde_json::from_slice(&queued_job)
+            .expect("job should deserialize");
+        assert_eq!(queued_job.tx_hash, replacement_tx.hash);
+        assert_eq!(queued_job.execution.planned_burns, planned_burns);
+    }
+
     async fn dispatch_exhausted_burn_with_result(
         manual_result: MockManualBurnResult,
     ) -> (Status, serde_json::Value) {
@@ -6926,7 +7139,7 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn endpoint_replaces_only_confirmed_reverted_prior_burn() {
+    async fn endpoint_replaces_only_finalized_reverted_prior_burn() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
         let tx_id = TxId::random();
@@ -6995,6 +7208,65 @@ mod tests {
             Level::INFO,
             &[&aggregate_id, "Transaction reverted onchain", "ResumeBurn"]
         ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_preserves_unfinalized_reverted_prior_burn() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let (receipt_inventory_store, vault) =
+            seed_receipt_reservation(&pool, &metadata.issuer_request_id).await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_unfinalized_reverted_checked_tx(),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(body.contains("prior_burn_unverifiable"));
+        assert_eq!(burn_recovery.calls(), 0);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(redemption, Redemption::Failed { .. }),
+            "ambiguous prior burn must remain failed: {redemption:?}"
+        );
+        let inventory = receipt_inventory_store
+            .load(&ReceiptVaultKey::new(
+                crate::test_utils::ANVIL_CHAIN_ID,
+                vault,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inventory.reserved_redemptions(),
+            vec![metadata.issuer_request_id],
+            "an unfinalized revert must preserve the receipt reservation"
+        );
     }
 
     #[traced_test]
@@ -8503,6 +8775,7 @@ mod tests {
                 issuer_request_id: IssuerRedemptionRequestId::random(),
                 sendable_tx: sendable_tx.clone(),
                 planned_burns: vec![],
+                external_tx_id: None,
             },
         ]);
 
@@ -9245,12 +9518,13 @@ mod tests {
                 .expect("mint must advance to the classified failure");
         }
 
-        // The persisted transaction is the NonceReplayed revert — provably
-        // unable to land — and the consumed nonce has no full-matching log.
+        // The persisted transaction is the finalized NonceReplayed revert —
+        // provably unable to land — and the consumed nonce has no
+        // full-matching log.
         let vault_mock = Arc::new(
             MockVaultService::new_success()
                 .with_nonce_used(true)
-                .with_burn_tx_status(BurnTxStatus::Reverted),
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
         );
         let (status, _body) = dispatch_close_mint(
             close_mint_rocket(&pool, mint_store.clone(), vault_mock.clone()),
@@ -9423,12 +9697,12 @@ mod tests {
             .await
             .expect("mint must park unresolved");
 
-        // The persisted transaction is the NonceReplayed revert (provably
-        // dead); the nonce is consumed with no full-matching log.
+        // The persisted transaction is the finalized NonceReplayed revert
+        // (provably dead); the nonce is consumed with no full-matching log.
         let vault_mock = Arc::new(
             MockVaultService::new_success()
                 .with_nonce_used(true)
-                .with_burn_tx_status(BurnTxStatus::Reverted),
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
         );
 
         let (status, _body) = dispatch_close_mint(
@@ -9520,6 +9794,52 @@ mod tests {
             body.contains("could still land"),
             "the refusal body must explain the pending transaction, got: \
              {body}"
+        );
+        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(!matches!(mint, Mint::Closed { .. }));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &issuer_request_id.to_string(),
+                "persisted transaction could still land"
+            ]
+        ));
+    }
+
+    /// A failed receipt can disappear in a reorganization until its exact
+    /// block is finalized, so it cannot prove a persisted transaction dead.
+    #[traced_test]
+    #[tokio::test]
+    async fn close_mint_refuses_unfinalized_reverted_persisted_tx() {
+        let pool = setup_pool().await;
+        seed_close_test_asset(&pool).await;
+        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), ()));
+        let issuer_request_id = seed_close_test_mint(
+            &mint_store,
+            VaultMode::Orchestrator { address: CLOSE_ORCHESTRATOR },
+        )
+        .await;
+        advance_close_test_mint_to_submitted(&mint_store, &issuer_request_id)
+            .await;
+
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Reverted),
+        );
+        let (status, body) = dispatch_close_mint(
+            close_mint_rocket(&pool, mint_store.clone(), vault_mock),
+            &issuer_request_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            Status::UnprocessableEntity,
+            "an unfinalized reverted transaction must refuse the close"
+        );
+        assert!(
+            body.contains("could still land"),
+            "the refusal body must explain the reorg risk, got: {body}"
         );
         let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(!matches!(mint, Mint::Closed { .. }));

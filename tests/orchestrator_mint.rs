@@ -818,13 +818,13 @@ async fn nonce_collision_fails_for_manual_reconciliation()
     )
     .await?;
 
-    // Move the other mint's landing past the reorg-confirmation buffer so
-    // the confirm-side scan can SEE it — the proven-mismatch verdict
-    // requires the log; an in-buffer landing would (correctly) read as the
-    // inconclusive `NonceReplayUnresolved` instead.
+    // Move the other mint's landing past the reorg-confirmation buffer and the
+    // failed transaction into Anvil's finalized range. The proven-mismatch
+    // verdict requires the log, while the typed revert is terminal only after
+    // its exact block is canonical and finalized.
     bot_provider(&evm)
         .await?
-        .raw_request::<_, serde_json::Value>("anvil_mine".into(), (40u64,))
+        .raw_request::<_, serde_json::Value>("anvil_mine".into(), (80u64,))
         .await?;
 
     let mint_callback_mock =

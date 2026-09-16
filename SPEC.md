@@ -463,14 +463,17 @@ or recovering work.
 
 `ConfirmMintJob` observes the submitted `tx_id` via bounded
 `get_transaction_receipt` polling and records `TokensMinted` only on a mined
-success with a valid `Deposit`. It may record `MintingFailed` only for a mined
-revert (`status=0`) when the job's `tx_id` matches the mint's current
-submission. Uncertain observations (no receipt within the poll budget,
-RPC/transport errors, invalid receipt shape, or a mined success body missing
-`Deposit` logs) leave the aggregate in `TxSubmitted` — or `MintIntended` if it
-was never submitted — with **no** event, never auto-replace. A missing `Deposit`
-on a successful receipt is anomalous and requires operator intervention, not a
-second deposit.
+success with a valid `Deposit`. It may record `MintingFailed` for a failed
+receipt (`status=0`) only when that receipt's exact block hash is canonical at
+or below the finalized head and the job's `tx_id` matches the mint's current
+submission. Uncertain observations (an unfinalized or non-canonical failed
+receipt, no receipt within the poll budget, RPC/transport errors, invalid
+receipt shape, or a mined success body missing `Deposit` logs) leave the
+aggregate in `TxSubmitted` — or `MintIntended` if it was never submitted — with
+**no** event, never auto-replace. A missing `Deposit` on a successful receipt is
+anomalous and requires operator intervention, not a second deposit. The same
+finality and canonical-block requirement applies before an orchestrator mint
+revert is decoded and recorded.
 
 Vault-direct mint recovery uses the same observation predicate as burn recovery
 for a persisted signed identity `(H, N)` of wallet `W` (the signing bot):
@@ -478,7 +481,9 @@ for a persisted signed identity `(H, N)` of wallet `W` (the signing bot):
 ```
 observe(H, N, W):
   receipt(H) with block + status=1 + Deposit → MinedSuccess
-  receipt(H) with block + status=0           → MinedReverted
+  receipt(H) with block + status=0
+    + exact block canonical and finalized    → MinedReverted
+  receipt(H) with block + status=0 otherwise → Uncertain (fail closed; Err)
   receipt None + finalized_nonce(W) ≤ N      → StillMineable
   receipt None + finalized_nonce(W) > N
     then recheck receipt(H):
@@ -659,6 +664,12 @@ on-chain transfer through calling Alpaca to burning tokens.
   receipt pointer range instead of a per-receipt list) — lifecycle state names
   stay backend-agnostic; only the audit-data shape differs
 - Timestamps for each lifecycle stage
+- A `Failed` state reached from `BurnIntended` or `BurnSubmitted` retains the
+  transaction's full burn lifecycle context and persisted receipt plan. This
+  lets `ReplaceExhaustedDeadBurn` reopen the exact plan without repeating the
+  Alpaca call. `BurnResumed` carries that retained context through `Burning`
+  until replacement succeeds or another terminal failure records it again.
+  Pre-Alpaca failures carry no burn context.
 
 **Commands:**
 
@@ -722,9 +733,11 @@ on-chain transfer through calling Alpaca to burning tokens.
   this redemption's current transaction and supplies a proof marker. The command
   handler checks the marker's request id, hash, and nonce before signing.
 - `ReplaceExhaustedDeadBurn` - Re-check a manager-supplied operator proof
-  against the current transaction, require a live `ProvablyDead` classification,
-  then atomically persist `ManualBurnReplacementAuthorized` and the replacement
-  `BurnIntended` event.
+  against the current transaction, then atomically persist
+  `ManualBurnReplacementAuthorized` and the replacement `BurnIntended` event.
+  `ProvablyDead` is accepted from `BurnIntended`, `BurnSubmitted`, or `Failed`.
+  `FinalizedReverted` is accepted only from `Failed`; the failed receipt's exact
+  block must be canonical at or below the finalized head.
 - `RecordBurnRecoveryExhausted` - Persist that the redemption-wide automatic
   recovery budget is spent
 - `RecordBurnPreparationRecoveryExhausted` - Persist exhaustion when repeated
@@ -740,11 +753,12 @@ on-chain transfer through calling Alpaca to burning tokens.
   to `Detected` state for reprocessing. Only valid from `Failed` state when no
   `AlpacaCalled` event exists in the history — post-Alpaca failures use
   `ResumeBurn` instead. The `metadata` field carries the original
-  `RedemptionMetadata` (extracted by the API layer from the event store's first
-  `Detected` event), since the `Failed` aggregate state does not preserve
-  metadata. Emits `Reprocessed` event with the metadata, previous state name,
-  and timestamp for audit trail. The existing recovery logic then picks it up
-  naturally from `Detected` state.
+  `RedemptionMetadata` extracted by the API layer from the event store's first
+  `Detected` event. Pre-Alpaca `Failed` states have no retained burn context, so
+  reprocessing cannot source this metadata from the terminal state. Emits
+  `Reprocessed` with the metadata, previous state name, and timestamp for audit
+  trail. The existing recovery logic then picks it up naturally from `Detected`
+  state.
 - `ResumeBurn { issuer_request_id, metadata, tokenization_request_id,
   alpaca_quantity, dust_quantity, called_at, alpaca_journal_completed_at,
   external_tx_id }` -
@@ -983,38 +997,38 @@ raw redemption amounts are emitted in the admission log.
 
 **Command -> Event Mappings:**
 
-| Command                                  | Events                                            | Notes                                                                                                                                                                                                                                              |
-| ---------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Detect`                                 | `RedemptionDetected`                              | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                  |
-| `Hold`                                   | `RedemptionHeld`                                  | Asset frozen; park pre-Alpaca (idempotent)                                                                                                                                                                                                         |
-| `ClaimAlpacaCall`                        | `AlpacaCallClaimed`                               | Durable pre-call admission, serialized with every freeze acquisition                                                                                                                                                                               |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                                    | Alpaca API called after durable admission                                                                                                                                                                                                          |
-| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                                | Terminal failure                                                                                                                                                                                                                                   |
-| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`                          | Journal complete                                                                                                                                                                                                                                   |
-| `IntendBurn`                             | `BurnIntended`                                    | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
-| `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                                 | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                      |
-| `RecordBurnConfirmed`                    | `TokensBurned`                                    | Pure: records the confirmation `ConfirmBurnJob` performed via `BurnManager::confirm_submitted_burn`; terminal success                                                                                                                              |
-| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`                           | Reserve one durable automatic recovery action                                                                                                                                                                                                      |
-| `RecordBurnNonceTooLow`                  | `BurnNonceTooLow`                                 | Persist deterministic proof that the current transaction's nonce is spent without consuming another action                                                                                                                                         |
-| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted`                | Reserve a retry before burn preparation                                                                                                                                                                                                            |
-| `ReplaceDeadBurn`                        | `BurnIntended`                                    | Re-check dead predicate, then persist replacement                                                                                                                                                                                                  |
-| `ReplaceNonceTooLowBurn`                 | `BurnIntended`                                    | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable nonce-too-low observation, then persist a replacement                                                      |
-| `RecordBurnSubmitRejected`               | `BurnSubmitRejected`                              | Persist proof that the node rejected the current transaction before acceptance and holds no transaction for its hash                                                                                                                               |
-| `ReplaceRejectedBurn`                    | `BurnIntended`                                    | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable submit rejection observation, then persist a replacement                                                   |
-| `ReplaceExhaustedDeadBurn`               | `ManualBurnReplacementAuthorized`, `BurnIntended` | Verify the operator proof matches the current transaction, re-check `ProvablyDead` under the wallet lock, then atomically record the authorization and replacement intent                                                                          |
-| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`                           | Stop automatic recovery durably                                                                                                                                                                                                                    |
-| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted`                | Stop preparation retries durably                                                                                                                                                                                                                   |
-| `RecordBurnFailure`                      | `BurningFailed`                                   | Records failure with optional tx metadata and `classification`                                                                                                                                                                                     |
-| `RecordExistingBurn`                     | `ExistingBurnRecovered`                           | Recovery from Failed with known tx; carries an `ExistingBurnProof::VaultDirect { burns }` payload cross-checked against the `Failed` state's persisted `burn_mode` anchor                                                                          |
-| `MarkFailed`                             | `RedemptionFailed`                                | Marks or reclassifies a failed redemption                                                                                                                                                                                                          |
-| `Reprocess`                              | `Reprocessed`                                     | Reset to Detected for reprocessing                                                                                                                                                                                                                 |
-| `ResumeBurn`                             | `BurnResumed`                                     | Resume to Burning for post-Alpaca recovery                                                                                                                                                                                                         |
-| `CloseRedemption`                        | `RedemptionClosed`                                | Admin close an unresolved redemption                                                                                                                                                                                                               |
-| `ForceCompleteBurn`                      | `BurnForceCompleted`                              | Admin terminalize a burn verified against this redemption's persisted `burn_mode`                                                                                                                                                                  |
-| `IntendBurn` (orchestrator mode)         | `BurnIntended`                                    | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                                                                                                                                                                      |
-| `RecordOrchestratorBurnSubmitted`        | `OrchestratorBurnSubmitted`                       | Pure: records the broadcast `SubmitBurnJob` performed; no per-receipt plan to reserve first                                                                                                                                                        |
-| `RecordOrchestratorBurnConfirmed`        | `OrchestratorTokensBurned`                        | Pure: records the confirmation `ConfirmBurnJob` performed; carries the consumed pointer range and `dust_retained`                                                                                                                                  |
-| `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`                       | Recovery via the orchestrator's `Burned` log; carries an `ExistingBurnProof::Orchestrator { shares_burned, burn_range, dust_retained }` payload (cross-checked against the `Failed` state's `burn_mode`); `dust_retained` for success-event parity |
+| Command                                  | Events                                            | Notes                                                                                                                                                                                                                                                                                            |
+| ---------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Detect`                                 | `RedemptionDetected`                              | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                                                                |
+| `Hold`                                   | `RedemptionHeld`                                  | Asset frozen; park pre-Alpaca (idempotent)                                                                                                                                                                                                                                                       |
+| `ClaimAlpacaCall`                        | `AlpacaCallClaimed`                               | Durable pre-call admission, serialized with every freeze acquisition                                                                                                                                                                                                                             |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                                    | Alpaca API called after durable admission                                                                                                                                                                                                                                                        |
+| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                                | Terminal failure                                                                                                                                                                                                                                                                                 |
+| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`                          | Journal complete                                                                                                                                                                                                                                                                                 |
+| `IntendBurn`                             | `BurnIntended`                                    | Persist exact signed tx before broadcasting                                                                                                                                                                                                                                                      |
+| `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                                 | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                                                                    |
+| `RecordBurnConfirmed`                    | `TokensBurned`                                    | Pure: records the confirmation `ConfirmBurnJob` performed via `BurnManager::confirm_submitted_burn`; terminal success                                                                                                                                                                            |
+| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`                           | Reserve one durable automatic recovery action                                                                                                                                                                                                                                                    |
+| `RecordBurnNonceTooLow`                  | `BurnNonceTooLow`                                 | Persist deterministic proof that the current transaction's nonce is spent without consuming another action                                                                                                                                                                                       |
+| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted`                | Reserve a retry before burn preparation                                                                                                                                                                                                                                                          |
+| `ReplaceDeadBurn`                        | `BurnIntended`                                    | Re-check dead predicate, then persist replacement                                                                                                                                                                                                                                                |
+| `ReplaceNonceTooLowBurn`                 | `BurnIntended`                                    | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable nonce-too-low observation, then persist a replacement                                                                                                    |
+| `RecordBurnSubmitRejected`               | `BurnSubmitRejected`                              | Persist proof that the node rejected the current transaction before acceptance and holds no transaction for its hash                                                                                                                                                                             |
+| `ReplaceRejectedBurn`                    | `BurnIntended`                                    | Verify the manager-supplied marker matches this redemption and current transaction; recovery only creates it after matching the durable submit rejection observation, then persist a replacement                                                                                                 |
+| `ReplaceExhaustedDeadBurn`               | `ManualBurnReplacementAuthorized`, `BurnIntended` | Verify the operator proof against the current transaction, then atomically record authorization and replacement only after the wallet-locked recheck returns `ProvablyDead`, or returns `FinalizedReverted` while the aggregate is `Failed`; unfinalized `Reverted` is never a replacement basis |
+| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`                           | Stop automatic recovery durably                                                                                                                                                                                                                                                                  |
+| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted`                | Stop preparation retries durably                                                                                                                                                                                                                                                                 |
+| `RecordBurnFailure`                      | `BurningFailed`                                   | Records failure with optional tx metadata and `classification`                                                                                                                                                                                                                                   |
+| `RecordExistingBurn`                     | `ExistingBurnRecovered`                           | Recovery from Failed with known tx; carries an `ExistingBurnProof::VaultDirect { burns }` payload cross-checked against the `Failed` state's persisted `burn_mode` anchor                                                                                                                        |
+| `MarkFailed`                             | `RedemptionFailed`                                | Marks or reclassifies a failed redemption                                                                                                                                                                                                                                                        |
+| `Reprocess`                              | `Reprocessed`                                     | Reset to Detected for reprocessing                                                                                                                                                                                                                                                               |
+| `ResumeBurn`                             | `BurnResumed`                                     | Resume to Burning for post-Alpaca recovery                                                                                                                                                                                                                                                       |
+| `CloseRedemption`                        | `RedemptionClosed`                                | Admin close an unresolved redemption                                                                                                                                                                                                                                                             |
+| `ForceCompleteBurn`                      | `BurnForceCompleted`                              | Admin terminalize a burn verified against this redemption's persisted `burn_mode`                                                                                                                                                                                                                |
+| `IntendBurn` (orchestrator mode)         | `BurnIntended`                                    | Persists the exact signed `orchestrator.burn()` tx with an empty receipt plan                                                                                                                                                                                                                    |
+| `RecordOrchestratorBurnSubmitted`        | `OrchestratorBurnSubmitted`                       | Pure: records the broadcast `SubmitBurnJob` performed; no per-receipt plan to reserve first                                                                                                                                                                                                      |
+| `RecordOrchestratorBurnConfirmed`        | `OrchestratorTokensBurned`                        | Pure: records the confirmation `ConfirmBurnJob` performed; carries the consumed pointer range and `dust_retained`                                                                                                                                                                                |
+| `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`                       | Recovery via the orchestrator's `Burned` log; carries an `ExistingBurnProof::Orchestrator { shares_burned, burn_range, dust_retained }` payload (cross-checked against the `Failed` state's `burn_mode`); `dust_retained` for success-event parity                                               |
 
 Burn transaction recovery runs once during startup and every five minutes while
 the service is running. Before any recovery side effect, the issuer classifies
@@ -1022,31 +1036,39 @@ the latest persisted signed transaction `(H, N)` for wallet `W` in this order:
 
 1. A receipt for `H` with a block number and successful status is **mined** and
    is confirmed and recorded; no transaction is signed or re-broadcast.
-2. A receipt for `H` with a block number and failed status is **reverted**. The
-   nonce is consumed and the failed attempt is recorded before any later retry.
+2. A receipt for `H` with a block number and failed status is **reverted**, but
+   it is not yet a replacement basis. Once its exact block hash is canonical at
+   or below the finalized head, it is **finalized reverted**. The nonce is then
+   permanently consumed and the failed attempt is recorded before any later
+   retry. For automatic recovery either status is a confirmation outcome, not a
+   replacement trigger. For exhausted manual recovery only `FinalizedReverted`
+   retained in `Failed` is a safe replacement basis.
 3. With no receipt, if the finalized account nonce for `W` is at most `N`, the
    transaction is **still mineable**. Recovery may only re-broadcast the exact
    persisted bytes, producing the same hash `H`.
 4. With no receipt, if the finalized account nonce for `W` is greater than `N`,
-   the transaction is **provably dead** and can never land. Only this case
+   the transaction is **provably dead** and can never land. This normally
    permits signing a replacement at a fresh nonce. The replacement preserves the
    persisted transaction's destination, value, and calldata exactly; only its
    nonce, gas limit, and fee fields are regenerated. Its fresh nonce is the
    authoritative pending account nonce so it cannot collide with another live
    transaction from the signing wallet.
 
-Equivalently, the exact replacement predicate is
-`receipt(H) = None AND finalized_nonce(W) > N`. Receipt lookup is evaluated
-before the nonce comparison. A latest-but-unfinalized nonce advance is not proof
-of death because a reorganization can remove it. A deterministic `nonce too low`
-response to rebroadcasting the exact persisted bytes is the additional death
-proof: recovery durably records it against `(H, N)`, and every later pass still
-checks `receipt(H)` before using that observation to select replacement. A
-definitive protocol rejection of the exact persisted bytes is the same kind of
-death proof: the transaction never entered the pool, recovery durably records it
-against `(H, N)`, and every later pass still checks `receipt(H)` before using
-that observation to select replacement. A server or transport error followed by
-a negative hash lookup remains ambiguous because load-balanced RPC backends can
+The normal replacement predicate is
+`receipt(H) = None AND finalized_nonce(W) > N`. Exhausted manual recovery has
+one additional predicate:
+`state = Failed AND canonical_receipt(H).status = failed AND receipt_block <= finalized_head`.
+Receipt lookup is evaluated before the nonce comparison in both cases. A
+latest-but-unfinalized nonce advance is not proof of death because a
+reorganization can remove it. A deterministic `nonce too low` response to
+rebroadcasting the exact persisted bytes is the additional death proof: recovery
+durably records it against `(H, N)`, and every later pass still checks
+`receipt(H)` before using that observation to select replacement. A definitive
+protocol rejection of the exact persisted bytes is the same kind of death proof:
+the transaction never entered the pool, recovery durably records it against
+`(H, N)`, and every later pass still checks `receipt(H)` before using that
+observation to select replacement. A server or transport error followed by a
+negative hash lookup remains ambiguous because load-balanced RPC backends can
 disagree about mempool contents. A missing block number, mismatched receipt
 hash, provider error, timeout, signer that differs from `W`, or any other
 identity/RPC uncertainty is unclassified and fails closed: the old transaction
@@ -1072,19 +1094,26 @@ exact transaction identity long enough to persist exhaustion safely. An
 exhausted persisted intent can be re-armed only through
 `POST /admin/recover/redemption/<id>`. The endpoint authorizes one replacement
 per operator request. `BurnManager` selects the persisted network, takes its
-wallet lock, reloads the aggregate, and requires a valid `BurnIntended` or
-`BurnSubmitted` transaction signed by the bot wallet whose decoded chain id
-matches that network's configured chain id. It uses the same finalized-nonce
-death predicate and signs only for `ProvablyDead`. Before signing, it refuses
-any unresolved signer intent on the network other than the current redemption.
-The aggregate command re-checks the exact hash, nonce, signer, and death
-predicate while the lock remains held. `StillMineable`, invalid identities, RPC
-uncertainty, invalid states, and competing intents produce no signature. If the
-current transaction is an already-authorized replacement and is `Mined` or
-`Reverted`, the operator request enqueues confirmation instead of attempting
-another replacement. A durable nonce-too-low observation is not sufficient for
-this manual path; a new signature requires the live classification to return
-`ProvablyDead`.
+wallet lock, reloads the aggregate, and requires a valid `BurnIntended`,
+`BurnSubmitted`, or retained `Failed` transaction signed by the bot wallet whose
+decoded chain id matches that network's configured chain id. It signs only when
+the live classification returns `ProvablyDead`, or when the transaction is
+retained in `Failed` and its failed receipt's exact block is canonical at or
+below the finalized head (`FinalizedReverted`). An unfinalized `Reverted`
+receipt cannot authorize a signature because a reorganization can remove it. A
+finalized revert is safe because the transaction permanently consumed its nonce
+without making burn state changes. Before signing, the manager refuses any
+signer intent on the network other than the current redemption. The aggregate
+command re-checks the exact hash, nonce, signer, and terminal classification
+while the lock remains held. `StillMineable`, invalid identities, RPC
+uncertainty, invalid states, and competing intents produce no signature. If an
+already-authorized replacement retained in `Failed` is `Mined`, the operator
+request confirms it inline and reports completion only after the completion
+event is recorded; a transient confirmation error reports deferred recovery. If
+it is `FinalizedReverted`, the failure is recorded and a fresh replacement may
+be authorized. An unfinalized `Reverted` result signs nothing. A durable
+nonce-too-low observation is not sufficient for this manual path; a new
+signature requires one of the two live terminal classifications above.
 
 The command validates the replacement's decoded chain id too, then records
 `ManualBurnReplacementAuthorized` and `BurnIntended` atomically, then enqueues
@@ -1095,20 +1124,22 @@ committed-inspection-required response with the recovery id and old transaction
 identity; it never reports a pre-sign refusal. A preparation outage before
 commit returns a stable 502 response. Scheduled recovery or a repeated operator
 request classifies the exact authorized bytes: mineable bytes may be
-re-enqueued, mined or reverted bytes move to confirmation, and provably-dead
-bytes wait for a new operator authorization. Automatic replacement attempts stay
-exhausted. A later operator request evaluates the new current transaction and
-may replace it only if it also becomes provably dead. Recovery derives a
-vault-direct target from the signed transaction destination and an orchestrator
-token from its decoded `burn` calldata, never from a later asset projection. At
-every point there is at most one transaction hash that can still land for a
-redemption. **Orchestrator mode** reuses `IntendBurn`, `RecordBurnFailure`, and
-`RecordExistingBurn`, and adds the orchestrator-mode record commands
-`RecordOrchestratorBurnSubmitted` and `RecordOrchestratorBurnConfirmed`.
-`BurnManager` calls the orchestrator-mode `VaultService` methods (see
-"VaultService" below) instead of the vault multicall and emits the
-orchestrator-mode events above. The persist-before-broadcast discipline is
-identical to vault-direct: `IntendBurn` builds and signs the
+re-enqueued, mined bytes are confirmed, and unfinalized reverted bytes outside
+`Failed` move to confirmation. Provably-dead bytes require a new operator
+authorization. In `Failed`, only `FinalizedReverted` may authorize a fresh
+replacement under the manual predicate above. Automatic replacement attempts
+stay exhausted. A later operator request evaluates the new current transaction
+and may replace it only when one of the manual terminal predicates holds.
+Recovery derives a vault-direct target from the signed transaction destination
+and an orchestrator token from its decoded `burn` calldata, never from a later
+asset projection. At every point there is at most one transaction hash that can
+still land for a redemption. **Orchestrator mode** reuses `IntendBurn`,
+`RecordBurnFailure`, and `RecordExistingBurn`, and adds the orchestrator-mode
+record commands `RecordOrchestratorBurnSubmitted` and
+`RecordOrchestratorBurnConfirmed`. `BurnManager` calls the orchestrator-mode
+`VaultService` methods (see "VaultService" below) instead of the vault multicall
+and emits the orchestrator-mode events above. The persist-before-broadcast
+discipline is identical to vault-direct: `IntendBurn` builds and signs the
 `orchestrator.burn()` transaction via `prepare_orchestrator_burn_tx` and
 persists it in the existing `BurnIntended` event with `planned_burns: vec![]`
 (there is no per-receipt plan; the field is already tolerant of an empty list).
@@ -4243,6 +4274,7 @@ stateDiagram-v2
     Failed --> Failed: MarkFailed (re-classify failure)
     Failed --> Detected: Reprocess (pre-Alpaca)
     Failed --> Burning: ResumeBurn (post-Alpaca)
+    Failed --> BurnIntended: ReplaceExhaustedDeadBurn
     Failed --> Completed: ForceCompleteBurn (admin, verified on-chain)
     Failed --> Closed: CloseRedemption (admin)
     Failed --> [*]

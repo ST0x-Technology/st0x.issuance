@@ -311,6 +311,10 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         sendable_tx: SendableTxWithHash,
         planned_burns: Vec<BurnRecord>,
+        /// External id assigned to this exact signed burn. Absent on legacy
+        /// intents, whose aggregate state supplies the preceding id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_tx_id: Option<BurnExternalTxId>,
     },
     /// Orchestrator-mode burn transaction broadcast (the counterpart of
     /// `BurnTxSubmitted`). Carries no `planned_burns` — there is no
