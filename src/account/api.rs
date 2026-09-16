@@ -15,7 +15,7 @@ use super::{
     Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
     view::AccountViewError, view::find_by_client_id, view::find_by_email,
 };
-use crate::auth::{InternalAuth, IssuerAuth};
+use crate::auth::{DebugOps, InternalAuth, IssuerAuth};
 
 impl<'a> FromParam<'a> for ClientId {
     type Error = uuid::Error;
@@ -95,10 +95,36 @@ pub struct RegisterAccountResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool), fields(email = %request.email.0))]
 #[post("/accounts", format = "json", data = "<request>")]
 pub(crate) async fn register_account(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    request: Json<RegisterAccountRequest>,
+) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
+    register_account_logic(store, pool, request).await
+}
+
+/// Debug-tier operator route mirroring [`register_account`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post("/ops/debug/accounts", format = "json", data = "<request>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn register_account_ops(
+    auth: DebugOps,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    request: Json<RegisterAccountRequest>,
+) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
+    register_account_logic(store, pool, request).await
+}
+
+#[tracing::instrument(skip(store, pool), fields(email = %request.email.0))]
+async fn register_account_logic(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<RegisterAccountRequest>,
@@ -241,13 +267,45 @@ pub struct WhitelistWalletResponse {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool), fields(
-    client_id = %client_id,
-    wallet = ?request.wallet
-))]
 #[post("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
 pub(crate) async fn whitelist_wallet(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    request: Json<WhitelistWalletRequest>,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    whitelist_wallet_logic(store, pool, client_id, request).await
+}
+
+/// Debug-tier operator route mirroring [`whitelist_wallet`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[post(
+    "/ops/debug/accounts/<client_id>/wallets",
+    format = "json",
+    data = "<request>"
+)]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn whitelist_wallet_ops(
+    auth: DebugOps,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    request: Json<WhitelistWalletRequest>,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    whitelist_wallet_logic(store, pool, client_id, request).await
+}
+
+#[tracing::instrument(skip(store, pool), fields(
+    client_id = %client_id,
+    wallet = ?request.wallet
+))]
+async fn whitelist_wallet_logic(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
@@ -286,13 +344,41 @@ pub(crate) async fn whitelist_wallet(
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool), fields(
-    client_id = %client_id,
-    wallet = %wallet.0
-))]
 #[delete("/accounts/<client_id>/wallets/<wallet>")]
 pub(crate) async fn unwhitelist_wallet(
     _auth: InternalAuth,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    wallet: WalletParam,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    unwhitelist_wallet_logic(store, pool, client_id, wallet).await
+}
+
+/// Debug-tier operator route mirroring [`unwhitelist_wallet`], gated by IAP
+/// (`DebugOps`) instead of the internal API key.
+#[delete("/ops/debug/accounts/<client_id>/wallets/<wallet>")]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn unwhitelist_wallet_ops(
+    auth: DebugOps,
+    store: &rocket::State<Arc<Store<Account>>>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    wallet: WalletParam,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    unwhitelist_wallet_logic(store, pool, client_id, wallet).await
+}
+
+#[tracing::instrument(skip(store, pool), fields(
+    client_id = %client_id,
+    wallet = %wallet.0
+))]
+async fn unwhitelist_wallet_logic(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,

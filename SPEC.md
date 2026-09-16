@@ -4706,10 +4706,14 @@ verify on another.
 Tiers and routes:
 
 - **read** (`/ops/read/*`): `stuck`, `orchestrator-health`,
-  `status/<underlying>`, `orchestrator-preflight/<network>`.
-- **debug** (`/ops/debug/*`): `recover/redemption/<id>`, `reprocess/mint/<id>`,
-  `orchestrator-verify-signing/<network>/<underlying>`,
-  `snapshots/<aggregate_type>/<aggregate_id>`.
+  `status/<underlying>`, `orchestrator-preflight/<network>`,
+  `network-telemetry`, `wrapped-transfers`.
+- **debug** (`/ops/debug/*`): `POST recover/redemption/<id>`,
+  `POST reprocess/mint/<id>`,
+  `POST orchestrator-verify-signing/<network>/<underlying>`, `POST accounts`,
+  `accounts/<client_id>/wallets` (`POST` and `DELETE .../<wallet>`),
+  `GET tokenized-assets/<underlying>?network=<network>`,
+  `POST tokenized-assets`, `snapshots/<aggregate_type>/<aggregate_id>`.
 - **capital** (`/ops/capital/*`): `freeze/<underlying>`,
   `unfreeze/<underlying>`, `freeze-schedules`,
   `orchestrator-approve/<network>/<underlying>`.
@@ -4751,6 +4755,20 @@ so it is likewise safe to retry, while an execute leaves the outcome unknown
 the route for the same deposit to read the persisted stream and resume it from
 wherever it stopped.
 
+The internal route holds the wallet lock across signing but pauses no poller, so
+it has no 503; it is bounded the same way, returning 504 when its run exceeds
+120 seconds, with the same dry-run-versus-execute distinction above.
+
+Both `burn-excess` routes take the network's RPC endpoint from the service's
+startup-verified chain configuration, never from a request-time environment
+read, so a deployment that supplies its RPC as a flag rather than an env var
+serves them too; a network with no chain configuration is a 500. The chain id is
+operator-supplied in the request and validated against the selected network's
+known chain id (a mismatch is a 422), not taken from configuration. The offline
+`issuer burn-excess` CLI keeps resolving the RPC from the environment and
+proving the chain id against it, since nothing verified that endpoint at
+startup.
+
 Configuration: `OPS_API_{READ,DEBUG,CAPITAL,BREAKGLASS}_AUDIENCE` name the IAP
 backend audiences (from the terraform `ops_api_audiences` output; non-secret),
 validated at startup as all-or-none, non-blank, unpadded, and pairwise distinct.
@@ -4771,8 +4789,9 @@ fails with a retryable 503 when the endpoint is unreachable and no usable key is
 retained. It also returns 503 when another request holds the refresh slot inside
 that throttle interval and the retained set does not contain the token's key id,
 including during a cold-cache request or key rotation. These failures never
-become a wrong-audience or forged-token acceptance. `move-receipts` and
-`confirm-custody` stay offline `issuer` CLI verbs.
+become a wrong-audience or forged-token acceptance. Every `InternalAuth`
+operator route now has an `/ops` twin; `move-receipts` and `confirm-custody`
+stay offline `issuer` CLI verbs.
 
 ### Recover Stuck Aggregates
 

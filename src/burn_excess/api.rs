@@ -28,17 +28,21 @@ use super::engine::{
 };
 use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
-use crate::config::{Config, configured_rpc_url, wss_to_http};
+use crate::chain::ChainConfig;
+use crate::config::{Config, wss_to_http};
 use crate::mint::IssuerMintRequestId;
 use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
 use crate::vault::NetworkVaultServices;
 
-/// Caps how long the external burn holds the network's transfer poller paused.
-/// A hung provider or vault call must not stop redemption detection until the
-/// process restarts; on elapse the guard drops and the poller resumes. Chosen
-/// above the expected broadcast-and-confirm window.
-const BURN_EXCESS_EXTERNAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Caps how long either burn-excess route runs the engine. Both hold the
+/// network's wallet lock across signing, and the external route additionally
+/// holds its transfer poller paused; a hung provider or vault call must not
+/// block live signing (or stop redemption detection) until the process
+/// restarts. On elapse the run is abandoned — releasing the wallet lock, and
+/// for the external route dropping the guard so the poller resumes — and the
+/// route returns 504. Chosen above the expected broadcast-and-confirm window.
+const BURN_EXCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An 18-decimal fixed-point share amount parsed from its decimal-string wire
 /// form at deserialize time, so an invalid or over-precise quantity is refused
@@ -89,22 +93,16 @@ pub(crate) struct BurnExcessCommon {
 }
 
 impl BurnExcessCommon {
-    /// Validates the network/chain-id pairing and builds the engine request. A
-    /// mismatch is refused with 422 before any poller pause or signing, so a
-    /// malformed request never stalls redemption detection.
+    /// Builds the engine request. The operator-supplied chain id is validated
+    /// against the network's configured chain entry in `run_burn_excess_ops`,
+    /// where that entry is resolved; this method cannot see the config, so it
+    /// is infallible.
     fn into_request(
         self,
         mode: BurnExcessMode,
         funding_tx_hash: Option<B256>,
-    ) -> Result<BurnExcessRequest, Status> {
-        if self.chain_id != self.network.chain_id() {
-            warn!(target: "admin", network = %self.network, chain_id = self.chain_id,
-                "burn-excess chain_id does not match network"
-            );
-            return Err(Status::UnprocessableEntity);
-        }
-
-        Ok(BurnExcessRequest {
+    ) -> BurnExcessRequest {
+        BurnExcessRequest {
             mode,
             issuer_request_id: self.issuer_request_id,
             deposit_tx_hash: self.deposit_tx_hash,
@@ -117,7 +115,7 @@ impl BurnExcessCommon {
             chain_id: self.chain_id,
             execute: self.execute,
             close: self.close,
-        })
+        }
     }
 }
 
@@ -139,14 +137,49 @@ pub(crate) struct BurnExcessResponse {
     outcome: BurnExcessOutcome,
 }
 
+/// Resolves and validates the configured chain before a route performs any
+/// side effect, including pausing the external-path transfer poller.
+fn resolve_chain<'config>(
+    config: &'config Config,
+    request: &BurnExcessRequest,
+    path: &'static str,
+) -> Result<&'config ChainConfig, Status> {
+    let chain = config
+        .chains
+        .iter()
+        .find(|candidate| candidate.network == request.network)
+        .ok_or_else(|| {
+            error!(target: "admin", network = %request.network, path,
+                "No chain configuration for network"
+            );
+            Status::InternalServerError
+        })?;
+
+    if request.chain_id != chain.chain_id {
+        warn!(target: "admin", network = %request.network, path,
+            chain_id = request.chain_id, configured = chain.chain_id,
+            "burn-excess chain_id does not match the configured chain"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
+
+    Ok(chain)
+}
+
 /// Runs the engine request for both routes through the running service's
 /// per-network vault service, so the burn takes the same wallet lock and nonce
-/// manager as every live mint and redemption burn, with a read provider on the
-/// network's configured RPC, and maps its outcome or error onto the HTTP
-/// response. `path` names the route for the failure log.
+/// manager as every live mint and redemption burn, and maps its outcome or
+/// error onto the HTTP response. `path` names the route for the failure log.
+///
+/// The read provider's RPC endpoint comes from the service's startup-verified
+/// chain configuration, never from a request-time environment read, so a
+/// deployment that supplies its RPC as a flag rather than an env var serves
+/// these routes too. That configuration was RPC-verified when the service
+/// started, so no per-request chain-id round trip is needed either.
 async fn run_burn_excess_ops(
     pool: &Pool<Sqlite>,
     config: &Config,
+    chain: &ChainConfig,
     vault_services: &NetworkVaultServices,
     request: BurnExcessRequest,
     path: &'static str,
@@ -160,34 +193,41 @@ async fn run_burn_excess_ops(
         error!(target: "admin", %error, path, "burn-excess signer address unavailable");
         Status::InternalServerError
     })?;
-    let rpc_url = configured_rpc_url(request.network).map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess RPC unavailable");
-        Status::InternalServerError
-    })?;
-    let http_url = wss_to_http(&rpc_url).map_err(|error| {
+    let http_url = wss_to_http(&chain.rpc_url).map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess RPC unavailable");
         Status::InternalServerError
     })?;
     let read_provider = ProviderBuilder::new().connect_http(http_url);
     let executed = request.execute;
 
-    let outcome = run_burn_excess(
-        pool,
-        vault_service.as_ref(),
-        &read_provider,
-        issuer_wallet,
-        request,
-        |plan: &str| {
-            // The CLI operator reads this plan before authorizing the burn;
-            // here the request's `execute` stood in for that answer, so the
-            // plan is recorded instead, next to the reason and incident.
-            warn!(target: "admin", plan, path,
-                "burn-excess auto-approving operator-confirmed plan"
-            );
-            Ok::<bool, std::io::Error>(true)
-        },
+    // Bound the run so a hung provider or vault call cannot hold the wallet
+    // lock (and, for the external route, the paused poller) indefinitely.
+    // On elapse the future is dropped, releasing the wallet lock; the burn
+    // stream is persisted before broadcast, so a re-invocation resumes it.
+    let outcome = tokio::time::timeout(
+        BURN_EXCESS_TIMEOUT,
+        run_burn_excess(
+            pool,
+            vault_service.as_ref(),
+            &read_provider,
+            issuer_wallet,
+            request,
+            |plan: &str| {
+                // The CLI operator reads this plan before authorizing the
+                // burn; here the request's `execute` stood in for that answer,
+                // so the plan is recorded instead, next to reason and incident.
+                warn!(target: "admin", plan, path,
+                    "burn-excess auto-approving operator-confirmed plan"
+                );
+                Ok::<bool, std::io::Error>(true)
+            },
+        ),
     )
     .await
+    .map_err(|_| {
+        error!(target: "admin", path, "burn-excess timed out");
+        Status::GatewayTimeout
+    })?
     .map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess failed");
         map_burn_excess_error(&error)
@@ -217,13 +257,13 @@ pub(crate) async fn burn_excess_internal_ops(
     vault_services: &State<NetworkVaultServices>,
     body: Json<BurnExcessInternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let request = body
-        .into_inner()
-        .common
-        .into_request(BurnExcessMode::Internal, None)?;
+    let request =
+        body.into_inner().common.into_request(BurnExcessMode::Internal, None);
+    let chain = resolve_chain(config.inner(), &request, "internal")?;
     run_burn_excess_ops(
         pool.inner(),
         config.inner(),
+        chain,
         vault_services,
         request,
         "internal",
@@ -272,7 +312,8 @@ pub(crate) async fn burn_excess_external_ops(
     let funding_tx_hash = body.funding_tx_hash;
     let request = body
         .common
-        .into_request(BurnExcessMode::External, Some(funding_tx_hash))?;
+        .into_request(BurnExcessMode::External, Some(funding_tx_hash));
+    let chain = resolve_chain(config.inner(), &request, "external")?;
 
     let Some(control) = poller_pauses.control(network) else {
         warn!(target: "admin", network = %network,
@@ -292,25 +333,18 @@ pub(crate) async fn burn_excess_external_ops(
         Status::ServiceUnavailable
     })?;
 
-    // Bound the paused window: a hung provider/vault call must not keep the
-    // poller stopped indefinitely. On elapse the guard drops and resumes it.
-    tokio::time::timeout(
-        BURN_EXCESS_EXTERNAL_TIMEOUT,
-        run_burn_excess_ops(
-            pool.inner(),
-            config.inner(),
-            vault_services,
-            request,
-            "external",
-        ),
+    // `run_burn_excess_ops` bounds the run and returns 504 on elapse; the
+    // guard resumes the poller when this handler returns on any path (success,
+    // error, timeout, panic).
+    run_burn_excess_ops(
+        pool.inner(),
+        config.inner(),
+        chain,
+        vault_services,
+        request,
+        "external",
     )
     .await
-    .map_err(|_| {
-        error!(target: "admin", network = %network,
-            "burn-excess (external) timed out; poller resumed"
-        );
-        Status::GatewayTimeout
-    })?
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a
