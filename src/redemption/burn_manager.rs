@@ -51,6 +51,7 @@ use crate::vault::{
 };
 
 pub(crate) const MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS: u32 = 5;
+const MAX_MANUAL_REPLAN_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct BurnRecoveryBudget {
@@ -120,6 +121,18 @@ fn recovery_burn_entries(planned_burns: &[BurnRecord]) -> Vec<MultiBurnEntry> {
             receipt_info_bytes: None,
         })
         .collect()
+}
+
+const fn receipt_plan_unavailable(error: &BurnManagerError) -> bool {
+    matches!(
+        error,
+        BurnManagerError::ReceiptRegistration(
+            ReceiptRegistrationError::Aggregate(AggregateError::UserError(
+                ReceiptInventoryError::UnknownReceipt { .. }
+                    | ReceiptInventoryError::InsufficientReceiptBalance { .. },
+            )),
+        )
+    )
 }
 
 fn burn_replacement_command(
@@ -831,16 +844,7 @@ impl BurnManager {
                         release_on_failure: !had_reservation,
                     });
                 }
-                Err(BurnManagerError::ReceiptRegistration(
-                    ReceiptRegistrationError::Aggregate(
-                        AggregateError::UserError(
-                            ReceiptInventoryError::UnknownReceipt { .. }
-                            | ReceiptInventoryError::InsufficientReceiptBalance {
-                                ..
-                            },
-                        ),
-                    ),
-                )) => {
+                Err(error) if receipt_plan_unavailable(&error) => {
                     debug!(target: "redemption",
                         issuer_request_id = %issuer_request_id,
                         "Retained burn plan is unavailable; planning current receipt inventory"
@@ -853,48 +857,67 @@ impl BurnManager {
         let burn_shares =
             candidate.alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = candidate.dust_quantity.to_u256_with_18_decimals()?;
-        let plan = self
-            .receipt_service
-            .for_burn(
-                chain_id,
-                vault,
-                issuer_request_id,
-                Shares::new(burn_shares),
-                Shares::new(dust_shares),
-            )
-            .await
-            .map_err(|error| match error {
-                BurnTrackingError::InsufficientBalance {
-                    required,
-                    available,
-                } => {
-                    ManualBurnReplacementRefusal::InsufficientReceiptInventory {
+        for attempt in 1..=MAX_MANUAL_REPLAN_ATTEMPTS {
+            let plan = self
+                .receipt_service
+                .for_burn(
+                    chain_id,
+                    vault,
+                    issuer_request_id,
+                    Shares::new(burn_shares),
+                    Shares::new(dust_shares),
+                )
+                .await
+                .map_err(|error| match error {
+                    BurnTrackingError::InsufficientBalance {
+                        required,
+                        available,
+                    } => ManualBurnReplacementRefusal::InsufficientReceiptInventory {
                         required,
                         available,
                     }
-                    .into()
+                    .into(),
+                    other => BurnManagerError::BurnTracking(other),
+                })?;
+            let execution = BurnExecutionPlan::vault_direct(
+                candidate.metadata.network,
+                vault,
+                &plan,
+                self.bot_wallet,
+                None,
+            );
+            match self
+                .reserve_with_conflict_retry(
+                    candidate.metadata.network,
+                    vault,
+                    issuer_request_id,
+                    execution.planned_burns.clone(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    return Ok(ManualBurnPlanSelection {
+                        replanned_params: Some(execution.params),
+                        release_on_failure: !had_reservation,
+                    });
                 }
-                other => BurnManagerError::BurnTracking(other),
-            })?;
-        let execution = BurnExecutionPlan::vault_direct(
-            candidate.metadata.network,
-            vault,
-            &plan,
-            self.bot_wallet,
-            None,
-        );
-        self.reserve_with_conflict_retry(
-            candidate.metadata.network,
-            vault,
-            issuer_request_id,
-            execution.planned_burns.clone(),
-        )
-        .await?;
+                Err(error)
+                    if receipt_plan_unavailable(&error)
+                        && attempt < MAX_MANUAL_REPLAN_ATTEMPTS =>
+                {
+                    debug!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        attempt,
+                        "Fresh burn plan became unavailable before reservation; replanning"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
-        Ok(ManualBurnPlanSelection {
-            replanned_params: Some(execution.params),
-            release_on_failure: !had_reservation,
-        })
+        unreachable!(
+            "bounded manual replan loop returns on every final attempt"
+        )
     }
 
     async fn repair_authorized_manual_burn(
@@ -4464,7 +4487,7 @@ mod tests {
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tracing_test::traced_test;
 
@@ -4687,6 +4710,143 @@ mod tests {
                     receipt_id: ReceiptId::from(U256::ZERO),
                 },
             )))
+        }
+
+        async fn reserved_redemptions(
+            &self,
+            chain_id: u64,
+            vault: Address,
+        ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
+        {
+            self.inner.reserved_redemptions(chain_id, vault).await
+        }
+
+        async fn find_by_issuer_request_id(
+            &self,
+            chain_id: u64,
+            vault: &Address,
+            issuer_request_id: &IssuerMintRequestId,
+        ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
+            self.inner
+                .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
+                .await
+        }
+    }
+
+    struct RacingReceiptService {
+        inner: Arc<dyn ReceiptService>,
+        competing_redemption: IssuerRedemptionRequestId,
+        race_injected: AtomicBool,
+        planning_calls: AtomicUsize,
+    }
+
+    impl RacingReceiptService {
+        fn new(
+            inner: Arc<dyn ReceiptService>,
+            competing_redemption: IssuerRedemptionRequestId,
+        ) -> Self {
+            Self {
+                inner,
+                competing_redemption,
+                race_injected: AtomicBool::new(false),
+                planning_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn planning_call_count(&self) -> usize {
+            self.planning_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReceiptService for RacingReceiptService {
+        async fn register_minted_receipt(
+            &self,
+            params: MintedReceiptParams,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner.register_minted_receipt(params).await
+        }
+
+        async fn for_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: &IssuerRedemptionRequestId,
+            shares_to_burn: Shares,
+            dust: Shares,
+        ) -> Result<BurnPlan, BurnTrackingError> {
+            self.planning_calls.fetch_add(1, Ordering::Relaxed);
+            let plan = self
+                .inner
+                .for_burn(
+                    chain_id,
+                    vault,
+                    redemption_issuer_request_id,
+                    shares_to_burn,
+                    dust,
+                )
+                .await?;
+            if !self.race_injected.swap(true, Ordering::AcqRel) {
+                let competing_burns = plan
+                    .allocations
+                    .iter()
+                    .map(|allocation| BurnRecord {
+                        receipt_id: allocation.receipt.receipt_id.inner(),
+                        shares_burned: allocation.burn_amount.inner(),
+                    })
+                    .collect();
+                self.inner
+                    .reserve_burn(
+                        chain_id,
+                        vault,
+                        self.competing_redemption.clone(),
+                        competing_burns,
+                    )
+                    .await
+                    .expect(
+                        "competing reservation should win the injected race",
+                    );
+            }
+            Ok(plan)
+        }
+
+        async fn reserve_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+            burns: Vec<BurnRecord>,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .reserve_burn(
+                    chain_id,
+                    vault,
+                    redemption_issuer_request_id,
+                    burns,
+                )
+                .await
+        }
+
+        async fn release_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .release_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
+        }
+
+        async fn settle_burn(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .settle_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
         }
 
         async fn reserved_redemptions(
@@ -10232,6 +10392,142 @@ mod tests {
         assert_eq!(reserved.len(), 2);
         assert!(reserved.contains(&issuer_request_id));
         assert!(reserved.contains(&competing_redemption));
+    }
+
+    #[tokio::test]
+    async fn manual_replacement_replans_after_fresh_reservation_race() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            vault,
+            Bytes::from_static(&[0xbe, 0xef]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_prepared_tx(old_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            owner,
+        )
+        .await;
+        let old_execution =
+            intended_execution(&harness.store, &issuer_request_id, vault).await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        fail_submitted_burn(
+            &harness.store,
+            &issuer_request_id,
+            &old_tx,
+            old_execution.planned_burns.clone(),
+        )
+        .await;
+        harness
+            .receipt_service
+            .release_burn(ANVIL_CHAIN_ID, vault, issuer_request_id.clone())
+            .await
+            .expect("finalized revert should release the old plan");
+        let old_plan_competitor = IssuerRedemptionRequestId::random();
+        harness
+            .receipt_service
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                old_plan_competitor.clone(),
+                old_execution.planned_burns,
+            )
+            .await
+            .expect("a later redemption should consume the released plan");
+        harness
+            .discover_receipt(
+                vault,
+                uint!(100_U256),
+                uint!(150_000000000000000000_U256),
+            )
+            .await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(101_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+        let fresh_plan_competitor = IssuerRedemptionRequestId::random();
+        let racing_receipt_service = Arc::new(RacingReceiptService::new(
+            harness.receipt_service.clone(),
+            fresh_plan_competitor.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            racing_receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        vault_mock.reset();
+        vault_mock.set_burn_tx_status(BurnTxStatus::FinalizedReverted);
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+
+        let outcome = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("manual recovery should replan after a reservation race");
+
+        assert_eq!(outcome.replacement.tx_hash, replacement_tx.hash);
+        assert_eq!(racing_receipt_service.planning_call_count(), 2);
+        assert_eq!(vault_mock.replacement_preparation_call_count(), 0);
+        assert_eq!(vault_mock.burn_preparation_call_count(), 1);
+        let replacement_aggregate =
+            load_aggregate(&manager.store, &issuer_request_id).await;
+        let Redemption::BurnIntended { planned_burns, .. } =
+            replacement_aggregate
+        else {
+            panic!(
+                "expected replanned BurnIntended, got {replacement_aggregate:?}"
+            );
+        };
+        assert_eq!(
+            planned_burns,
+            vec![BurnRecord {
+                receipt_id: uint!(101_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }]
+        );
+        let reserved = harness
+            .receipt_service
+            .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+            .await
+            .expect("replacement reservations should load");
+        assert_eq!(reserved.len(), 3);
+        assert!(reserved.contains(&issuer_request_id));
+        assert!(reserved.contains(&old_plan_competitor));
+        assert!(reserved.contains(&fresh_plan_competitor));
     }
 
     #[tokio::test]
