@@ -487,10 +487,9 @@ impl BurnSubmitRejectedProof {
 
 enum BurnReplacementBasis {
     LiveClassification,
-    /// Manual exhausted recovery may replace either a transaction proven
-    /// absent from the chain or, only from `Failed`, one whose failed receipt
-    /// is canonical at or below the finalized head.
-    ExhaustedTerminalClassification,
+    /// Manual exhausted recovery has already reclassified the exact persisted
+    /// transaction under the wallet lock.
+    ExhaustedTerminalVerified,
     NonceTooLow(BurnNonceTooLowProof),
     SubmitRejected(BurnSubmitRejectedProof),
 }
@@ -502,6 +501,15 @@ struct BurnReplacementInput<'transaction> {
     network: Network,
     sendable_tx: &'transaction SendableTxWithHash,
     external_tx_id: Option<BurnExternalTxId>,
+}
+
+struct ExhaustedBurnReplacementInput {
+    issuer_request_id: IssuerRedemptionRequestId,
+    recovery_id: uuid::Uuid,
+    previous_tx_hash: B256,
+    previous_nonce: u64,
+    owner: Address,
+    replanned_params: Option<BurnParams>,
 }
 
 /// Input parameters for the `IntendBurn` command handler.
@@ -2075,32 +2083,7 @@ impl Redemption {
                     });
                 }
             }
-            BurnReplacementBasis::ExhaustedTerminalClassification => {
-                let status = vault_service
-                    .classify_burn_tx(owner, sendable_tx)
-                    .await
-                    .map_err(|_| {
-                        RedemptionError::BurnRecoveryClassificationFailed {
-                            tx_hash: sendable_tx.hash,
-                            nonce: sendable_tx.nonce,
-                        }
-                    })?;
-                let replacement_safe = match status {
-                    BurnTxStatus::ProvablyDead => true,
-                    BurnTxStatus::FinalizedReverted => {
-                        matches!(self, Self::Failed { .. })
-                    }
-                    BurnTxStatus::Mined
-                    | BurnTxStatus::Reverted
-                    | BurnTxStatus::StillMineable => false,
-                };
-                if !replacement_safe {
-                    return Err(RedemptionError::BurnReplacementNotSafe {
-                        tx_hash: sendable_tx.hash,
-                        nonce: sendable_tx.nonce,
-                    });
-                }
-            }
+            BurnReplacementBasis::ExhaustedTerminalVerified => {}
         }
 
         let planned_burns = match self {
@@ -2230,6 +2213,18 @@ pub(crate) enum RedemptionError {
          alpaca_quantity {expected} in share-wei"
     )]
     OrchestratorAmountMismatch { expected: U256, actual: U256 },
+    #[error(
+        "Vault-direct burn amount {actual} diverges from the persisted \
+         alpaca_quantity {expected} in share-wei"
+    )]
+    VaultDirectAmountMismatch { expected: U256, actual: U256 },
+    #[error(
+        "Vault-direct dust {actual} diverges from the persisted dust_quantity \
+         {expected} in share-wei"
+    )]
+    VaultDirectDustMismatch { expected: U256, actual: U256 },
+    #[error("Vault-direct burn allocation total overflowed U256")]
+    VaultDirectAmountOverflow,
     #[error("Quantity conversion failed: {message}")]
     QuantityConversion { message: String },
     #[error(
@@ -2776,14 +2771,18 @@ impl Redemption {
                 previous_tx_hash,
                 previous_nonce,
                 owner,
+                replanned_params,
             } => {
                 self.handle_replace_exhausted_dead_burn(
                     services,
-                    issuer_request_id,
-                    recovery_id,
-                    previous_tx_hash,
-                    previous_nonce,
-                    owner,
+                    ExhaustedBurnReplacementInput {
+                        issuer_request_id,
+                        recovery_id,
+                        previous_tx_hash,
+                        previous_nonce,
+                        owner,
+                        replanned_params,
+                    },
                 )
                 .await
             }
@@ -2819,16 +2818,171 @@ impl Redemption {
             }),
         }
     }
+    async fn prepare_replanned_exhausted_burn(
+        &self,
+        services: &RedemptionServices,
+        issuer_request_id: IssuerRedemptionRequestId,
+        previous: &SendableTxWithHash,
+        owner: Address,
+        external_tx_id: BurnExternalTxId,
+        params: BurnParams,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let (metadata, alpaca_quantity, dust_quantity) = match self {
+            Self::BurnIntended {
+                metadata,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            }
+            | Self::BurnSubmitted {
+                metadata,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            } => (metadata, alpaca_quantity, dust_quantity),
+            Self::Failed { burn_context: Some(context), .. } => (
+                &context.metadata,
+                &context.alpaca_quantity,
+                &context.dust_quantity,
+            ),
+            _ => {
+                return Err(RedemptionError::InvalidState {
+                    expected: "BurnIntended, BurnSubmitted, or Failed"
+                        .to_string(),
+                    found: self.state_name().to_string(),
+                });
+            }
+        };
+        if !matches!(metadata.burn_mode, VaultMode::VaultDirect) {
+            return Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::Orchestrator,
+                found: VaultModeKind::VaultDirect,
+            });
+        }
+        let BurnParams::VaultDirect {
+            vault,
+            burns,
+            dust_shares,
+            owner: params_owner,
+        } = params
+        else {
+            return Err(RedemptionError::BurnModeMismatch {
+                expected: VaultModeKind::VaultDirect,
+                found: VaultModeKind::Orchestrator,
+            });
+        };
+        let previous_target = previous
+            .validate_for_owner(owner)
+            .map_err(|_| RedemptionError::PersistedBurnOwnerMismatch {
+                tx_hash: previous.hash,
+                nonce: previous.nonce,
+            })?
+            .to();
+        if previous_target != Some(vault) || params_owner != owner {
+            return Err(RedemptionError::BurnReplacementValidationFailed {
+                previous_hash: previous.hash,
+                previous_nonce: previous.nonce,
+                replacement_hash: B256::ZERO,
+                replacement_nonce: 0,
+            });
+        }
+
+        let actual_burn = burns.iter().try_fold(U256::ZERO, |total, entry| {
+            total.checked_add(entry.burn_shares)
+        });
+        let Some(actual_burn) = actual_burn else {
+            return Err(RedemptionError::VaultDirectAmountOverflow);
+        };
+        let expected_burn = alpaca_quantity
+            .to_u256_with_18_decimals()
+            .map_err(|error| RedemptionError::QuantityConversion {
+                message: error.to_string(),
+            })?;
+        if actual_burn != expected_burn {
+            return Err(RedemptionError::VaultDirectAmountMismatch {
+                expected: expected_burn,
+                actual: actual_burn,
+            });
+        }
+        let expected_dust =
+            dust_quantity.to_u256_with_18_decimals().map_err(|error| {
+                RedemptionError::QuantityConversion {
+                    message: error.to_string(),
+                }
+            })?;
+        if dust_shares != expected_dust {
+            return Err(RedemptionError::VaultDirectDustMismatch {
+                expected: expected_dust,
+                actual: dust_shares,
+            });
+        }
+
+        let planned_burns = burns
+            .iter()
+            .map(|entry| BurnRecord {
+                receipt_id: entry.receipt_id,
+                shares_burned: entry.burn_shares,
+            })
+            .collect();
+        let replacement = services
+            .vault_for(metadata.network)?
+            .prepare_burn_tx(&MultiBurnParams {
+                vault,
+                burns,
+                dust_shares,
+                owner,
+                user: metadata.wallet,
+                origin: BurnRequestOrigin::Redemption(
+                    issuer_request_id.clone(),
+                ),
+                detected_tx_hash: metadata.detected_tx_hash,
+                external_tx_id: Some(external_tx_id.clone()),
+            })
+            .await
+            .map_err(|_| RedemptionError::BurnReplacementPreparationFailed {
+                tx_hash: previous.hash,
+                nonce: previous.nonce,
+            })?;
+        replacement.validate_for_owner(owner).map_err(|_| {
+            RedemptionError::BurnReplacementValidationFailed {
+                previous_hash: previous.hash,
+                previous_nonce: previous.nonce,
+                replacement_hash: replacement.hash,
+                replacement_nonce: replacement.nonce,
+            }
+        })?;
+        if replacement.nonce <= previous.nonce
+            || replacement.hash == previous.hash
+        {
+            return Err(RedemptionError::BurnReplacementNotFresh {
+                previous_hash: previous.hash,
+                previous_nonce: previous.nonce,
+                replacement_hash: replacement.hash,
+                replacement_nonce: replacement.nonce,
+            });
+        }
+
+        Ok(vec![RedemptionEvent::BurnIntended {
+            issuer_request_id,
+            sendable_tx: replacement,
+            planned_burns,
+            external_tx_id: Some(external_tx_id),
+        }])
+    }
 
     async fn handle_replace_exhausted_dead_burn(
         &self,
         services: &RedemptionServices,
-        issuer_request_id: IssuerRedemptionRequestId,
-        recovery_id: uuid::Uuid,
-        previous_tx_hash: B256,
-        previous_nonce: u64,
-        owner: Address,
+        input: ExhaustedBurnReplacementInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let ExhaustedBurnReplacementInput {
+            issuer_request_id,
+            recovery_id,
+            previous_tx_hash,
+            previous_nonce,
+            owner,
+            replanned_params,
+        } = input;
         let (network, previous, detected_tx_hash, latest_external_tx_id) =
             self.exhausted_burn_replacement_context()?;
         if previous.hash != previous_tx_hash || previous.nonce != previous_nonce
@@ -2857,25 +3011,59 @@ impl Redemption {
                 found_chain_id: previous_chain_id,
             });
         }
+        let status = services
+            .vault_for(network)?
+            .classify_burn_tx(owner, previous)
+            .await
+            .map_err(|_| RedemptionError::BurnRecoveryClassificationFailed {
+                tx_hash: previous.hash,
+                nonce: previous.nonce,
+            })?;
+        let replacement_safe = match status {
+            BurnTxStatus::ProvablyDead => true,
+            BurnTxStatus::FinalizedReverted => {
+                matches!(self, Self::Failed { .. })
+            }
+            BurnTxStatus::Mined
+            | BurnTxStatus::Reverted
+            | BurnTxStatus::StillMineable => false,
+        };
+        if !replacement_safe {
+            return Err(RedemptionError::BurnReplacementNotSafe {
+                tx_hash: previous.hash,
+                nonce: previous.nonce,
+            });
+        }
+
         let replacement_external_tx_id = Self::next_burn_retry_external_tx_id(
             &detected_tx_hash,
             &latest_external_tx_id,
         )?;
 
-        let mut replacement_events = self
-            .replace_burn_transaction(
+        let mut replacement_events = if let Some(params) = replanned_params {
+            self.prepare_replanned_exhausted_burn(
+                services,
+                issuer_request_id.clone(),
+                previous,
+                owner,
+                replacement_external_tx_id,
+                params,
+            )
+            .await?
+        } else {
+            self.replace_burn_transaction(
                 services,
                 BurnReplacementInput {
                     issuer_request_id: issuer_request_id.clone(),
                     owner,
-                    basis:
-                        BurnReplacementBasis::ExhaustedTerminalClassification,
+                    basis: BurnReplacementBasis::ExhaustedTerminalVerified,
                     network,
                     sendable_tx: previous,
                     external_tx_id: Some(replacement_external_tx_id),
                 },
             )
-            .await?;
+            .await?
+        };
         let Some(RedemptionEvent::BurnIntended {
             sendable_tx: replacement,
             ..
@@ -2907,8 +3095,7 @@ impl Redemption {
                 found_chain_id: replacement_chain_id,
             });
         }
-        replacement_events.insert(
-            0,
+        replacement_events.push(
             RedemptionEvent::ManualBurnReplacementAuthorized {
                 issuer_request_id,
                 recovery_id,
@@ -5429,7 +5616,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_dead_burn_records_authorization_before_replacement() {
+    async fn exhausted_dead_burn_records_replacement_and_authorization_atomically()
+     {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let destination =
             address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -5463,6 +5651,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce,
             owner,
+            replanned_params: None,
         })
         .await
         .events();
@@ -5470,6 +5659,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
+                RedemptionEvent::BurnIntended { sendable_tx, .. },
                 RedemptionEvent::ManualBurnReplacementAuthorized {
                     issuer_request_id: event_request_id,
                     recovery_id: event_recovery_id,
@@ -5478,8 +5668,7 @@ mod tests {
                     replacement_tx_hash,
                     replacement_nonce,
                     ..
-                },
-                RedemptionEvent::BurnIntended { sendable_tx, .. }
+                }
             ] if event_request_id == &issuer_request_id
                 && event_recovery_id == &recovery_id
                 && *previous_tx_hash == old_tx.hash
@@ -5488,6 +5677,78 @@ mod tests {
                 && *replacement_nonce == replacement_tx.nonce
                 && sendable_tx == &replacement_tx
         ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_replan_binds_burn_and_dust_to_persisted_quantities() {
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let cases = [
+            (
+                uint!(99_000000000000000000_U256),
+                U256::ZERO,
+                RedemptionError::VaultDirectAmountMismatch {
+                    expected: uint!(100_000000000000000000_U256),
+                    actual: uint!(99_000000000000000000_U256),
+                },
+            ),
+            (
+                uint!(100_000000000000000000_U256),
+                uint!(1_U256),
+                RedemptionError::VaultDirectDustMismatch {
+                    expected: U256::ZERO,
+                    actual: uint!(1_U256),
+                },
+            ),
+        ];
+
+        for (burn_shares, dust_shares, expected) in cases {
+            let issuer_request_id = IssuerRedemptionRequestId::random();
+            let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+                7,
+                destination,
+                Bytes::from_static(&[0xde, 0xad]),
+                ANVIL_CHAIN_ID,
+            );
+            let owner = old_tx.signer_for_test();
+            let vault = Arc::new(
+                MockVaultService::new_success()
+                    .with_burn_tx_status(BurnTxStatus::ProvablyDead),
+            );
+            let services: Arc<dyn VaultService> = vault.clone();
+
+            let error = TestHarness::<Redemption>::with(
+                RedemptionServices::with_single_vault(Network::Base, services),
+            )
+            .given(intended_burn_history(&issuer_request_id, old_tx.clone()))
+            .when(RedemptionCommand::ReplaceExhaustedDeadBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                recovery_id: Uuid::new_v4(),
+                previous_tx_hash: old_tx.hash,
+                previous_nonce: old_tx.nonce,
+                owner,
+                replanned_params: Some(BurnParams::VaultDirect {
+                    vault: destination,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(100_U256),
+                        burn_shares,
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares,
+                    owner,
+                }),
+            })
+            .await
+            .then_expect_error();
+
+            let LifecycleError::Apply(actual) = error else {
+                panic!("expected apply error, got {error:?}");
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(vault.burn_preparation_call_count(), 0);
+            assert_eq!(vault.replacement_preparation_call_count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -5541,6 +5802,7 @@ mod tests {
                 previous_tx_hash: old_tx.hash,
                 previous_nonce: old_tx.nonce,
                 owner,
+                replanned_params: None,
             })
             .await
             .then_expect_error();
@@ -5627,6 +5889,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce,
             owner,
+            replanned_params: None,
         })
         .await
         .events();
@@ -5634,12 +5897,12 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                RedemptionEvent::ManualBurnReplacementAuthorized { .. },
                 RedemptionEvent::BurnIntended {
                     sendable_tx,
                     external_tx_id: Some(external_tx_id),
                     ..
-                }
+                },
+                RedemptionEvent::ManualBurnReplacementAuthorized { .. }
             ] if sendable_tx == &replacement_tx
                 && external_tx_id == &replacement_external_tx_id
         ));
@@ -5694,6 +5957,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce,
             owner,
+            replanned_params: None,
         })
         .await
         .then_expect_error();
@@ -5723,6 +5987,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce + 1,
             owner,
+            replanned_params: None,
         };
 
         let error = TestHarness::<Redemption>::with(mock_services())
@@ -5762,6 +6027,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce,
             owner: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            replanned_params: None,
         };
 
         let error = TestHarness::<Redemption>::with(mock_services())
@@ -5797,6 +6063,7 @@ mod tests {
             previous_tx_hash: old_tx.hash,
             previous_nonce: old_tx.nonce,
             owner,
+            replanned_params: None,
         };
 
         let error = TestHarness::<Redemption>::with(mock_services())
