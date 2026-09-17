@@ -898,7 +898,7 @@ impl BurnManager {
                 Ok(()) => {
                     return Ok(ManualBurnPlanSelection {
                         replanned_params: Some(execution.params),
-                        release_on_failure: !had_reservation,
+                        release_on_failure: true,
                     });
                 }
                 Err(error)
