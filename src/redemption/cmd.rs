@@ -290,6 +290,9 @@ pub(crate) enum RedemptionCommand {
         previous_tx_hash: B256,
         previous_nonce: u64,
         owner: Address,
+        /// Fresh vault-direct parameters when the retained receipt allocation
+        /// can no longer be reserved. `None` keeps exact-calldata replacement.
+        replanned_params: Option<BurnParams>,
     },
     ReplaceNonceTooLowBurn {
         issuer_request_id: IssuerRedemptionRequestId,

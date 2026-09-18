@@ -195,6 +195,7 @@ enum RecoverRedemptionCode {
     InvalidBurnIdentity,
     BurnRecoveryNotExhausted,
     CompetingSignerIntent,
+    InsufficientReceiptInventory,
     BurnReplacementAlreadyQueued,
     BurnClassificationUnavailable,
     BurnReplacementPreparationUnavailable,
@@ -850,6 +851,15 @@ fn map_manual_burn_replacement_error(
         ) => RecoverRedemptionError::new(
             Status::UnprocessableEntity,
             RecoverRedemptionCode::CompetingSignerIntent,
+            error.to_string(),
+        ),
+        BurnManagerError::ManualReplacementRefused(
+            ManualBurnReplacementRefusal::InsufficientReceiptInventory {
+                ..
+            },
+        ) => RecoverRedemptionError::new(
+            Status::UnprocessableEntity,
+            RecoverRedemptionCode::InsufficientReceiptInventory,
             error.to_string(),
         ),
         BurnManagerError::ManualReplacementRefused(
@@ -7057,6 +7067,20 @@ mod tests {
                 ),
                 Status::UnprocessableEntity,
                 super::RecoverRedemptionCode::CompetingSignerIntent,
+            ),
+            (
+                super::BurnManagerError::ManualReplacementRefused(
+                    super::ManualBurnReplacementRefusal::InsufficientReceiptInventory {
+                        required: crate::receipt_inventory::Shares::new(
+                            U256::from(100),
+                        ),
+                        available: crate::receipt_inventory::Shares::new(
+                            U256::from(99),
+                        ),
+                    },
+                ),
+                Status::UnprocessableEntity,
+                super::RecoverRedemptionCode::InsufficientReceiptInventory,
             ),
             (
                 super::BurnManagerError::ManualReplacementRefused(
