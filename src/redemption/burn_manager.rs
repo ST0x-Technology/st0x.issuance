@@ -949,9 +949,11 @@ impl BurnManager {
             }
         }
 
-        unreachable!(
-            "bounded manual replan loop returns on every final attempt"
-        )
+        Err(ManualBurnReplacementRefusal::InsufficientReceiptInventory {
+            required: Shares::new(burn_shares),
+            available: Shares::new(U256::ZERO),
+        }
+        .into())
     }
 
     async fn repair_authorized_manual_burn(
