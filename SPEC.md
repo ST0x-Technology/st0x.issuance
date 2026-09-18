@@ -4874,7 +4874,11 @@ Auto-detects the right recovery path from the event history:
   `Failed`, is replaced through `ReplaceExhaustedDeadBurn`. Vault-direct
   recovery first re-reserves the retained receipt plan. If later redemptions
   consumed released allocations, it reserves a fresh plan for the same persisted
-  burn and dust quantities before signing new calldata. The endpoint returns
+  burn and dust quantities before signing new calldata. If current inventory
+  cannot be secured, including when every bounded fresh-plan reservation attempt
+  loses its allocation race, the endpoint returns
+  `422
+  insufficient_receipt_inventory` without signing. The endpoint returns
   after the replacement intent commits and its durable submit job is queued; it
   does not wait for the burn to land. If the intent commits but queue dispatch
   fails, the response identifies the partial success, and recovery re-enqueues
