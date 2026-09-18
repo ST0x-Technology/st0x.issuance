@@ -2855,8 +2855,8 @@ impl Redemption {
         };
         if !matches!(metadata.burn_mode, VaultMode::VaultDirect) {
             return Err(RedemptionError::BurnModeMismatch {
-                expected: VaultModeKind::Orchestrator,
-                found: VaultModeKind::VaultDirect,
+                expected: VaultModeKind::VaultDirect,
+                found: VaultModeKind::Orchestrator,
             });
         }
         let BurnParams::VaultDirect {
@@ -3633,7 +3633,7 @@ mod tests {
         has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
-    use crate::config::VaultMode;
+    use crate::config::{VaultMode, VaultModeKind};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
@@ -5677,6 +5677,57 @@ mod tests {
                 && *replacement_nonce == replacement_tx.nonce
                 && sendable_tx == &replacement_tx
         ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_replan_reports_persisted_orchestrator_mode() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let mut history = orchestrator_burning_given_events(&issuer_request_id);
+        history.push(RedemptionEvent::BurnIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            sendable_tx: old_tx.clone(),
+            planned_burns: vec![],
+            external_tx_id: None,
+        });
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead),
+        );
+
+        let error = TestHarness::<Redemption>::with(
+            RedemptionServices::with_single_vault(Network::Base, services),
+        )
+        .given(history)
+        .when(RedemptionCommand::ReplaceExhaustedDeadBurn {
+            issuer_request_id,
+            recovery_id: Uuid::new_v4(),
+            previous_tx_hash: old_tx.hash,
+            previous_nonce: old_tx.nonce,
+            owner,
+            replanned_params: Some(vault_direct_burn_params()),
+        })
+        .await
+        .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(RedemptionError::BurnModeMismatch {
+                    expected: VaultModeKind::VaultDirect,
+                    found: VaultModeKind::Orchestrator,
+                })
+            ),
+            "expected the persisted Orchestrator mode to be reported, got {error:?}"
+        );
     }
 
     #[tokio::test]
