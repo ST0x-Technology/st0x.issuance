@@ -393,7 +393,7 @@ pub(crate) enum RedemptionEvent {
         exhausted_at: DateTime<Utc>,
     },
     /// Durable audit record for an operator-authorized replacement beyond the
-    /// automatic recovery cap. Emitted atomically immediately before the
+    /// automatic recovery cap. Emitted atomically immediately after the
     /// replacement `BurnIntended` event.
     ManualBurnReplacementAuthorized {
         issuer_request_id: IssuerRedemptionRequestId,
