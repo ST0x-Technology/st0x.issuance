@@ -139,14 +139,14 @@ impl RedeemCallManager {
                     );
                     auto_failed += 1;
                 }
-                // The Alpaca call failed and `handle_redemption_detected`
+                // The Alpaca integration failed and `handle_redemption_detected`
                 // already recorded `RecordAlpacaFailure`, so the redemption is
                 // properly terminal-ized. Count it as auto-failed rather than a
                 // recovery failure that would be re-attempted every sweep.
                 DetectedRecoveryClassification::AutoFailedAlpaca(err) => {
                     debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
-                        "Auto-failed Detected redemption via Alpaca rejection"
+                        "Auto-failed Detected redemption via Alpaca integration failure"
                     );
                     auto_failed += 1;
                 }
@@ -234,7 +234,7 @@ impl RedeemCallManager {
                 DetectedRecoveryClassification::AutoFailedAlpaca(err) => {
                     debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
-                        "Auto-failed Held redemption via Alpaca rejection"
+                        "Auto-failed Held redemption via Alpaca integration failure"
                     );
                     auto_failed += 1;
                 }
@@ -286,7 +286,14 @@ impl RedeemCallManager {
                 Err(error) => DetectedRecoveryClassification::Failed(error),
             },
             Err(RedeemCallManagerError::Alpaca(error)) => {
-                DetectedRecoveryClassification::AutoFailedAlpaca(error)
+                DetectedRecoveryClassification::AutoFailedAlpaca(
+                    error.to_string(),
+                )
+            }
+            Err(RedeemCallManagerError::AlpacaBoundary(error)) => {
+                DetectedRecoveryClassification::AutoFailedAlpaca(
+                    error.to_string(),
+                )
             }
             Err(error) => DetectedRecoveryClassification::Failed(error),
         }
@@ -604,7 +611,26 @@ impl RedeemCallManager {
             network: metadata.network,
             wallet: metadata.wallet,
             tx_hash: metadata.detected_tx_hash,
-        })?;
+        });
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    error = %error,
+                    "Failed to build Alpaca redeem request"
+                );
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::RecordAlpacaFailure {
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                return Err(RedeemCallManagerError::AlpacaBoundary(error));
+            }
+        };
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
@@ -750,7 +776,7 @@ enum DetectedRecoveryClassification {
     Held,
     Skipped,
     AutoFailedAccount,
-    AutoFailedAlpaca(AlpacaError),
+    AutoFailedAlpaca(String),
     Failed(RedeemCallManagerError),
 }
 
@@ -2186,11 +2212,80 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
             &[
-                "Auto-failed Detected redemption via Alpaca rejection",
+                "Auto-failed Detected redemption via Alpaca integration failure",
                 "API timeout",
                 id_string.as_str()
             ]
         ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Detected redemption recovery complete",
+                "auto_failed=1",
+                "failed=0"
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_detected_boundary_failure_counts_auto_failed() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        let alpaca_account = AlpacaAccountNumber("acc-boundary".to_string());
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let network = Network::Base;
+
+        harness
+            .register_and_link_account(
+                client_id,
+                "boundary@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &network).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .redemption_store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token: TokenSymbol::new(""),
+                    network,
+                    wallet,
+                    quantity: Quantity::new(Decimal::from(100)),
+                    tx_hash: b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                    block_number: 12345,
+                    burn_mode: VaultMode::VaultDirect,
+                },
+            )
+            .await
+            .unwrap();
+
+        manager.recover_detected_redemptions().await;
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 0);
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let Redemption::Failed { reason, .. } = updated_aggregate else {
+            panic!("Expected Failed state, got {updated_aggregate:?}");
+        };
+        assert!(reason.contains("Invalid Alpaca symbol"));
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &[
