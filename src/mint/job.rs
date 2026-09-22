@@ -34,7 +34,7 @@ use super::{
     UnderlyingSymbol, has_unresolved_signer_intent,
     orchestrator_mint_failure_classification,
 };
-use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
+use crate::alpaca::{AlpacaError, AlpacaService, mint_callback_request};
 use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
@@ -2628,13 +2628,13 @@ impl Job<SendCallbackContext> for SendCallbackJob {
         };
 
         ctx.alpaca
-            .send_mint_callback(MintCallbackRequest {
-                tokenization_request_id,
+            .send_mint_callback(mint_callback_request(
+                &tokenization_request_id,
                 client_id,
-                wallet_address: wallet,
+                wallet,
                 tx_hash,
                 network,
-            })
+            ))
             .await?;
 
         ctx.mint_store
