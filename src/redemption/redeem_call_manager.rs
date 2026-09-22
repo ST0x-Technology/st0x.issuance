@@ -621,7 +621,8 @@ impl RedeemCallManager {
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
                     fees = ?response.fees.as_ref().map(|fees| fees.0),
-                    quantity_matches_request = response.quantity.0.to_string() == alpaca_quantity.to_string(),
+                    quantity_matches_request = crate::alpaca::issuance_quantity(&response.quantity)
+                        .is_ok_and(|quantity| quantity == alpaca_quantity),
                     wallet_matches_request = response.wallet == metadata.wallet,
                     fees_nonzero = response.fees.as_ref().is_some_and(|fees| {
                         !fees.0.is_zero()
