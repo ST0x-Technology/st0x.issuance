@@ -16,7 +16,10 @@ use super::{
 use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
-use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
+use crate::alpaca::{
+    AlpacaBoundaryError, AlpacaError, AlpacaService, RedeemRequestInput,
+    issuance_tokenization_request_id, redeem_request,
+};
 use crate::notifications::{LifecycleNotification, LifecycleNotifier};
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
@@ -592,33 +595,33 @@ impl RedeemCallManager {
             "Calling Alpaca redeem endpoint"
         );
 
-        let request = RedeemRequest {
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: metadata.underlying.clone(),
-            token: metadata.token.clone(),
+        let request = redeem_request(RedeemRequestInput {
+            issuer_request_id,
+            underlying: &metadata.underlying,
+            token: &metadata.token,
             client_id,
-            quantity: alpaca_quantity.clone(),
+            quantity: &alpaca_quantity,
             network: metadata.network,
             wallet: metadata.wallet,
             tx_hash: metadata.detected_tx_hash,
-        };
+        })?;
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
-                info!(target: "redemption", issuer_request_id = %response.issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
                     status = ?response.status,
                     created_at = %response.created_at,
                     issuer = %response.issuer,
-                    underlying = %response.underlying.as_str(),
+                    underlying = %response.underlying.0.as_str(),
                     token = %response.token.0,
                     quantity = %response.quantity.0,
                     network = %response.network,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
                     fees = ?response.fees.as_ref().map(|fees| fees.0),
-                    quantity_matches_request = response.quantity == alpaca_quantity,
+                    quantity_matches_request = response.quantity.0.to_string() == alpaca_quantity.to_string(),
                     wallet_matches_request = response.wallet == metadata.wallet,
                     fees_nonzero = response.fees.as_ref().is_some_and(|fees| {
                         !fees.0.is_zero()
@@ -631,8 +634,10 @@ impl RedeemCallManager {
                         issuer_request_id,
                         RedemptionCommand::RecordAlpacaCall {
                             issuer_request_id: issuer_request_id.clone(),
-                            tokenization_request_id: response
-                                .tokenization_request_id,
+                            tokenization_request_id:
+                                issuance_tokenization_request_id(
+                                    response.tokenization_request_id,
+                                ),
                             alpaca_quantity,
                             dust_quantity,
                         },
@@ -684,6 +689,8 @@ impl RedeemCallManager {
 pub(crate) enum RedeemCallManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
+    #[error("Alpaca boundary conversion error: {0}")]
+    AlpacaBoundary(#[from] AlpacaBoundaryError),
     #[error("CQRS error: {0}")]
     Cqrs(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Invalid aggregate state: {current_state}")]
@@ -774,9 +781,10 @@ mod tests {
     use crate::alpaca::{
         AlpacaError, AlpacaService, Fees, RedeemRequest, RedeemRequestStatus,
         RedeemResponse, TokenizationRequest, TokenizationRequestType,
+        issuance_network,
     };
     use crate::config::VaultMode;
-    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::mint::Quantity;
     use crate::notifications::{
         CapturingLifecycleNotifier, LifecycleNotification, LifecycleNotifier,
         NoopLifecycleNotifier,
@@ -1119,12 +1127,14 @@ mod tests {
                 &self,
                 request: RedeemRequest,
             ) -> Result<RedeemResponse, AlpacaError> {
-                *self.captured_network.lock().unwrap() = Some(request.network);
+                *self.captured_network.lock().unwrap() =
+                    Some(issuance_network(request.network));
 
                 Ok(RedeemResponse {
-                    tokenization_request_id: TokenizationRequestId::new(
-                        "tok-eth-capture",
-                    ),
+                    tokenization_request_id:
+                        crate::alpaca::TokenizationRequestId::new(
+                            "tok-eth-capture",
+                        ),
                     issuer_request_id: request.issuer_request_id,
                     created_at: Utc::now(),
                     r#type: TokenizationRequestType::Redeem,
@@ -1142,7 +1152,7 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                _tokenization_request_id: &TokenizationRequestId,
+                _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
                 unreachable!("redeem test should not poll request status")
             }
