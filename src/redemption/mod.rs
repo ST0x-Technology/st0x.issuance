@@ -22,7 +22,7 @@ use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::Quantity;
 use crate::config::{VaultMode, VaultModeKind};
@@ -1124,6 +1124,32 @@ impl Redemption {
         }) {
             return Ok(vec![]);
         }
+        // Every failure that names no transaction at all comes from a gate
+        // that runs BEFORE one exists, so once this redemption has signed or
+        // broadcast a burn the command can only be a loser of that race —
+        // its gate read state that a concurrent driver has since advanced.
+        // `apply_failure_event` would still carry the in-flight burn into
+        // `Failed.unresolved_burn_tx`; the hazard is the terminal event
+        // itself, which names no transaction and is the shape operator
+        // recovery resumed from by starting a fresh burn — a second burn of
+        // the same shares. Leave the redemption in flight instead, where
+        // recovery classifies the persisted transaction on-chain before
+        // deciding anything.
+        if expected_tx_hash.is_none()
+            && tx_id.is_none()
+            && matches!(
+                self,
+                Self::BurnIntended { .. } | Self::BurnSubmitted { .. }
+            )
+        {
+            debug!(target: "redemption", %issuer_request_id,
+                state = self.state_name(),
+                error = %error,
+                "Ignoring stale burn failure that names no transaction; \
+                 this redemption already has one in flight"
+            );
+            return Ok(vec![]);
+        }
         if !matches!(
             self,
             Self::Burning { .. }
@@ -1347,7 +1373,7 @@ impl Redemption {
         }
 
         let persisted_burn_tx = self
-            .persisted_unresolved_burn_tx()
+            .unresolved_burn_tx()
             .filter(|sendable_tx| !sendable_tx.tx.is_empty());
         let acknowledged_unresolved_burn_tx_hash =
             match (persisted_burn_tx, acknowledged_unresolved_burn_tx_hash) {
@@ -1425,7 +1451,7 @@ impl Redemption {
         let legacy_burn_without_persisted_tx =
             matches!(self, Self::Failed { .. } | Self::Closed { .. })
                 && self
-                    .persisted_unresolved_burn_tx()
+                    .unresolved_burn_tx()
                     .filter(|sendable_tx| !sendable_tx.tx.is_empty())
                     .is_none();
         let acknowledged_unresolved_burn_tx_hash =
@@ -1734,7 +1760,30 @@ impl Redemption {
         }
     }
 
-    const fn persisted_unresolved_burn_tx(
+    /// The burns the retained transaction planned, when this redemption is
+    /// `Failed` and holds one.
+    ///
+    /// `apply_failure_event` derives `burn_context` from the same state it
+    /// took `unresolved_burn_tx` from, so these are THAT transaction's
+    /// burns — which is what recovery needs if the retained transaction turns
+    /// out to have landed. The failure event's own `planned_burns` describe a
+    /// different attempt and are empty whenever the event named no
+    /// transaction.
+    pub(crate) fn retained_planned_burns(&self) -> Option<Vec<BurnRecord>> {
+        match self {
+            Self::Failed { burn_context: Some(context), .. } => {
+                Some(context.planned_burns.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// A signed burn that may still land on-chain, if this redemption holds
+    /// one. Derived from the state a failure interrupted, so it is found even
+    /// when the failure event itself named no transaction — which is what
+    /// lets operator recovery classify that transaction before it starts a
+    /// second burn.
+    pub(crate) const fn unresolved_burn_tx(
         &self,
     ) -> Option<&SendableTxWithHash> {
         match self {
@@ -1780,7 +1829,7 @@ impl Redemption {
     fn persisted_burn_tx(
         &self,
     ) -> Result<&SendableTxWithHash, RedemptionError> {
-        self.persisted_unresolved_burn_tx()
+        self.unresolved_burn_tx()
             .filter(|sendable_tx| !sendable_tx.tx.is_empty())
             .ok_or(RedemptionError::PersistedBurnHashUnavailable)
     }
@@ -3227,7 +3276,7 @@ impl Redemption {
 
     fn apply_failure_event(&mut self, event: RedemptionEvent) {
         let unresolved_burn_tx = self
-            .persisted_unresolved_burn_tx()
+            .unresolved_burn_tx()
             .filter(|sendable_tx| !sendable_tx.tx.is_empty())
             .cloned();
         let burn_context = self.failed_burn_context();
@@ -3487,7 +3536,7 @@ impl Redemption {
                 // pre-close state is the only reliable carrier of a signed
                 // burn that may still land, so retain it through the closure.
                 let unresolved_burn_tx = self
-                    .persisted_unresolved_burn_tx()
+                    .unresolved_burn_tx()
                     .filter(|sendable_tx| !sendable_tx.tx.is_empty())
                     .cloned();
                 *self = Self::Closed {
@@ -7963,6 +8012,82 @@ mod tests {
             events.as_slice(),
             [RedemptionEvent::BurningFailed { .. }]
         ));
+    }
+
+    /// A pre-submit gate that loses its race records a failure naming no
+    /// transaction. The aggregate would still carry the in-flight burn into
+    /// `Failed.unresolved_burn_tx`; the hazard is the terminal event naming
+    /// no transaction, the shape `/admin/recover` resumed from by starting a
+    /// fresh burn — a second burn of the same shares.
+    #[traced_test]
+    #[tokio::test]
+    async fn tx_free_burn_failure_is_ignored_once_a_burn_exists() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        for (state, given) in [
+            (
+                "BurnIntended",
+                burn_intended_given_events(&issuer_request_id, tx_hash),
+            ),
+            ("BurnSubmitted", burn_submitted_given_events(&issuer_request_id)),
+        ] {
+            let events = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
+                    expected_tx_hash: None,
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "stale pre-submit gate".to_string(),
+                    tx_id: None,
+                    planned_burns: vec![],
+                })
+                .await
+                .events();
+
+            assert!(
+                events.is_empty(),
+                "a tx-free failure must not terminalize from {state}, \
+                 got {events:?}"
+            );
+        }
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["stale", "names no transaction"]
+        ));
+    }
+
+    /// The guard keys on transaction identity, not on the state: a failure
+    /// that names the burn it is about still terminalizes after submission,
+    /// so the real post-broadcast failure path is untouched.
+    #[tokio::test]
+    async fn identified_burn_failure_still_terminalizes_after_submission() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_id = TxId::Hash(B256::random());
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(burn_submitted_given_events(&issuer_request_id))
+            .when(RedemptionCommand::RecordBurnFailure {
+                classification: BurnFailureClassification::Unclassified,
+                expected_tx_hash: None,
+                issuer_request_id,
+                error: "burn reverted on-chain".to_string(),
+                tx_id: Some(tx_id),
+                planned_burns: vec![],
+            })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RedemptionEvent::BurningFailed { tx_id: Some(_), .. }]
+            ),
+            "expected a BurningFailed carrying its tx id, got {events:?}"
+        );
     }
 
     #[tokio::test]
