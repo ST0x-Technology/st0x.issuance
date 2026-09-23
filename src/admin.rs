@@ -1086,7 +1086,8 @@ async fn recover_post_alpaca(
                     RecoverRedemptionCode::UpstreamUnavailable,
                     "Alpaca returned a mismatched tokenization request id",
                 ),
-                AlpacaError::Reqwest(_)
+                AlpacaError::InvalidUrl(_)
+                | AlpacaError::Reqwest(_)
                 | AlpacaError::Jwt(_)
                 | AlpacaError::Parse { .. }
                 | AlpacaError::Auth(_)

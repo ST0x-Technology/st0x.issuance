@@ -3,8 +3,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Args;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::debug;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -205,7 +205,11 @@ impl AlpacaService for InstrumentedAlpacaService {
             method = "POST",
             "Sending mint callback to Alpaca"
         );
-        self.client.send_mint_callback(request).await
+        let started_at = Instant::now();
+        let result = self.client.send_mint_callback(request).await;
+        debug!(target: "alpaca", elapsed = ?started_at.elapsed(), success = result.is_ok(),
+            "Alpaca mint callback finished");
+        result
     }
 
     async fn call_redeem_endpoint(
@@ -218,7 +222,15 @@ impl AlpacaService for InstrumentedAlpacaService {
             method = "POST",
             "Calling Alpaca redeem endpoint"
         );
-        self.client.call_redeem_endpoint(request).await
+        let started_at = Instant::now();
+        let result = self.client.call_redeem_endpoint(request).await;
+        debug!(target: "alpaca", elapsed = ?started_at.elapsed(), success = result.is_ok(),
+            "Alpaca redeem call finished");
+        if let Err(AlpacaError::Parse { body, source }) = &result {
+            error!(target: "alpaca", %body, error = %source,
+                "Failed to parse Alpaca redeem response");
+        }
+        result
     }
 
     async fn poll_request_status(
@@ -232,19 +244,86 @@ impl AlpacaService for InstrumentedAlpacaService {
             %tokenization_request_id,
             "Polling Alpaca request status"
         );
-        self.client.poll_request_status(tokenization_request_id).await
+        let started_at = Instant::now();
+        let result =
+            self.client.poll_request_status(tokenization_request_id).await;
+        debug!(target: "alpaca", elapsed = ?started_at.elapsed(), success = result.is_ok(),
+            "Alpaca request poll finished");
+        match &result {
+            Ok(TokenizationRequest::Redeem { id, .. }) => {
+                debug!(target: "alpaca", tokenization_request_id = %id,
+                    "Alpaca keyed request response received");
+            }
+            Ok(TokenizationRequest::Mint {}) => {
+                warn!(target: "alpaca", %tokenization_request_id,
+                    "Alpaca keyed request response received Mint variant (unexpected for redemption polling)");
+            }
+            Err(AlpacaError::Parse { body, source }) => {
+                error!(target: "alpaca", %body, error = %source,
+                    "Failed to parse Alpaca request response");
+            }
+            Err(_) => {}
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
+    use clap::Parser;
 
     use super::{
         AlpacaConfig, CorporateActionBootstrapSince,
         CorporateActionBootstrapSinceError,
         DEFAULT_CORPORATE_ACTIONS_STREAM_URL,
     };
+
+    #[derive(Debug, Parser)]
+    struct AlpacaConfigTestCli {
+        #[command(flatten)]
+        alpaca: AlpacaConfig,
+    }
+
+    fn parse_config_with_bootstrap(
+        bootstrap_since: &str,
+    ) -> Result<AlpacaConfigTestCli, clap::Error> {
+        AlpacaConfigTestCli::try_parse_from([
+            "test",
+            "--alpaca-account-id",
+            "test-account",
+            "--alpaca-api-key",
+            "test-key",
+            "--alpaca-api-secret",
+            "test-secret",
+            "--alpaca-corporate-actions-bootstrap-since",
+            bootstrap_since,
+        ])
+    }
+
+    #[test]
+    fn accepts_and_normalizes_an_explicit_corporate_action_bootstrap_instant() {
+        let config =
+            parse_config_with_bootstrap("2026-08-30T21:00:00-03:00").unwrap();
+        assert_eq!(
+            config
+                .alpaca
+                .corporate_actions_bootstrap_since
+                .unwrap()
+                .query_value(),
+            "2026-08-31T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_corporate_action_bootstrap_instant() {
+        assert!(parse_config_with_bootstrap("yesterday").is_err());
+    }
+
+    #[test]
+    fn rejects_a_future_corporate_action_bootstrap_instant() {
+        assert!(parse_config_with_bootstrap("2999-01-01T00:00:00Z").is_err());
+    }
 
     #[test]
     fn debug_redacts_credentials_and_preserves_operational_configuration() {

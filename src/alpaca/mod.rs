@@ -13,7 +13,6 @@ use crate::tokenized_asset::{
     UnderlyingSymbol as IssuanceUnderlyingSymbol,
 };
 
-#[cfg(test)]
 pub(crate) mod itn;
 #[cfg(test)]
 pub(crate) mod mock;
@@ -35,6 +34,13 @@ pub(crate) use st0x_alpaca::issuer::{
 pub(crate) enum AlpacaBoundaryError {
     #[error("Invalid Alpaca issuer request id: {0}")]
     IssuerRequestId(#[from] IssuerRedemptionRequestIdParseError),
+    #[error(
+        "Alpaca redeem response issuer request id {returned} does not match {requested}"
+    )]
+    IssuerRequestIdMismatch {
+        requested: IssuerRedemptionRequestId,
+        returned: IssuerRedemptionRequestId,
+    },
     #[error("Invalid Alpaca symbol: {0}")]
     Symbol(#[from] st0x_finance::EmptySymbolError),
     #[error("Invalid Alpaca quantity: {0}")]
@@ -43,6 +49,13 @@ pub(crate) enum AlpacaBoundaryError {
     IssuanceQuantity(#[from] rust_decimal::Error),
     #[error("Invalid issuance underlying symbol: {0}")]
     IssuanceUnderlying(#[from] st0x_issuance_dto::UnderlyingSymbolError),
+    #[error(
+        "Unsupported Alpaca tokenization network {network}; see {reference}"
+    )]
+    UnsupportedTokenizationNetwork {
+        network: IssuanceNetwork,
+        reference: &'static str,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +91,12 @@ pub(crate) fn mint_callback_request(
 pub(crate) fn redeem_request(
     input: RedeemRequestInput<'_>,
 ) -> Result<RedeemRequest, AlpacaBoundaryError> {
+    if !itn::accepts_network_wire_string(input.network.as_str()) {
+        return Err(AlpacaBoundaryError::UnsupportedTokenizationNetwork {
+            network: input.network,
+            reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+        });
+    }
     Ok(RedeemRequest {
         issuer_request_id: st0x_alpaca::issuer::IssuerRequestId(
             input.issuer_request_id.to_string(),
@@ -85,7 +104,7 @@ pub(crate) fn redeem_request(
         underlying: alpaca_underlying_symbol(input.underlying)?,
         token: alpaca_token_symbol(input.token)?,
         client_id: st0x_alpaca::issuer::ClientId(input.client_id.into()),
-        quantity: alpaca_quantity(input.quantity)?,
+        quantity: alpaca_redeem_quantity(input.quantity)?,
         network: alpaca_network(input.network),
         wallet: input.wallet,
         tx_hash: input.tx_hash,
@@ -151,13 +170,20 @@ fn alpaca_underlying_symbol(
 fn alpaca_token_symbol(
     value: &IssuanceTokenSymbol,
 ) -> Result<st0x_alpaca::issuer::TokenSymbol, AlpacaBoundaryError> {
-    Ok(st0x_alpaca::issuer::TokenSymbol::new(value.0.clone())?)
+    Ok(st0x_alpaca::issuer::TokenSymbol::new(value.0.clone()))
 }
 
+#[cfg(test)]
 fn alpaca_quantity(
     value: &Quantity,
 ) -> Result<st0x_alpaca::issuer::Qty, AlpacaBoundaryError> {
     Ok(st0x_alpaca::issuer::Qty(value.to_string().parse()?))
+}
+
+fn alpaca_redeem_quantity(
+    value: &Quantity,
+) -> Result<st0x_alpaca::issuer::RedeemQty, AlpacaBoundaryError> {
+    Ok(st0x_alpaca::issuer::RedeemQty::new(value.to_string())?)
 }
 
 const fn alpaca_network(value: IssuanceNetwork) -> st0x_alpaca::core::Network {
@@ -209,7 +235,9 @@ pub(crate) fn test_redeem_response(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256};
+    use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use tracing_test::traced_test;
 
     use super::{
         AlpacaBoundaryError, RedeemRequestInput, TokenizationRequestId,
@@ -220,6 +248,7 @@ mod tests {
     use crate::Quantity;
     use crate::account::ClientId;
     use crate::redemption::IssuerRedemptionRequestId;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     #[test]
@@ -260,7 +289,7 @@ mod tests {
             assert_eq!(request.underlying.0.as_str(), "SPYM");
             assert_eq!(request.token.0.as_str(), "tSPYM");
             assert_eq!(request.client_id.0.to_string(), client_id.to_string());
-            assert_eq!(request.quantity.0.to_string(), "1.234567891");
+            assert_eq!(request.quantity.as_str(), "1.234567891");
             assert_eq!(request.network, expected);
             assert_eq!(request.wallet, wallet);
             assert_eq!(request.tx_hash, tx_hash);
@@ -278,8 +307,7 @@ mod tests {
             st0x_alpaca::issuer::IssuerRequestId(issuer_request_id.to_string());
         let shared_underlying =
             st0x_alpaca::issuer::UnderlyingSymbol::new("SPYM").unwrap();
-        let shared_token =
-            st0x_alpaca::issuer::TokenSymbol::new("tSPYM").unwrap();
+        let shared_token = st0x_alpaca::issuer::TokenSymbol::new("tSPYM");
         let shared_quantity = st0x_alpaca::issuer::Qty(
             "1.234567891".parse::<st0x_finance::FractionalShares>().unwrap(),
         );
@@ -310,5 +338,60 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AlpacaBoundaryError::IssuerRequestId(_))));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn redeem_adapter_and_shared_client_preserve_exact_wire_body() {
+        let tx_hash = B256::repeat_byte(0x11);
+        let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
+        let underlying = UnderlyingSymbol::new("SPYM").unwrap();
+        let token = TokenSymbol::new(" tSPYM ");
+        let quantity = Quantity::new(dec!(100.50));
+        let request = redeem_request(RedeemRequestInput {
+            issuer_request_id: &issuer_request_id,
+            underlying: &underlying,
+            token: &token,
+            client_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            quantity: &quantity,
+            network: Network::Base,
+            wallet: Address::repeat_byte(0x22),
+            tx_hash,
+        })
+        .unwrap();
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["qty"], "100.50");
+        assert_eq!(body["token_symbol"], " tSPYM ");
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                .json_body(body);
+            then.status(200).json_body(serde_json::json!({
+                "tokenization_request_id": "tok-1",
+                "issuer_request_id": issuer_request_id.to_string(),
+                "created_at": "2026-09-23T00:00:00Z",
+                "type": "redeem",
+                "status": "pending",
+                "underlying_symbol": "SPYM",
+                "token_symbol": " tSPYM ",
+                "qty": "100.50",
+                "issuer": "st0x",
+                "network": "base",
+                "wallet_address": Address::repeat_byte(0x22).to_string(),
+                "tx_hash": tx_hash.to_string(),
+                "fees": null
+            }));
+        });
+        let mut config = super::AlpacaConfig::test_default();
+        config.api_base_url = server.base_url();
+        config.account_id = "test-account".into();
+        config.service().unwrap().call_redeem_endpoint(request).await.unwrap();
+        mock.assert();
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca redeem call finished", "success=true"]
+        ));
     }
 }

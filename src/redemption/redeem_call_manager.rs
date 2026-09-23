@@ -18,7 +18,9 @@ use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{
     AlpacaBoundaryError, AlpacaError, AlpacaService, RedeemRequestInput,
-    issuance_tokenization_request_id, redeem_request,
+    issuance_issuer_request_id, issuance_quantity,
+    issuance_tokenization_request_id, issuance_underlying_symbol,
+    redeem_request,
 };
 use crate::notifications::{LifecycleNotification, LifecycleNotifier};
 use crate::tokenized_asset::view::{
@@ -285,15 +287,9 @@ impl RedeemCallManager {
                 Ok(()) => DetectedRecoveryClassification::AutoFailedAccount,
                 Err(error) => DetectedRecoveryClassification::Failed(error),
             },
-            Err(RedeemCallManagerError::Alpaca(error)) => {
-                DetectedRecoveryClassification::AutoFailedAlpaca(
-                    error.to_string(),
-                )
-            }
-            Err(RedeemCallManagerError::AlpacaBoundary(error)) => {
-                DetectedRecoveryClassification::AutoFailedAlpaca(
-                    error.to_string(),
-                )
+            Err(error @ RedeemCallManagerError::Alpaca(_))
+            | Err(error @ RedeemCallManagerError::AlpacaBoundary(_)) => {
+                DetectedRecoveryClassification::AutoFailedAlpaca(error)
             }
             Err(error) => DetectedRecoveryClassification::Failed(error),
         }
@@ -634,6 +630,47 @@ impl RedeemCallManager {
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
+                let converted = (|| -> Result<_, AlpacaBoundaryError> {
+                    let response_issuer_id = issuance_issuer_request_id(
+                        &response.issuer_request_id,
+                    )?;
+                    if response_issuer_id != *issuer_request_id {
+                        return Err(
+                            AlpacaBoundaryError::IssuerRequestIdMismatch {
+                                requested: issuer_request_id.clone(),
+                                returned: response_issuer_id,
+                            },
+                        );
+                    }
+                    let response_quantity =
+                        issuance_quantity(&response.quantity)?;
+                    let response_underlying =
+                        issuance_underlying_symbol(&response.underlying)?;
+                    Ok((response_quantity, response_underlying))
+                })();
+                let (response_quantity, _response_underlying) = match converted
+                {
+                    Ok(values) => values,
+                    Err(error) => {
+                        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                            error = %error,
+                            "Invalid Alpaca redeem response"
+                        );
+                        self.store
+                            .send(
+                                issuer_request_id,
+                                RedemptionCommand::RecordAlpacaFailure {
+                                    issuer_request_id: issuer_request_id
+                                        .clone(),
+                                    error: error.to_string(),
+                                },
+                            )
+                            .await?;
+                        return Err(RedeemCallManagerError::AlpacaBoundary(
+                            error,
+                        ));
+                    }
+                };
                 info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
@@ -647,8 +684,7 @@ impl RedeemCallManager {
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
                     fees = ?response.fees.as_ref().map(|fees| fees.0),
-                    quantity_matches_request = crate::alpaca::issuance_quantity(&response.quantity)
-                        .is_ok_and(|quantity| quantity == alpaca_quantity),
+                    quantity_matches_request = response_quantity == alpaca_quantity,
                     wallet_matches_request = response.wallet == metadata.wallet,
                     fees_nonzero = response.fees.as_ref().is_some_and(|fees| {
                         !fees.0.is_zero()
@@ -776,7 +812,7 @@ enum DetectedRecoveryClassification {
     Held,
     Skipped,
     AutoFailedAccount,
-    AutoFailedAlpaca(String),
+    AutoFailedAlpaca(RedeemCallManagerError),
     Failed(RedeemCallManagerError),
 }
 
@@ -788,6 +824,7 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
+    use st0x_finance::FractionalShares;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{Barrier, watch};
@@ -1168,7 +1205,7 @@ mod tests {
                     status: RedeemRequestStatus::Pending,
                     underlying: request.underlying,
                     token: request.token,
-                    quantity: request.quantity,
+                    quantity: request.quantity.shares(),
                     issuer: "test-issuer".to_string(),
                     network: request.network,
                     wallet: request.wallet,
@@ -1317,6 +1354,122 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::WARN,
             &["Alpaca redeem API call failed"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn domain_invalid_redeem_responses_are_terminal_failures() {
+        #[derive(Clone, Copy)]
+        enum InvalidResponse {
+            IssuerId,
+            Quantity,
+        }
+
+        struct InvalidRedeemResponseService(InvalidResponse);
+
+        #[async_trait]
+        impl AlpacaService for InvalidRedeemResponseService {
+            async fn send_mint_callback(
+                &self,
+                _request: crate::alpaca::MintCallbackRequest,
+            ) -> Result<(), AlpacaError> {
+                unreachable!("redeem test should not send a mint callback")
+            }
+
+            async fn call_redeem_endpoint(
+                &self,
+                request: RedeemRequest,
+            ) -> Result<RedeemResponse, AlpacaError> {
+                let issuer_request_id = match self.0 {
+                    InvalidResponse::IssuerId => {
+                        st0x_alpaca::issuer::IssuerRequestId(
+                            "not-a-hash".into(),
+                        )
+                    }
+                    InvalidResponse::Quantity => request.issuer_request_id,
+                };
+                let quantity = match self.0 {
+                    InvalidResponse::IssuerId => request.quantity.shares(),
+                    InvalidResponse::Quantity => st0x_alpaca::issuer::Qty(
+                        "10000000000000000000000000000000000000000"
+                            .parse::<FractionalShares>()
+                            .unwrap(),
+                    ),
+                };
+                Ok(RedeemResponse {
+                    tokenization_request_id:
+                        crate::alpaca::TokenizationRequestId::new("tok-invalid"),
+                    issuer_request_id,
+                    created_at: Utc::now(),
+                    r#type: TokenizationRequestType::Redeem,
+                    status: RedeemRequestStatus::Pending,
+                    underlying: request.underlying,
+                    token: request.token,
+                    quantity,
+                    issuer: "test-issuer".into(),
+                    network: request.network,
+                    wallet: request.wallet,
+                    tx_hash: request.tx_hash,
+                    fees: None,
+                })
+            }
+
+            async fn poll_request_status(
+                &self,
+                _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                unreachable!("redeem test should not poll")
+            }
+        }
+
+        for invalid in [InvalidResponse::IssuerId, InvalidResponse::Quantity] {
+            let harness = TestHarness::new().await;
+            let manager = harness.create_manager(Arc::new(
+                InvalidRedeemResponseService(invalid),
+            ));
+            let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+            let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+            harness.add_asset(&underlying, &Network::Base).await;
+            let issuer_request_id = IssuerRedemptionRequestId::random();
+            harness
+                .detect_redemption(
+                    &issuer_request_id,
+                    &underlying,
+                    &Network::Base,
+                    wallet,
+                )
+                .await;
+            let aggregate = harness
+                .redemption_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let result = manager
+                .handle_redemption_detected(
+                    &test_alpaca_account(),
+                    &issuer_request_id,
+                    &aggregate,
+                    ClientId::new(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(RedeemCallManagerError::AlpacaBoundary(_))
+            ));
+            let updated = harness
+                .redemption_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(updated, Redemption::Failed { .. }));
+        }
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Invalid Alpaca redeem response"]
         ));
     }
 

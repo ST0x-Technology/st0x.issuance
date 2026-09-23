@@ -85,7 +85,7 @@ rustls = { version = "0.23.40", default-features = false, features = [
   "aws_lc_rs",
   "std",
 ] }
-st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "fb228247af4d083ac8b5b4d5eb69fb004bc7452a", version = "0.1.0", default-features = false, features = [
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "8e4df10ba37715532485dfef936cbf693e788a2b", version = "0.1.0", default-features = false, features = [
   "issuer",
 ] }
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.2.0", version = "0.2.0", default-features = false }
