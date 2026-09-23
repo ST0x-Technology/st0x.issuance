@@ -144,7 +144,17 @@ pub(crate) fn issuance_token_symbol(
 pub(crate) fn issuance_quantity(
     value: &st0x_alpaca::issuer::Qty,
 ) -> Result<Quantity, AlpacaBoundaryError> {
-    Ok(Quantity::new(value.0.to_string().parse()?))
+    Ok(Quantity::new(parse_issuance_decimal(&value.0.to_string())?))
+}
+
+fn parse_issuance_decimal(
+    value: &str,
+) -> Result<rust_decimal::Decimal, rust_decimal::Error> {
+    if value.contains('e') || value.contains('E') {
+        rust_decimal::Decimal::from_scientific(value)
+    } else {
+        value.parse()
+    }
 }
 
 pub(crate) const fn issuance_network(
@@ -246,7 +256,7 @@ mod tests {
         AlpacaBoundaryError, RedeemRequestInput, TokenizationRequestId,
         issuance_issuer_request_id, issuance_quantity, issuance_token_symbol,
         issuance_tokenization_request_id, issuance_underlying_symbol,
-        redeem_request,
+        parse_issuance_decimal, redeem_request,
     };
     use crate::Quantity;
     use crate::account::ClientId;
@@ -341,6 +351,12 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AlpacaBoundaryError::IssuerRequestId(_))));
+    }
+
+    #[test]
+    fn scientific_response_quantity_parses_when_in_decimal_range() {
+        assert_eq!(parse_issuance_decimal("1e-9").unwrap(), dec!(0.000000001));
+        assert!(parse_issuance_decimal("1e-77").is_err());
     }
 
     #[traced_test]

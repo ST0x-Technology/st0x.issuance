@@ -473,4 +473,28 @@ mod tests {
             &["Alpaca request poll finished", "success=false"]
         ));
     }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn keyed_poll_retries_transient_errors_and_logs_final_outcome() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/accounts/test-account/tokenization/requests/tok-retry",
+            );
+            then.status(500).body("temporary failure");
+        });
+
+        let error = service_for(&server)
+            .poll_request_status(&TokenizationRequestId::new("tok-retry"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AlpacaError::Api { status_code: 500, .. }));
+        assert!(error.is_retryable());
+        mock.assert_calls(6);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca request poll finished", "success=false"]
+        ));
+    }
 }
