@@ -287,10 +287,10 @@ impl RedeemCallManager {
                 Ok(()) => DetectedRecoveryClassification::AutoFailedAccount,
                 Err(error) => DetectedRecoveryClassification::Failed(error),
             },
-            Err(error @ RedeemCallManagerError::Alpaca(_))
-            | Err(error @ RedeemCallManagerError::AlpacaBoundary(_)) => {
-                DetectedRecoveryClassification::AutoFailedAlpaca(error)
-            }
+            Err(
+                error @ (RedeemCallManagerError::Alpaca(_)
+                | RedeemCallManagerError::AlpacaBoundary(_)),
+            ) => DetectedRecoveryClassification::AutoFailedAlpaca(error),
             Err(error) => DetectedRecoveryClassification::Failed(error),
         }
     }
@@ -630,47 +630,9 @@ impl RedeemCallManager {
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
-                let converted = (|| -> Result<_, AlpacaBoundaryError> {
-                    let response_issuer_id = issuance_issuer_request_id(
-                        &response.issuer_request_id,
-                    )?;
-                    if response_issuer_id != *issuer_request_id {
-                        return Err(
-                            AlpacaBoundaryError::IssuerRequestIdMismatch {
-                                requested: issuer_request_id.clone(),
-                                returned: response_issuer_id,
-                            },
-                        );
-                    }
-                    let response_quantity =
-                        issuance_quantity(&response.quantity)?;
-                    let response_underlying =
-                        issuance_underlying_symbol(&response.underlying)?;
-                    Ok((response_quantity, response_underlying))
-                })();
-                let (response_quantity, _response_underlying) = match converted
-                {
-                    Ok(values) => values,
-                    Err(error) => {
-                        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                            error = %error,
-                            "Invalid Alpaca redeem response"
-                        );
-                        self.store
-                            .send(
-                                issuer_request_id,
-                                RedemptionCommand::RecordAlpacaFailure {
-                                    issuer_request_id: issuer_request_id
-                                        .clone(),
-                                    error: error.to_string(),
-                                },
-                            )
-                            .await?;
-                        return Err(RedeemCallManagerError::AlpacaBoundary(
-                            error,
-                        ));
-                    }
-                };
+                let response_quantity = self
+                    .validate_redeem_response(issuer_request_id, &response)
+                    .await?;
                 info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
@@ -743,6 +705,43 @@ impl RedeemCallManager {
                 );
 
                 Err(RedeemCallManagerError::Alpaca(err))
+            }
+        }
+    }
+
+    async fn validate_redeem_response(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        response: &st0x_alpaca::issuer::RedeemResponse,
+    ) -> Result<crate::Quantity, RedeemCallManagerError> {
+        let converted = (|| -> Result<_, AlpacaBoundaryError> {
+            let response_issuer_id =
+                issuance_issuer_request_id(&response.issuer_request_id)?;
+            if response_issuer_id != *issuer_request_id {
+                return Err(AlpacaBoundaryError::IssuerRequestIdMismatch {
+                    requested: issuer_request_id.clone(),
+                    returned: response_issuer_id,
+                });
+            }
+            let response_quantity = issuance_quantity(&response.quantity)?;
+            issuance_underlying_symbol(&response.underlying)?;
+            Ok(response_quantity)
+        })();
+        match converted {
+            Ok(quantity) => Ok(quantity),
+            Err(error) => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    error = %error, "Invalid Alpaca redeem response");
+                self.store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::RecordAlpacaFailure {
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                Err(RedeemCallManagerError::AlpacaBoundary(error))
             }
         }
     }

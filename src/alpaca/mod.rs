@@ -170,6 +170,9 @@ fn alpaca_underlying_symbol(
 fn alpaca_token_symbol(
     value: &IssuanceTokenSymbol,
 ) -> Result<st0x_alpaca::issuer::TokenSymbol, AlpacaBoundaryError> {
+    // Validate without using Symbol's normalized value: the request must keep
+    // the issuer's original token spelling (including surrounding spaces).
+    st0x_finance::Symbol::new(value.0.clone())?;
     Ok(st0x_alpaca::issuer::TokenSymbol::new(value.0.clone()))
 }
 
