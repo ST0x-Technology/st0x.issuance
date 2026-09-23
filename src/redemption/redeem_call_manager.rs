@@ -631,7 +631,12 @@ impl RedeemCallManager {
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
                 let response_quantity = self
-                    .validate_redeem_response(issuer_request_id, &response)
+                    .validate_redeem_response(
+                        issuer_request_id,
+                        &response,
+                        &alpaca_quantity,
+                        &dust_quantity,
+                    )
                     .await?;
                 info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
@@ -713,6 +718,8 @@ impl RedeemCallManager {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
         response: &st0x_alpaca::issuer::RedeemResponse,
+        alpaca_quantity: &crate::Quantity,
+        dust_quantity: &crate::Quantity,
     ) -> Result<crate::Quantity, RedeemCallManagerError> {
         let converted = (|| -> Result<_, AlpacaBoundaryError> {
             let response_issuer_id =
@@ -731,13 +738,23 @@ impl RedeemCallManager {
             Ok(quantity) => Ok(quantity),
             Err(error) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    tokenization_request_id = %response.tokenization_request_id.0,
                     error = %error, "Invalid Alpaca redeem response");
                 self.store
                     .send(
                         issuer_request_id,
-                        RedemptionCommand::RecordAlpacaFailure {
+                        RedemptionCommand::RecordAlpacaInvalidResponse {
                             issuer_request_id: issuer_request_id.clone(),
-                            error: error.to_string(),
+                            tokenization_request_id:
+                                issuance_tokenization_request_id(
+                                    response.tokenization_request_id.clone(),
+                                ),
+                            alpaca_quantity: alpaca_quantity.clone(),
+                            dust_quantity: dust_quantity.clone(),
+                            error: format!(
+                                "{error} (Alpaca accepted tokenization request {})",
+                                response.tokenization_request_id.0
+                            ),
                         },
                     )
                     .await?;
@@ -1464,7 +1481,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(updated, Redemption::Failed { .. }));
+            let Redemption::Failed { reason, alpaca_quantity, .. } = updated
+            else {
+                panic!("Expected Failed after invalid Alpaca response");
+            };
+            assert!(reason.contains("tok-invalid"));
+            assert_eq!(
+                alpaca_quantity,
+                Some(Quantity::new(Decimal::from(100)))
+            );
         }
         assert!(logs_contain_at!(
             tracing::Level::WARN,

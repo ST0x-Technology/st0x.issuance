@@ -92,6 +92,16 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
     },
+    /// Alpaca returned 200 with a request ID, but its remaining response is
+    /// invalid for the issuance domain. Persist acceptance and failure in one
+    /// transition so recovery cannot repeat the external redeem call.
+    RecordAlpacaInvalidResponse {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+        error: String,
+    },
     /// Parks a redemption of a frozen asset before the Alpaca redeem call.
     /// Valid from `Detected` (produces `RedemptionHeld`) and idempotent from
     /// `Held` (no event) so concurrent guard paths cannot race each other.

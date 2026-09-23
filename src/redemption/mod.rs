@@ -811,6 +811,38 @@ impl Redemption {
         }])
     }
 
+    fn handle_record_alpaca_invalid_response(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+        error: String,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::AlpacaCallClaimed { .. }) {
+            return Err(RedemptionError::InvalidState {
+                expected: "AlpacaCallClaimed".to_string(),
+                found: self.state_name().to_string(),
+            });
+        }
+
+        let now = Utc::now();
+        Ok(vec![
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at: now,
+            },
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id,
+                reason: error,
+                failed_at: now,
+            },
+        ])
+    }
+
     fn handle_mark_failed(
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
@@ -2416,6 +2448,7 @@ impl EventSourced for Redemption {
             RedemptionCommand::ClaimAlpacaCall { .. }
             | RedemptionCommand::RecordAlpacaCall { .. }
             | RedemptionCommand::RecordAlpacaFailure { .. }
+            | RedemptionCommand::RecordAlpacaInvalidResponse { .. }
             | RedemptionCommand::Hold { .. } => {
                 Err(RedemptionError::InvalidState {
                     expected: "Detected".to_string(),
@@ -2530,6 +2563,19 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 error,
             } => self.handle_record_alpaca_failure(issuer_request_id, error),
+            RedemptionCommand::RecordAlpacaInvalidResponse {
+                issuer_request_id,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                error,
+            } => self.handle_record_alpaca_invalid_response(
+                issuer_request_id,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                error,
+            ),
             RedemptionCommand::Hold { issuer_request_id } => {
                 self.handle_hold(issuer_request_id)
             }

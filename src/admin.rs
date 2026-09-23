@@ -5012,6 +5012,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_accepted_alpaca_response_is_post_alpaca_for_recovery() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let metadata = test_metadata();
+        let alpaca_data = test_alpaca_data();
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: metadata.network,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    burn_mode: metadata.burn_mode,
+                },
+            )
+            .await
+            .unwrap();
+        claim_alpaca_call(&store, &metadata.issuer_request_id).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaInvalidResponse {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                    error: "invalid response quantity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(redemption, Redemption::Failed { .. }));
+        let context =
+            load_reprocess_context(&pool, &metadata.issuer_request_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            context.alpaca_called.unwrap().tokenization_request_id,
+            alpaca_data.tokenization_request_id
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_reprocess_context_derives_retry_id_from_history() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
