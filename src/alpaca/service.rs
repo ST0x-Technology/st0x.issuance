@@ -272,6 +272,13 @@ impl AlpacaService for InstrumentedAlpacaService {
 mod tests {
     use chrono::{Duration, Utc};
     use clap::Parser;
+    use httpmock::prelude::*;
+    use tracing_test::traced_test;
+
+    use crate::alpaca::{
+        AlpacaError, TokenizationRequest, TokenizationRequestId,
+    };
+    use crate::test_utils::logs_contain_at;
 
     use super::{
         AlpacaConfig, CorporateActionBootstrapSince,
@@ -344,6 +351,126 @@ mod tests {
         assert!(matches!(
             result,
             Err(CorporateActionBootstrapSinceError::Future(_))
+        ));
+    }
+
+    fn service_for(
+        server: &MockServer,
+    ) -> std::sync::Arc<dyn super::AlpacaService> {
+        let mut config = AlpacaConfig::test_default();
+        config.api_base_url = server.base_url();
+        config.account_id = "test-account".into();
+        config.service().unwrap()
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn keyed_poll_preserves_not_found_and_outcome_log() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/accounts/test-account/tokenization/requests/tok-missing",
+            );
+            then.status(404).body("not found");
+        });
+
+        let error = service_for(&server)
+            .poll_request_status(&TokenizationRequestId::new("tok-missing"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AlpacaError::RequestNotFound { .. }));
+        assert!(!error.is_retryable());
+        mock.assert_calls(1);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca request poll finished", "success=false"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn keyed_poll_warns_on_unexpected_mint_variant() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/accounts/test-account/tokenization/requests/tok-mint-1",
+            );
+            then.status(200).json_body(serde_json::json!({"type": "mint"}));
+        });
+
+        let result = service_for(&server)
+            .poll_request_status(&TokenizationRequestId::new("tok-mint-1"))
+            .await
+            .unwrap();
+        assert!(matches!(result, TokenizationRequest::Mint {}));
+        mock.assert_calls(1);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Alpaca keyed request response received Mint variant",
+                "tok-mint-1"
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn keyed_poll_accepts_omitted_transaction_hash_and_logs_receipt() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/accounts/test-account/tokenization/requests/tok-456",
+            );
+            then.status(200).json_body(serde_json::json!({
+                "type": "redeem",
+                "tokenization_request_id": "tok-456",
+                "issuer_request_id": "red-574378e0",
+                "status": "pending",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "50.00",
+                "network": "base",
+                "wallet_address": "0x9999999999999999999999999999999999999999",
+                "updated_at": "2025-09-12T17:30:00-04:00"
+            }));
+        });
+
+        let result = service_for(&server)
+            .poll_request_status(&TokenizationRequestId::new("tok-456"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            TokenizationRequest::Redeem { tx_hash: None, .. }
+        ));
+        mock.assert_calls(1);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca keyed request response received", "tok-456"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn keyed_poll_keeps_auth_failure_non_retryable() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/accounts/test-account/tokenization/requests/tok-auth",
+            );
+            then.status(401).body("Unauthorized");
+        });
+
+        let error = service_for(&server)
+            .poll_request_status(&TokenizationRequestId::new("tok-auth"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AlpacaError::Auth(_)));
+        assert!(!error.is_retryable());
+        mock.assert_calls(1);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca request poll finished", "success=false"]
         ));
     }
 }
