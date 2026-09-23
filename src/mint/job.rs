@@ -2751,13 +2751,13 @@ mod tests {
     use async_trait::async_trait;
     use cqrs_es::{AggregateError, DomainEvent};
     use event_sorcery::test_store;
+    use st0x_alpaca::issuer::mock::MockIssuerApi;
     use std::any::type_name;
     use std::collections::HashMap;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::burn_excess::BurnExcessEvent;
     use crate::mint::MintEvent;
     use crate::mint::api::test_utils::TestHarness;
@@ -5088,7 +5088,7 @@ mod tests {
         )
         .await;
 
-        let alpaca = Arc::new(MockAlpacaService::new_success());
+        let alpaca = Arc::new(MockIssuerApi::new_success());
         let ctx = SendCallbackContext {
             mint_store: harness.mint_store.clone(),
             alpaca: alpaca.clone(),

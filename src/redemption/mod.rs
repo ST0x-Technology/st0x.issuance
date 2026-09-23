@@ -4842,6 +4842,105 @@ mod tests {
         );
     }
 
+    fn record_invalid_response_command(
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> RedemptionCommand {
+        RedemptionCommand::RecordAlpacaInvalidResponse {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("alp-tok-bad"),
+            alpaca_quantity: Quantity::new(Decimal::from(100)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
+            error: "invalid response".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_alpaca_invalid_response_records_call_then_fails() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(vec![
+                detected_event(&issuer_request_id),
+                RedemptionEvent::AlpacaCallClaimed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    claimed_at: Utc::now(),
+                },
+            ])
+            .when(record_invalid_response_command(&issuer_request_id))
+            .await
+            .events();
+
+        let [
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: called_id,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            },
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id: failed_id,
+                reason,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!(
+                "Expected AlpacaCalled then RedemptionFailed, got {events:?}"
+            );
+        };
+        assert_eq!(called_id, &issuer_request_id);
+        assert_eq!(tokenization_request_id.0, "alp-tok-bad");
+        assert_eq!(alpaca_quantity, &Quantity::new(Decimal::from(100)));
+        assert_eq!(dust_quantity, &Quantity::new(Decimal::ZERO));
+        assert_eq!(failed_id, &issuer_request_id);
+        assert_eq!(reason, "invalid response");
+    }
+
+    #[tokio::test]
+    async fn record_alpaca_invalid_response_requires_claimed_call() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let alpaca_called = RedemptionEvent::AlpacaCalled {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("alp-tok-1"),
+            alpaca_quantity: Quantity::new(Decimal::from(100)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
+            called_at: Utc::now(),
+        };
+
+        for (given, found) in [
+            (vec![detected_event(&issuer_request_id)], "Detected"),
+            (
+                vec![
+                    detected_event(&issuer_request_id),
+                    RedemptionEvent::AlpacaCallClaimed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        claimed_at: Utc::now(),
+                    },
+                    alpaca_called.clone(),
+                ],
+                "AlpacaCalled",
+            ),
+        ] {
+            let error = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(record_invalid_response_command(&issuer_request_id))
+                .await
+                .then_expect_error();
+
+            let LifecycleError::Apply(error) = error else {
+                panic!("Expected Apply error, got {error:?}");
+            };
+            assert_eq!(
+                error,
+                RedemptionError::InvalidState {
+                    expected: "AlpacaCallClaimed".to_string(),
+                    found: found.to_string(),
+                }
+            );
+        }
+    }
+
     fn detected_event(
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> RedemptionEvent {

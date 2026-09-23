@@ -3,6 +3,7 @@ use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
+use st0x_finance::HasZero;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -13,12 +14,11 @@ use super::{
     IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionState,
     RedemptionView, RedemptionViewError, find_detected, find_held,
 };
-use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{
     AlpacaBoundaryError, AlpacaError, AlpacaService, RedeemRequestInput,
-    issuance_issuer_request_id, issuance_quantity,
+    RedeemResponse, issuance_issuer_request_id, issuance_quantity,
     issuance_tokenization_request_id, issuance_underlying_symbol,
     redeem_request,
 };
@@ -31,6 +31,7 @@ use crate::underlying::{
     PersistedUnderlyingOutcomeError, load_committed_freeze_status,
     with_freeze_admission,
 };
+use crate::{Quantity, QuantityConversionError};
 
 /// Interval between held-redemption drain passes.
 ///
@@ -638,25 +639,11 @@ impl RedeemCallManager {
                         &dust_quantity,
                     )
                     .await?;
-                info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
-                    tokenization_request_id = %response.tokenization_request_id.0,
-                    r#type = ?response.r#type,
-                    status = ?response.status,
-                    created_at = %response.created_at,
-                    issuer = %response.issuer,
-                    underlying = %response.underlying.0.as_str(),
-                    token = %response.token.0,
-                    quantity = %response.quantity.0,
-                    network = %response.network,
-                    wallet = %response.wallet,
-                    tx_hash = %response.tx_hash,
-                    fees = ?response.fees.as_ref().map(|fees| fees.0),
-                    quantity_matches_request = response_quantity == alpaca_quantity,
-                    wallet_matches_request = response.wallet == metadata.wallet,
-                    fees_nonzero = response.fees.as_ref().is_some_and(|fees| {
-                        !fees.0.is_zero()
-                    }),
-                    "Alpaca redeem API call succeeded"
+                log_redeem_success(
+                    &response,
+                    &response_quantity,
+                    &alpaca_quantity,
+                    metadata.wallet,
                 );
 
                 self.store
@@ -717,10 +704,10 @@ impl RedeemCallManager {
     async fn validate_redeem_response(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-        response: &st0x_alpaca::issuer::RedeemResponse,
-        alpaca_quantity: &crate::Quantity,
-        dust_quantity: &crate::Quantity,
-    ) -> Result<crate::Quantity, RedeemCallManagerError> {
+        response: &RedeemResponse,
+        alpaca_quantity: &Quantity,
+        dust_quantity: &Quantity,
+    ) -> Result<Quantity, RedeemCallManagerError> {
         let converted = (|| -> Result<_, AlpacaBoundaryError> {
             let response_issuer_id =
                 issuance_issuer_request_id(&response.issuer_request_id)?;
@@ -832,6 +819,40 @@ enum DetectedRecoveryClassification {
     Failed(RedeemCallManagerError),
 }
 
+/// Logs an accepted redeem call with every response field and how it compares
+/// to the request.
+fn log_redeem_success(
+    response: &RedeemResponse,
+    response_quantity: &Quantity,
+    alpaca_quantity: &Quantity,
+    requested_wallet: Address,
+) {
+    let fees_nonzero = response
+        .fees
+        .as_ref()
+        .map(|fees| fees.0.is_zero().map(|is_zero| !is_zero))
+        .transpose();
+    info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
+        tokenization_request_id = %response.tokenization_request_id.0,
+        r#type = ?response.r#type,
+        status = ?response.status,
+        created_at = %response.created_at,
+        issuer = %response.issuer,
+        underlying = %response.underlying.0.as_str(),
+        token = %response.token.0,
+        quantity = %response.quantity.0,
+        network = %response.network,
+        wallet = %response.wallet,
+        tx_hash = %response.tx_hash,
+        fees = ?response.fees.as_ref().map(|fees| fees.0),
+        quantity_matches_request = response_quantity == alpaca_quantity,
+        wallet_matches_request = response.wallet == requested_wallet,
+        fees_nonzero = matches!(fees_nonzero, Ok(Some(true))),
+        fees_zero_check_error = ?fees_nonzero.as_ref().err(),
+        "Alpaca redeem API call succeeded"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
@@ -840,7 +861,11 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
-    use st0x_finance::FractionalShares;
+    use st0x_alpaca::issuer::itn::{
+        REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string,
+    };
+    use st0x_alpaca::issuer::mock::MockIssuerApi;
+    use st0x_finance::{FractionalShares, HasZero, Usd};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{Barrier, watch};
@@ -854,10 +879,6 @@ mod tests {
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
-    use crate::alpaca::itn::{
-        REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string,
-    };
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::alpaca::{
         AlpacaError, AlpacaService, Fees, RedeemRequest, RedeemRequestStatus,
         RedeemResponse, TokenizationRequest, TokenizationRequestType,
@@ -1128,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_redemption_detected_with_success() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -1226,7 +1247,7 @@ mod tests {
                     network: request.network,
                     wallet: request.wallet,
                     tx_hash: request.tx_hash,
-                    fees: Some(Fees(Decimal::ZERO)),
+                    fees: Some(Fees(Usd::ZERO)),
                 })
             }
 
@@ -1308,7 +1329,7 @@ mod tests {
     async fn test_handle_redemption_detected_with_alpaca_failure() {
         let harness = TestHarness::new().await;
         let alpaca_service_mock =
-            Arc::new(MockAlpacaService::new_failure("API timeout"));
+            Arc::new(MockIssuerApi::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -1376,9 +1397,12 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn domain_invalid_redeem_responses_are_terminal_failures() {
+        const MISMATCHED_ISSUER_REQUEST_ID: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
         #[derive(Clone, Copy)]
         enum InvalidResponse {
             IssuerId,
+            MismatchedIssuerId,
             Quantity,
         }
 
@@ -1403,10 +1427,18 @@ mod tests {
                             "not-a-hash".into(),
                         )
                     }
+                    InvalidResponse::MismatchedIssuerId => {
+                        st0x_alpaca::issuer::IssuerRequestId(
+                            MISMATCHED_ISSUER_REQUEST_ID.to_string(),
+                        )
+                    }
                     InvalidResponse::Quantity => request.issuer_request_id,
                 };
                 let quantity = match self.0 {
-                    InvalidResponse::IssuerId => request.quantity.shares(),
+                    InvalidResponse::IssuerId
+                    | InvalidResponse::MismatchedIssuerId => {
+                        request.quantity.shares()
+                    }
                     InvalidResponse::Quantity => st0x_alpaca::issuer::Qty(
                         "10000000000000000000000000000000000000000"
                             .parse::<FractionalShares>()
@@ -1439,7 +1471,11 @@ mod tests {
             }
         }
 
-        for invalid in [InvalidResponse::IssuerId, InvalidResponse::Quantity] {
+        for invalid in [
+            InvalidResponse::IssuerId,
+            InvalidResponse::MismatchedIssuerId,
+            InvalidResponse::Quantity,
+        ] {
             let harness = TestHarness::new().await;
             let manager = harness.create_manager(Arc::new(
                 InvalidRedeemResponseService(invalid),
@@ -1486,6 +1522,19 @@ mod tests {
                 panic!("Expected Failed after invalid Alpaca response");
             };
             assert!(reason.contains("tok-invalid"));
+            let rejected_value = match invalid {
+                InvalidResponse::IssuerId => "\"not-a-hash\"",
+                InvalidResponse::MismatchedIssuerId => {
+                    MISMATCHED_ISSUER_REQUEST_ID
+                }
+                InvalidResponse::Quantity => {
+                    "10000000000000000000000000000000000000000"
+                }
+            };
+            assert!(
+                reason.contains(rejected_value),
+                "failure reason must keep the rejected value: {reason}"
+            );
             assert_eq!(
                 alpaca_quantity,
                 Some(Quantity::new(Decimal::from(100)))
@@ -1504,7 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_redemption_detected_holds_frozen_asset() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -1567,7 +1616,7 @@ mod tests {
     #[tokio::test]
     async fn committed_freeze_holds_when_projection_update_fails() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -1631,7 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_holds_frozen_redemption_before_account_lookup() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -1671,7 +1720,7 @@ mod tests {
     #[tokio::test]
     async fn freeze_wins_before_durable_alpaca_call_claim() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let reached = Arc::new(Barrier::new(2));
         let proceed = Arc::new(Barrier::new(2));
         let manager = harness.create_manager_paused_before_claim(
@@ -1738,7 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_resumes_a_durable_claim_ahead_of_a_later_freeze() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -1799,7 +1848,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_claim_is_not_reported_as_recovered() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -1859,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn test_held_redemption_stays_held_then_resumes_after_unfreeze() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let notifier = Arc::new(CapturingLifecycleNotifier::default());
@@ -1969,10 +2018,9 @@ mod tests {
     #[tokio::test]
     async fn held_redemption_resume_failure_is_notified() {
         let harness = TestHarness::new().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_failure(
-            "redeem endpoint unavailable",
-        ))
-            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_service =
+            Arc::new(MockIssuerApi::new_failure("redeem endpoint unavailable"))
+                as Arc<dyn crate::alpaca::AlpacaService>;
         let notifier = Arc::new(CapturingLifecycleNotifier::default());
         let manager = harness
             .create_manager_with_notifier(alpaca_service, notifier.clone());
@@ -2042,7 +2090,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_redemption_detected_with_wrong_state_fails() {
         let (store, pool) = setup_test_store().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(
             alpaca_service,
@@ -2086,7 +2134,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_account_for_recovery_success() {
         let harness = TestHarness::new().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
@@ -2114,7 +2162,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_account_for_recovery_not_found() {
         let (store, pool) = setup_test_store().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(
             alpaca_service,
@@ -2139,7 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_asset_enabled_success() {
         let harness = TestHarness::new().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
@@ -2157,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_asset_enabled_not_found() {
         let (store, pool) = setup_test_store().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(
             alpaca_service,
@@ -2184,7 +2232,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_asset_enabled_wrong_network() {
         let harness = TestHarness::new().await;
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
@@ -2211,7 +2259,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_detected_redemptions_empty() {
         let (store, pool) = setup_test_store().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(
@@ -2234,7 +2282,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_detected_redemptions_with_valid_redemption() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2294,7 +2342,7 @@ mod tests {
     #[tokio::test]
     async fn frozen_redemption_is_counted_as_held_not_recovered() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -2338,7 +2386,7 @@ mod tests {
         // every subsequent sweep.
         let harness = TestHarness::new().await;
         let alpaca_service_mock =
-            Arc::new(MockAlpacaService::new_failure("API timeout"));
+            Arc::new(MockIssuerApi::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2408,7 +2456,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_detected_boundary_failure_counts_auto_failed() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
 
@@ -2476,7 +2524,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_single_detected_missing_account() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2508,7 +2556,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_detected_missing_account_marks_failed() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2556,7 +2604,7 @@ mod tests {
     #[tokio::test]
     async fn held_redemption_reconciler_stops_on_shutdown() {
         let harness = TestHarness::new().await;
-        let alpaca = Arc::new(MockAlpacaService::new_success());
+        let alpaca = Arc::new(MockIssuerApi::new_success());
         let manager = Arc::new(harness.create_manager(alpaca.clone()));
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -2622,7 +2670,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_held_redemptions_resumes_after_unfreeze() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2710,7 +2758,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_held_redemptions_noop_when_none_held() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
@@ -2728,7 +2776,7 @@ mod tests {
     #[tokio::test]
     async fn drain_terminalizes_held_redemption_with_unlinked_account() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let manager = harness.create_manager(alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>);
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
@@ -2779,7 +2827,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_single_detected_missing_asset() {
         let harness = TestHarness::new().await;
-        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);

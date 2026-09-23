@@ -670,11 +670,11 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use event_sorcery::{Store, StoreBuilder, test_store};
     use sqlx::SqlitePool;
+    use st0x_alpaca::issuer::mock::MockIssuerApi;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::{TransferPollError, watch_redemption_flow};
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::config::VaultModeConfig;
     use crate::network_telemetry::NetworkTelemetry;
     use crate::notifications::NoopLifecycleNotifier;
@@ -758,7 +758,7 @@ mod tests {
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
         let (store, receipt_service) = setup_test_store(&pool);
 
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+        let alpaca_service = Arc::new(MockIssuerApi::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let redeem_call_manager = Arc::new(
             crate::redemption::redeem_call_manager::RedeemCallManager::new(

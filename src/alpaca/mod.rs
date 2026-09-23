@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256};
 #[cfg(test)]
 use chrono::{DateTime, Utc};
+use st0x_finance::{DecimalShares, DecimalSharesConversionError};
 
 use crate::Quantity;
 use crate::account::ClientId;
@@ -13,27 +14,26 @@ use crate::tokenized_asset::{
     UnderlyingSymbol as IssuanceUnderlyingSymbol,
 };
 
-pub(crate) mod itn;
-#[cfg(test)]
-pub(crate) mod mock;
 pub(crate) mod service;
 
 pub use service::AlpacaConfig;
 pub(crate) use st0x_alpaca::AlpacaError;
 pub(crate) use st0x_alpaca::core::TokenizationRequestId;
 #[cfg(test)]
-pub(crate) use st0x_alpaca::issuer::{
-    Fees, RedeemResponse, TokenizationRequestType,
-};
+pub(crate) use st0x_alpaca::issuer::{Fees, TokenizationRequestType};
 pub(crate) use st0x_alpaca::issuer::{
     IssuerApi as AlpacaService, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, TokenizationRequest,
+    RedeemRequestStatus, RedeemResponse, TokenizationRequest,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaBoundaryError {
-    #[error("Invalid Alpaca issuer request id: {0}")]
-    IssuerRequestId(#[from] IssuerRedemptionRequestIdParseError),
+    #[error("Invalid Alpaca issuer request id {value:?}: {source}")]
+    IssuerRequestId {
+        value: String,
+        #[source]
+        source: IssuerRedemptionRequestIdParseError,
+    },
     #[error(
         "Alpaca redeem response issuer request id {returned} does not match {requested}"
     )]
@@ -45,16 +45,19 @@ pub(crate) enum AlpacaBoundaryError {
     Symbol(#[from] st0x_finance::EmptySymbolError),
     #[error("Invalid Alpaca quantity: {0}")]
     Quantity(#[from] st0x_finance::FloatError),
-    #[error("Invalid issuance quantity: {0}")]
-    IssuanceQuantity(#[from] rust_decimal::Error),
-    #[error("Invalid issuance underlying symbol: {0}")]
-    IssuanceUnderlying(#[from] st0x_issuance_dto::UnderlyingSymbolError),
     #[error(
-        "Unsupported Alpaca tokenization network {network}; see {reference}"
+        "Alpaca quantity {value} is not a valid issuance quantity: {source}"
     )]
-    UnsupportedTokenizationNetwork {
-        network: IssuanceNetwork,
-        reference: &'static str,
+    IssuanceQuantity {
+        value: String,
+        #[source]
+        source: DecimalSharesConversionError,
+    },
+    #[error("Invalid Alpaca underlying symbol {value:?}: {source}")]
+    IssuanceUnderlying {
+        value: String,
+        #[source]
+        source: st0x_issuance_dto::UnderlyingSymbolError,
     },
 }
 
@@ -91,12 +94,6 @@ pub(crate) fn mint_callback_request(
 pub(crate) fn redeem_request(
     input: RedeemRequestInput<'_>,
 ) -> Result<RedeemRequest, AlpacaBoundaryError> {
-    if !itn::accepts_network_wire_string(input.network.as_str()) {
-        return Err(AlpacaBoundaryError::UnsupportedTokenizationNetwork {
-            network: input.network,
-            reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
-        });
-    }
     Ok(RedeemRequest {
         issuer_request_id: st0x_alpaca::issuer::IssuerRequestId(
             input.issuer_request_id.to_string(),
@@ -126,13 +123,23 @@ pub(crate) fn issuance_tokenization_request_id(
 pub(crate) fn issuance_issuer_request_id(
     value: &st0x_alpaca::issuer::IssuerRequestId,
 ) -> Result<IssuerRedemptionRequestId, AlpacaBoundaryError> {
-    Ok(value.0.parse()?)
+    let st0x_alpaca::issuer::IssuerRequestId(wire) = value;
+    wire.parse().map_err(|source| AlpacaBoundaryError::IssuerRequestId {
+        value: wire.clone(),
+        source,
+    })
 }
 
 pub(crate) fn issuance_underlying_symbol(
     value: &st0x_alpaca::issuer::UnderlyingSymbol,
 ) -> Result<IssuanceUnderlyingSymbol, AlpacaBoundaryError> {
-    Ok(IssuanceUnderlyingSymbol::new(value.0.as_str())?)
+    let wire = value.0.as_str();
+    IssuanceUnderlyingSymbol::new(wire).map_err(|source| {
+        AlpacaBoundaryError::IssuanceUnderlying {
+            value: wire.to_string(),
+            source,
+        }
+    })
 }
 
 pub(crate) fn issuance_token_symbol(
@@ -144,17 +151,43 @@ pub(crate) fn issuance_token_symbol(
 pub(crate) fn issuance_quantity(
     value: &st0x_alpaca::issuer::Qty,
 ) -> Result<Quantity, AlpacaBoundaryError> {
-    Ok(Quantity::new(parse_issuance_decimal(&value.0.to_string())?))
+    let st0x_alpaca::issuer::Qty(shares) = value;
+    let decimal =
+        DecimalShares::from_fractional_shares(*shares).map_err(|source| {
+            AlpacaBoundaryError::IssuanceQuantity {
+                value: shares.to_string(),
+                source,
+            }
+        })?;
+    Ok(Quantity::new(decimal.inner()))
 }
 
-fn parse_issuance_decimal(
-    value: &str,
-) -> Result<rust_decimal::Decimal, rust_decimal::Error> {
-    if value.contains('e') || value.contains('E') {
-        rust_decimal::Decimal::from_scientific(value)
-    } else {
-        value.parse()
-    }
+/// Issuance-domain values of the identifying fields in a redeem request that
+/// Alpaca returned.
+pub(crate) struct IssuanceRedeemFields {
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    pub(crate) underlying: IssuanceUnderlyingSymbol,
+    pub(crate) token: IssuanceTokenSymbol,
+    pub(crate) quantity: Quantity,
+    pub(crate) network: IssuanceNetwork,
+}
+
+/// Converts the identifying fields of an Alpaca redeem request to issuance
+/// types, failing on the first field issuance rejects.
+pub(crate) fn issuance_redeem_fields(
+    issuer_request_id: &st0x_alpaca::issuer::IssuerRequestId,
+    underlying: &st0x_alpaca::issuer::UnderlyingSymbol,
+    token: &st0x_alpaca::issuer::TokenSymbol,
+    quantity: &st0x_alpaca::issuer::Qty,
+    network: st0x_alpaca::core::Network,
+) -> Result<IssuanceRedeemFields, AlpacaBoundaryError> {
+    Ok(IssuanceRedeemFields {
+        issuer_request_id: issuance_issuer_request_id(issuer_request_id)?,
+        underlying: issuance_underlying_symbol(underlying)?,
+        token: issuance_token_symbol(token),
+        quantity: issuance_quantity(quantity)?,
+        network: issuance_network(network),
+    })
 }
 
 pub(crate) const fn issuance_network(
@@ -250,19 +283,40 @@ mod tests {
     use alloy::primitives::{Address, B256};
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use st0x_alpaca::issuer::itn::{
+        REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string,
+    };
     use tracing_test::traced_test;
 
     use super::{
         AlpacaBoundaryError, RedeemRequestInput, TokenizationRequestId,
         issuance_issuer_request_id, issuance_quantity, issuance_token_symbol,
         issuance_tokenization_request_id, issuance_underlying_symbol,
-        parse_issuance_decimal, redeem_request,
+        redeem_request,
     };
     use crate::Quantity;
     use crate::account::ClientId;
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+
+    #[test]
+    fn issued_network_wire_strings_are_alpaca_itn_values() {
+        for network in [
+            Network::Base,
+            Network::Ethereum,
+            Network::HyperEvm,
+            Network::Robinhood,
+            Network::BnbSmartChain,
+        ] {
+            let wire = network.as_str();
+            assert!(
+                accepts_network_wire_string(wire),
+                "issued network {wire} must be on the Alpaca ITN \
+                 TokenizationNetwork list ({REDEEM_CALLBACK_OPENAPI_REFERENCE})"
+            );
+        }
+    }
 
     #[test]
     fn redeem_request_preserves_issuance_boundary_values_for_every_network() {
@@ -350,13 +404,27 @@ mod tests {
             &st0x_alpaca::issuer::IssuerRequestId("not-an-id".to_string()),
         );
 
-        assert!(matches!(result, Err(AlpacaBoundaryError::IssuerRequestId(_))));
+        let Err(AlpacaBoundaryError::IssuerRequestId { value, .. }) = result
+        else {
+            panic!("Expected IssuerRequestId error, got {result:?}");
+        };
+        assert_eq!(value, "not-an-id");
     }
 
     #[test]
-    fn scientific_response_quantity_parses_when_in_decimal_range() {
-        assert_eq!(parse_issuance_decimal("1e-9").unwrap(), dec!(0.000000001));
-        assert!(parse_issuance_decimal("1e-77").is_err());
+    fn shared_underlying_rejects_empty_wire_before_domain_conversion() {
+        let invalid = serde_json::from_str::<
+            st0x_alpaca::issuer::UnderlyingSymbol,
+        >("\"   \"");
+        assert!(invalid.is_err());
+
+        let shared =
+            st0x_alpaca::issuer::UnderlyingSymbol::new(" AAPL ").unwrap();
+        assert_eq!(shared.0.as_str(), "AAPL");
+        assert_eq!(
+            issuance_underlying_symbol(&shared).unwrap(),
+            UnderlyingSymbol::new("AAPL").unwrap()
+        );
     }
 
     #[traced_test]

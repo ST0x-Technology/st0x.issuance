@@ -85,10 +85,10 @@ rustls = { version = "0.23.40", default-features = false, features = [
   "aws_lc_rs",
   "std",
 ] }
-st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "8e4df10ba37715532485dfef936cbf693e788a2b", version = "0.1.0", default-features = false, features = [
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false, features = [
   "issuer",
 ] }
-st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.2.0", version = "0.2.0", default-features = false }
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.3.0", version = "0.3.0", default-features = false }
 
 [dev-dependencies]
 alloy-node-bindings = "1.8.3"
@@ -104,6 +104,10 @@ p256 = { version = "0.13", default-features = false, features = [
 ] }
 proptest = "1.10.0"
 rust_decimal_macros = "1.40.0"
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false, features = [
+  "issuer",
+  "test-support",
+] }
 st0x-issuance-client = { path = "crates/client" }
 tempfile = "3.23.0"
 tokio = { workspace = true, features = ["macros", "test-util"] }

@@ -14,10 +14,9 @@ use super::{
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber};
 use crate::alpaca::{
-    AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
-    alpaca_tokenization_request_id, issuance_issuer_request_id,
-    issuance_network, issuance_quantity, issuance_token_symbol,
-    issuance_underlying_symbol,
+    AlpacaBoundaryError, AlpacaError, AlpacaService, IssuanceRedeemFields,
+    RedeemRequestStatus, TokenizationRequest, alpaca_tokenization_request_id,
+    issuance_redeem_fields,
 };
 use crate::mint::TokenizationRequestId;
 
@@ -240,20 +239,26 @@ impl JournalManager {
                 }
             })?;
 
-        let boundary_error = |error: crate::alpaca::AlpacaBoundaryError| {
-            JournalManagerError::ValidationFailed {
+        let boundary_error = |source: AlpacaBoundaryError| {
+            JournalManagerError::InvalidPollResponse {
                 issuer_request_id: issuer_request_id.clone(),
-                reason: error.to_string(),
+                source: Box::new(source),
             }
         };
-        let req_issuer_id = issuance_issuer_request_id(req_issuer_id)
-            .map_err(boundary_error)?;
-        let req_underlying = issuance_underlying_symbol(req_underlying)
-            .map_err(boundary_error)?;
-        let req_token = issuance_token_symbol(req_token);
-        let req_quantity =
-            issuance_quantity(req_quantity).map_err(boundary_error)?;
-        let req_network = issuance_network(*req_network);
+        let IssuanceRedeemFields {
+            issuer_request_id: req_issuer_id,
+            underlying: req_underlying,
+            token: req_token,
+            quantity: req_quantity,
+            network: req_network,
+        } = issuance_redeem_fields(
+            req_issuer_id,
+            req_underlying,
+            req_token,
+            req_quantity,
+            *req_network,
+        )
+        .map_err(boundary_error)?;
 
         Self::check_field_match(
             issuer_request_id,
@@ -406,6 +411,23 @@ impl JournalManager {
                     .await
                 {
                     Ok(status) => status,
+                    Err(
+                        err @ JournalManagerError::InvalidPollResponse {
+                            ..
+                        },
+                    ) => {
+                        // Alpaca's poll body did not convert to issuance types.
+                        // Treat it like an unparseable body: keep polling and
+                        // let the polling timeout terminalize a lasting problem.
+                        warn!(target: "redemption",
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
+                            error = %err,
+                            next_poll_in = ?poll_interval,
+                            "Polling error, will retry"
+                        );
+                        return Ok(true);
+                    }
                     Err(err @ JournalManagerError::StoreLoad { .. }) => {
                         // Transient store error — do not terminalize the redemption.
                         // This polling session exits; the background recovery job
@@ -582,6 +604,14 @@ pub(crate) enum JournalManagerError {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     },
+    #[error(
+        "Invalid Alpaca poll response for redemption {issuer_request_id}: {source}"
+    )]
+    InvalidPollResponse {
+        issuer_request_id: IssuerRedemptionRequestId,
+        #[source]
+        source: Box<AlpacaBoundaryError>,
+    },
     #[error("View error: {0}")]
     View(#[from] super::RedemptionViewError),
     #[error("Account view error: {0}")]
@@ -740,6 +770,9 @@ mod tests {
         ResponseIdMismatch {
             returned_id: String,
         },
+        /// A Pending response whose issuer request id the shared wire type
+        /// accepts but issuance's `IssuerRedemptionRequestId` rejects.
+        UnconvertibleIssuerRequestId,
     }
 
     struct StatefulMockAlpacaService {
@@ -839,6 +872,21 @@ mod tests {
                         status_code: *status_code,
                         body: body.clone(),
                     })
+                }
+                MockResponse::UnconvertibleIssuerRequestId => {
+                    let mut request =
+                        self.create_mock_request(RedeemRequestStatus::Pending);
+                    if let TokenizationRequest::Redeem {
+                        issuer_request_id,
+                        ..
+                    } = &mut request
+                    {
+                        *issuer_request_id =
+                            st0x_alpaca::issuer::IssuerRequestId(
+                                "not-an-issuer-request-id".to_string(),
+                            );
+                    }
+                    Ok(request)
                 }
                 MockResponse::NotFound => Err(AlpacaError::RequestNotFound {
                     id: tokenization_request_id.clone(),
@@ -1184,6 +1232,61 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Expected Ok after retries, got {result:?}");
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn unconvertible_poll_response_keeps_polling_until_completed() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-unconvertible-456");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![
+                MockResponse::UnconvertibleIssuerRequestId,
+                MockResponse::Success(RedeemRequestStatus::Completed),
+            ],
+            issuer_request_id.clone(),
+        ));
+
+        let manager = JournalManager::new(
+            mock.clone() as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mock.call_count(), 2);
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "Expected Burning after the retried poll completed, got {aggregate:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Polling error, will retry",
+                "Invalid Alpaca issuer request id",
+                "not-an-issuer-request-id",
+            ]
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]

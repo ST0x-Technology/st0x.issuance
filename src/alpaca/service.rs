@@ -163,7 +163,7 @@ impl AlpacaConfig {
         &self,
     ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
         let client = st0x_alpaca::AlpacaClient::new(
-            self.api_base_url.clone(),
+            &self.api_base_url,
             self.account_id.clone(),
             self.api_key.clone(),
             self.api_secret.clone(),

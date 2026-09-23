@@ -17,6 +17,7 @@ use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
+use st0x_alpaca::issuer::mock::MockIssuerApi;
 use st0x_issuance_dto::{TokenizedAssetDetailResponse, TokenizedAssetStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +39,6 @@ use crate::account::{
 };
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
-use crate::alpaca::mock::MockAlpacaService;
 use crate::burn_excess::api::BurnExcessExternalRequest;
 use crate::chain::{ChainConfig, ConfiguredNetworks};
 use crate::config::{Config, OpsApiConfig};
@@ -574,7 +574,7 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
         tokenized_asset_store,
         mint_store,
         redemption_store,
-        alpaca_service: Arc::new(MockAlpacaService::new_success()),
+        alpaca_service: Arc::new(MockIssuerApi::new_success()),
         burn_recovery: Arc::new(UnreachableBurnRecovery),
         vault_services,
         configured_networks: ConfiguredNetworks::from_iter([Network::Base]),
@@ -1178,8 +1178,7 @@ async fn recovery_ops_rocket(
         Arc::new(CqrsReceiptService::new(receipt_inventory));
     let burn_recovery: Arc<dyn RedemptionBurnRecovery> =
         Arc::new(UnreachableBurnRecovery);
-    let alpaca: Arc<dyn AlpacaService> =
-        Arc::new(MockAlpacaService::new_success());
+    let alpaca: Arc<dyn AlpacaService> = Arc::new(MockIssuerApi::new_success());
 
     rocket
         .manage(verifiers)
