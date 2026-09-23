@@ -56,6 +56,10 @@ use crate::wallet::{SignerConfig, SignerEnv};
 /// asset is not supported, the operator aborts a mutation, or the command
 /// dispatch fails.
 pub async fn run_issuer_cli() -> anyhow::Result<()> {
+    // Both rustls crypto providers are compiled in (aws-lc-rs via Alloy and reqwest, ring via
+    // apalis-sqlite), so rustls cannot pick a process default. Install one before any TLS client
+    // exists. `Err` only means a provider is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     setup_tracing(&LogLevel::Info, LogFormat::Text);
     IssuerCli::parse().dispatch().await
 }
@@ -1658,10 +1662,13 @@ mod tests {
     use alloy::primitives::{U256, address, b256};
     use alloy::providers::ext::AnvilApi;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::transports::{RpcError, TransportErrorKind};
     use chrono::Utc;
     use cqrs_es::DomainEvent;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
     use tracing_test::traced_test;
 
     use super::*;
@@ -1732,6 +1739,39 @@ mod tests {
                 .expect("Failed to build underlying store");
 
         AssetAdmin { store, pool }
+    }
+
+    /// Both rustls crypto providers are compiled in, and tokio-tungstenite builds its TLS config
+    /// with `ClientConfig::builder()`, which panics without a process default. The binaries
+    /// install one at startup; this pins that Alloy's WS transport also works without it, as in
+    /// tests and library callers. The peer accepting the TCP connection proves the connect reached
+    /// the TLS stage; the peer then closes the socket, so the handshake must fail cleanly.
+    #[tokio::test]
+    async fn wss_rpc_url_connect_fails_at_tls_handshake_instead_of_panicking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let endpoint = format!("wss://{address}");
+        let result = timeout(
+            Duration::from_secs(3),
+            ProviderBuilder::new().connect(endpoint.as_str()),
+        )
+        .await
+        .expect("wss connect attempt timed out");
+
+        timeout(Duration::from_secs(3), peer)
+            .await
+            .expect("connect never reached the TCP listener")
+            .unwrap();
+        let error = result.expect_err("closed peer must fail the connect");
+        assert!(
+            matches!(error, RpcError::Transport(TransportErrorKind::Custom(_))),
+            "expected a transport-level handshake failure, got {error:?}"
+        );
     }
 
     #[traced_test]

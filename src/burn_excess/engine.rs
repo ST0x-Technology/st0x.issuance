@@ -1752,7 +1752,7 @@ mod tests {
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .with_gas_estimation()
-            .filler(BlobGasFiller)
+            .filler(BlobGasFiller::default())
             .filler(NonceFiller::new(nonce_manager.clone()))
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer.clone()))

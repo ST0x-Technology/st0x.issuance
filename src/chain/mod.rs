@@ -310,7 +310,7 @@ async fn build_chain_runtime(
     let signing_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .with_gas_estimation()
-        .filler(BlobGasFiller)
+        .filler(BlobGasFiller::default())
         .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
