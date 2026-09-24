@@ -1111,20 +1111,38 @@ then defers without recording an event — so the mint sits in `Minting`, not
 `JournalConfirmed`, holding real backing and minting nothing until the
 authorization lands.
 
-**There is no alert for this yet.** Today the only signal is `/admin/stuck`, and
-an in-progress mint does not appear there until it is an hour old
-(`STUCK_THRESHOLD`, `src/admin.rs`). An hour of silently-held AP shares is the
-gap; a WARN-then-ERROR alert on the wait is tracked separately and this section
-gets a detection step when it lands. Until then, the trigger is an
-orchestrator-mode `Minting` row for the asset with no `tx_id`, past the
-threshold — check for it deliberately during the pilot rather than waiting to be
-told:
+**Detection.** The mint recovery pass raises the alert itself; do not wait for
+`/admin/stuck`, which does not surface an in-progress mint until it is an hour
+old (`STUCK_THRESHOLD`, `src/admin.rs`) — an hour of silently-held AP shares.
+The pass runs every five minutes and measures each wait from the moment the
+shares were journaled, so the first line appears on the second or third pass
+after that point:
+
+| Level   | Wait      | Meaning                                                    |
+| ------- | --------- | ---------------------------------------------------------- |
+| `WARN`  | 10-30 min | Chase the delivery.                                        |
+| `ERROR` | ≥ 30 min  | Escalate: the shares have been committed for half an hour. |
+
+A mint that passes 30 minutes moves from the `WARN` line to the `ERROR` line, so
+a mint that leaves the `WARN` line is not resolved.
+
+Each level prints at most ONE line per pass, not one per mint, carrying
+`waiting_mints` (how many are in that band) and the OLDEST waiter's
+`oldest_issuer_request_id`, `oldest_tokenization_request_id` and
+`oldest_waited_seconds`. So the count tells you the scale and the ids give you
+somewhere to start; the other waiting mints are not named, and the same line
+repeats every pass while the condition holds. Once they are old enough for
+`/admin/stuck`, the rest are the orchestrator-mode `Minting` rows for the asset
+with no `tx_id`:
 
 ```sh
 curl -fsS -H "X-API-KEY: $INTERNAL_API_KEY" "$ISSUER_BASE_URL/admin/stuck" \
   | jq --arg sym <SYM> \
       '.stuck[] | select(.underlying == $sym and .state == "Minting" and .tx_id == null)'
 ```
+
+Mints waiting BEFORE their journal confirms are deliberately not alerted: Alpaca
+has committed nothing at that point, so there is no exposure.
 
 Escalation:
 
@@ -1136,15 +1154,56 @@ Escalation:
    `Orchestrator mint is awaiting its recipient authorization;
    deferring submission`
    for that `issuer_request_id`, repeated on every recovery pass, is this case.
-   It repeats about once a minute until recovery gives up after about 6 hours
-   (the ERROR "Scheduled mint recovery abandoned the mint while still
-   incomplete"), so for an older wait, search the log back to when the mint
-   started.
-2. Have the liquidity bot redeliver to
+   That WARN repeats only while the mint's recovery job is live. The job gives
+   up after `MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS` polls with no progress
+   (360 polls at one minute each, so about 6 hours), logs the ERROR
+   "Scheduled mint recovery abandoned the mint while still incomplete", and
+   is marked `Killed`.
+   After that, the reconcile pass does not start a new job for the mint, so the
+   per-mint WARN stops, while the summary `ERROR` above keeps firing. The WARN
+   comes back when something drives the mint again: a restart (the startup
+   re-scan), or `POST /admin/reprocess/mint/<issuer_request_id>`, which accepts
+   a `Minting` mint and replaces its `Killed` recovery job. So for a long wait,
+   such as one overnight, do not expect a recent WARN: search the log back to
+   when the mint started.
+
+   The alert names only the oldest waiter. With `waiting_mints` above one, find
+   the others by the age of their wait. For the first hour, `/admin/stuck` does
+   not list them (see Detection), so use the per-mint WARN lines. After one
+   hour, use the `/admin/stuck` filter above. After about 6 hours, that filter
+   is the only source, because the WARN lines stop when the jobs are `Killed`.
+2. Check the liquidity bot's side before anything else: is its delivery job
+   running, and does its deployed config carry the `[orchestrator]` section with
+   THIS chain's address? A missing or stale address means it is signing
+   `MintAuth`s for the wrong contract, and no amount of redelivery fixes that
+   (step 7's cutover pre-checks verify both).
+
+   Then have it redeliver to
    `POST /internal/mints/<tokenization_request_id>/authorization`. Redelivery is
    the designed repair vector: an identical redelivery is idempotent and
    re-drives mint recovery, which covers the case where the first delivery
-   recorded but its wake was lost.
+   recorded but its wake was lost. If the first delivery was recorded, the
+   redelivery must be byte-identical: a different nonce is then a conflicting
+   authorization (step 3).
+
+   This route carries the same JSON data guard as the close below, so a bodyless
+   POST answers `404` rather than anything descriptive:
+
+   ```sh
+   curl --fail-with-body -sS -X POST \
+     -H "X-API-KEY: $INTERNAL_API_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"nonce":"0x…","signature":"0x…"}' \
+     "$ISSUER_BASE_URL/internal/mints/<tokenization_request_id>/authorization"
+   ```
+
+   `--fail-with-body`, not `-f`: every refusal comes back as a JSON body that
+   names its cause (for example a conflicting authorization), and step 3 needs
+   that cause.
+
+   An empty `"0x"` signature is valid for a contract recipient authorized
+   through the orchestrator's `authorizeMint` callback; it is not a way to skip
+   the signature for an EOA, which is refused.
 3. If redelivery does not work, read the delivery's response. It tells you which
    case you have, and the two cases need different actions.
 
