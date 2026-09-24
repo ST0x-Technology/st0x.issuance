@@ -2392,11 +2392,14 @@ shares with us; `issuer_request_id` is minted here and never leaves the Alpaca
 channel. Responses: `200` authorization validated and recorded (idempotent —
 redelivering the identical authorization is a no-op `200`); `404` no mint exists
 for the tokenization request; `409` a conflicting authorization is already
-recorded, or the mint has advanced past intent (its signed transaction already
-binds a nonce); `422` the mint is vault-direct, the signer does not recover to
-the recipient (or a contract recipient rejects the signature via ERC-1271
-`isValidSignature`), or the nonce is already consumed on-chain; `502` the
-on-chain validation read failed (retryable).
+recorded, another mint of this recipient already holds the nonce (see "One mint
+per pair" below — this includes a completed mint, whose nonce is refused here
+before the chain is read rather than as the `422` below), or the mint has
+advanced past intent (its signed transaction already binds a nonce); `422` the
+mint is vault-direct, the signer does not recover to the recipient (or a
+contract recipient rejects the signature via ERC-1271 `isValidSignature`), or
+the nonce is already consumed on-chain by a mint this issuer does not hold;
+`502` the on-chain validation read failed (retryable).
 
 The authorization is persisted by its own command and event — `AuthorizeMint` ->
 `MintAuthorizationReceived` (see "Mint Aggregate" above) — never on `Initiated`.
@@ -2479,6 +2482,40 @@ transaction was in fact _this_ mint (never bare `MintingFailed` either way — s
 that earlier mint (`tx_hash`, `shares_minted`, `block_number`) still requires
 querying the orchestrator's `Minted` event log filtered by `(to, nonce)` —
 simpler than today's `ReceiptService` mirror, but not lookup-free.
+
+**One mint per pair.** The orchestrator keys `nonceUsed` on `(recipient, nonce)`
+across all tokens. Two mints that hold one pair are therefore unsafe. The pair
+produces at most one landing, and the full-match rule below lets both mints
+claim it — one AP receives tokens once for shares journaled twice. The internal
+mint-authorization call refuses an authorization whose pair another mint already
+holds — open, completed, or closed without releasing it — and answers
+`409 Conflict`. It checks before the on-chain reads, to refuse a duplicate
+cheaply, and again before each attempt to record the authorization, to catch a
+pair claimed while those reads were in flight. That second check and the record
+that follows it run under one process-wide admission lock, so two deliveries for
+two mints cannot both read "no holder" and both record. The on-chain `nonceUsed`
+read cannot do this work, because neither mint has landed yet and the pair
+therefore still reads free. A mint holds its pair for its whole lifecycle,
+because a nonce its transaction consumed stays consumed. Two cases release it,
+on different grounds. A rejected journal releases because nothing was ever
+submitted, so the nonce is provably unconsumed. A `CloseMint` that supplied
+`acknowledged_unresolved_mint_nonce` releases on the operator's recorded claim
+that the nonce's absence was verified against a chain view outside this bot — an
+attestation, not a proof: that acknowledgement is accepted only from
+`MintingFailed` with `NonceReplayUnresolved`, a mint that did submit, and it is
+the one path that hands a pair on after a submission.
+
+An ordinary close does NOT release it. `CloseMint` otherwise demands only that
+the operator echo the persisted transaction hash, which acknowledges an
+unresolved transaction rather than a dead one — so a closed mint keeps its pair
+in `Closed.unreleased_nonce`. Releasing on every close would let an operator
+close a stuck submitted mint, hand the pair to a successor, and have the
+acknowledged transaction land afterwards: the successor's `Minted`-log
+full-match would complete it, paying one AP's tokens for two journaled
+positions.
+
+The liquidity bot redelivers the same authorization to the same mint unchanged,
+so redelivery stays accepted.
 
 **Full-match requirement.** The nonce-uniqueness view is keyed only on
 `(to, nonce)`, but the EIP-712 signature — and this mint's own intent — binds
