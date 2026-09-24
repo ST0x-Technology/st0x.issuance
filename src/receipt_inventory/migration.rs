@@ -4239,6 +4239,108 @@ mod tests {
             );
         }
 
+        /// A rollback refuses a mirror an on-chain drain left stale, and
+        /// verifies once a reading is applied.
+        ///
+        /// Both halves are asserted here: the refusal the stale mirror
+        /// produces, then the confirmation the reconciled one allows.
+        /// Confirmation demands tracked and on-chain balances agree exactly,
+        /// which is why a burn that inventory never followed blocks the
+        /// rollback.
+        ///
+        /// Scope, so the coverage is not overstated: this drains the receipt
+        /// with a direct `withdraw` and applies the reading by sending
+        /// `ReconcileBalance` against the BOT WALLET, which is also the holder
+        /// on record here. It pins the migration side of the contract only. It
+        /// does not run `BurnManager`, an orchestrator burn, or a reading taken
+        /// against the orchestrator — `burn_manager`'s
+        /// `orchestrator_burn_reconciles_inventory_from_the_chain` covers that
+        /// path.
+        #[tokio::test]
+        async fn a_burn_reconciled_into_the_mirror_still_confirms() {
+            let evm = LocalEvm::with_chain_id(Network::Base.chain_id())
+                .await
+                .unwrap();
+            let pool = pool_with_migrations().await;
+            let (provider, receipt_id, shares) =
+                seeded_vault(&evm, &pool).await;
+            let underlying: UnderlyingSymbol = "TSLA".parse().unwrap();
+            seed_listing(&pool, evm.vault_address, &underlying).await;
+
+            // Drain part of the receipt on-chain, as an orchestrator's burn
+            // walk does, leaving the mirror untouched at its pre-burn value.
+            evm.grant_withdraw_role(evm.wallet_address).await.unwrap();
+            let burned = shares / U256::from(5);
+            evm.withdraw_directly(receipt_id, burned, evm.wallet_address)
+                .await
+                .unwrap();
+            let remaining = shares - burned;
+
+            let identity = || {
+                VaultIdentity::from_observations(
+                    Network::Base,
+                    Network::Base.chain_id(),
+                    Network::Base.chain_id(),
+                    evm.vault_address,
+                    evm.vault_address,
+                    &underlying,
+                )
+                .unwrap()
+            };
+
+            let stale = confirm_custody_holder_for_identity(
+                &pool,
+                provider.clone(),
+                identity(),
+                evm.wallet_address,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    stale.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::HolderMismatch(_))
+                ),
+                "a mirror left stale by the burn must refuse the rollback, \
+                 got: {stale}"
+            );
+
+            // What the confirm path now does for an orchestrator burn: apply
+            // the balance the chain actually holds.
+            let store = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            send_receipt_inventory_command(
+                &store,
+                Network::Base.chain_id(),
+                &evm.vault_address,
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: ReceiptId::from(receipt_id),
+                    on_chain_balance: Shares::from(remaining),
+                    observed_wallet: evm.wallet_address,
+                },
+            )
+            .await
+            .unwrap();
+
+            let receipts = confirm_custody_holder(
+                &pool,
+                provider,
+                identity(),
+                evm.wallet_address,
+            )
+            .await
+            .expect("a reconciled mirror must confirm the rollback");
+
+            assert_eq!(receipts, 1);
+            assert_eq!(
+                recorded_holder(&pool, evm.vault_address).await,
+                Some(evm.wallet_address),
+                "the rollback's holder must be on record"
+            );
+        }
+
         /// A wallet that does not hold the tracked receipts is refused and
         /// nothing is recorded — a mistyped or wrong-workspace wallet cannot
         /// become the trusted custody holder.

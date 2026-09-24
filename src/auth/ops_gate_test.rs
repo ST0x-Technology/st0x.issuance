@@ -66,7 +66,7 @@ use crate::tokenized_asset::{
     UnderlyingSymbol,
 };
 use crate::underlying::Underlying;
-use crate::vault::{BurnVerification, NetworkVaultServices};
+use crate::vault::{BurnRange, BurnVerification, NetworkVaultServices};
 use crate::wallet::SignerConfig;
 
 const TEST_KID: &str = "test-key";
@@ -1144,6 +1144,17 @@ impl RedemptionBurnRecovery for UnreachableBurnRecovery {
         _: String,
         _: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError> {
+        unreachable!("the IAP gate refuses before the handler runs")
+    }
+
+    async fn reconcile_recorded_orchestrator_burn(
+        &self,
+        _: &IssuerRedemptionRequestId,
+        _: &UnderlyingSymbol,
+        _: Network,
+        _: Address,
+        _: BurnRange,
+    ) {
         unreachable!("the IAP gate refuses before the handler runs")
     }
 }

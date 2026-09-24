@@ -33,11 +33,13 @@ use super::{
 };
 use crate::bindings::IST0xOrchestratorV1::IST0xOrchestratorV1Errors;
 use crate::bindings::{
-    IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault,
+    IERC1271, IST0xOrchestratorV1, OffchainAssetReceiptVault, Receipt,
 };
 use crate::redemption::BurnExternalTxId;
 use crate::vault::orchestrator::BurnProofKind;
-use crate::vault::{OrchestratorMintResult, OrchestratorMintedLog};
+use crate::vault::{
+    OrchestratorMintDeposit, OrchestratorMintResult, OrchestratorMintedLog,
+};
 
 /// Alloy provider configured with transaction filling middleware for blockchain interactions.
 pub type RealBlockchainServiceProvider = FillProvider<
@@ -1710,6 +1712,31 @@ impl VaultService for RealBlockchainService {
         Ok(contract.nextBurnReceiptId(token).call().await?)
     }
 
+    async fn receipt_balances(
+        &self,
+        vault: Address,
+        holder: Address,
+        receipt_ids: &[U256],
+    ) -> Result<Vec<U256>, VaultError> {
+        // The receipt contract is read from the vault rather than configured,
+        // so a balance can never be read from a contract belonging to a
+        // different vault than the one being reconciled.
+        let receipt_contract =
+            OffchainAssetReceiptVault::new(vault, &self.provider)
+                .receipt()
+                .call()
+                .await?;
+        let receipts = Receipt::new(receipt_contract, &self.provider);
+
+        let mut balances = Vec::with_capacity(receipt_ids.len());
+        for receipt_id in receipt_ids {
+            balances
+                .push(receipts.balanceOf(holder, *receipt_id).call().await?);
+        }
+
+        Ok(balances)
+    }
+
     async fn prepare_orchestrator_mint_tx(
         &self,
         params: &OrchestratorMintParams,
@@ -1811,10 +1838,50 @@ impl VaultService for RealBlockchainService {
             .ok_or(VaultError::EventNotFound { tx_hash })?;
         let minted = minted.data();
 
+        // The orchestrator mints by depositing into the vault, so the same
+        // transaction carries the `Deposit` that created the receipt it now
+        // custodies. Decoded here because this receipt is the only place it
+        // appears — inventory has no other way to learn of a receipt minted
+        // after custody moved.
+        // Bound to the vault AND to the orchestrator that owns the receipt,
+        // for the same reason the `Minted` decode above is bound to the
+        // orchestrator: the mint calls into the recipient contract before
+        // completing (ERC-1271 today, `authorizeMint` on the bridge path).
+        // The vault binding alone refuses a `Deposit` the recipient forged
+        // from its own address, but not one the recipient deposited into this
+        // same vault on its own behalf — that log carries the vault's address
+        // and runs before the mint completes, so it sits earlier in the
+        // receipt and would win the scan. `owner` is the wallet the receipt
+        // was minted to (the field `ReceiptBackfiller` narrows on at
+        // `backfill.rs`), and an orchestrator mint's receipt is owned by the
+        // orchestrator, so the pair pins the log to THIS mint. A mis-bound
+        // decode is not self-correcting — it becomes a tracked receipt whose
+        // `balanceOf` reads zero, which then blocks `confirm-custody` on a
+        // `HolderMismatch`. The vault-direct `confirm_mint` decodes unbound,
+        // but that path has no recipient callback in the transaction.
+        let vault = minted.token;
+        let deposit = receipt.inner.logs().iter().find_map(|log| {
+            if log.address() != vault {
+                return None;
+            }
+            let decoded =
+                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok()?;
+            let event = decoded.data();
+            if event.owner != orchestrator {
+                return None;
+            }
+            Some(OrchestratorMintDeposit {
+                receipt_id: event.id,
+                shares: event.shares,
+                receipt_info_bytes: event.receiptInformation.clone(),
+            })
+        });
+
         Ok(OrchestratorMintResult {
             tx_hash,
             nonce: minted.nonce,
             shares_minted: minted.amount,
+            deposit,
             gas_used: receipt.gas_used,
             block_number,
         })
@@ -5704,6 +5771,202 @@ mod tests {
                 Bloom::default(),
             )),
         }
+    }
+
+    /// A `Minted` receipt carrying one `Deposit`, emitted by `deposit_emitter`
+    /// and owned by `deposit_owner`.
+    ///
+    /// The `Deposit` is placed BEFORE the `Minted` log on purpose: the mint
+    /// calls into the recipient before completing, so a deposit the recipient
+    /// made on its own behalf really does sit earlier in the receipt and would
+    /// win an under-bound scan.
+    fn create_minted_receipt_with_deposit(
+        tx_hash: B256,
+        deposit_emitter: Address,
+        deposit_owner: Address,
+        receipt_id: U256,
+        shares: U256,
+    ) -> TransactionReceipt {
+        let mut receipt = create_minted_receipt(
+            tx_hash,
+            test_receiver(),
+            shares,
+            B256::repeat_byte(0x07),
+            true,
+        );
+
+        let deposit_event = OffchainAssetReceiptVault::Deposit {
+            sender: test_orchestrator_address(),
+            owner: deposit_owner,
+            assets: shares,
+            shares,
+            id: receipt_id,
+            receiptInformation: Bytes::new(),
+        };
+        let deposit_log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: deposit_emitter,
+                data: deposit_event.into_log_data(),
+            },
+            block_hash: Some(b256!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            )),
+            block_number: Some(0x9c4),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let mut logs = vec![deposit_log];
+        logs.extend(receipt.inner.logs().iter().cloned());
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 0x8000,
+                logs,
+            },
+            Bloom::default(),
+        ));
+
+        receipt
+    }
+
+    /// The vault's own `Deposit` is the receipt inventory has no other way to
+    /// learn about, so its id and shares must come through exactly.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_decodes_the_vaults_deposit() {
+        let tx_hash = b256!(
+            "0x7171717171717171717171717171717171717171717171717171717171717171"
+        );
+        let receipt = create_minted_receipt_with_deposit(
+            tx_hash,
+            test_vault_address(),
+            test_orchestrator_address(),
+            U256::from(11u8),
+            U256::from(1_000_000u64),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_mint(&TxId::Hash(tx_hash))
+            .await
+            .expect("expected OrchestratorMintResult");
+
+        let deposit = result
+            .deposit
+            .expect("the vault's own Deposit must decode into the result");
+        assert_eq!(deposit.receipt_id, U256::from(11u8));
+        assert_eq!(deposit.shares, U256::from(1_000_000u64));
+    }
+
+    /// The recipient callback runs inside the mint transaction, so a `Deposit`
+    /// it emits from its own address must never become a tracked receipt. A
+    /// fabricated id is not self-correcting: its `balanceOf` reads zero, which
+    /// then blocks `confirm-custody` on a holder mismatch.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_ignores_a_foreign_deposit_log() {
+        let tx_hash = b256!(
+            "0x7272727272727272727272727272727272727272727272727272727272727272"
+        );
+        let receipt = create_minted_receipt_with_deposit(
+            tx_hash,
+            // The spoof vector: the RECIPIENT emitting the Deposit.
+            test_receiver(),
+            test_orchestrator_address(),
+            U256::from(99u8),
+            U256::from(1_000_000u64),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_mint(&TxId::Hash(tx_hash))
+            .await
+            .expect("the mint itself still confirms");
+
+        assert!(
+            result.deposit.is_none(),
+            "a Deposit from a foreign address must not be tracked, got {:?}",
+            result.deposit
+        );
+    }
+
+    /// The vault binding alone is not enough. The recipient callback can
+    /// deposit into this same vault on its OWN behalf, and that log carries the
+    /// vault's address, so only the `owner` ties the deposit to this mint's
+    /// receipt — which the orchestrator custodies.
+    #[tokio::test]
+    async fn confirm_orchestrator_mint_ignores_a_deposit_owned_by_another() {
+        let tx_hash = b256!(
+            "0x7373737373737373737373737373737373737373737373737373737373737373"
+        );
+        let receipt = create_minted_receipt_with_deposit(
+            tx_hash,
+            test_vault_address(),
+            // Same vault, but the receipt went to the recipient, not to the
+            // orchestrator this mint targeted.
+            test_receiver(),
+            U256::from(99u8),
+            U256::from(1_000_000u64),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .confirm_orchestrator_mint(&TxId::Hash(tx_hash))
+            .await
+            .expect("the mint itself still confirms");
+
+        assert!(
+            result.deposit.is_none(),
+            "a vault Deposit owned by another wallet must not be tracked, got \
+             {:?}",
+            result.deposit
+        );
+    }
+
+    /// `receipt_balances` reads the ERC-1155 contract the VAULT names, so a
+    /// balance can never come from a contract belonging to a different vault.
+    /// Readings come back one per requested id, in the order given — the
+    /// pairing the orchestrator burn reconciliation relies on.
+    #[tokio::test]
+    async fn receipt_balances_reads_the_vaults_own_receipt_contract() {
+        let receipt_contract =
+            address!("0x00000000000000000000000000000000000000aa");
+        let asserter = Asserter::new();
+        // vault.receipt()
+        asserter.push_success(&B256::left_padding_from(
+            receipt_contract.as_slice(),
+        ));
+        // balanceOf(holder, id), one per requested id, in order.
+        asserter.push_success(&B256::from(U256::from(40u64)));
+        asserter.push_success(&B256::from(U256::ZERO));
+        asserter.push_success(&B256::from(U256::from(7u64)));
+        let service = create_service_with_asserter(asserter);
+
+        let balances = service
+            .receipt_balances(
+                test_vault_address(),
+                test_orchestrator_address(),
+                &[U256::from(1u8), U256::from(2u8), U256::from(3u8)],
+            )
+            .await
+            .expect("balance readings should succeed");
+
+        assert_eq!(
+            balances,
+            vec![U256::from(40u64), U256::ZERO, U256::from(7u64)],
+            "each reading must stay on the id it was requested for"
+        );
     }
 
     #[tokio::test]

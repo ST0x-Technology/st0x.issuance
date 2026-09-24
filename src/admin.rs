@@ -59,8 +59,9 @@ use crate::underlying::{
     AssetStatus, Underlying, UnderlyingViewError, load_freeze_status,
 };
 use crate::vault::{
-    BurnTxFate, BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
-    NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
+    BurnRange, BurnTxFate, BurnTxStatus, BurnVerification, MintedLogQuery,
+    MintedLogScan, NetworkVaultServices, SendableTxWithHash, TxId, VaultError,
+    VaultService,
 };
 use crate::wrapped_transfer::{
     InboundWrappedTransfer, WrappedTransferPage, list_inbound_wrapped_transfers,
@@ -88,10 +89,42 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
         reason: String,
         acknowledged_unresolved_burn_tx_hash: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError>;
+
+    /// Brings receipt inventory in line with a landed orchestrator burn that
+    /// the admin prior-burn inspection just recorded, exactly as the confirm
+    /// path does for one it recorded itself. Best-effort and infallible to
+    /// the caller: the burn is already recorded, so a bookkeeping failure
+    /// only warns.
+    async fn reconcile_recorded_orchestrator_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+        orchestrator: Address,
+        burn_range: BurnRange,
+    );
 }
 
 #[async_trait]
 impl RedemptionBurnRecovery for BurnManager {
+    async fn reconcile_recorded_orchestrator_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+        orchestrator: Address,
+        burn_range: BurnRange,
+    ) {
+        self.reconcile_recorded_orchestrator_burn(
+            issuer_request_id,
+            underlying,
+            network,
+            orchestrator,
+            burn_range,
+        )
+        .await;
+    }
+
     async fn replace_exhausted_dead_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -1128,6 +1161,15 @@ async fn recover_post_alpaca(
         PriorBurnDisposition::AlreadyRecorded(response) => {
             return Ok(Json(response));
         }
+        PriorBurnDisposition::OrchestratorBurnRecorded(recorded) => {
+            let response = finish_recorded_orchestrator_burn(
+                burn_recovery,
+                &metadata,
+                *recorded,
+            )
+            .await;
+            return Ok(Json(response));
+        }
         PriorBurnDisposition::ResumeWith(external_tx_id) => external_tx_id,
     };
 
@@ -1202,9 +1244,44 @@ enum PriorBurnDisposition {
     /// The prior burn already completed on-chain and was recorded; the caller
     /// should return this response directly.
     AlreadyRecorded(ReprocessResponse),
+    /// An orchestrator burn that already completed on-chain was recorded.
+    /// The caller returns the response after it reconciles receipt inventory
+    /// over the burn's pointer range: the orchestrator reserved nothing, so
+    /// without that the mirror keeps the pre-burn balances and a rollback's
+    /// `confirm-custody` refuses. Boxed so this rare case does not inflate
+    /// every disposition.
+    OrchestratorBurnRecorded(Box<RecordedOrchestratorBurn>),
     /// No prior burn exists, or the prior burn conclusively reverted; resume
     /// with this (possibly fallback) retry `externalTxId`.
     ResumeWith(Option<BurnExternalTxId>),
+}
+
+/// A landed orchestrator burn the prior-burn inspection recorded, with what
+/// the caller needs to reconcile receipt inventory over it.
+struct RecordedOrchestratorBurn {
+    response: ReprocessResponse,
+    orchestrator: Address,
+    burn_range: BurnRange,
+}
+
+/// Reconciles receipt inventory over a recorded orchestrator burn, then hands
+/// back the response to return. Best-effort: the burn is already recorded, so
+/// the reconciliation only warns on failure.
+async fn finish_recorded_orchestrator_burn(
+    burn_recovery: &Arc<dyn RedemptionBurnRecovery>,
+    metadata: &RedemptionMetadata,
+    recorded: RecordedOrchestratorBurn,
+) -> ReprocessResponse {
+    burn_recovery
+        .reconcile_recorded_orchestrator_burn(
+            &metadata.issuer_request_id,
+            &metadata.underlying,
+            metadata.network,
+            recorded.orchestrator,
+            recorded.burn_range,
+        )
+        .await;
+    recorded.response
 }
 
 /// Inspects the prior tx (if any) from a previous `BurningFailed` event to
@@ -1396,7 +1473,7 @@ async fn inspect_prior_burn(
                 &error,
             )),
         },
-        VaultMode::Orchestrator { .. } => {
+        VaultMode::Orchestrator { address: orchestrator } => {
             match vault_service.confirm_orchestrator_burn(tx_id).await {
                 Ok(result) => {
                     let dust_retained = dust_quantity
@@ -1414,7 +1491,7 @@ async fn inspect_prior_burn(
                         "Orchestrator burn already completed on-chain, recording existing burn"
                     );
 
-                    record_existing_burn(
+                    let disposition = record_existing_burn(
                         store,
                         aggregate_id,
                         issuer_request_id,
@@ -1427,7 +1504,20 @@ async fn inspect_prior_burn(
                         },
                         result.block_number,
                     )
-                    .await
+                    .await?;
+
+                    Ok(match disposition {
+                        PriorBurnDisposition::AlreadyRecorded(response) => {
+                            PriorBurnDisposition::OrchestratorBurnRecorded(
+                                Box::new(RecordedOrchestratorBurn {
+                                    response,
+                                    orchestrator,
+                                    burn_range: result.burn_range,
+                                }),
+                            )
+                        }
+                        other => other,
+                    })
                 }
                 Err(
                     VaultError::OrchestratorReverted { .. }
@@ -4652,6 +4742,9 @@ mod tests {
         force_calls: AtomicUsize,
         force_result: MockForceResult,
         manual_result: MockManualBurnResult,
+        /// `(orchestrator, burn_range)` of every recorded-burn
+        /// reconciliation the handler asked for.
+        reconciled_burns: std::sync::Mutex<Vec<(Address, BurnRange)>>,
     }
 
     impl Default for MockBurnRecovery {
@@ -4665,6 +4758,7 @@ mod tests {
                 force_calls: AtomicUsize::new(0),
                 force_result: MockForceResult::Verified,
                 manual_result: MockManualBurnResult::Succeeds,
+                reconciled_burns: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -4672,6 +4766,10 @@ mod tests {
     impl MockBurnRecovery {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        fn reconciled_burns(&self) -> Vec<(Address, BurnRange)> {
+            self.reconciled_burns.lock().unwrap().clone()
         }
 
         fn manual_calls(&self) -> usize {
@@ -4735,6 +4833,16 @@ mod tests {
             >,
         ) -> Result<super::BurnVerification, super::BurnManagerError> {
             unimplemented!("not used by redemption recovery route tests")
+        }
+
+        async fn reconcile_recorded_orchestrator_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+            _underlying: &UnderlyingSymbol,
+            _network: Network,
+            _orchestrator: Address,
+            _burn_range: BurnRange,
+        ) {
         }
     }
 
@@ -4850,6 +4958,20 @@ mod tests {
                     ))
                 }
             }
+        }
+
+        async fn reconcile_recorded_orchestrator_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+            _underlying: &UnderlyingSymbol,
+            _network: Network,
+            orchestrator: Address,
+            burn_range: BurnRange,
+        ) {
+            self.reconciled_burns
+                .lock()
+                .unwrap()
+                .push((orchestrator, burn_range));
         }
     }
 
@@ -7592,6 +7714,27 @@ mod tests {
             Level::INFO,
             &[&aggregate_id, "recording existing burn"]
         ));
+        // The landed burn drained receipts the orchestrator holds, so
+        // inventory must follow it over the recorded pointer range, exactly
+        // as the confirm path does — or a rollback's `confirm-custody`
+        // refuses on the pre-burn balances.
+        let VaultMode::Orchestrator { address: orchestrator } =
+            metadata.burn_mode
+        else {
+            panic!("fixture must be an orchestrator redemption");
+        };
+        assert_eq!(
+            burn_recovery.reconciled_burns(),
+            vec![(
+                orchestrator,
+                BurnRange {
+                    first_receipt_id: U256::ZERO,
+                    next_burn_receipt_id_after: U256::ONE,
+                },
+            )],
+            "the recorded orchestrator burn must be reconciled once, over its \
+             own pointer range"
+        );
     }
 
     #[traced_test]
