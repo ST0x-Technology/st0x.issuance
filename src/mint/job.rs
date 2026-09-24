@@ -1025,6 +1025,13 @@ impl SubmitMintJob {
     /// can have landed under this mint's nonce (the on-chain uniqueness
     /// key), sparing the full lookback scan on every ordinary first
     /// submission.
+    ///
+    /// The full match identifies the landing as THIS mint's only because at
+    /// most one mint can hold a given `(to, nonce)` pair: the delivery
+    /// endpoint refuses an authorization whose pair another mint already
+    /// holds ([`Mint::held_authorization_nonce`]). Without that guard two
+    /// same-sized mints of the same asset for one recipient would both match
+    /// a single landing and both complete.
     async fn recover_landed_orchestrator_mint(
         &self,
         ctx: &SubmitMintContext,
