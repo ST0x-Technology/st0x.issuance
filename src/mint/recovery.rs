@@ -2,8 +2,8 @@ use alloy::primitives::Address;
 use apalis::prelude::AbortError;
 use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
-use chrono::Utc;
-use event_sorcery::{SendError, Store};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use event_sorcery::{Projection, SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::fmt;
@@ -18,8 +18,8 @@ use super::job::{
 };
 use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand,
-    MintFailureClassification, MintView, Network, UnderlyingSymbol,
-    find_all_recoverable_mints,
+    MintFailureClassification, MintView, Network, TokenizationRequestId,
+    UnderlyingSymbol, find_all_recoverable_mints,
 };
 use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
@@ -726,6 +726,7 @@ pub(crate) async fn reconcile_recoverable_mints(
     }
 
     let count = recoverable_mints.len();
+    let waiting_candidates = authorization_wait_candidates(&recoverable_mints);
     for (issuer_request_id, view) in recoverable_mints {
         // An unresolved replay is reconciled on the NORMAL SCHEDULE (SPEC
         // "Nonce"): each pass re-runs one widened `Minted`-log query. Its
@@ -763,6 +764,180 @@ pub(crate) async fn reconcile_recoverable_mints(
          Killed job are silent no-ops (unresolved replays release their \
          terminal row first, so their reconciliation re-runs every pass)"
     );
+
+    alert_on_overdue_authorizations(pool, &waiting_candidates, Utc::now())
+        .await;
+}
+
+/// The recoverable mints that could still be blocked on an authorization,
+/// paired with the moment their shares were journaled.
+///
+/// Only `JournalConfirmed` and `Minting` qualify. `MintIntended` and
+/// `MintTxSubmitted` are past intent, where the nonce is already baked into
+/// the signed bytes (`Mint::handle_authorize_mint`), so no authorization can
+/// still be pending for them; a `MintingFailed` or `CallbackPending` mint is
+/// past the point where the authorization is what holds it up; and
+/// `Initiated` never reaches this pass at all — which also means a mint
+/// waiting BEFORE its journal confirms is deliberately out of scope: nothing
+/// of the AP's is committed yet, so there is no exposure to alert on.
+///
+/// Keep this match in sync with `Mint::accepts_mint_authorization` by hand.
+/// The aggregate recheck in [`alert_on_overdue_authorizations`] only removes
+/// candidates this filter selected; a journaled state missing here is never
+/// loaded, so it silently drops out of the alert.
+fn authorization_wait_candidates(
+    recoverable_mints: &[(IssuerMintRequestId, MintView)],
+) -> Vec<(IssuerMintRequestId, TokenizationRequestId, DateTime<Utc>)> {
+    recoverable_mints
+        .iter()
+        .filter_map(|(issuer_request_id, view)| {
+            let (MintView::JournalConfirmed {
+                tokenization_request_id,
+                journal_confirmed_at,
+                ..
+            }
+            | MintView::Minting {
+                tokenization_request_id,
+                journal_confirmed_at,
+                ..
+            }) = view
+            else {
+                return None;
+            };
+
+            Some((
+                issuer_request_id.clone(),
+                tokenization_request_id.clone(),
+                *journal_confirmed_at,
+            ))
+        })
+        .collect()
+}
+
+/// An orchestrator-mode mint whose shares Alpaca has already journaled, still
+/// waiting for the liquidity bot's authorization.
+struct OverdueAuthorization {
+    issuer_request_id: IssuerMintRequestId,
+    tokenization_request_id: TokenizationRequestId,
+    waited: ChronoDuration,
+}
+
+/// How long a journaled mint may wait for its authorization before the wait
+/// is worth an operator's attention, and before it is worth waking one.
+///
+/// The window matters because the shares are ALREADY journaled by this point:
+/// the AP's position is committed and the mint cannot proceed until the
+/// authorization arrives. `/admin/stuck` only surfaces an in-progress mint
+/// after an hour (`STUCK_THRESHOLD`), so these thresholds fire well before it.
+const AUTHORIZATION_WAIT_WARN: ChronoDuration = ChronoDuration::minutes(10);
+const AUTHORIZATION_WAIT_ERROR: ChronoDuration = ChronoDuration::minutes(30);
+
+/// Raises the operator alert for mints stuck waiting on a recipient
+/// authorization.
+///
+/// Only orchestrator-mode mints can wait on one, and only a mint that has no
+/// authorization recorded is actually blocked — the mode and the authorization
+/// both live on the aggregate rather than the view, so each candidate is
+/// loaded to decide. The same load asks the aggregate whether it still
+/// accepts an authorization at all (`accepts_mint_authorization`, the one
+/// state list `handle_authorize_mint` keeps in sync), so a mint that advanced
+/// after the view snapshot was taken drops out. That recheck only NARROWS the
+/// view-side selection in [`authorization_wait_candidates`]: it can remove a
+/// candidate, but it can never add one. So the two state lists must still be
+/// kept in sync by hand — a journaled state added to
+/// `accepts_mint_authorization` but not to that view match is never alerted
+/// on, and no test fails. A load
+/// failure skips that mint rather than failing the pass: the next pass
+/// re-evaluates it, and a missed alert is better than a reconcile that stops
+/// re-enqueuing recovery jobs.
+///
+/// Emits at most one line per severity per pass, never one per mint
+/// (AGENTS.md loop-logging rule): each line carries the cohort count plus the
+/// oldest waiter's identifiers, which is what an operator needs to start
+/// chasing the delivery.
+async fn alert_on_overdue_authorizations(
+    pool: &Pool<Sqlite>,
+    candidates: &[(
+        IssuerMintRequestId,
+        TokenizationRequestId,
+        DateTime<Utc>,
+    )],
+    now: DateTime<Utc>,
+) {
+    let projection = Projection::<Mint>::sqlite(pool.clone());
+    let mut overdue = Vec::new();
+    for (issuer_request_id, tokenization_request_id, journal_confirmed_at) in
+        candidates
+    {
+        let mint = match projection.load(issuer_request_id).await {
+            Ok(Some(mint)) => mint,
+            Ok(None) => continue,
+            Err(error) => {
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                    error = %error,
+                    "Skipping authorization-wait check for a mint that failed \
+                     to load; the next reconcile pass re-evaluates it"
+                );
+                continue;
+            }
+        };
+
+        if !mint.accepts_mint_authorization()
+            || !matches!(mint.mint_mode(), Some(VaultMode::Orchestrator { .. }))
+            || mint.mint_authorization().is_some()
+        {
+            continue;
+        }
+
+        let waited = now.signed_duration_since(*journal_confirmed_at);
+        if waited < AUTHORIZATION_WAIT_WARN {
+            continue;
+        }
+
+        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+            tokenization_request_id = %tokenization_request_id,
+            waited_seconds = waited.num_seconds(),
+            "Orchestrator mint is waiting for its recipient authorization"
+        );
+        overdue.push(OverdueAuthorization {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            waited,
+        });
+    }
+
+    let (escalated, warned): (Vec<_>, Vec<_>) = overdue
+        .into_iter()
+        .partition(|entry| entry.waited >= AUTHORIZATION_WAIT_ERROR);
+
+    if let Some(oldest) = oldest_wait(&escalated) {
+        error!(target: "mint", waiting_mints = escalated.len(),
+            oldest_issuer_request_id = %oldest.issuer_request_id,
+            oldest_tokenization_request_id = %oldest.tokenization_request_id,
+            oldest_waited_seconds = oldest.waited.num_seconds(),
+            threshold_minutes = AUTHORIZATION_WAIT_ERROR.num_minutes(),
+            "Orchestrator mints have waited past the escalation threshold for \
+             a recipient authorization; Alpaca already journaled their shares, \
+             so chase the liquidity bot's delivery now"
+        );
+    }
+
+    if let Some(oldest) = oldest_wait(&warned) {
+        warn!(target: "mint", waiting_mints = warned.len(),
+            oldest_issuer_request_id = %oldest.issuer_request_id,
+            oldest_tokenization_request_id = %oldest.tokenization_request_id,
+            oldest_waited_seconds = oldest.waited.num_seconds(),
+            threshold_minutes = AUTHORIZATION_WAIT_WARN.num_minutes(),
+            "Orchestrator mints are waiting for a recipient authorization \
+             past the warning threshold; their shares are already journaled"
+        );
+    }
+}
+
+fn oldest_wait(
+    entries: &[OverdueAuthorization],
+) -> Option<&OverdueAuthorization> {
+    entries.iter().max_by_key(|entry| entry.waited)
 }
 
 /// Why [`recover_mint_until_automatic_budget_exhausted`] abandoned a mint while
@@ -2936,6 +3111,435 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Drives an orchestrator-mode mint to `JournalConfirmed` without
+    /// delivering an authorization — the shape that waits.
+    async fn seed_orchestrator_mint_awaiting_authorization(
+        harness: &TestHarness,
+        issuer_request_id: &IssuerMintRequestId,
+        tokenization_request_id: &str,
+        mint_mode: VaultMode,
+    ) {
+        let TestAccountAndAsset {
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet,
+        } = harness.setup_account_and_asset().await;
+
+        harness
+            .mint_store
+            .send(
+                issuer_request_id,
+                MintCommand::Initiate {
+                    mint_mode,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        tokenization_request_id,
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .mint_store
+            .send(
+                issuer_request_id,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives an orchestrator-mode mint to `Minting` without delivering an
+    /// authorization — the shape production actually leaves waiting.
+    /// `process_journal_completion` sends `Deposit` right after the journal
+    /// completes, and the orchestrator submit branch then holds an
+    /// unauthorized mint in `Minting` with no event recorded, so
+    /// `JournalConfirmed` lasts only a moment.
+    async fn seed_orchestrator_mint_awaiting_authorization_in_minting(
+        harness: &TestHarness,
+        issuer_request_id: &IssuerMintRequestId,
+        tokenization_request_id: &str,
+        mint_mode: VaultMode,
+    ) {
+        seed_orchestrator_mint_awaiting_authorization(
+            harness,
+            issuer_request_id,
+            tokenization_request_id,
+            mint_mode,
+        )
+        .await;
+        harness
+            .mint_store
+            .send(
+                issuer_request_id,
+                MintCommand::Deposit {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Alpaca journals the AP's shares before the authorization is needed, so
+    /// a mint waiting on one holds a committed position it cannot act on, and
+    /// `/admin/stuck` only surfaces it an hour later. Both thresholds must
+    /// fire first, and each must produce exactly ONE summary line per pass
+    /// rather than one per mint.
+    #[traced_test]
+    #[tokio::test]
+    async fn overdue_authorizations_warn_then_escalate_to_error() {
+        let harness = TestHarness::new().await;
+        let orchestrator = VaultMode::Orchestrator { address: VAULT };
+
+        let warned_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &warned_id,
+            "tok-wait-warn",
+            orchestrator,
+        )
+        .await;
+
+        // TWO escalated mints, so the summary rule is actually under test:
+        // one mint could not tell a per-mint line from a summary.
+        let oldest_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &oldest_id,
+            "tok-wait-error-oldest",
+            orchestrator,
+        )
+        .await;
+        let escalated_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &escalated_id,
+            "tok-wait-error",
+            orchestrator,
+        )
+        .await;
+
+        let recoverable =
+            find_all_recoverable_mints(&harness.pool).await.unwrap();
+        let candidates = authorization_wait_candidates(&recoverable);
+        assert_eq!(candidates.len(), 3, "every journaled mint must qualify");
+
+        // Each candidate's own journal time is shifted to the wait under
+        // test; a single `now` offset would put them all in one cohort.
+        let now = Utc::now();
+        let aged: Vec<_> = candidates
+            .into_iter()
+            .map(|(issuer_request_id, tokenization_request_id, _)| {
+                let waited = if issuer_request_id == oldest_id {
+                    ChronoDuration::minutes(45)
+                } else if issuer_request_id == escalated_id {
+                    ChronoDuration::minutes(35)
+                } else {
+                    ChronoDuration::minutes(15)
+                };
+                (issuer_request_id, tokenization_request_id, now - waited)
+            })
+            .collect();
+
+        alert_on_overdue_authorizations(&harness.pool, &aged, now).await;
+
+        // One line for the whole escalated cohort, naming its OLDEST member
+        // and counting both.
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "waited past the escalation threshold",
+                &oldest_id.to_string(),
+                "tok-wait-error-oldest",
+                "waiting_mints=2",
+            ]
+        ));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "waiting for a recipient authorization",
+                &warned_id.to_string(),
+                "tok-wait-warn",
+                "waiting_mints=1",
+            ]
+        ));
+        // Scoped to this test's oldest id: `log_count_at!` reads a buffer
+        // shared with the tests running alongside it.
+        assert_eq!(
+            log_count_at!(
+                Level::ERROR,
+                &["waited past the escalation", &oldest_id.to_string()]
+            ),
+            1,
+            "two escalated mints must produce ONE summary line, not two"
+        );
+        assert_eq!(
+            log_count_at!(
+                Level::ERROR,
+                &["waited past the escalation", &escalated_id.to_string()]
+            ),
+            0,
+            "the summary names only the oldest waiter, not every mint"
+        );
+    }
+
+    /// The alert must stay silent for mints that are not actually blocked: a
+    /// vault-direct mint never consumes an authorization, and an
+    /// orchestrator mint that already holds one is waiting on nothing. A
+    /// false page here trains operators to ignore the real one. The two are
+    /// aged into DIFFERENT bands — one in the warning band, one past
+    /// escalation — so each cohort's filter has an assertion that can fire:
+    /// with both past escalation, the warning assertions could never fail.
+    #[traced_test]
+    #[tokio::test]
+    async fn overdue_authorizations_ignore_mints_that_are_not_waiting() {
+        let harness = TestHarness::new().await;
+
+        let vault_direct_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &vault_direct_id,
+            "tok-wait-vault-direct",
+            VaultMode::VaultDirect,
+        )
+        .await;
+
+        let authorized_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &authorized_id,
+            "tok-wait-authorized",
+            VaultMode::Orchestrator { address: VAULT },
+        )
+        .await;
+        harness
+            .mint_store
+            .send(
+                &authorized_id,
+                MintCommand::AuthorizeMint {
+                    issuer_request_id: authorized_id.clone(),
+                    mint_authorization: test_mint_authorization(),
+                },
+            )
+            .await
+            .expect("authorization must record");
+
+        let recoverable =
+            find_all_recoverable_mints(&harness.pool).await.unwrap();
+        let now = Utc::now();
+        let aged: Vec<_> = authorization_wait_candidates(&recoverable)
+            .into_iter()
+            .map(|(issuer_request_id, tokenization_request_id, _)| {
+                // Warning band for one, past escalation for the other.
+                let waited = if issuer_request_id == vault_direct_id {
+                    ChronoDuration::minutes(15)
+                } else {
+                    ChronoDuration::minutes(45)
+                };
+                (issuer_request_id, tokenization_request_id, now - waited)
+            })
+            .collect();
+        assert_eq!(aged.len(), 2, "both mints reach the wait check");
+
+        alert_on_overdue_authorizations(&harness.pool, &aged, now).await;
+
+        // Scoped to THIS test's ids: `log_count_at!` reads a buffer shared
+        // with the tests running alongside it, so a bare message snippet
+        // would match a sibling's alert.
+        for (label, id) in [
+            ("vault-direct", &vault_direct_id),
+            ("already authorized", &authorized_id),
+        ] {
+            assert_eq!(
+                log_count_at!(
+                    Level::ERROR,
+                    &["waited past the escalation", &id.to_string()]
+                ),
+                0,
+                "the {label} mint must raise no escalation"
+            );
+            assert_eq!(
+                log_count_at!(
+                    Level::WARN,
+                    &["waiting for a recipient authorization", &id.to_string()]
+                ),
+                0,
+                "the {label} mint must raise no warning"
+            );
+        }
+    }
+
+    /// The alert is only worth anything if the reconcile pass actually calls
+    /// it. Every other test here drives `alert_on_overdue_authorizations`
+    /// directly, so deleting the call site would leave them all green. This
+    /// one goes through `reconcile_recoverable_mints` on the real clock,
+    /// backdating each view's journal timestamp rather than the event (the
+    /// wait is read from the view; the aggregate load decides mode,
+    /// authorization and accepting state, which backdating does not touch).
+    ///
+    /// Two waiters, one per qualifying state, with the `Minting` one the
+    /// oldest: that is the state production actually leaves an unauthorized
+    /// mint in, so it is the one the escalation line must name — a regression
+    /// that dropped `Minting` from the candidate filter would turn the alert
+    /// off for exactly the mints it exists to catch.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconcile_pass_raises_the_overdue_authorization_alert() {
+        let harness = TestHarness::new().await;
+        let minting_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization_in_minting(
+            &harness,
+            &minting_id,
+            "tok-wait-wiring-minting",
+            VaultMode::Orchestrator { address: VAULT },
+        )
+        .await;
+        let journaled_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &journaled_id,
+            "tok-wait-wiring-journaled",
+            VaultMode::Orchestrator { address: VAULT },
+        )
+        .await;
+
+        for (issuer_request_id, backdate, waited) in [
+            (
+                &minting_id,
+                "
+                UPDATE mint_view
+                SET payload = json_set(
+                    payload,
+                    '$.Live.Minting.journal_confirmed_at',
+                    ?
+                )
+                WHERE view_id = ?
+                ",
+                ChronoDuration::minutes(45),
+            ),
+            (
+                &journaled_id,
+                "
+                UPDATE mint_view
+                SET payload = json_set(
+                    payload,
+                    '$.Live.JournalConfirmed.journal_confirmed_at',
+                    ?
+                )
+                WHERE view_id = ?
+                ",
+                ChronoDuration::minutes(35),
+            ),
+        ] {
+            let journaled_at = (Utc::now() - waited)
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            let updated = sqlx::query(backdate)
+                .bind(&journaled_at)
+                .bind(issuer_request_id.to_string())
+                .execute(&harness.pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                updated.rows_affected(),
+                1,
+                "the backdate must hit the seeded mint's view row"
+            );
+        }
+
+        reconcile_recoverable_mints(&harness.pool, &harness.apalis_pool).await;
+
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "waited past the escalation threshold",
+                &minting_id.to_string(),
+                "tok-wait-wiring-minting",
+                "waiting_mints=2",
+            ]
+        ));
+    }
+
+    /// Only a journaled, pre-intent state can be blocked on an authorization:
+    /// `JournalConfirmed`, and `Minting` — the state production actually
+    /// leaves an unauthorized mint in, since `Deposit` follows the journal at
+    /// once. A `MintingFailed` or `CallbackPending` mint is past that point,
+    /// so including it would page an operator about a wait that is not
+    /// happening.
+    #[tokio::test]
+    async fn authorization_wait_candidates_cover_journaled_and_minting() {
+        let harness = TestHarness::new().await;
+        let journaled_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization(
+            &harness,
+            &journaled_id,
+            "tok-wait-states",
+            VaultMode::Orchestrator { address: VAULT },
+        )
+        .await;
+        let minting_id = IssuerMintRequestId::random();
+        seed_orchestrator_mint_awaiting_authorization_in_minting(
+            &harness,
+            &minting_id,
+            "tok-wait-states-minting",
+            VaultMode::Orchestrator { address: VAULT },
+        )
+        .await;
+
+        let minted_id = IssuerMintRequestId::random();
+        seed_recoverable_mint(&harness, &minted_id).await;
+        // `RecordMintFailed` only applies from a minting state, so move past
+        // `JournalConfirmed` first — otherwise the mint silently stays
+        // journaled and the test would assert nothing.
+        harness
+            .mint_store
+            .send(
+                &minted_id,
+                MintCommand::Deposit { issuer_request_id: minted_id.clone() },
+            )
+            .await
+            .expect("deposit must record");
+        harness
+            .mint_store
+            .send(
+                &minted_id,
+                MintCommand::RecordMintFailed {
+                    issuer_request_id: minted_id.clone(),
+                    error: "minting failed".to_string(),
+                    classification: MintFailureClassification::Unclassified,
+                },
+            )
+            .await
+            .expect("failure must record");
+
+        let recoverable =
+            find_all_recoverable_mints(&harness.pool).await.unwrap();
+        // `find_all_recoverable_mints` promises no order, so compare as sets.
+        let mut candidates: Vec<String> =
+            authorization_wait_candidates(&recoverable)
+                .into_iter()
+                .map(|(issuer_request_id, _, _)| issuer_request_id.to_string())
+                .collect();
+        candidates.sort_unstable();
+        let mut expected =
+            vec![journaled_id.to_string(), minting_id.to_string()];
+        expected.sort_unstable();
+
+        assert_eq!(
+            candidates, expected,
+            "exactly the journaled and minting pre-intent states qualify"
+        );
     }
 
     /// The reconciler must enqueue a job for a recoverable mint that has no
