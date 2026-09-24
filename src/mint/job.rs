@@ -34,7 +34,7 @@ use super::{
     UnderlyingSymbol, has_unresolved_signer_intent,
     orchestrator_mint_failure_classification,
 };
-use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
+use crate::alpaca::{AlpacaError, AlpacaService, mint_callback_request};
 use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
@@ -2628,13 +2628,13 @@ impl Job<SendCallbackContext> for SendCallbackJob {
         };
 
         ctx.alpaca
-            .send_mint_callback(MintCallbackRequest {
-                tokenization_request_id,
+            .send_mint_callback(mint_callback_request(
+                &tokenization_request_id,
                 client_id,
-                wallet_address: wallet,
+                wallet,
                 tx_hash,
                 network,
-            })
+            ))
             .await?;
 
         ctx.mint_store
@@ -2751,13 +2751,13 @@ mod tests {
     use async_trait::async_trait;
     use cqrs_es::{AggregateError, DomainEvent};
     use event_sorcery::test_store;
+    use st0x_alpaca::issuer::mock::MockIssuerApi;
     use std::any::type_name;
     use std::collections::HashMap;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::burn_excess::BurnExcessEvent;
     use crate::mint::MintEvent;
     use crate::mint::api::test_utils::TestHarness;
@@ -5088,7 +5088,7 @@ mod tests {
         )
         .await;
 
-        let alpaca = Arc::new(MockAlpacaService::new_success());
+        let alpaca = Arc::new(MockIssuerApi::new_success());
         let ctx = SendCallbackContext {
             mint_store: harness.mint_store.clone(),
             alpaca: alpaca.clone(),

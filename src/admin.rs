@@ -18,7 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::Quantity;
 use crate::alpaca::{
-    AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+    AlpacaError, AlpacaService, IssuanceRedeemFields, RedeemRequestStatus,
+    TokenizationRequest, alpaca_tokenization_request_id,
+    issuance_redeem_fields,
 };
 use crate::auth::{BreakglassOps, CapitalOps, DebugOps, InternalAuth, ReadOps};
 use crate::config::{Config, VaultMode};
@@ -1020,35 +1022,13 @@ async fn recover_post_alpaca(
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
     // without receiving the underlying shares.
+    let alpaca_tokenization_request_id =
+        alpaca_tokenization_request_id(&alpaca_data.tokenization_request_id);
     let request = alpaca_service
-        .poll_request_status(&alpaca_data.tokenization_request_id)
+        .poll_request_status(&alpaca_tokenization_request_id)
         .await
         .map_err(|err| {
-            let (status, code, msg) = match &err {
-                AlpacaError::RequestNotFound { .. } => (
-                    Status::NotFound,
-                    RecoverRedemptionCode::AlpacaRequestNotFound,
-                    "Tokenization request not found at Alpaca (404)",
-                ),
-                AlpacaError::ResponseIdMismatch { .. } => (
-                    Status::BadGateway,
-                    RecoverRedemptionCode::UpstreamUnavailable,
-                    "Alpaca returned a mismatched tokenization request id",
-                ),
-                AlpacaError::UnsupportedTokenizationNetwork { .. } => (
-                    Status::UnprocessableEntity,
-                    RecoverRedemptionCode::RecoveryRefused,
-                    "Network is not a published Alpaca TokenizationNetwork value",
-                ),
-                AlpacaError::Reqwest(_)
-                | AlpacaError::Parse { .. }
-                | AlpacaError::Auth(_)
-                | AlpacaError::Api { .. } => (
-                    Status::BadGateway,
-                    RecoverRedemptionCode::UpstreamUnavailable,
-                    "Failed to poll Alpaca for journal status",
-                ),
-            };
+            let (status, code, msg) = classify_journal_poll_error(&err);
             error!(target: "admin", aggregate_id = %aggregate_id,
                 tokenization_request_id = %alpaca_data.tokenization_request_id,
                 error = %err,
@@ -1070,13 +1050,32 @@ async fn recover_post_alpaca(
             updated_at,
             ..
         } => {
+            let IssuanceRedeemFields {
+                issuer_request_id: req_issuer_id,
+                underlying: req_underlying,
+                token: req_token,
+                quantity: req_quantity,
+                network: req_network,
+            } = issuance_redeem_fields(
+                req_issuer_id,
+                req_underlying,
+                req_token,
+                req_quantity,
+                *req_network,
+            )
+            .map_err(|error| {
+                error!(target: "admin", %aggregate_id, %error,
+                    "Alpaca redeem request fields are invalid"
+                );
+                RecoverRedemptionError::from(Status::BadGateway)
+            })?;
             // Validate Alpaca's response matches our records — defense-in-depth
             // against data corruption or misrouted requests.
-            if req_issuer_id != &metadata.issuer_request_id
-                || req_underlying != &metadata.underlying
-                || req_token != &metadata.token
-                || req_quantity != &alpaca_data.alpaca_quantity
-                || req_network != &metadata.network
+            if req_issuer_id != metadata.issuer_request_id
+                || req_underlying != metadata.underlying
+                || req_token != metadata.token
+                || req_quantity != alpaca_data.alpaca_quantity
+                || req_network != metadata.network
                 || req_wallet != &metadata.wallet
             {
                 error!(target: "admin", aggregate_id = %aggregate_id,
@@ -1205,6 +1204,37 @@ enum PriorBurnDisposition {
     /// No prior burn exists, or the prior burn conclusively reverted; resume
     /// with this (possibly fallback) retry `externalTxId`.
     ResumeWith(Option<BurnExternalTxId>),
+}
+
+/// Maps a failed Alpaca journal-status poll to the recovery endpoint's
+/// HTTP status, stable error code, and operator message.
+const fn classify_journal_poll_error(
+    error: &AlpacaError,
+) -> (Status, RecoverRedemptionCode, &'static str) {
+    match error {
+        AlpacaError::RequestNotFound { .. } => (
+            Status::NotFound,
+            RecoverRedemptionCode::AlpacaRequestNotFound,
+            "Tokenization request not found at Alpaca (404)",
+        ),
+        AlpacaError::ResponseIdMismatch { .. } => (
+            Status::BadGateway,
+            RecoverRedemptionCode::UpstreamUnavailable,
+            "Alpaca returned a mismatched tokenization request id",
+        ),
+        AlpacaError::InvalidUrl(_)
+        | AlpacaError::Reqwest(_)
+        | AlpacaError::Jwt(_)
+        | AlpacaError::Parse { .. }
+        | AlpacaError::Auth(_)
+        | AlpacaError::Api { .. }
+        | AlpacaError::RateLimited { .. }
+        | AlpacaError::UnsupportedTokenizationNetwork { .. } => (
+            Status::BadGateway,
+            RecoverRedemptionCode::UpstreamUnavailable,
+            "Failed to poll Alpaca for journal status",
+        ),
+    }
 }
 
 /// Inspects the prior tx (if any) from a previous `BurningFailed` event to
@@ -4214,13 +4244,14 @@ mod tests {
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
     };
     use super::{
-        AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
-        recover_post_alpaca,
+        AlpacaCalledData, PostAlpacaRecoveryInput, classify_journal_poll_error,
+        load_reprocess_context, recover_post_alpaca,
     };
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-        RedeemRequestStatus, RedeemResponse, TokenizationRequest,
+        RedeemRequestStatus, RedeemResponse, TestRedeemResponse,
+        TokenizationRequest, test_redeem_response,
     };
     use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
     use crate::jobs::job_type;
@@ -4567,8 +4598,10 @@ mod tests {
         metadata: &RedemptionMetadata,
         alpaca_data: &AlpacaCalledData,
     ) -> TokenizationRequest {
-        TokenizationRequest::Redeem {
-            id: alpaca_data.tokenization_request_id.clone(),
+        test_redeem_response(TestRedeemResponse {
+            tokenization_request_id: alpaca_data
+                .tokenization_request_id
+                .clone(),
             issuer_request_id: metadata.issuer_request_id.clone(),
             status,
             underlying: metadata.underlying.clone(),
@@ -4578,7 +4611,8 @@ mod tests {
             wallet: metadata.wallet,
             tx_hash: None,
             updated_at: Some(Utc::now()),
-        }
+        })
+        .unwrap()
     }
 
     #[async_trait]
@@ -4599,7 +4633,7 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            _tokenization_request_id: &TokenizationRequestId,
+            _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
         ) -> Result<TokenizationRequest, AlpacaError> {
             match &self.response {
                 PollResponse::Ok(request) => Ok(request.clone()),
@@ -4942,6 +4976,60 @@ mod tests {
             .expect("MarkFailed failed");
 
         (store, pool, metadata, alpaca_data)
+    }
+
+    #[tokio::test]
+    async fn invalid_accepted_alpaca_response_is_post_alpaca_for_recovery() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let metadata = test_metadata();
+        let alpaca_data = test_alpaca_data();
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: metadata.network,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    burn_mode: metadata.burn_mode,
+                },
+            )
+            .await
+            .unwrap();
+        claim_alpaca_call(&store, &metadata.issuer_request_id).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaInvalidResponse {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                    error: "invalid response quantity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(redemption, Redemption::Failed { .. }));
+        let context =
+            load_reprocess_context(&pool, &metadata.issuer_request_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            context.alpaca_called.unwrap().tokenization_request_id,
+            alpaca_data.tokenization_request_id
+        );
     }
 
     #[tokio::test]
@@ -5413,6 +5501,28 @@ mod tests {
         assert!(logs_contain_at!(Level::INFO, &["journal was rejected"]));
     }
 
+    #[test]
+    fn journal_poll_errors_map_to_stable_recovery_responses() {
+        let not_found = AlpacaError::RequestNotFound {
+            id: crate::alpaca::TokenizationRequestId::new("tok-1"),
+            body: "not found".to_string(),
+        };
+        let unsupported_network = AlpacaError::UnsupportedTokenizationNetwork {
+            network: st0x_alpaca::core::Network::Base,
+            reference: "https://docs.alpaca.markets",
+        };
+
+        let (status, code, _) = classify_journal_poll_error(&not_found);
+        assert_eq!(status, Status::NotFound);
+        assert_eq!(code, super::RecoverRedemptionCode::AlpacaRequestNotFound);
+
+        let (status, code, message) =
+            classify_journal_poll_error(&unsupported_network);
+        assert_eq!(status, Status::BadGateway);
+        assert_eq!(code, super::RecoverRedemptionCode::UpstreamUnavailable);
+        assert_eq!(message, "Failed to poll Alpaca for journal status");
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_api_error_returns_502() {
@@ -5492,7 +5602,8 @@ mod tests {
         if let TokenizationRequest::Redeem { ref mut underlying, .. } =
             mismatched
         {
-            *underlying = UnderlyingSymbol::new("WRONG").unwrap();
+            *underlying =
+                st0x_alpaca::issuer::UnderlyingSymbol::new("WRONG").unwrap();
         }
 
         let alpaca: Arc<dyn AlpacaService> =
@@ -5518,6 +5629,61 @@ mod tests {
         assert!(logs_contain_at!(
             Level::ERROR,
             &["do not match redemption metadata"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn recover_post_alpaca_unconvertible_poll_response_returns_502() {
+        let (store, _pool, metadata, alpaca_data) =
+            setup_failed_redemption().await;
+
+        let mut unconvertible = redeem_response(
+            RedeemRequestStatus::Completed,
+            &metadata,
+            &alpaca_data,
+        );
+        if let TokenizationRequest::Redeem {
+            ref mut issuer_request_id, ..
+        } = unconvertible
+        {
+            *issuer_request_id = st0x_alpaca::issuer::IssuerRequestId(
+                "not-an-issuer-request-id".to_string(),
+            );
+        }
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(unconvertible),
+        });
+
+        let result = recover_post_alpaca(
+            &store,
+            &alpaca,
+            &mock_vault_service(),
+            &mock_burn_recovery(),
+            PostAlpacaRecoveryInput {
+                aggregate_id: metadata.issuer_request_id.to_string(),
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                metadata,
+                alpaca_data,
+                burning_failed: None,
+                burn_retry_external_tx_id: None,
+            },
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.status, Status::BadGateway);
+        assert_eq!(
+            error.body.code,
+            super::RecoverRedemptionCode::UpstreamUnavailable
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Alpaca redeem request fields are invalid",
+                "not-an-issuer-request-id",
+            ]
         ));
     }
 
@@ -7434,7 +7600,7 @@ mod tests {
 
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Error(AlpacaError::RequestNotFound {
-                id: TokenizationRequestId::new("tok-test-1"),
+                id: crate::alpaca::TokenizationRequestId::new("tok-test-1"),
                 body: "not found".to_string(),
             }),
         });
@@ -7574,8 +7740,9 @@ mod tests {
         let store = setup_store(&pool);
         let (metadata, _alpaca_data) = setup_post_alpaca_failure(&store).await;
 
-        let requested = TokenizationRequestId::new("tok-test-1");
-        let returned = TokenizationRequestId::new("tok-other-id");
+        let requested = crate::alpaca::TokenizationRequestId::new("tok-test-1");
+        let returned =
+            crate::alpaca::TokenizationRequestId::new("tok-other-id");
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Error(AlpacaError::ResponseIdMismatch {
                 requested: requested.clone(),

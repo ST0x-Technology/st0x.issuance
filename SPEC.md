@@ -691,6 +691,13 @@ on-chain transfer through calling Alpaca to burning tokens.
   `AlpacaCallClaimed`.
 - `RecordAlpacaFailure` - Alpaca redeem API call failed (valid only from
   `AlpacaCallClaimed`).
+- `RecordAlpacaInvalidResponse` - Alpaca accepted the redeem call (HTTP 200) but
+  the response is invalid for issuance: the issuer request id does not parse or
+  does not match, the quantity does not fit in a `Decimal`, or the underlying
+  symbol is invalid. Valid only from `AlpacaCallClaimed`. Emits `AlpacaCalled`
+  (with the accepted `tokenization_request_id`) and then `RedemptionFailed` in
+  one commit. Recovery then treats the redemption as post-Alpaca and never sends
+  a second redeem call.
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
@@ -1012,6 +1019,7 @@ raw redemption amounts are emitted in the admission log.
 | `ClaimAlpacaCall`                        | `AlpacaCallClaimed`                               | Durable pre-call admission, serialized with every freeze acquisition                                                                                                                                                                                                                                                                                                                           |
 | `RecordAlpacaCall`                       | `AlpacaCalled`                                    | Alpaca API called after durable admission                                                                                                                                                                                                                                                                                                                                                      |
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                                | Terminal failure                                                                                                                                                                                                                                                                                                                                                                               |
+| `RecordAlpacaInvalidResponse`            | `AlpacaCalled`, `RedemptionFailed`                | HTTP 200 with a domain-invalid response; keeps the accepted request id                                                                                                                                                                                                                                                                                                                         |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`                          | Journal complete                                                                                                                                                                                                                                                                                                                                                                               |
 | `IntendBurn`                             | `BurnIntended`                                    | Persist exact signed tx before broadcasting                                                                                                                                                                                                                                                                                                                                                    |
 | `RecordBurnTxSubmitted`                  | `BurnTxSubmitted`                                 | Pure: records the broadcast `SubmitBurnJob` performed via `BurnManager::submit_intended_burn`                                                                                                                                                                                                                                                                                                  |
@@ -4279,7 +4287,7 @@ stateDiagram-v2
     Held --> AlpacaCallClaimed: ClaimAlpacaCall (asset unfrozen)
     Held --> Failed: MarkFailed
     AlpacaCallClaimed --> AlpacaCalled: RecordAlpacaCall
-    AlpacaCallClaimed --> Failed: RecordAlpacaFailure
+    AlpacaCallClaimed --> Failed: RecordAlpacaFailure / RecordAlpacaInvalidResponse
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn

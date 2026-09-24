@@ -179,15 +179,11 @@
 
         crateSrc = craneLib.cleanCargoSource ./.;
 
-        # Vendoring reads the whole workspace lock, so the main crate's git
-        # dependency needs a pinned hash even though the dto crate never pulls
-        # it in.
+        # Vendoring reads the whole workspace lock, so every git dependency
+        # needs a pinned hash even though the dto crate never pulls them in.
         cargoVendorDir = craneLib.vendorCargoDeps {
           src = crateSrc;
-          outputHashes = {
-            "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.2#8f5c81f3472ac4ca84bbcebbddaa0b3b01f2cfea" =
-              "sha256-d0bl1jVmPeu9UPl4cNjY+cAaaLEDmLxw1BQhGrH5eV8=";
-          };
+          outputHashes = import ./nix/cargo-git-hashes.nix;
         };
 
         # The dto crate is a pure-Rust wire-types helper: no sqlx, no Rain

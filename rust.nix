@@ -24,10 +24,7 @@ let
   # Git dependency output hashes — update when Cargo.lock is re-pinned.
   baseVendorDir = craneLib.vendorCargoDeps {
     src = fullSrc;
-    outputHashes = {
-      "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.2#8f5c81f3472ac4ca84bbcebbddaa0b3b01f2cfea" =
-        "sha256-d0bl1jVmPeu9UPl4cNjY+cAaaLEDmLxw1BQhGrH5eV8=";
-    };
+    outputHashes = import ./nix/cargo-git-hashes.nix;
   };
 
   # sqlite-es uses sqlx::migrate!("../../migrations") which resolves inside
