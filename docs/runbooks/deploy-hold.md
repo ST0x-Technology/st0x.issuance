@@ -39,7 +39,19 @@ hold and starting the service.
 ## Release the hold
 
 Release the hold only after the maintenance procedure and post-operation checks
-are complete. Remove the hold on the target host:
+are complete.
+
+If the maintenance changed the TOML config (for example a `vault_mode` flip),
+deploy the system profile first, while the hold is still armed. The service
+deployment below restarts the existing unit, and the unit's `CONFIG` path
+changes only with the system profile:
+
+```sh
+nix run .#prodDeployNixos -- -i "$SSH_IDENTITY"
+# Staging: nix run .#stagingDeployNixos -- -i "$SSH_IDENTITY"
+```
+
+Remove the hold on the target host:
 
 ```sh
 rm /run/st0x/st0x-issuance.hold
