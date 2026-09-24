@@ -16,20 +16,46 @@
 # mint/burn path.
 default_vault_mode = "vault_direct"
 
-# ST0xOrchestrator, one deployment per chain at the same pinned address. Only
-# Robinhood Chain (4663) is recorded so far; the other chains' entries land
-# with their own cutovers.
+# ST0xOrchestrator, one deployment per chain at the same pinned address.
 #
-# Verified live on Robinhood: eip712Domain() answers name "ST0xOrchestrator",
-# version "1", chainId 4663, verifyingContract equal to this address, and the
-# deployed code hashes equal to Base's instance.
+# EVERY supported network is listed, not just the ones a cutover is imminent
+# for. `vault_mode` is keyed by SYMBOL, so the first asset to resolve to
+# orchestrator mode does so on every chain this deployment runs, and startup
+# then demands an entry for each of them (`Env::into_config` iterates the
+# running chain set from the CHAIN_<NETWORK>_* groups, not the asset's
+# listings — see the deliberately over-strict block in src/config.rs). A
+# missing entry is a refusal to start, never a silent vault-direct fallback,
+# so listing every network is what keeps enabling a chain group from
+# bricking startup.
+#
+# Verified live on EVERY network listed below: eip712Domain() answers name
+# "ST0xOrchestrator", version "1", the chain's own chainId, and
+# verifyingContract equal to this address; the deployed proxy code hashes
+# match across instances. One deployment per chain at the same pinned
+# address, as the heading says.
+#
+# Each address is a BeaconProxy, so equal proxy code hashes do NOT prove
+# equal logic: the proxy stub is the same on every chain whatever its beacon
+# points to, and the beacons have different owners. Before the chain's asset
+# flips, re-run the domain read and read the beacon's implementation hash per
+# chain, and record the outputs in the prod-facts table
+# (docs/runbooks/orchestrator-onboarding.md, step 7's per-chain
+# `eip712Domain()` / implementation-hash check) — this comment is the claim,
+# the table is the evidence. The preflight and
+# `approve-orchestrator` both refuse an address that does not answer as an
+# orchestrator, so a wrong entry here fails those gates rather than reaching
+# the mint/burn path.
 #
 # Recording the address stays inert until an asset resolves to orchestrator
 # mode (`VaultModeConfig::mode_for` is the only reader), so this is the
 # onboarding tooling's source of truth ahead of the first cutover, not a live
 # dependency of the mint/burn path.
 [orchestrator.addresses]
+base = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
+ethereum = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
+hyperevm = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
 robinhood = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
+binance = "0x3A7387a484d87Aa8bBA45E98AAB401Ce4FBF03E2"
 
 # Wrapped-token (ERC-4626 wrapper) contracts watched for inbound transfers to
 # the issuer wallet, which cannot be redeemed and so are alerted on instead

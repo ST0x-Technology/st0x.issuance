@@ -2466,25 +2466,29 @@ mod tests {
             );
             assert!(cfg.per_asset.is_empty(), "{name} has asset overrides");
 
-            // Recording the address neither enables the orchestrator nor
+            // Recording an address neither enables the orchestrator nor
             // requires it to exist on-chain, but it must name the instance
             // the onboarding tooling will approve roles on.
-            assert_eq!(
-                cfg.orchestrator_address_for(Network::Robinhood),
-                Some(ROBINHOOD_ORCHESTRATOR.parse().unwrap()),
-                "{name} must pin the Robinhood orchestrator address"
-            );
+            //
+            // EVERY supported network is pinned, at the one deployed
+            // address. `vault_mode` is keyed by symbol, so the first asset
+            // to resolve to orchestrator mode does so on every chain the
+            // deployment runs, and `Env::into_config` then demands an entry
+            // for each of them — a missing one is a refusal to start. The
+            // list is therefore the full `Network` set rather than only the
+            // chains that have cut over; what keeps the rollout dark is the
+            // two assertions above, not the absence of addresses.
             for network in [
                 Network::Base,
                 Network::Ethereum,
                 Network::HyperEvm,
+                Network::Robinhood,
                 Network::BnbSmartChain,
             ] {
                 assert_eq!(
                     cfg.orchestrator_address_for(network),
-                    None,
-                    "{name} carries an orchestrator address for {network}, \
-                     which has not cut over"
+                    Some(ROBINHOOD_ORCHESTRATOR.parse().unwrap()),
+                    "{name} must pin the orchestrator address for {network}"
                 );
             }
 
