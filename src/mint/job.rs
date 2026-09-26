@@ -17,7 +17,7 @@
 //! submission resolves, while every outcome command is a no-op once its event
 //! is recorded.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use apalis_sqlite::SqlitePool;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
@@ -44,9 +44,9 @@ use crate::receipt_inventory::{
 use crate::tokenized_asset::Network;
 use crate::vault::{
     MintAuthorization, MintTxStatus, MintedLogQuery, MintedLogScan,
-    NetworkVaultServices, OrchestratorMintParams, OrchestratorRevertReason,
-    PreparedMintTx, ReceiptInformation, TxId, UnconfiguredNetworkError,
-    VaultError, VaultService,
+    NetworkVaultServices, OrchestratorMintParams, OrchestratorMintResult,
+    OrchestratorRevertReason, PreparedMintTx, ReceiptInformation, TxId,
+    UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 /// Failure of a mint side-effect job. A domain rejection is recorded as a
@@ -155,9 +155,12 @@ impl Job<SubmitMintContext> for SubmitMintJob {
             // uncertain observation preserves MintIntended (no MintingFailed).
             Mint::TxIntended {
                 prepared_tx,
-                network,
+                tokenization_request_id,
                 quantity,
+                underlying,
+                network,
                 wallet,
+                journal_confirmed_at,
                 mint_mode,
                 mint_authorization,
                 ..
@@ -166,9 +169,12 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                     ctx,
                     prepared_tx,
                     SubmitFromTxIntendedParams {
+                        tokenization_request_id,
+                        quantity,
+                        underlying,
                         network: *network,
                         wallet: *wallet,
-                        quantity,
+                        journal_confirmed_at: *journal_confirmed_at,
                         mint_mode,
                         mint_authorization: mint_authorization.as_ref(),
                     },
@@ -221,9 +227,12 @@ struct ResolvePreparedParams<'a> {
 }
 
 struct SubmitFromTxIntendedParams<'a> {
+    tokenization_request_id: &'a TokenizationRequestId,
+    quantity: &'a Quantity,
+    underlying: &'a UnderlyingSymbol,
     network: Network,
     wallet: Address,
-    quantity: &'a Quantity,
+    journal_confirmed_at: DateTime<Utc>,
     /// Mode anchor from the aggregate — decides whether the pre-submit
     /// double-mint guard runs before the prepared bytes are rebroadcast.
     mint_mode: &'a VaultMode,
@@ -376,10 +385,25 @@ impl SubmitMintJob {
                 .recover_landed_orchestrator_mint(
                     ctx,
                     &vault,
-                    *orchestrator,
-                    params.wallet,
-                    authorization,
-                    assets,
+                    MintedLogQuery {
+                        orchestrator: *orchestrator,
+                        to: params.wallet,
+                        nonce: authorization.nonce,
+                        token: self.vault,
+                        amount: assets,
+                        lookback_blocks: None,
+                    },
+                    OrchestratorReceiptRegistration {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                        chain_id: self.chain_id,
+                        vault: self.vault,
+                        tokenization_request_id: params
+                            .tokenization_request_id
+                            .clone(),
+                        quantity: params.quantity.clone(),
+                        underlying: params.underlying.clone(),
+                        journal_confirmed_at: params.journal_confirmed_at,
+                    },
                 )
                 .await?
             {
@@ -643,10 +667,25 @@ impl SubmitMintJob {
                 .recover_landed_orchestrator_mint(
                     ctx,
                     &vault,
-                    *orchestrator,
-                    params.wallet,
-                    authorization,
-                    assets,
+                    MintedLogQuery {
+                        orchestrator: *orchestrator,
+                        to: params.wallet,
+                        nonce: authorization.nonce,
+                        token: self.vault,
+                        amount: assets,
+                        lookback_blocks: None,
+                    },
+                    OrchestratorReceiptRegistration {
+                        issuer_request_id: self.issuer_request_id.clone(),
+                        chain_id: self.chain_id,
+                        vault: self.vault,
+                        tokenization_request_id: params
+                            .tokenization_request_id
+                            .clone(),
+                        quantity: params.quantity.clone(),
+                        underlying: params.underlying.clone(),
+                        journal_confirmed_at: params.journal_confirmed_at,
+                    },
                 )
                 .await?
             {
@@ -1025,17 +1064,22 @@ impl SubmitMintJob {
     /// can have landed under this mint's nonce (the on-chain uniqueness
     /// key), sparing the full lookback scan on every ordinary first
     /// submission.
+    ///
+    /// A full match also registers the receipt the landed mint created,
+    /// BEFORE the recovery is recorded: `RecordOrchestratorMintRecovered`
+    /// carries no `Deposit`, nothing rediscovers an orchestrator-held receipt
+    /// later, and once the aggregate is `CallbackPending` the recovery loop
+    /// enqueues the callback on its own — so a registration left to the
+    /// confirm job could lose the race to `MintCompleted` and never run.
     async fn recover_landed_orchestrator_mint(
         &self,
         ctx: &SubmitMintContext,
         vault: &Arc<dyn VaultService>,
-        orchestrator: Address,
-        wallet: Address,
-        authorization: &MintAuthorization,
-        assets: U256,
+        query: MintedLogQuery,
+        registration: OrchestratorReceiptRegistration,
     ) -> Result<OrchestratorPreSubmitOutcome, MintJobError> {
         let consumed = match vault
-            .nonce_used(orchestrator, wallet, authorization.nonce)
+            .nonce_used(query.orchestrator, query.to, query.nonce)
             .await
         {
             Ok(consumed) => consumed,
@@ -1054,17 +1098,8 @@ impl SubmitMintJob {
             return Ok(OrchestratorPreSubmitOutcome::Proceed);
         }
 
-        match vault
-            .find_orchestrator_minted_log(MintedLogQuery {
-                orchestrator,
-                to: wallet,
-                nonce: authorization.nonce,
-                token: self.vault,
-                amount: assets,
-                lookback_blocks: None,
-            })
-            .await
-        {
+        let orchestrator = query.orchestrator;
+        match vault.find_orchestrator_minted_log(query).await {
             Ok(MintedLogScan::FullMatch(minted)) => {
                 info!(
                     target: "mint",
@@ -1074,6 +1109,15 @@ impl SubmitMintJob {
                     "Found landed orchestrator mint, recording recovery \
                      instead of re-submitting"
                 );
+
+                register_recovered_orchestrator_receipt(
+                    vault.as_ref(),
+                    ctx.receipts.as_ref(),
+                    &registration,
+                    orchestrator,
+                    minted.tx_hash,
+                )
+                .await;
 
                 ctx.mint_store
                     .send(
@@ -1101,10 +1145,10 @@ impl SubmitMintJob {
                 error!(
                     target: "mint",
                     issuer_request_id = %self.issuer_request_id,
-                    to = %wallet,
-                    nonce = %authorization.nonce,
-                    token = %self.vault,
-                    amount = %assets,
+                    to = %query.to,
+                    nonce = %query.nonce,
+                    token = %query.token,
+                    amount = %query.amount,
                     "Authorization nonce was consumed by a different mint; \
                      manual reconciliation required"
                 );
@@ -1137,7 +1181,7 @@ impl SubmitMintJob {
                 warn!(
                     target: "mint",
                     issuer_request_id = %self.issuer_request_id,
-                    nonce = %authorization.nonce,
+                    nonce = %query.nonce,
                     "Nonce is consumed but no Minted log was found at the \
                      pair; parking for reconciliation"
                 );
@@ -1493,6 +1537,217 @@ struct ConfirmWhileTxSubmitted {
     stored_tx_id: TxId,
 }
 
+/// Owned inputs of the orchestrator receipt registration, so every path that
+/// completes an orchestrator mint can reach it from whatever it holds — the
+/// ordinary confirm, the replayed-nonce recovery in this job, the pre-submit
+/// landed-mint recovery, and recovery's widened reconciliation.
+pub(super) struct OrchestratorReceiptRegistration {
+    pub(super) issuer_request_id: IssuerMintRequestId,
+    pub(super) chain_id: u64,
+    pub(super) vault: Address,
+    pub(super) tokenization_request_id: TokenizationRequestId,
+    pub(super) quantity: Quantity,
+    pub(super) underlying: UnderlyingSymbol,
+    pub(super) journal_confirmed_at: DateTime<Utc>,
+}
+
+/// Tracks the receipt an orchestrator mint created.
+///
+/// The orchestrator custodies it, not the bot wallet, but inventory mirrors a
+/// vault's receipts against whichever wallet holds them — so a receipt minted
+/// after the cutover belongs in inventory exactly like the ones the migration
+/// moved there. Without it the mirror stays LOW, and `confirm-custody` builds
+/// its comparison list FROM the tracked receipts: an unregistered receipt is
+/// never compared, so a rollback PASSES and strands it at the orchestrator.
+/// That is the unsafe direction, and it is silent, which is why every path
+/// that completes an orchestrator mint comes through here.
+///
+/// Best-effort, matching the vault-direct registration it mirrors: a failure
+/// must not block `MintCompleted`. Registration is idempotent, so
+/// re-registering the same receipt is a no-op — which is also why every
+/// caller runs this BEFORE the command that records the mint, exactly as the
+/// vault-direct path does: a crash between the two then costs a repeated
+/// registration rather than a receipt lost for good.
+///
+/// Unlike the vault-direct case, nothing discovers this receipt later.
+/// `ReceiptBackfiller` narrows `Deposit` logs to `owner == bot_wallet` and
+/// otherwise scans inbound ERC-1155 transfers to the bot wallet; an
+/// orchestrator mint's receipt is owned by the ORCHESTRATOR and matches
+/// neither. A failure here is therefore permanent until someone reconciles by
+/// hand.
+async fn register_orchestrator_receipt(
+    receipts: &dyn ReceiptService,
+    params: &OrchestratorReceiptRegistration,
+    result: &OrchestratorMintResult,
+) {
+    let Some(deposit) = result.deposit.as_ref() else {
+        warn!(
+            target: "mint",
+            issuer_request_id = %params.issuer_request_id,
+            tx_hash = %result.tx_hash,
+            "Orchestrator mint carried no decodable Deposit; its receipt \
+             stays invisible to inventory. `confirm-custody` compares only \
+             receipts inventory already tracks, so a rollback will PASS and \
+             strand this one at the orchestrator — register it by hand \
+             before rolling back"
+        );
+        return;
+    };
+
+    let receipt_info = ReceiptInformation::new(
+        params.tokenization_request_id.clone(),
+        params.issuer_request_id.clone(),
+        params.underlying.clone(),
+        params.quantity.clone(),
+        params.journal_confirmed_at,
+        None,
+    );
+
+    if let Err(error) = receipts
+        .register_minted_receipt(MintedReceiptParams {
+            chain_id: params.chain_id,
+            vault: params.vault,
+            receipt_id: ReceiptId::from(deposit.receipt_id),
+            shares: Shares::from(deposit.shares),
+            block_number: result.block_number,
+            tx_hash: result.tx_hash,
+            receipt_info,
+            receipt_info_bytes: deposit.receipt_info_bytes.clone(),
+        })
+        .await
+    {
+        warn!(
+            target: "mint",
+            issuer_request_id = %params.issuer_request_id,
+            receipt_id = %deposit.receipt_id,
+            error = %error,
+            "Failed to register the orchestrator mint's receipt; it stays \
+             invisible to inventory until registered by hand. \
+             `confirm-custody` builds its comparison list FROM tracked \
+             receipts, so a rollback will PASS and strand this one at the \
+             orchestrator"
+        );
+    }
+}
+
+/// Registers the receipt of an orchestrator mint that landed without the
+/// caller seeing its transaction receipt.
+///
+/// `RecordOrchestratorMintRecovered` carries only the `Minted` log's fields,
+/// so the `Deposit` that created the receipt has to be sourced by re-reading
+/// the landed transaction. Best-effort in both steps, like the registration on
+/// the ordinary confirm path.
+///
+/// A recovered mint can be registered long after it landed, and the
+/// `Deposit`'s `shares` is the balance at mint time. An orchestrator burn in
+/// between may have consumed the receipt, and that burn's reconciliation
+/// skipped it because it was not tracked yet. So the registration is followed
+/// by a reading of what the orchestrator holds now (see
+/// [`reconcile_recovered_receipt`]).
+pub(super) async fn register_recovered_orchestrator_receipt(
+    vault_service: &dyn VaultService,
+    receipts: &dyn ReceiptService,
+    params: &OrchestratorReceiptRegistration,
+    orchestrator: Address,
+    tx_hash: B256,
+) {
+    match vault_service.confirm_orchestrator_mint(&TxId::Hash(tx_hash)).await {
+        Ok(result) => {
+            register_orchestrator_receipt(receipts, params, &result).await;
+            if let Some(deposit) = result.deposit.as_ref() {
+                reconcile_recovered_receipt(
+                    vault_service,
+                    receipts,
+                    params,
+                    orchestrator,
+                    deposit.receipt_id,
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            warn!(
+                target: "mint",
+                issuer_request_id = %params.issuer_request_id,
+                tx_hash = %tx_hash,
+                error = %error,
+                "Could not re-read the recovered mint's transaction to \
+                 register its receipt; the receipt stays invisible to \
+                 inventory until registered by hand"
+            );
+        }
+    }
+}
+
+/// Brings a just-registered recovered receipt to the balance the orchestrator
+/// holds now, rather than the mint-time balance its `Deposit` carried.
+///
+/// A reading, not a delta, applied through the same `ReconcileBalance` the
+/// burn path uses, so it is a no-op when nothing was consumed. Best-effort: a
+/// failure leaves the mint-time balance, which can only be HIGH, so a
+/// rollback's `confirm-custody` refuses loudly rather than passing.
+async fn reconcile_recovered_receipt(
+    vault_service: &dyn VaultService,
+    receipts: &dyn ReceiptService,
+    params: &OrchestratorReceiptRegistration,
+    orchestrator: Address,
+    receipt_id: U256,
+) {
+    let balance = match vault_service
+        .receipt_balances(params.vault, orchestrator, &[receipt_id])
+        .await
+    {
+        Ok(balances) => balances.first().copied(),
+        Err(error) => {
+            warn!(
+                target: "mint",
+                issuer_request_id = %params.issuer_request_id,
+                %receipt_id,
+                %orchestrator,
+                error = %error,
+                "Failed to read the recovered receipt's current balance; \
+                 inventory keeps its mint-time balance, and a rollback's \
+                 `confirm-custody` refuses if a burn has consumed it since"
+            );
+            return;
+        }
+    };
+    let Some(balance) = balance else {
+        warn!(
+            target: "mint",
+            issuer_request_id = %params.issuer_request_id,
+            %receipt_id,
+            "Balance read for the recovered receipt returned no reading; \
+             inventory keeps its mint-time balance"
+        );
+        return;
+    };
+
+    if let Err(error) = receipts
+        .reconcile_receipt_balance(
+            params.chain_id,
+            params.vault,
+            ReceiptId::from(receipt_id),
+            Shares::from(balance),
+            orchestrator,
+        )
+        .await
+    {
+        warn!(
+            target: "mint",
+            issuer_request_id = %params.issuer_request_id,
+            %receipt_id,
+            balance = %balance,
+            %orchestrator,
+            error = %error,
+            "Inventory refused the recovered receipt's current balance; it \
+             keeps its mint-time balance, and a rollback's `confirm-custody` \
+             refuses on it. No operator command re-runs this reading: \
+             escalate to engineering before any rollback"
+        );
+    }
+}
+
 /// Owned fields from `Mint::MintingFailed` needed for re-observe + receipt
 /// registration. Passing them explicitly avoids re-destructuring `mint` and
 /// silently skipping registration if the match fails.
@@ -1672,15 +1927,9 @@ impl ConfirmMintJob {
         if let VaultMode::Orchestrator { address: orchestrator } =
             &params.mint_mode
         {
+            let orchestrator = *orchestrator;
             return self
-                .confirm_orchestrator(
-                    ctx,
-                    vault,
-                    *orchestrator,
-                    params.wallet,
-                    &params.quantity,
-                    params.mint_authorization.as_ref(),
-                )
+                .confirm_orchestrator(ctx, vault, orchestrator, &params)
                 .await;
         }
 
@@ -2313,24 +2562,45 @@ impl ConfirmMintJob {
         Ok(())
     }
 
+    /// The receipt registration inputs this job holds for the mint it is
+    /// confirming (see [`register_orchestrator_receipt`]).
+    fn registration(
+        &self,
+        params: &ConfirmWhileTxSubmitted,
+    ) -> OrchestratorReceiptRegistration {
+        OrchestratorReceiptRegistration {
+            issuer_request_id: self.issuer_request_id.clone(),
+            chain_id: self.chain_id,
+            vault: self.vault,
+            tokenization_request_id: params.tokenization_request_id.clone(),
+            quantity: params.quantity.clone(),
+            underlying: params.underlying.clone(),
+            journal_confirmed_at: params.journal_confirmed_at,
+        }
+    }
+
     /// Orchestrator-mode confirmation: the job counterpart of
     /// `Mint::handle_record_orchestrator_tokens_minted`. Success records
-    /// `OrchestratorTokensMinted` with NO receipt registration — the
-    /// orchestrator holds receipt custody. A decoded `NonceReplayed` revert
-    /// means an earlier transaction consumed this `(to, nonce)` pair, so the
-    /// landed `Minted` log is full-matched on `(to, nonce, token, amount)`:
-    /// only a full match may complete the mint; a consumed nonce whose token
-    /// or amount differs fails as `NonceConsumedByOtherMint` for manual
-    /// reconciliation, never a false completion.
+    /// `OrchestratorTokensMinted` and then tracks the vault receipt the mint
+    /// deposited — the orchestrator custodies that receipt, but inventory
+    /// mirrors it all the same (see [`register_orchestrator_receipt`]). A
+    /// decoded `NonceReplayed`
+    /// revert means an earlier transaction consumed this `(to, nonce)` pair,
+    /// so the landed `Minted` log is full-matched on
+    /// `(to, nonce, token, amount)`: only a full match may complete the mint;
+    /// a consumed nonce whose token or amount differs fails as
+    /// `NonceConsumedByOtherMint` for manual reconciliation, never a false
+    /// completion.
     async fn confirm_orchestrator(
         &self,
         ctx: &ConfirmMintContext,
         vault_service: Arc<dyn VaultService>,
         orchestrator: Address,
-        to: Address,
-        quantity: &Quantity,
-        authorization: Option<&MintAuthorization>,
+        params: &ConfirmWhileTxSubmitted,
     ) -> Result<(), MintJobError> {
+        let to = params.wallet;
+        let quantity = &params.quantity;
+        let authorization = params.mint_authorization.as_ref();
         let revert = match vault_service
             .confirm_orchestrator_mint(&self.tx_id)
             .await
@@ -2344,6 +2614,17 @@ impl ConfirmMintJob {
                     shares_minted = %result.shares_minted,
                     "Orchestrator mint confirmed"
                 );
+
+                // Registration first, as on the vault-direct path: it is
+                // idempotent, so a crash between the two costs a repeated
+                // registration, while the other order loses the receipt for
+                // good once the aggregate reaches `CallbackPending`.
+                register_orchestrator_receipt(
+                    ctx.receipts.as_ref(),
+                    &self.registration(params),
+                    &result,
+                )
+                .await;
 
                 ctx.mint_store
                     .send(
@@ -2443,6 +2724,24 @@ impl ConfirmMintJob {
                     "Replayed nonce full-matched an earlier landed mint; \
                      recovering"
                 );
+
+                // `RecordOrchestratorMintRecovered` carries no `Deposit`, so
+                // the receipt this mint created would otherwise never enter
+                // inventory — and nothing picks it up later, because the
+                // backfiller only sees receipts owned by the bot wallet.
+                // Re-read the landed transaction to source it, BEFORE the
+                // recovery is recorded: registration is idempotent, so a
+                // crash between the two costs a repeat, while the other
+                // order loses the receipt once the mint completes.
+                // Best-effort, like the registration on the ordinary path.
+                register_recovered_orchestrator_receipt(
+                    vault_service.as_ref(),
+                    ctx.receipts.as_ref(),
+                    &self.registration(params),
+                    orchestrator,
+                    minted.tx_hash,
+                )
+                .await;
 
                 ctx.mint_store
                     .send(
@@ -2668,6 +2967,30 @@ async fn record_existing_receipt_from_inventory(
         return Ok(false);
     };
 
+    // An orchestrator mint's own receipt is in inventory by design: it is
+    // registered BEFORE the command that records the mint, so a crash or a
+    // failed send between the two leaves it there with the mint not yet
+    // recorded. That receipt is not a recovery signal for this path —
+    // `RecordExistingMint` is the vault-direct completion, and the aggregate
+    // refuses it for an orchestrator mint with `MintModeMismatch`, which
+    // would stop the drive before orchestrator recovery finds the landed mint
+    // through its nonce and `Minted` log. So step aside for orchestrator
+    // mode and let that recovery run, exactly as before orchestrator mints
+    // registered receipts at all.
+    let mint = mint_store.load(issuer_request_id).await?;
+    if let Some(VaultMode::Orchestrator { .. }) =
+        mint.as_ref().and_then(Mint::mint_mode)
+    {
+        debug!(
+            target: "mint",
+            issuer_request_id = %issuer_request_id,
+            receipt_id = %receipt.receipt_id,
+            "Inventory holds this orchestrator mint's receipt; leaving \
+             recovery to the orchestrator nonce and Minted-log path"
+        );
+        return Ok(false);
+    }
+
     info!(
         target: "mint",
         issuer_request_id = %issuer_request_id,
@@ -2779,8 +3102,8 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MintResult, MintTxStatus, NetworkVault, OrchestratorMintResult,
-        OrchestratorMintedLog,
+        MintResult, MintTxStatus, NetworkVault, OrchestratorMintDeposit,
+        OrchestratorMintResult, OrchestratorMintedLog,
     };
 
     /// Seeds raw `Mint` events directly into the event store so job tests can
@@ -3060,6 +3383,27 @@ mod tests {
             _issuer_request_id: &IssuerMintRequestId,
         ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
             Ok(None)
+        }
+
+        async fn tracked_receipts_in_range(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _start: U256,
+            _end: U256,
+        ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+            Ok(vec![])
+        }
+
+        async fn reconcile_receipt_balance(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _receipt_id: ReceiptId,
+            _on_chain_balance: Shares,
+            _observed_wallet: Address,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
         }
     }
 
@@ -5566,6 +5910,282 @@ mod tests {
         ));
     }
 
+    /// A mint recovered forward still owes inventory its receipt, and owes it
+    /// BEFORE the recovery is recorded.
+    ///
+    /// A recovered mint can be registered long after it landed, and a burn in
+    /// between may already have consumed part of its receipt. That burn's
+    /// reconciliation skipped the receipt because it was not tracked yet, so
+    /// registering the `Deposit`'s mint-time shares alone would leave the
+    /// mirror HIGH until some later burn happened to re-read this id. The
+    /// registration must end on the balance the orchestrator holds now.
+    #[tokio::test]
+    async fn recovered_receipt_is_registered_at_its_current_balance() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+
+        let shares =
+            U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let remaining = shares / U256::from(4u8);
+        let landed_tx_hash = B256::repeat_byte(0xce);
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    block_number: 777,
+                })
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    deposit: Some(OrchestratorMintDeposit {
+                        receipt_id: U256::from(15u8),
+                        shares,
+                        receipt_info_bytes: Bytes::new(),
+                    }),
+                    gas_used: 50_000,
+                    block_number: 777,
+                })
+                // A burn since the mint left a quarter on the receipt.
+                .with_receipt_balance(
+                    ORCHESTRATOR,
+                    U256::from(15u8),
+                    remaining,
+                ),
+        );
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&submit_ctx(&harness, vault))
+        .await
+        .unwrap();
+
+        let recovered = cqrs_receipts(&harness.pool)
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &VAULT,
+                &issuer_request_id,
+            )
+            .await
+            .expect("receipt lookup should succeed")
+            .expect("the recovered mint's receipt must be tracked");
+        assert_eq!(recovered.receipt_id, U256::from(15u8));
+        assert_eq!(
+            recovered.shares, remaining,
+            "the mirror must hold what the orchestrator holds now, not the \
+             mint-time balance"
+        );
+    }
+
+    /// The crash window the registration-first order opens: the receipt was
+    /// registered, but `RecordOrchestratorMintRecovered` never landed (a
+    /// restart, or a failed send). The next drive finds this mint's own
+    /// receipt in inventory. That must not end the drive: the vault-direct
+    /// `RecordExistingMint` is refused for an orchestrator mint with
+    /// `MintModeMismatch`, and stopping there would leave a landed mint in
+    /// `TxIntended` with no callback. The drive must go on to the orchestrator
+    /// nonce and `Minted`-log recovery and complete the mint.
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_redrive_after_registration_without_record_recovers() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+
+        let shares =
+            U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let landed_tx_hash = B256::repeat_byte(0xcd);
+        let receipts = cqrs_receipts(&harness.pool);
+        let receipt_info = ReceiptInformation::new(
+            super::super::TokenizationRequestId::new("tok-123"),
+            issuer_request_id.clone(),
+            super::super::UnderlyingSymbol::new("AAPL").unwrap(),
+            crate::Quantity::new(rust_decimal::Decimal::from(100)),
+            chrono::Utc::now(),
+            None,
+        );
+        receipts
+            .register_minted_receipt(MintedReceiptParams {
+                chain_id: ANVIL_CHAIN_ID,
+                vault: VAULT,
+                receipt_id: ReceiptId::from(U256::from(14u8)),
+                shares: Shares::new(shares),
+                block_number: 777,
+                tx_hash: landed_tx_hash,
+                receipt_info_bytes: receipt_info.encode().unwrap(),
+                receipt_info,
+            })
+            .await
+            .unwrap();
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    block_number: 777,
+                }),
+        );
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&submit_ctx(&harness, vault.clone()))
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(&mint, Mint::CallbackPending { .. }),
+            "a re-drive over an already-registered receipt must still recover \
+             the landed mint, got: {mint:?}"
+        );
+        assert_eq!(
+            vault.find_minted_log_call_count(),
+            1,
+            "recovery must reach the orchestrator Minted-log scan"
+        );
+        let test =
+            "orchestrator_redrive_after_registration_without_record_recovers";
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                test,
+                "Inventory holds this orchestrator mint's receipt",
+                &issuer_request_id.to_string(),
+            ]
+        ));
+        assert!(!logs_contain_at!(
+            Level::ERROR,
+            &[test, "Vault receipt mis-attributed"]
+        ));
+    }
+
+    /// `RecordOrchestratorMintRecovered` carries only the `Minted` log's
+    /// fields, and the backfiller never sees an orchestrator-held receipt, so
+    /// the recovery itself must re-read the landed transaction and register.
+    /// It cannot be left to the confirm job: once the aggregate is
+    /// `CallbackPending` the recovery loop enqueues the callback on its own,
+    /// and a callback that wins that race completes the mint with the receipt
+    /// still untracked. Skipping it fails UNSAFE and silently:
+    /// `confirm-custody` compares only tracked receipts, so a rollback PASSES
+    /// and strands it at the orchestrator.
+    #[tokio::test]
+    async fn recovered_landed_orchestrator_mint_registers_its_receipt() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_tx_intended(&issuer_request_id),
+        )
+        .await;
+
+        let shares =
+            U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let landed_tx_hash = B256::repeat_byte(0xcc);
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_nonce_used(true)
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    block_number: 777,
+                })
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    deposit: Some(OrchestratorMintDeposit {
+                        receipt_id: U256::from(13u8),
+                        shares,
+                        receipt_info_bytes: Bytes::new(),
+                    }),
+                    gas_used: 50_000,
+                    block_number: 777,
+                }),
+        );
+
+        SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&submit_ctx(&harness, vault.clone()))
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(&mint, Mint::CallbackPending { .. }),
+            "the landed mint must be recovered forward, got: {mint:?}"
+        );
+
+        // Tracked by the submit job itself, before any downstream job runs:
+        // the confirm and callback jobs it hands off to are not raced here.
+        let receipts = cqrs_receipts(&harness.pool);
+        let recovered = receipts
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &VAULT,
+                &issuer_request_id,
+            )
+            .await
+            .expect("receipt lookup should succeed")
+            .expect(
+                "the recovered mint's receipt must be tracked by the recovery \
+                 itself, before the confirm job runs",
+            );
+        assert_eq!(recovered.receipt_id, U256::from(13u8));
+        assert_eq!(recovered.shares, shares);
+
+        // The confirm job the recovery enqueued, run as apalis would run it,
+        // still drives the mint on to its callback.
+        ConfirmMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+            tx_id: TxId::Hash(landed_tx_hash),
+        }
+        .perform(&confirm_ctx(&harness, vault, receipts))
+        .await
+        .unwrap();
+        assert_eq!(
+            count_jobs(
+                &harness.pool,
+                type_name::<SendCallbackJob>(),
+                &issuer_request_id.to_string(),
+            )
+            .await,
+            1,
+            "the callback must still be enqueued"
+        );
+    }
+
     /// The same crash window when the pair's landing belongs to a different
     /// mint: the rebroadcast path must park the typed verdict instead of
     /// resubmitting into a `NonceReplayed` revert that records
@@ -5884,9 +6504,156 @@ mod tests {
         ));
     }
 
-    /// Orchestrator confirmation records `OrchestratorTokensMinted` and never
-    /// touches the receipt service — the orchestrator custodies the receipt.
-    /// The failing receipt stub would log a warning if it were reached.
+    /// An orchestrator mint's receipt belongs in inventory even though the
+    /// orchestrator, not the bot, custodies it: inventory mirrors a vault's
+    /// receipts against whichever wallet holds them, and a rollback's
+    /// `confirm-custody` refuses on any receipt it cannot account for.
+    #[traced_test]
+    #[tokio::test]
+    async fn confirm_mint_job_orchestrator_tracks_the_minted_receipt() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+        )
+        .await;
+
+        let shares = U256::from(100_000_000_000_000_000_000u128);
+        let receipts = cqrs_receipts(&harness.pool);
+        let ctx = confirm_ctx(
+            &harness,
+            Arc::new(
+                MockVaultService::new_success().with_orchestrator_mint_result(
+                    OrchestratorMintResult {
+                        tx_hash: B256::ZERO,
+                        nonce: test_mint_authorization().nonce,
+                        shares_minted: shares,
+                        deposit: Some(OrchestratorMintDeposit {
+                            receipt_id: U256::from(7u8),
+                            shares,
+                            receipt_info_bytes: Bytes::new(),
+                        }),
+                        gas_used: 50_000,
+                        block_number: 5_000,
+                    },
+                ),
+            ),
+            receipts.clone(),
+        );
+
+        ConfirmMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+            tx_id: TxId::Legacy("fb-1".to_string()),
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let recovered = receipts
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &VAULT,
+                &issuer_request_id,
+            )
+            .await
+            .expect("receipt lookup should succeed")
+            .expect("the orchestrator mint's receipt must be tracked");
+        assert_eq!(recovered.receipt_id, U256::from(7u8));
+        assert_eq!(recovered.shares, shares);
+    }
+
+    /// A registration failure must not block the mint, and must say so loudly.
+    ///
+    /// This is the direction that fails UNSAFE: the mirror is left LOW, and
+    /// `confirm-custody` builds its comparison list FROM the tracked receipts,
+    /// so an unregistered one is never compared and a rollback PASSES while
+    /// stranding it at the orchestrator. Nothing rediscovers it either, because
+    /// the backfiller only sees receipts owned by the bot wallet. The warning
+    /// is therefore the only prompt an operator gets, which is what the SPEC
+    /// relies on.
+    #[traced_test]
+    #[tokio::test]
+    async fn confirm_mint_job_orchestrator_warns_when_registration_fails() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            orchestrator_events_through_tx_submitted(&issuer_request_id),
+        )
+        .await;
+
+        let shares = U256::from(100_000_000_000_000_000_000u128);
+        let ctx = confirm_ctx(
+            &harness,
+            Arc::new(
+                MockVaultService::new_success().with_orchestrator_mint_result(
+                    OrchestratorMintResult {
+                        tx_hash: B256::ZERO,
+                        nonce: test_mint_authorization().nonce,
+                        shares_minted: shares,
+                        deposit: Some(OrchestratorMintDeposit {
+                            receipt_id: U256::from(7u8),
+                            shares,
+                            receipt_info_bytes: Bytes::new(),
+                        }),
+                        gas_used: 50_000,
+                        block_number: 5_000,
+                    },
+                ),
+            ),
+            Arc::new(FailingReceiptService),
+        );
+
+        ConfirmMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+            tx_id: TxId::Legacy("fb-1".to_string()),
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        let mint =
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(&mint, Mint::CallbackPending { .. }),
+            "a registration failure must not block the mint, got: {mint:?}"
+        );
+        assert_eq!(
+            count_jobs(
+                &harness.pool,
+                type_name::<SendCallbackJob>(),
+                &issuer_request_id.to_string(),
+            )
+            .await,
+            1,
+            "the callback must still be enqueued"
+        );
+        let test =
+            "confirm_mint_job_orchestrator_warns_when_registration_fails";
+        assert!(
+            logs_contain_at!(
+                Level::WARN,
+                &[
+                    test,
+                    "Failed to register the orchestrator mint's receipt",
+                    "7",
+                ]
+            ),
+            "the operator's only prompt is this warning, and it must name the \
+             receipt"
+        );
+    }
+
+    /// Orchestrator confirmation records `OrchestratorTokensMinted` and, with
+    /// no decodable `Deposit` to track, leaves the receipt service alone. The
+    /// failing receipt stub would log a warning if it were reached.
     #[traced_test]
     #[tokio::test]
     async fn confirm_mint_job_orchestrator_records_without_receipts() {
@@ -5911,6 +6678,7 @@ mod tests {
                         shares_minted: U256::from(
                             100_000_000_000_000_000_000u128,
                         ),
+                        deposit: None,
                         gas_used: 50_000,
                         block_number: 5_000,
                     },
@@ -5954,11 +6722,20 @@ mod tests {
         );
         let test = "confirm_mint_job_orchestrator_records_without_receipts";
         assert!(
+            logs_contain_at!(
+                Level::WARN,
+                &[test, "Orchestrator mint carried no decodable Deposit"]
+            ),
+            "a mint with no decodable Deposit must say so, since nothing \
+             rediscovers an orchestrator-held receipt later"
+        );
+        assert!(
             !logs_contain_at!(
                 Level::WARN,
-                &[test, "Failed to register minted receipt"]
+                &[test, "Failed to register the orchestrator mint's receipt"]
             ),
-            "the receipt service must never be called for an orchestrator mint"
+            "with no Deposit to track, the receipt service must never be \
+             reached — the failing stub would warn if it were"
         );
     }
 
@@ -5978,21 +6755,41 @@ mod tests {
         .await;
 
         let authorization = test_mint_authorization();
+        let shares =
+            U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let landed_tx_hash = B256::repeat_byte(0xab);
         let vault = Arc::new(
             MockVaultService::new_success()
-                .with_orchestrator_mint_confirm_revert(
+                // Scoped to the submission this job holds. The EARLIER
+                // transaction that consumed the nonce landed, so re-reading it
+                // must succeed — that re-read is where the recovered mint's
+                // receipt comes from, and an unscoped revert would make the
+                // registration below unreachable.
+                .with_orchestrator_mint_confirm_revert_for(
+                    TxId::Legacy("fb-1".to_string()),
                     OrchestratorRevertReason::NonceReplayed {
                         to: Address::ZERO,
                         nonce: authorization.nonce,
                     },
                 )
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: landed_tx_hash,
+                    nonce: authorization.nonce,
+                    shares_minted: shares,
+                    deposit: Some(OrchestratorMintDeposit {
+                        receipt_id: U256::from(9u8),
+                        shares,
+                        receipt_info_bytes: Bytes::new(),
+                    }),
+                    gas_used: 50_000,
+                    block_number: 777,
+                })
                 .with_minted_log(OrchestratorMintedLog {
-                    tx_hash: B256::ZERO,
+                    tx_hash: landed_tx_hash,
                     nonce: authorization.nonce,
                     // The mock full-matches like the real lookup: the landed
                     // amount must equal the mint's 18-decimal share amount.
-                    shares_minted: U256::from(100u64)
-                        * U256::from(10u64).pow(U256::from(18u64)),
+                    shares_minted: shares,
                     block_number: 777,
                 })
                 // Bound to the fixture's exact orchestrator, recipient, and
@@ -6003,12 +6800,13 @@ mod tests {
                     VAULT,
                 ),
         );
-        let ctx = confirm_ctx(&harness, vault, cqrs_receipts(&harness.pool));
+        let receipts = cqrs_receipts(&harness.pool);
+        let ctx = confirm_ctx(&harness, vault, receipts.clone());
 
         ConfirmMintJob {
             issuer_request_id: issuer_request_id.clone(),
             vault: VAULT,
-            chain_id: 1,
+            chain_id: ANVIL_CHAIN_ID,
             tx_id: TxId::Legacy("fb-1".to_string()),
         }
         .perform(&ctx)
@@ -6032,11 +6830,35 @@ mod tests {
             1,
         );
 
+        // The recovered command carries no `Deposit`, so the receipt can only
+        // come from re-reading the landed transaction. Nothing rediscovers an
+        // orchestrator-held receipt later, so a recovery that skipped this
+        // would strand it silently.
+        let recovered = receipts
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &VAULT,
+                &issuer_request_id,
+            )
+            .await
+            .expect("receipt lookup should succeed")
+            .expect("the recovered mint's receipt must be tracked");
+        assert_eq!(recovered.receipt_id, U256::from(9u8));
+        assert_eq!(recovered.shares, shares);
+
         let test = "confirm_mint_job_orchestrator_replayed_nonce_recovers";
         assert!(logs_contain_at!(
             Level::INFO,
             &[test, "full-matched an earlier landed mint"]
         ));
+        assert!(
+            !logs_contain_at!(
+                Level::WARN,
+                &[test, "Could not re-read the recovered mint's transaction"]
+            ),
+            "the landed transaction must be readable, or the registration \
+             above is vacuous"
+        );
     }
 
     /// A replayed nonce whose `Minted` log at the pair disagrees on amount

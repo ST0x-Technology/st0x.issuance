@@ -4,6 +4,7 @@ use alloy::sol_types::SolCall;
 use apalis_sqlite::SqlitePool;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
+use itertools::izip;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -31,8 +32,8 @@ use crate::jobs::{JobQueue, QueuePushError, job_type};
 use crate::mint::QuantityConversionError;
 use crate::mint::recovery::release_terminal_job;
 use crate::receipt_inventory::{
-    BurnPlan, BurnTrackingError, ReceiptInventoryError, ReceiptLookupError,
-    ReceiptRegistrationError, ReceiptService, Shares,
+    BurnPlan, BurnTrackingError, ReceiptId, ReceiptInventoryError,
+    ReceiptLookupError, ReceiptRegistrationError, ReceiptService, Shares,
 };
 use crate::redemption::force_complete::{
     ForceCompleteRefusal, bind_verified_burns,
@@ -44,7 +45,7 @@ use crate::redemption::{
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
-    BurnRequestOrigin, BurnTxFate, BurnTxStatus, BurnVerification,
+    BurnRange, BurnRequestOrigin, BurnTxFate, BurnTxStatus, BurnVerification,
     MultiBurnEntry, MultiBurnParams, NetworkVaultServices,
     OrchestratorBurnParams, OrchestratorBurnReadiness, SendableTxWithHash,
     TxId, UnconfiguredNetworkError, VaultError, VaultService,
@@ -215,6 +216,22 @@ enum FailedBurnInspection {
     /// The retained burn can still land, or could not be classified: leave
     /// the redemption for the next pass.
     Wait,
+}
+
+/// Where a recovered orchestrator burn landed: the network it was sent on,
+/// the vault whose receipts it drained, and the orchestrator that custodies
+/// them.
+///
+/// `orchestrator` travels in from the caller rather than being read back from
+/// the aggregate: `Redemption::metadata()` carries the `burn_mode` anchor only
+/// while the redemption is in flight, and existing-burn recovery runs from
+/// `Failed` into `Completed` — neither of which exposes it. Both callers
+/// already destructure `VaultMode::Orchestrator { address }` to reach it.
+#[derive(Debug, Clone, Copy)]
+struct OrchestratorBurnSite {
+    network: Network,
+    vault: Address,
+    orchestrator: Address,
 }
 
 /// The persisted-burn recovery inputs pulled from a `BurnSubmitted` /
@@ -1085,9 +1102,13 @@ impl BurnManager {
                         )
                         .await?
                     }
-                    VaultMode::Orchestrator { .. } => {
+                    VaultMode::Orchestrator { address } => {
                         self.recover_orchestrator_burn_failed_with_existing_tx(
-                            candidate.metadata.network,
+                            OrchestratorBurnSite {
+                                network: candidate.metadata.network,
+                                vault,
+                                orchestrator: address,
+                            },
                             issuer_request_id,
                             &tx_id,
                             candidate.alpaca_quantity,
@@ -1321,9 +1342,11 @@ impl BurnManager {
     /// Verifies the operator-supplied `burn_tx_hash` on-chain — the receipt
     /// must have succeeded and contain a real `Transfer(bot_wallet -> 0x0)` of
     /// the vault's shares — before recording the proving terminal event and
-    /// transitioning the redemption to `Completed`. The held receipt
-    /// reservation is then settled (mirror reduced), exactly as a normal burn
-    /// completion would. Returns the on-chain verification so the caller can
+    /// transitioning the redemption to `Completed`. Inventory then follows the
+    /// burn exactly as a normal completion would: a vault-direct reservation
+    /// is settled (mirror reduced), and an orchestrator burn, which reserved
+    /// nothing, is reconciled from the chain over the proving transaction's
+    /// `Burned` range. Returns the on-chain verification so the caller can
     /// report the proven block number and burned shares.
     ///
     /// The supplied hash must match this redemption's non-empty persisted exact
@@ -1455,11 +1478,29 @@ impl BurnManager {
             )
             .await?;
 
-        // Orchestrator redemptions never reserved receipts, so there is
-        // nothing to settle and the receipt service must not be touched.
+        // The burn landed, so inventory must follow it, as on every other
+        // path that completes one. Vault-direct settles the reservation it
+        // made. Orchestrator redemptions reserved nothing, so inventory is
+        // re-read from the chain over the proving burn's pointer range —
+        // without this a force-completed burn leaves the mirror at its
+        // pre-burn balances and a rollback's `confirm-custody` refuses.
         let chain_id = self.chain_id_for(metadata.network)?;
-        if matches!(metadata.burn_mode, VaultMode::VaultDirect) {
-            self.settle_reserved_burn(chain_id, vault, issuer_request_id).await;
+        match metadata.burn_mode {
+            VaultMode::VaultDirect => {
+                self.settle_reserved_burn(chain_id, vault, issuer_request_id)
+                    .await;
+            }
+            VaultMode::Orchestrator { address: orchestrator } => {
+                self.reconcile_proven_orchestrator_burn(
+                    chain_id,
+                    metadata.network,
+                    vault,
+                    issuer_request_id,
+                    orchestrator,
+                    burn_tx_hash,
+                )
+                .await;
+            }
         }
 
         Ok(verification)
@@ -1669,9 +1710,13 @@ impl BurnManager {
                         )
                         .await?;
                     }
-                    VaultMode::Orchestrator { .. } => {
+                    VaultMode::Orchestrator { address } => {
                         self.recover_orchestrator_burn_failed_with_existing_tx(
-                            *network,
+                            OrchestratorBurnSite {
+                                network: *network,
+                                vault,
+                                orchestrator: *address,
+                            },
                             issuer_request_id,
                             persisted_tx_id,
                             alpaca_quantity,
@@ -2085,7 +2130,7 @@ impl BurnManager {
     /// none is settled or released.
     async fn recover_orchestrator_burn_failed_with_existing_tx(
         &self,
-        network: Network,
+        site: OrchestratorBurnSite,
         issuer_request_id: &IssuerRedemptionRequestId,
         tx_id: &TxId,
         alpaca_quantity: &Quantity,
@@ -2098,7 +2143,7 @@ impl BurnManager {
 
         match self
             .vaults
-            .service(network)?
+            .service(site.network)?
             .confirm_orchestrator_burn(tx_id)
             .await
         {
@@ -2159,6 +2204,23 @@ impl BurnManager {
                         },
                     )
                     .await?;
+
+                // Same shape as the confirm path: this burn landed, so the
+                // mirror still holds its pre-burn balances and only a
+                // reconciliation brings it back in line. Without it a burn
+                // whose FIRST confirm attempt failed would leave the mirror
+                // stale forever — the exact state this reconciliation
+                // exists to prevent, reached by the recovery door instead
+                // of the confirm one.
+                self.reconcile_orchestrator_burn(
+                    self.chain_id_for(site.network)?,
+                    site.network,
+                    site.vault,
+                    issuer_request_id,
+                    site.orchestrator,
+                    result.burn_range,
+                )
+                .await;
 
                 Ok(ExistingBurnRecoveryOutcome::Recovered)
             }
@@ -4086,7 +4148,7 @@ impl BurnManager {
             }
         };
 
-        let _wallet_guard = vault_service.lock_wallet().await;
+        let wallet_guard = vault_service.lock_wallet().await;
         if !self.is_confirming_burn_current(issuer_request_id, &tx_id).await? {
             debug!(target: "redemption",
                 issuer_request_id = %issuer_request_id,
@@ -4111,6 +4173,37 @@ impl BurnManager {
             }
         };
 
+        // Captured before the command lands: `Completed` retains no metadata,
+        // so the orchestrator holding this vault's receipts can only be read
+        // while the redemption is still in flight.
+        let orchestrator_burn = match &record_command {
+            RedemptionCommand::RecordOrchestratorBurnConfirmed {
+                burn_range,
+                ..
+            } => match self
+                .persisted_orchestrator_address(issuer_request_id)
+                .await
+            {
+                Ok(orchestrator) => {
+                    orchestrator.map(|address| (address, *burn_range))
+                }
+                // Inventory bookkeeping must not stand between a burn that
+                // landed and the record of it: a failed read here degrades to
+                // the un-reconciled warning below, exactly as a failed
+                // reconciliation does.
+                Err(error) => {
+                    warn!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Failed to read the redemption's orchestrator before \
+                         recording its confirmed burn"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+
         // Records the confirmed burn through a pure command. Domain validation
         // errors, such as an orchestrator share mismatch, propagate unchanged.
         self.store.send(issuer_request_id, record_command).await?;
@@ -4119,16 +4212,323 @@ impl BurnManager {
             "Burn confirmed successfully"
         );
 
-        // The burn landed on chain: consume the reservation so the mirror
-        // balance drops to match.
+        // The guard serializes nonce assignment through broadcast, and the
+        // record above is the last step that needs it. Inventory bookkeeping
+        // assigns no nonce, but it does make one `receipt()` call and a
+        // balance read per tracked receipt, so holding the guard across it
+        // would let a slow RPC block every other mint and burn submission for
+        // this wallet.
+        drop(wallet_guard);
+
+        // The burn landed on chain: bring inventory back in line with it.
+        // Vault-direct consumes the reservation it made; an orchestrator burn
+        // reserved nothing and drained receipts the bot no longer holds, so
+        // inventory is re-read from the chain instead.
         let chain_id = self.chain_id_for(execution.network)?;
-        if !execution.is_orchestrator() {
-            self.settle_reserved_burn(
+        match orchestrator_burn {
+            Some((orchestrator, burn_range)) => {
+                self.reconcile_orchestrator_burn(
+                    chain_id,
+                    execution.network,
+                    execution.vault,
+                    issuer_request_id,
+                    orchestrator,
+                    burn_range,
+                )
+                .await;
+            }
+            None if !execution.is_orchestrator() => {
+                self.settle_reserved_burn(
+                    chain_id,
+                    execution.vault,
+                    issuer_request_id,
+                )
+                .await;
+            }
+            None => {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    "Orchestrator burn confirmed without a persisted \
+                     orchestrator address; receipt inventory still reflects \
+                     the pre-burn balances and a rollback will refuse until \
+                     it is reconciled"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The orchestrator this redemption's burn was anchored to, or `None` for
+    /// a vault-direct redemption.
+    async fn persisted_orchestrator_address(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<Option<Address>, BurnManagerError> {
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            return Ok(None);
+        };
+
+        Ok(aggregate.metadata().and_then(|metadata| match metadata.burn_mode {
+            VaultMode::Orchestrator { address } => Some(address),
+            VaultMode::VaultDirect => None,
+        }))
+    }
+
+    /// Re-reads, from the chain, the balance of every tracked receipt the
+    /// orchestrator's burn walk covered, and applies those readings to
+    /// inventory.
+    ///
+    /// Orchestrator burns consume receipts the orchestrator custodies, with no
+    /// bot-side reservation to settle, so without this the mirror keeps the
+    /// pre-burn balances forever: the periodic reconciler deliberately stands
+    /// down once custody has migrated, and a rollback's `confirm-custody`
+    /// demands tracked and on-chain agree exactly.
+    ///
+    /// Readings, not deltas. Re-running is a no-op rather than a second
+    /// subtraction, an over-wide pointer range costs only reads, and any drift
+    /// already present is corrected rather than compounded.
+    ///
+    /// Best-effort, like the vault-direct settlement it replaces: a failure
+    /// leaves the mirror high, which a rollback refuses loudly rather than
+    /// acting on.
+    async fn reconcile_orchestrator_burn(
+        &self,
+        chain_id: u64,
+        network: Network,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        orchestrator: Address,
+        burn_range: BurnRange,
+    ) {
+        if let Err(error) = self
+            .try_reconcile_orchestrator_burn(
                 chain_id,
-                execution.vault,
+                network,
+                vault,
                 issuer_request_id,
+                orchestrator,
+                burn_range,
             )
-            .await;
+            .await
+        {
+            warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                vault = %vault,
+                %orchestrator,
+                error = %error,
+                "Failed to reconcile receipt inventory after an orchestrator \
+                 burn; the mirror still holds the pre-burn balances, and a \
+                 rollback's confirm-custody refuses on them. No operator \
+                 command re-runs this reconciliation: escalate to \
+                 engineering before any rollback"
+            );
+        }
+    }
+
+    /// Reconciles inventory after an orchestrator burn the admin prior-burn
+    /// inspection recorded. That path holds the `Burned` pointer range but no
+    /// vault address, and the redemption is already `Completed`, so the vault
+    /// is resolved from the asset listing — the same fallback `BurnFailed`
+    /// recovery uses when no burn is retained.
+    pub(crate) async fn reconcile_recorded_orchestrator_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+        orchestrator: Address,
+        burn_range: BurnRange,
+    ) {
+        let target = async {
+            let chain_id = self.chain_id_for(network)?;
+            let vault = find_vault(&self.view_pool, underlying, &network)
+                .await?
+                .ok_or_else(|| BurnManagerError::AssetNotFound {
+                    underlying: underlying.clone(),
+                    network,
+                })?;
+            Ok::<_, BurnManagerError>((chain_id, vault))
+        }
+        .await;
+        match target {
+            Ok((chain_id, vault)) => {
+                self.reconcile_orchestrator_burn(
+                    chain_id,
+                    network,
+                    vault,
+                    issuer_request_id,
+                    orchestrator,
+                    burn_range,
+                )
+                .await;
+            }
+            Err(error) => {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    %underlying,
+                    %network,
+                    error = %error,
+                    "Failed to resolve the vault of a recorded orchestrator \
+                     burn; the mirror still holds the pre-burn balances, and \
+                     a rollback's confirm-custody refuses on them. Escalate \
+                     to engineering before any rollback"
+                );
+            }
+        }
+    }
+
+    /// Reconciles inventory after an orchestrator burn a recovery path proved
+    /// by its transaction hash alone — force-complete — where the `Burned`
+    /// pointer range has not been read yet.
+    ///
+    /// The range is read from the proving transaction's own `Burned` event.
+    /// Best-effort like the reconciliation it feeds: a failed read leaves the
+    /// mirror high, which a rollback refuses loudly.
+    async fn reconcile_proven_orchestrator_burn(
+        &self,
+        chain_id: u64,
+        network: Network,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        orchestrator: Address,
+        burn_tx_hash: B256,
+    ) {
+        let burn_range = async {
+            let result = self
+                .vault_for(network)?
+                .confirm_orchestrator_burn(&TxId::Hash(burn_tx_hash))
+                .await?;
+            Ok::<_, BurnManagerError>(result.burn_range)
+        }
+        .await;
+        match burn_range {
+            Ok(burn_range) => {
+                self.reconcile_orchestrator_burn(
+                    chain_id,
+                    network,
+                    vault,
+                    issuer_request_id,
+                    orchestrator,
+                    burn_range,
+                )
+                .await;
+            }
+            Err(error) => {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    %burn_tx_hash,
+                    error = %error,
+                    "Failed to read the proven orchestrator burn's pointer \
+                     range; the mirror still holds the pre-burn balances, and \
+                     a rollback's confirm-custody refuses on them. Escalate \
+                     to engineering before any rollback"
+                );
+            }
+        }
+    }
+
+    async fn try_reconcile_orchestrator_burn(
+        &self,
+        chain_id: u64,
+        network: Network,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        orchestrator: Address,
+        burn_range: BurnRange,
+    ) -> Result<(), BurnManagerError> {
+        // The pointer range is HALF-OPEN, so `next_burn_receipt_id_after` is
+        // the receipt the next burn resumes from — the partially-consumed
+        // boundary this burn stopped inside (SPEC "Contract Summary" ->
+        // `Burned`). Its balance is exactly what changed and is still
+        // non-zero, so reconciling the half-open range would skip the one
+        // receipt that most needs re-reading. Worse, a burn served entirely
+        // out of the current pointer receipt does not move the pointer at
+        // all, making the half-open range EMPTY after a burn that did drain
+        // shares. Burn amounts do not line up with receipt boundaries, so
+        // that is the ordinary case, not a corner.
+        //
+        // Including the boundary is safe in the other direction: these are
+        // readings, not deltas, so re-reading an untouched receipt is a
+        // no-op — the same "an over-wide pointer range costs only reads"
+        // property the rest of this path leans on.
+        let receipt_ids = self
+            .receipt_service
+            .tracked_receipts_in_range(
+                chain_id,
+                vault,
+                burn_range.first_receipt_id,
+                burn_range
+                    .next_burn_receipt_id_after
+                    .saturating_add(U256::from(1)),
+            )
+            .await?;
+        if receipt_ids.is_empty() {
+            debug!(target: "redemption", vault = %vault,
+                first_receipt_id = %burn_range.first_receipt_id,
+                next_burn_receipt_id_after =
+                    %burn_range.next_burn_receipt_id_after,
+                "Orchestrator burn covered no tracked receipts; nothing to \
+                 reconcile"
+            );
+            return Ok(());
+        }
+
+        let ids: Vec<U256> = receipt_ids.iter().map(ReceiptId::inner).collect();
+        let balances = self
+            .vault_for(network)?
+            .receipt_balances(vault, orchestrator, &ids)
+            .await?;
+        // `izip!` would pair what it can and drop the rest, leaving receipts
+        // silently un-reconciled; a short reading is a bug in the reader, so
+        // it fails loudly instead.
+        if balances.len() != receipt_ids.len() {
+            return Err(BurnManagerError::ReceiptBalanceCountMismatch {
+                vault,
+                requested: receipt_ids.len(),
+                returned: balances.len(),
+            });
+        }
+
+        // Each reading is applied on its own, because one refusal must not
+        // cost the rest of the batch. `ReconcileBalance` refuses a reading per
+        // receipt — a zero reading while no holder is on record, or a reading
+        // taken against a wallet other than the recorded holder — and a `?`
+        // here would abandon every later receipt in the walk, including ones
+        // that would have applied cleanly. The refused ids are raised after the
+        // loop so the caller still warns, naming them, that the mirror is not
+        // fully in line.
+        let mut refused = Vec::new();
+        for (receipt_id, balance) in izip!(receipt_ids, balances) {
+            if let Err(error) = self
+                .receipt_service
+                .reconcile_receipt_balance(
+                    chain_id,
+                    vault,
+                    receipt_id,
+                    Shares::from(balance),
+                    orchestrator,
+                )
+                .await
+            {
+                debug!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    vault = %vault,
+                    %receipt_id,
+                    balance = %balance,
+                    %orchestrator,
+                    error = %error,
+                    "Receipt inventory refused an orchestrator burn's balance \
+                     reading; this receipt stays at its pre-burn balance"
+                );
+                refused.push(receipt_id);
+            }
+        }
+
+        if !refused.is_empty() {
+            return Err(BurnManagerError::ReceiptReadingsRefused {
+                vault,
+                refused,
+            });
         }
 
         Ok(())
@@ -4620,6 +5020,20 @@ pub(crate) const fn is_pending_burn_confirmation(error: &VaultError) -> bool {
 pub(crate) enum BurnManagerError {
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
+    #[error(
+        "Receipt balance reading for vault {vault} returned {returned} \
+         balances for {requested} receipts"
+    )]
+    ReceiptBalanceCountMismatch {
+        vault: Address,
+        requested: usize,
+        returned: usize,
+    },
+    #[error(
+        "Receipt inventory refused the balance readings for vault {vault} \
+         receipts {refused:?}"
+    )]
+    ReceiptReadingsRefused { vault: Address, refused: Vec<ReceiptId> },
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("JSON error: {0}")]
@@ -4949,6 +5363,37 @@ mod tests {
                 .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
                 .await
         }
+
+        async fn tracked_receipts_in_range(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            start: U256,
+            end: U256,
+        ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+            self.inner
+                .tracked_receipts_in_range(chain_id, vault, start, end)
+                .await
+        }
+
+        async fn reconcile_receipt_balance(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            receipt_id: ReceiptId,
+            on_chain_balance: Shares,
+            observed_wallet: Address,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .reconcile_receipt_balance(
+                    chain_id,
+                    vault,
+                    receipt_id,
+                    on_chain_balance,
+                    observed_wallet,
+                )
+                .await
+        }
     }
 
     struct RacingReceiptService {
@@ -5092,6 +5537,37 @@ mod tests {
         ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
             self.inner
                 .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
+                .await
+        }
+
+        async fn tracked_receipts_in_range(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            start: U256,
+            end: U256,
+        ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+            self.inner
+                .tracked_receipts_in_range(chain_id, vault, start, end)
+                .await
+        }
+
+        async fn reconcile_receipt_balance(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            receipt_id: ReceiptId,
+            on_chain_balance: Shares,
+            observed_wallet: Address,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .reconcile_receipt_balance(
+                    chain_id,
+                    vault,
+                    receipt_id,
+                    on_chain_balance,
+                    observed_wallet,
+                )
                 .await
         }
     }
@@ -5483,15 +5959,25 @@ mod tests {
     struct RecordingReceiptService {
         inner: Arc<dyn ReceiptService>,
         calls: AtomicUsize,
+        reconciled: std::sync::Mutex<Vec<(ReceiptId, Shares)>>,
     }
 
     impl RecordingReceiptService {
         fn new(inner: Arc<dyn ReceiptService>) -> Self {
-            Self { inner, calls: AtomicUsize::new(0) }
+            Self {
+                inner,
+                calls: AtomicUsize::new(0),
+                reconciled: std::sync::Mutex::new(Vec::new()),
+            }
         }
 
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        /// The balance readings applied to inventory, in call order.
+        fn reconciled_balances(&self) -> Vec<(ReceiptId, Shares)> {
+            self.reconciled.lock().expect("reconciled mutex poisoned").clone()
         }
 
         fn record(&self) {
@@ -5590,6 +6076,45 @@ mod tests {
             self.record();
             self.inner
                 .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
+                .await
+        }
+
+        // Balance reconciliation is deliberately NOT counted as a receipt
+        // lifecycle call: orchestrator burns must still reserve, settle and
+        // release nothing, which is what `call_count` asserts. Reconciled
+        // readings are recorded separately.
+        async fn tracked_receipts_in_range(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            start: U256,
+            end: U256,
+        ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+            self.inner
+                .tracked_receipts_in_range(chain_id, vault, start, end)
+                .await
+        }
+
+        async fn reconcile_receipt_balance(
+            &self,
+            chain_id: u64,
+            vault: Address,
+            receipt_id: ReceiptId,
+            on_chain_balance: Shares,
+            observed_wallet: Address,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.reconciled
+                .lock()
+                .expect("reconciled mutex poisoned")
+                .push((receipt_id, on_chain_balance));
+            self.inner
+                .reconcile_receipt_balance(
+                    chain_id,
+                    vault,
+                    receipt_id,
+                    on_chain_balance,
+                    observed_wallet,
+                )
                 .await
         }
     }
@@ -6014,6 +6539,245 @@ mod tests {
                 &setup.issuer_request_id.to_string(),
             ]
         ));
+    }
+
+    /// An orchestrator burn drains receipts the orchestrator custodies, with
+    /// no bot-side reservation to settle. Inventory must still follow it:
+    /// once custody has migrated the periodic reconciler stands down, so
+    /// without this the mirror keeps the pre-burn balances forever and a
+    /// rollback's `confirm-custody` refuses on the mismatch.
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_burn_reconciles_inventory_from_the_chain() {
+        let orchestrator = test_orchestrator_address();
+        // Two receipts, covering both shapes one walk produces: receipt 1 is
+        // DRAINED to zero and receipt 2 is the partially-consumed BOUNDARY,
+        // which keeps 40 of its original 100 and is where the pointer stops —
+        // `next_burn_receipt_id_after` is 2. A half-open read of `[1, 2)`
+        // would skip receipt 2 entirely, which is the bug the `+ 1` exists to
+        // prevent; a burn served inside one receipt does not move the pointer
+        // at all, so the boundary is the ordinary case, not a corner. Two
+        // receipts with DIFFERENT balances also pin that the reader pairs id
+        // N with balance N rather than pairing them by accident.
+        //
+        // Both readings are seeded against the ORCHESTRATOR: the mock keys
+        // them on the holder, so a reader that passed the bot wallet instead
+        // would read zero for both and fail here, exactly as it would deplete
+        // live receipts in production.
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_receipt_balance(orchestrator, U256::from(1u8), U256::ZERO)
+                .with_receipt_balance(
+                    orchestrator,
+                    U256::from(2u8),
+                    U256::from(40u8),
+                ),
+        );
+        vault_mock.seed_orchestrator_burn_result(OrchestratorBurnResult {
+            tx_hash: b256!(
+                "0x4545454545454545454545454545454545454545454545454545454545454545"
+            ),
+            shares_burned: uint!(100_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: U256::from(1u8),
+                next_burn_receipt_id_after: U256::from(2u8),
+            },
+            gas_used: 50000,
+            block_number: 5000,
+        });
+        let setup = setup_orchestrator_burning(vault_mock).await;
+        setup
+            .harness
+            .discover_receipt(setup.vault, U256::from(1u8), U256::from(60u8))
+            .await;
+        setup
+            .harness
+            .discover_receipt(setup.vault, U256::from(2u8), U256::from(100u8))
+            .await;
+        setup
+            .harness
+            .receipt_inventory_store
+            .send(
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, setup.vault),
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: TEST_WALLET,
+                    to: orchestrator,
+                    tx_hash: None,
+                },
+            )
+            .await
+            .expect("custody migration should persist");
+
+        setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("orchestrator burn should complete");
+        drive_intended_burn_to_completion(
+            &setup.manager,
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+
+        let inventory = setup
+            .harness
+            .receipt_inventory_store
+            .load(&ReceiptVaultKey::new(ANVIL_CHAIN_ID, setup.vault))
+            .await
+            .expect("inventory should load")
+            .expect("inventory should exist");
+        let tracked: Vec<_> = inventory
+            .receipts_with_balance()
+            .into_iter()
+            .map(|receipt| (receipt.receipt_id, receipt.available_balance))
+            .collect();
+        assert_eq!(
+            tracked,
+            vec![(
+                ReceiptId::from(U256::from(2u8)),
+                Shares::from(U256::from(40u8)),
+            )],
+            "the mirror must follow the chain after an orchestrator burn: the \
+             drained receipt is gone and the boundary receipt keeps its \
+             remainder"
+        );
+        assert_eq!(
+            setup.recording.reconciled_balances(),
+            vec![
+                (ReceiptId::from(U256::from(1u8)), Shares::from(U256::ZERO)),
+                (
+                    ReceiptId::from(U256::from(2u8)),
+                    Shares::from(U256::from(40u8)),
+                ),
+            ],
+            "each receipt's reading must be the one taken from the chain for \
+             that receipt, in id order"
+        );
+        assert_eq!(
+            setup.recording.call_count(),
+            0,
+            "reconciliation must not run the reserve/settle/release lifecycle"
+        );
+    }
+
+    /// One refused reading must cost one receipt, not the rest of the walk.
+    ///
+    /// With no holder on record, `ReconcileBalance` refuses a DESTRUCTIVE zero
+    /// reading (`CustodyUnconfirmed`) while accepting a non-zero one. Receipt 1
+    /// therefore refuses and receipt 2 applies cleanly — so a reconciliation
+    /// that gave up on the first refusal would abandon a receipt that had
+    /// nothing wrong with it. The refusal still surfaces: the batch reports it
+    /// after the loop, and the caller's warning says the mirror is not in line.
+    #[traced_test]
+    #[tokio::test]
+    async fn one_refused_reading_does_not_abandon_the_rest_of_the_burn() {
+        let orchestrator = test_orchestrator_address();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_receipt_balance(orchestrator, U256::from(1u8), U256::ZERO)
+                .with_receipt_balance(
+                    orchestrator,
+                    U256::from(2u8),
+                    U256::from(30u8),
+                ),
+        );
+        vault_mock.seed_orchestrator_burn_result(OrchestratorBurnResult {
+            tx_hash: b256!(
+                "0x4646464646464646464646464646464646464646464646464646464646464646"
+            ),
+            shares_burned: uint!(100_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: U256::from(1u8),
+                next_burn_receipt_id_after: U256::from(2u8),
+            },
+            gas_used: 50000,
+            block_number: 5000,
+        });
+        let setup = setup_orchestrator_burning(vault_mock).await;
+        setup
+            .harness
+            .discover_receipt(setup.vault, U256::from(1u8), U256::from(60u8))
+            .await;
+        setup
+            .harness
+            .discover_receipt(setup.vault, U256::from(2u8), U256::from(100u8))
+            .await;
+        // Deliberately NO custody on record: this is the state of a vault that
+        // never went through a migration.
+
+        setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("orchestrator burn should complete");
+        drive_intended_burn_to_completion(
+            &setup.manager,
+            &setup.harness.store,
+            &setup.issuer_request_id,
+            setup.vault,
+        )
+        .await;
+
+        let inventory = setup
+            .harness
+            .receipt_inventory_store
+            .load(&ReceiptVaultKey::new(ANVIL_CHAIN_ID, setup.vault))
+            .await
+            .expect("inventory should load")
+            .expect("inventory should exist");
+        // `receipts_with_balance` does not promise an order, so sort before
+        // comparing two of them.
+        let mut tracked: Vec<_> = inventory
+            .receipts_with_balance()
+            .into_iter()
+            .map(|receipt| (receipt.receipt_id, receipt.available_balance))
+            .collect();
+        tracked.sort_by_key(|(receipt_id, _)| receipt_id.inner());
+        assert_eq!(
+            tracked,
+            vec![
+                (
+                    ReceiptId::from(U256::from(1u8)),
+                    Shares::from(U256::from(60u8)),
+                ),
+                (
+                    ReceiptId::from(U256::from(2u8)),
+                    Shares::from(U256::from(30u8)),
+                ),
+            ],
+            "the refused receipt keeps its pre-burn balance while the readable \
+             one follows the chain"
+        );
+        // Snippets are pinned to this redemption's id: the log buffer is shared
+        // across tests, so a bare message could be satisfied by another test's
+        // output.
+        let issuer_request_id = setup.issuer_request_id.to_string();
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &[
+                    "Receipt inventory refused an orchestrator burn's balance \
+                     reading",
+                    &issuer_request_id,
+                    "receipt_id=1",
+                ]
+            ),
+            "the refused reading must be diagnosable per receipt"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Failed to reconcile receipt inventory",
+                    &issuer_request_id,
+                    "ReceiptId(1)",
+                ]
+            ),
+            "the batch must report that the mirror is not in line, and name \
+             which receipt is out"
+        );
     }
 
     /// Overtaken *during* the readiness read, not before it. Every
@@ -7370,11 +8134,125 @@ mod tests {
         assert_eq!(
             recording.call_count(),
             0,
-            "orchestrator force-complete must never touch the receipt service"
+            "orchestrator force-complete must never run the \
+             reserve/settle/release lifecycle"
         );
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Force-completing stuck Burning redemption", "verified on-chain"]
+        ));
+    }
+
+    /// A force-completed orchestrator burn landed, so inventory must follow
+    /// it exactly as it does on the confirm path. The orchestrator reserved
+    /// nothing, so there is no settlement; instead the tracked receipts in
+    /// the proving transaction's `Burned` range are re-read from the chain.
+    /// Without this the mirror keeps the pre-burn balances and a rollback's
+    /// `confirm-custody` refuses on them.
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_orchestrator_reconciles_inventory() {
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let orchestrator = test_orchestrator_address();
+        let persisted_tx = persisted_orchestrator_tx(7, vault);
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns_and_total(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    ORCHESTRATOR_BURN_AMOUNT,
+                    vec![],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone())
+                .with_receipt_balance(
+                    orchestrator,
+                    U256::from(1u8),
+                    U256::from(40u8),
+                ),
+        );
+        // The proving transaction's `Burned` event: the burn stopped inside
+        // receipt 1.
+        vault_mock.seed_orchestrator_burn_result(OrchestratorBurnResult {
+            tx_hash: persisted_tx.hash,
+            shares_burned: ORCHESTRATOR_BURN_AMOUNT,
+            burn_range: BurnRange {
+                first_receipt_id: U256::from(1u8),
+                next_burn_receipt_id_after: U256::from(1u8),
+            },
+            gas_used: 50_000,
+            block_number: 45_989_009,
+        });
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        harness
+            .discover_receipt(vault, U256::from(1u8), U256::from(100u8))
+            .await;
+        harness
+            .receipt_inventory_store
+            .send(
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: owner,
+                    to: orchestrator,
+                    tx_hash: None,
+                },
+            )
+            .await
+            .expect("custody migration should persist");
+        let recording = Arc::new(RecordingReceiptService::new(
+            harness.receipt_service.clone(),
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            recording.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_orchestrator_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        persist_test_orchestrator_burn_intent(
+            &harness.store,
+            &issuer_request_id,
+            vault,
+            owner,
+        )
+        .await;
+
+        manager
+            .force_complete_burn(
+                &issuer_request_id,
+                persisted_tx.hash,
+                "orchestrator burn confirmed".to_string(),
+                None,
+            )
+            .await
+            .expect("orchestrator force-complete should succeed");
+
+        assert_eq!(
+            recording.reconciled_balances(),
+            vec![(
+                ReceiptId::from(U256::from(1u8)),
+                Shares::from(U256::from(40u8)),
+            )],
+            "force-complete must apply the chain's reading for the burned \
+             receipt"
+        );
+        assert!(!logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Failed to reconcile receipt inventory",
+                &issuer_request_id.to_string(),
+            ]
         ));
     }
 
@@ -12676,6 +13554,184 @@ mod tests {
             load_aggregate(&harness.store, &issuer_request_id).await,
             Redemption::Failed { .. }
         ));
+    }
+
+    /// Inventory must follow a burn recovered through the `Failed` door too.
+    ///
+    /// This is the same "the burn landed, so the mirror is stale" state the
+    /// confirm path reconciles, reached after a first confirm attempt failed.
+    /// The orchestrator address cannot be read back from the aggregate here:
+    /// `RecordExistingBurn` moves it to `Completed`, and `metadata()` returns
+    /// `None` for both `Completed` and the `Failed` state it came from, so the
+    /// address has to travel in from the caller's `burn_mode` anchor.
+    #[traced_test]
+    #[tokio::test]
+    async fn recovered_orchestrator_burn_reconciles_inventory_from_the_chain() {
+        let orchestrator = test_orchestrator_address();
+        let token = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let calldata = IST0xOrchestratorV1::burnCall {
+            token,
+            amount: uint!(100_000000000000000000_U256),
+            burnInfo: Bytes::default(),
+        }
+        .abi_encode();
+        let old_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            7,
+            orchestrator,
+            calldata.clone().into(),
+            ANVIL_CHAIN_ID,
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test_with_chain_id(
+            8,
+            orchestrator,
+            calldata.into(),
+            ANVIL_CHAIN_ID,
+        );
+        let owner = old_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::ProvablyDead,
+                    BurnTxStatus::Mined,
+                ])
+                .with_prepared_tx(old_tx.clone())
+                .with_receipt_balance(
+                    orchestrator,
+                    U256::from(1u8),
+                    U256::from(25u8),
+                ),
+        );
+        vault_mock.seed_orchestrator_burn_result(OrchestratorBurnResult {
+            tx_hash: replacement_tx.hash,
+            shares_burned: uint!(100_000000000000000000_U256),
+            burn_range: BurnRange {
+                first_receipt_id: U256::from(1u8),
+                next_burn_receipt_id_after: U256::from(1u8),
+            },
+            gas_used: 50_000,
+            block_number: 5_000,
+        });
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), token).await;
+        harness
+            .discover_receipt(token, U256::from(1u8), U256::from(80u8))
+            .await;
+        harness
+            .receipt_inventory_store
+            .send(
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, token),
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: TEST_WALLET,
+                    to: orchestrator,
+                    tx_hash: None,
+                },
+            )
+            .await
+            .expect("custody migration should persist");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_orchestrator_burning_with_amounts(
+            &harness.store,
+            &issuer_request_id,
+            Quantity::new(Decimal::from(100)),
+            Quantity::new(Decimal::ZERO),
+        )
+        .await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token,
+                        amount: uint!(100_000000000000000000_U256),
+                        owner,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("orchestrator burn intent should persist");
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: old_tx.hash,
+                    nonce: old_tx.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("exhaustion marker should persist");
+        vault_mock.set_prepared_tx(replacement_tx.clone());
+        let manager = BurnManager::new_for_tests(
+            vault_mock,
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("orchestrator replacement should be authorized");
+        fail_submitted_orchestrator_burn(
+            &harness.store,
+            &issuer_request_id,
+            &replacement_tx,
+        )
+        .await;
+
+        let outcome = manager
+            .replace_exhausted_dead_burn(&issuer_request_id)
+            .await
+            .expect("the mined orchestrator burn should be recovered");
+
+        assert_eq!(
+            outcome.disposition,
+            ManualBurnReplacementDisposition::ExistingBurnRecovered
+        );
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+
+        let inventory = harness
+            .receipt_inventory_store
+            .load(&ReceiptVaultKey::new(ANVIL_CHAIN_ID, token))
+            .await
+            .expect("inventory should load")
+            .expect("inventory should exist");
+        let tracked: Vec<_> = inventory
+            .receipts_with_balance()
+            .into_iter()
+            .map(|receipt| (receipt.receipt_id, receipt.available_balance))
+            .collect();
+        assert_eq!(
+            tracked,
+            vec![(
+                ReceiptId::from(U256::from(1u8)),
+                Shares::from(U256::from(25u8)),
+            )],
+            "a burn recovered from Failed must leave the mirror on the chain's \
+             reading, not the pre-burn balance"
+        );
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Failed to reconcile receipt inventory",
+                    &issuer_request_id.to_string(),
+                ]
+            ),
+            "the reconciliation must run, not degrade to its warning"
+        );
     }
 
     #[tokio::test]

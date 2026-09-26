@@ -9,6 +9,8 @@ use alloy::rpc::types::TransactionReceipt;
 #[cfg(test)]
 use alloy::transports::TransportErrorKind;
 use async_trait::async_trait;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -21,9 +23,10 @@ use super::{
     BurnRange, BurnTxStatus, BurnVerification, MintAuthorization, MintResult,
     MintTxStatus, MintedLogQuery, MintedLogScan, MultiBurnParams,
     MultiBurnResult, MultiBurnResultEntry, OrchestratorBurnParams,
-    OrchestratorBurnReadiness, OrchestratorBurnResult, OrchestratorMintParams,
-    OrchestratorMintResult, PreparedMintTx, ReceiptInformation, SubmittedTx,
-    VaultError, VaultService, WalletNonceGuard,
+    OrchestratorBurnReadiness, OrchestratorBurnResult, OrchestratorMintDeposit,
+    OrchestratorMintParams, OrchestratorMintResult, PreparedMintTx,
+    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    WalletNonceGuard,
 };
 #[cfg(test)]
 use super::{
@@ -210,6 +213,19 @@ struct OrchestratorMockState {
     /// Value returned by `next_burn_receipt_id`; `None` means `U256::ZERO`.
     #[cfg(test)]
     next_burn_receipt_id: Mutex<Option<U256>>,
+    /// Post-burn `balanceOf(holder, receipt_id)` readings returned by
+    /// `receipt_balances`, keyed by `(holder, receipt_id)`. A pair with no
+    /// entry reads zero — the common outcome of a walk that drained the
+    /// receipt.
+    ///
+    /// The holder is part of the key on purpose. `balanceOf` is meaningless
+    /// without the wallet it was read against: an orchestrator burn drains
+    /// receipts the ORCHESTRATOR custodies, so a reader that passed the bot
+    /// wallet instead would read zero for every one of them in production and
+    /// deplete tracked receipts that still hold shares. Keying on the holder
+    /// makes that swap read zero here too, and fail the test.
+    #[cfg(test)]
+    receipt_balances: Mutex<HashMap<(Address, U256), U256>>,
     /// When set, `next_burn_receipt_id` fails with an RPC-style error.
     #[cfg(test)]
     next_burn_receipt_id_should_error: Mutex<bool>,
@@ -222,6 +238,15 @@ struct OrchestratorMockState {
     /// `VaultError::OrchestratorReverted` carrying this reason.
     #[cfg(test)]
     mint_confirm_revert: Mutex<Option<OrchestratorRevertReason>>,
+    /// Limits [`Self::mint_confirm_revert`] to one transaction; `None` reverts
+    /// every `tx_id`.
+    ///
+    /// The replayed-nonce recovery confirms a DIFFERENT transaction from the
+    /// one that reverted — the earlier mint that actually landed — so an
+    /// unscoped revert makes that re-read, and the receipt registration behind
+    /// it, unreachable.
+    #[cfg(test)]
+    mint_confirm_revert_tx: Mutex<Option<TxId>>,
     /// Landed mint returned by `find_orchestrator_minted_log`; `None` means
     /// no full match on-chain.
     #[cfg(test)]
@@ -709,6 +734,7 @@ impl MockVaultService {
         self.orchestrator.vault_logic_call_count.store(0, Ordering::Relaxed);
         *self.orchestrator.pending_mint_result.lock().unwrap() = None;
         *self.orchestrator.mint_confirm_revert.lock().unwrap() = None;
+        *self.orchestrator.mint_confirm_revert_tx.lock().unwrap() = None;
         *self.orchestrator.minted_log.lock().unwrap() = None;
         *self.orchestrator.minted_log_binding.lock().unwrap() = None;
         *self.orchestrator.nonce_used.lock().unwrap() = None;
@@ -983,6 +1009,24 @@ impl MockVaultService {
         self
     }
 
+    /// Seeds the post-burn balance `receipt_balances` reports for a receipt
+    /// held by `holder`. Pairs left unseeded read zero, and a reading taken
+    /// against any other wallet reads zero too.
+    #[cfg(test)]
+    pub(crate) fn with_receipt_balance(
+        self,
+        holder: Address,
+        receipt_id: U256,
+        balance: U256,
+    ) -> Self {
+        self.orchestrator
+            .receipt_balances
+            .lock()
+            .unwrap()
+            .insert((holder, receipt_id), balance);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_orchestrator_readiness(
         self,
@@ -1038,13 +1082,30 @@ impl MockVaultService {
     }
 
     /// Configures `confirm_orchestrator_mint` to fail with
-    /// `VaultError::OrchestratorReverted` carrying the given typed reason.
+    /// `VaultError::OrchestratorReverted` carrying the given typed reason, for
+    /// every `tx_id`.
     #[cfg(test)]
     pub(crate) fn with_orchestrator_mint_confirm_revert(
         self,
         reason: OrchestratorRevertReason,
     ) -> Self {
         *self.orchestrator.mint_confirm_revert.lock().unwrap() = Some(reason);
+        self
+    }
+
+    /// Same, but only for `tx_id`; any other transaction confirms normally.
+    ///
+    /// Models the replayed-nonce shape faithfully: the submission this job
+    /// holds reverted, while the earlier transaction that consumed the nonce
+    /// landed and can still be read for its `Deposit`.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_mint_confirm_revert_for(
+        self,
+        tx_id: TxId,
+        reason: OrchestratorRevertReason,
+    ) -> Self {
+        *self.orchestrator.mint_confirm_revert.lock().unwrap() = Some(reason);
+        *self.orchestrator.mint_confirm_revert_tx.lock().unwrap() = Some(tx_id);
         self
     }
 
@@ -1229,6 +1290,11 @@ fn default_orchestrator_mint_result() -> OrchestratorMintResult {
         tx_hash: MOCK_MINT_TX_HASH,
         nonce: B256::with_last_byte(1),
         shares_minted: U256::from(100_000_000_000_000_000_000u128),
+        deposit: Some(OrchestratorMintDeposit {
+            receipt_id: U256::from(1u8),
+            shares: U256::from(100_000_000_000_000_000_000u128),
+            receipt_info_bytes: Bytes::new(),
+        }),
         gas_used: 50000,
         block_number: 5000,
     }
@@ -1813,6 +1879,35 @@ impl VaultService for MockVaultService {
         Some(self.wallet_nonce_lock.clone().lock_owned().await)
     }
 
+    async fn receipt_balances(
+        &self,
+        _vault: Address,
+        holder: Address,
+        receipt_ids: &[U256],
+    ) -> Result<Vec<U256>, VaultError> {
+        #[cfg(test)]
+        {
+            let seeded = self.orchestrator.receipt_balances.lock().unwrap();
+            return Ok(receipt_ids
+                .iter()
+                .map(|receipt_id| {
+                    seeded
+                        .get(&(holder, *receipt_id))
+                        .copied()
+                        .unwrap_or(U256::ZERO)
+                })
+                .collect());
+        }
+        #[cfg(not(test))]
+        {
+            // Seeded readings are unit-test-only, so outside them the holder
+            // cannot change the answer. Bound here so it is not an unused
+            // argument under the inverse config.
+            let _ = holder;
+            Ok(vec![U256::ZERO; receipt_ids.len()])
+        }
+    }
+
     async fn check_orchestrator_burn_readiness(
         &self,
         _orchestrator: Address,
@@ -2104,6 +2199,11 @@ impl VaultService for MockVaultService {
                     tx_hash,
                     nonce: params.authorization.nonce,
                     shares_minted: params.amount,
+                    deposit: Some(OrchestratorMintDeposit {
+                        receipt_id: U256::from(1u8),
+                        shares: params.amount,
+                        receipt_info_bytes: Bytes::new(),
+                    }),
                     gas_used: 21000,
                     block_number: 1000,
                 });
@@ -2139,7 +2239,17 @@ impl VaultService for MockVaultService {
         {
             let reason_opt =
                 *self.orchestrator.mint_confirm_revert.lock().unwrap();
-            if let Some(reason) = reason_opt {
+            let scoped_tx = self
+                .orchestrator
+                .mint_confirm_revert_tx
+                .lock()
+                .unwrap()
+                .clone();
+            let applies =
+                scoped_tx.as_ref().is_none_or(|scoped| scoped == _tx_id);
+            if let Some(reason) = reason_opt
+                && applies
+            {
                 return Err(VaultError::OrchestratorReverted {
                     tx_hash: MOCK_MINT_TX_HASH,
                     reason,
@@ -2901,6 +3011,7 @@ mod tests {
             ),
             nonce: B256::repeat_byte(0x33),
             shares_minted: U256::from(42u64),
+            deposit: None,
             gas_used: 777,
             block_number: 4242,
         };

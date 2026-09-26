@@ -73,8 +73,23 @@ pub(crate) struct OrchestratorMintResult {
     pub(crate) nonce: B256,
     /// `Minted.amount` — shares minted and forwarded to the recipient.
     pub(crate) shares_minted: U256,
+    /// The ERC-1155 receipt the vault's `Deposit` created for this mint, from
+    /// the same transaction. The orchestrator custodies it, so inventory
+    /// tracks it against the migrated holder rather than the bot wallet —
+    /// without it a rollback cannot account for receipts minted after the
+    /// cutover. `None` only when the transaction carried no decodable
+    /// `Deposit`, which a real orchestrator mint always does.
+    pub(crate) deposit: Option<OrchestratorMintDeposit>,
     pub(crate) gas_used: u64,
     pub(crate) block_number: u64,
+}
+
+/// The vault-side deposit an orchestrator mint produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OrchestratorMintDeposit {
+    pub(crate) receipt_id: U256,
+    pub(crate) shares: U256,
+    pub(crate) receipt_info_bytes: Bytes,
 }
 
 /// Query identifying one specific mint's landing on-chain: the full-match

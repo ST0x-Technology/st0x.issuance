@@ -12,7 +12,10 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::job::{ConfirmMintJob, SendCallbackJob, SubmitMintJob};
+use super::job::{
+    ConfirmMintJob, OrchestratorReceiptRegistration, SendCallbackJob,
+    SubmitMintJob, register_recovered_orchestrator_receipt,
+};
 use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand,
     MintFailureClassification, MintView, Network, UnderlyingSymbol,
@@ -1517,10 +1520,12 @@ async fn reconcile_unresolved_replay(
     issuer_request_id: &IssuerMintRequestId,
 ) -> Result<ReconcileOutcome, MintRecoveryStepError> {
     let Mint::MintingFailed {
+        tokenization_request_id,
         underlying,
         network,
         wallet,
         quantity,
+        journal_confirmed_at,
         mint_mode,
         mint_authorization,
         ..
@@ -1574,6 +1579,31 @@ async fn reconcile_unresolved_replay(
                 "Widened reconciliation full-matched the unresolved replay; \
                  recovering the landed mint"
             );
+            // The recovered command carries only the `Minted` log's fields, so
+            // the receipt this mint created is still outside inventory — and
+            // nothing else picks it up, because the backfiller only sees
+            // receipts owned by the bot wallet. Re-read the landed transaction
+            // for its `Deposit` and register the receipt BEFORE recording the
+            // recovery: the loop's next iteration enqueues the callback as
+            // soon as the mint is `CallbackPending`, so a registration left
+            // to a later job could lose the race to `MintCompleted`.
+            // Best-effort, like every other orchestrator registration.
+            register_recovered_orchestrator_receipt(
+                vault_service.as_ref(),
+                ctx.receipts.as_ref(),
+                &OrchestratorReceiptRegistration {
+                    issuer_request_id: issuer_request_id.clone(),
+                    chain_id: vault.chain_id,
+                    vault: vault.address,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    quantity: quantity.clone(),
+                    underlying: underlying.clone(),
+                    journal_confirmed_at: *journal_confirmed_at,
+                },
+                *orchestrator,
+                minted.tx_hash,
+            )
+            .await;
             ctx.mint_store
                 .send(
                     issuer_request_id,
@@ -1679,9 +1709,21 @@ async fn minting_failed_receipt_exists(
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
 ) -> Result<bool, MintRecoveryStepError> {
-    let Mint::MintingFailed { underlying, network, .. } = mint else {
+    let Mint::MintingFailed { underlying, network, mint_mode, .. } = mint
+    else {
         return Ok(false);
     };
+
+    // An orchestrator mint's receipt is registered before the mint is
+    // recorded, so it can sit in inventory for a mint that never recorded its
+    // landing. "Receipt exists" here means "SubmitMintJob can record
+    // ExistingMint", which is vault-direct only; the submit job steps aside
+    // for orchestrator mints (`record_existing_receipt_from_inventory`), so a
+    // `true` would keep this loop waiting on a completion that never comes.
+    // Orchestrator recovery finds a landed mint through its nonce instead.
+    if matches!(mint_mode, VaultMode::Orchestrator { .. }) {
+        return Ok(false);
+    }
 
     let vault = resolve_vault(ctx, underlying, *network).await?;
 
@@ -1783,7 +1825,7 @@ async fn enqueue_callback(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address};
+    use alloy::primitives::{Address, B256, Bytes, U256, address};
     use async_trait::async_trait;
     use chrono::Utc;
     use event_sorcery::test_store;
@@ -1807,15 +1849,16 @@ mod tests {
     };
     use crate::receipt_inventory::{
         BurnPlan, BurnTrackingError, CqrsReceiptService, MintedReceiptParams,
-        ReceiptInventory, ReceiptLookupError, ReceiptRegistrationError,
-        RecoveredReceipt, Shares,
+        ReceiptId, ReceiptInventory, ReceiptLookupError,
+        ReceiptRegistrationError, RecoveredReceipt, Shares,
     };
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MintTxStatus, OrchestratorMintedLog, PreparedMintTx, VaultService,
+        MintTxStatus, OrchestratorMintDeposit, OrchestratorMintResult,
+        OrchestratorMintedLog, PreparedMintTx, VaultService,
     };
 
     /// Configurable `ReceiptService` stub for recovery tests. Only
@@ -1909,6 +1952,27 @@ mod tests {
                     })
                 }
             }
+        }
+
+        async fn tracked_receipts_in_range(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _start: U256,
+            _end: U256,
+        ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+            Ok(vec![])
+        }
+
+        async fn reconcile_receipt_balance(
+            &self,
+            _chain_id: u64,
+            _vault: Address,
+            _receipt_id: ReceiptId,
+            _on_chain_balance: Shares,
+            _observed_wallet: Address,
+        ) -> Result<(), ReceiptRegistrationError> {
+            Ok(())
         }
     }
 
@@ -4380,15 +4444,32 @@ mod tests {
             )
             .await;
 
-        let vault = Arc::new(MockVaultService::new_success().with_minted_log(
-            OrchestratorMintedLog {
-                tx_hash: B256::repeat_byte(0xcc),
-                nonce: test_mint_authorization().nonce,
-                shares_minted: U256::from(100u64)
-                    * U256::from(10u64).pow(U256::from(18u64)),
-                block_number: 777,
-            },
-        ));
+        let shares =
+            U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let landed_tx_hash = B256::repeat_byte(0xcc);
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_minted_log(OrchestratorMintedLog {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    block_number: 777,
+                })
+                // The landed transaction, re-read for the `Deposit` the
+                // recovered command does not carry.
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: landed_tx_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: shares,
+                    deposit: Some(OrchestratorMintDeposit {
+                        receipt_id: U256::from(21u8),
+                        shares,
+                        receipt_info_bytes: Bytes::new(),
+                    }),
+                    gas_used: 50_000,
+                    block_number: 777,
+                }),
+        );
 
         recover_mint_until_automatic_budget_exhausted(
             &fixture.context_with_vault(vault.clone()),
@@ -4407,6 +4488,20 @@ mod tests {
              got: {}",
             mint.state_name()
         );
+        // Registered by the reconciliation itself, not by a later job: the
+        // callback the loop enqueues would otherwise race the registration
+        // and could complete the mint with the receipt still untracked.
+        let recovered = CqrsReceiptService::new(fixture.receipt_store.clone())
+            .find_by_issuer_request_id(
+                ANVIL_CHAIN_ID,
+                &VAULT,
+                &issuer_request_id,
+            )
+            .await
+            .expect("receipt lookup should succeed")
+            .expect("the recovered mint's receipt must be tracked");
+        assert_eq!(recovered.receipt_id, U256::from(21u8));
+        assert_eq!(recovered.shares, shares);
         let callback_jobs: i64 = sqlx::query_scalar(
             "
             SELECT COUNT(*)

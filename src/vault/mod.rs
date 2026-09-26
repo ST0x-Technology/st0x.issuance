@@ -41,8 +41,8 @@ pub(crate) use network_services::{
 pub(crate) use orchestrator::{
     BurnRange, MintAuthorization, MintedLogQuery, MintedLogScan,
     OrchestratorBurnParams, OrchestratorBurnReadiness, OrchestratorBurnResult,
-    OrchestratorMintParams, OrchestratorMintResult, OrchestratorMintedLog,
-    OrchestratorRevertReason,
+    OrchestratorMintDeposit, OrchestratorMintParams, OrchestratorMintResult,
+    OrchestratorMintedLog, OrchestratorRevertReason,
 };
 
 /// Service abstraction for vault operations.
@@ -293,6 +293,22 @@ pub(crate) trait VaultService: Send + Sync {
         _orchestrator: Address,
         _token: Address,
     ) -> Result<U256, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
+
+    /// Reads `balanceOf(holder, receipt_id)` on `vault`'s ERC-1155 receipt
+    /// contract, one entry per requested id in the order given.
+    ///
+    /// Inventory mirrors balances rather than deltas, so reconciling after an
+    /// orchestrator burn reads what the walk actually left behind instead of
+    /// subtracting what its event said it took — the chain is the authority,
+    /// and applying the same reading twice is a no-op.
+    async fn receipt_balances(
+        &self,
+        _vault: Address,
+        _holder: Address,
+        _receipt_ids: &[U256],
+    ) -> Result<Vec<U256>, VaultError> {
         Err(VaultError::InvalidReceipt)
     }
 

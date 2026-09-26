@@ -606,11 +606,16 @@ reused unchanged, with the jobs branching on `VaultMode` internally to submit
 orchestrator-mode events above. An orchestrator-mode mint creates no bot-held
 receipt for the receipt monitor to discover (the orchestrator custodies it — see
 "Orchestrator Migration" -> "Dual-Mode Operation and Cutover"), so the
-inventory-backed `RecordExistingMint` short-circuit does not apply; the submit
-and recovery paths' existing-mint check instead queries the orchestrator's
-`Minted` log by `(wallet, nonce)`, emitting `OrchestratorMintRecovered` only
-when the log's `token`/`amount` also exactly match this mint's own request facts
-(see "Nonce" below for the full-match rule and its manual-failure fallback). See
+inventory-backed `RecordExistingMint` short-circuit does not apply. The jobs
+still register the orchestrator's receipt in inventory, before the command that
+records the mint, so a crash between the two can leave this mint's own receipt
+tracked while the mint is unrecorded. The submit and recovery paths therefore
+skip the inventory check explicitly for orchestrator mode — the vault-direct
+`RecordExistingMint` would be refused with `MintModeMismatch` and stop the
+drive. Their existing-mint check instead queries the orchestrator's `Minted` log
+by `(wallet, nonce)`, emitting `OrchestratorMintRecovered` only when the log's
+`token`/`amount` also exactly match this mint's own request facts (see "Nonce"
+below for the full-match rule and its manual-failure fallback). See
 "Orchestrator Migration" for the mint flow, failure states
 (`BadRecipientSignature`, `RecipientCallbackRejected`, `VaultAmountMismatch`,
 `VaultLogicMismatch`/`ReceiptLogicMismatch`), and the full event reuse/new
@@ -1193,6 +1198,37 @@ commands are not persisted and may change shape freely per AGENTS.md.
 reservation lifecycle — the orchestrator custodies receipts directly, so there
 is no bot-side inventory to reserve against — and derives the burn amount from
 redemption state (`alpaca_quantity` in share-wei; dust stays in the bot wallet).
+
+Inventory still follows the burn. Skipping the reservation lifecycle does not
+mean skipping the mirror: once custody has migrated, the periodic reconciler
+stands down (it reads balances against the bot wallet, which holds none), so
+nothing else would ever correct it, and a rollback's `confirm-custody` demands
+tracked and on-chain balances agree exactly. On confirmation the manager takes
+the receipts inventory tracks from `firstReceiptId` through
+`nextBurnReceiptIdAfter` **inclusive**, re-reads
+`balanceOf(orchestrator, receipt_id)` for each, and applies those readings
+through the existing `ReconcileBalance` command. The inclusive end is deliberate
+and must not be "corrected" to the half-open pointer reading the "Contract
+Summary" mandates for `burn_range` itself: the receipt at
+`nextBurnReceiptIdAfter` is the partially-consumed boundary this burn stopped
+inside, so it is exactly the one whose balance moved, and a burn served entirely
+out of the current pointer receipt does not move the pointer at all, which makes
+the half-open range empty after a burn that did drain shares. Reading one extra
+untouched receipt is harmless here because these are readings, not deltas:
+re-running is a no-op rather than a second subtraction, an over-wide pointer
+range costs only reads, and existing drift is corrected rather than compounded.
+The half-open rule still governs every inference drawn from `burn_range` as
+provenance, and no burned quantity is ever derived from the range. Orchestrator
+mints register their `Deposit`'s receipt the same way vault-direct mints do —
+the orchestrator holds it, and inventory mirrors a vault's receipts against
+whichever wallet holds them. Both are best-effort, but they fail in OPPOSITE
+directions and only one of them fails safe. A failed burn reconciliation leaves
+the mirror HIGH, and `confirm-custody` compares every tracked receipt, so the
+rollback refuses loudly rather than acting on it. A failed mint registration
+leaves the mirror LOW, and `confirm-custody` builds its comparison list FROM the
+tracked receipts — an unregistered one is never compared, so the rollback passes
+and strands that receipt at the orchestrator. The mint half therefore needs the
+operator to register it by hand before a rollback; the warning it logs says so.
 `RecordBurnFailure`'s existing `planned_burns` field carries `vec![]` for an
 orchestrator-mode failure (already `#[serde(default)]`-tolerant of that), and
 its `classification` field (see "Failure States") carries

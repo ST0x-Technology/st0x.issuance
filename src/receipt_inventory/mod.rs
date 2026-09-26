@@ -313,6 +313,35 @@ pub(crate) trait ReceiptService: Send + Sync {
         vault: &Address,
         issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>;
+
+    /// The tracked receipts whose ids fall in the half-open range
+    /// `[start, end)`, in ascending id order.
+    ///
+    /// An orchestrator burn reports the pointer range its on-chain walk
+    /// covered, not the receipts it drained: the walk skips ids that are
+    /// already empty or were never this vault's. Intersecting the range with
+    /// what inventory tracks turns that span into the set actually worth
+    /// re-reading.
+    async fn tracked_receipts_in_range(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        start: U256,
+        end: U256,
+    ) -> Result<Vec<ReceiptId>, ReceiptLookupError>;
+
+    /// Applies an on-chain `balanceOf(holder, receipt_id)` reading.
+    ///
+    /// The aggregate refuses a reading taken against a wallet other than the
+    /// recorded custody holder, so the holder is passed rather than assumed.
+    async fn reconcile_receipt_balance(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        receipt_id: ReceiptId,
+        on_chain_balance: Shares,
+        observed_wallet: Address,
+    ) -> Result<(), ReceiptRegistrationError>;
 }
 
 #[derive(Debug, Error)]
@@ -626,6 +655,48 @@ impl ReceiptService for CqrsReceiptService {
             shares: metadata.balance.inner(),
             block_number: metadata.block_number,
         }))
+    }
+
+    async fn tracked_receipts_in_range(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        start: U256,
+        end: U256,
+    ) -> Result<Vec<ReceiptId>, ReceiptLookupError> {
+        let receipt_inventory =
+            load_inventory(&self.store, chain_id, &vault).await?;
+
+        Ok(receipt_inventory
+            .receipts
+            .keys()
+            .copied()
+            .filter(|receipt_id| (start..end).contains(&receipt_id.inner()))
+            .sorted_by_key(ReceiptId::inner)
+            .collect())
+    }
+
+    async fn reconcile_receipt_balance(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        receipt_id: ReceiptId,
+        on_chain_balance: Shares,
+        observed_wallet: Address,
+    ) -> Result<(), ReceiptRegistrationError> {
+        send_receipt_inventory_command(
+            &self.store,
+            chain_id,
+            &vault,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id,
+                on_chain_balance,
+                observed_wallet,
+            },
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
