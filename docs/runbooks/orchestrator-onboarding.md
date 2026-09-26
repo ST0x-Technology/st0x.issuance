@@ -777,20 +777,35 @@ then defers without recording an event — so the mint sits in `Minting`, not
 `JournalConfirmed`, holding real backing and minting nothing until the
 authorization lands.
 
-**There is no alert for this yet.** Today the only signal is `/admin/stuck`, and
-an in-progress mint does not appear there until it is an hour old
-(`STUCK_THRESHOLD`, `src/admin.rs`). An hour of silently-held AP shares is the
-gap; a WARN-then-ERROR alert on the wait is tracked separately and this section
-gets a detection step when it lands. Until then, the trigger is an
-orchestrator-mode `Minting` row for the asset with no `tx_id`, past the
-threshold — check for it deliberately during the pilot rather than waiting to be
-told:
+**Detection.** The mint recovery pass raises the alert itself; do not wait for
+`/admin/stuck`, which does not surface an in-progress mint until it is an hour
+old (`STUCK_THRESHOLD`, `src/admin.rs`) — an hour of silently-held AP shares.
+The pass runs every five minutes and measures each wait from the moment the
+shares were journaled, so the first line appears on the second or third pass
+after that point:
+
+| Level   | Wait     | Meaning                                                    |
+| ------- | -------- | ---------------------------------------------------------- |
+| `WARN`  | ≥ 10 min | Chase the delivery.                                        |
+| `ERROR` | ≥ 30 min | Escalate: the shares have been committed for half an hour. |
+
+Each level prints at most ONE line per pass, not one per mint, carrying
+`waiting_mints` (how many are in that band) and the OLDEST waiter's
+`oldest_issuer_request_id`, `oldest_tokenization_request_id` and
+`oldest_waited_seconds`. So the count tells you the scale and the ids give you
+somewhere to start; the other waiting mints are not named, and the same line
+repeats every pass while the condition holds. Once they are old enough for
+`/admin/stuck`, the rest are the orchestrator-mode `Minting` rows for the asset
+with no `tx_id`:
 
 ```sh
 curl -fsS -H "X-API-KEY: $INTERNAL_API_KEY" "$ISSUANCE_URL/admin/stuck" \
   | jq --arg sym <SYM> \
       '.stuck[] | select(.underlying == $sym and .state == "Minting" and .tx_id == null)'
 ```
+
+Mints waiting BEFORE their journal confirms are deliberately not alerted: Alpaca
+has committed nothing at that point, so there is no exposure.
 
 Escalation:
 
@@ -802,11 +817,45 @@ Escalation:
    `Orchestrator mint is awaiting its recipient authorization;
    deferring submission`
    for that `issuer_request_id`, repeated on every recovery pass, is this case.
-2. Have the liquidity bot redeliver to
+   That WARN repeats only while the mint's recovery job is live. The job gives
+   up after `MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS` polls with no progress
+   (360 polls at one minute each, so about 6 hours) and is marked `Killed`.
+   After that, the reconcile pass does not start a new job for the mint, so the
+   per-mint WARN stops, while the summary `ERROR` above keeps firing. The WARN
+   comes back only when the service restarts, because the startup re-scan drives
+   the mint again. So for a long wait, such as one overnight, do not expect to
+   find the WARN.
+
+   The alert names only the oldest waiter, so with `waiting_mints` above one,
+   find the others with the `/admin/stuck` filter above. The per-mint WARN lines
+   help too, but only in the first 6 hours of each wait.
+2. Check the liquidity bot's side before anything else: is its delivery job
+   running, and does its deployed config carry the `[orchestrator]` section with
+   THIS chain's address? A missing or stale address means it is signing
+   `MintAuth`s for the wrong contract, and no amount of redelivery fixes that
+   (step 7's cutover pre-checks verify both).
+
+   Then have it redeliver to
    `POST /internal/mints/<tokenization_request_id>/authorization`. Redelivery is
    the designed repair vector: an identical redelivery is idempotent and
    re-drives mint recovery, which covers the case where the first delivery
-   recorded but its wake was lost.
+   recorded but its wake was lost. The nonce must be byte-identical to the
+   original — a different nonce is a conflicting authorization, not a retry.
+
+   This route carries the same JSON data guard as the close below, so a bodyless
+   POST answers `404` rather than anything descriptive:
+
+   ```sh
+   curl -fsS -X POST \
+     -H "X-API-KEY: $INTERNAL_API_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"nonce":"0x…","signature":"0x…"}' \
+     "$ISSUANCE_URL/internal/mints/<tokenization_request_id>/authorization"
+   ```
+
+   An empty `"0x"` signature is valid for a contract recipient authorized
+   through the orchestrator's `authorizeMint` callback; it is not a way to skip
+   the signature for an EOA, which is refused.
 3. If redelivery does not work, find out which case you have. The two cases need
    different actions.
 
