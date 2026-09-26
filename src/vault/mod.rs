@@ -376,6 +376,33 @@ pub(crate) enum BurnTxStatus {
     ProvablyDead,
 }
 
+impl BurnTxStatus {
+    /// Whether a burn a redemption still holds can land.
+    ///
+    /// The admin resume gate and the automatic `BurnFailed` recovery both
+    /// decide from this one mapping, because they must agree: resuming over a
+    /// burn that can still land signs a second burn of the same shares.
+    pub(crate) const fn fate(self) -> BurnTxFate {
+        match self {
+            Self::Mined => BurnTxFate::Landed,
+            Self::FinalizedReverted | Self::ProvablyDead => BurnTxFate::Dead,
+            Self::StillMineable | Self::Reverted => BurnTxFate::Live,
+        }
+    }
+}
+
+/// See [`BurnTxStatus::fate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurnTxFate {
+    /// The burn mined: record it instead of burning again.
+    Landed,
+    /// The burn can never land, so a fresh burn is safe.
+    Dead,
+    /// The burn can still land — still mineable, or reverted in a block that
+    /// is not finalized yet — so nothing may resume over it.
+    Live,
+}
+
 /// Observation of a persisted signed vault-direct mint transaction.
 ///
 /// Parallel to [`BurnTxStatus`]. Provider/identity uncertainty is **not** a

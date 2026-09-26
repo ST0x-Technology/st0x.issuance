@@ -61,7 +61,7 @@ use crate::underlying::{
     AssetStatus, Underlying, UnderlyingViewError, load_freeze_status,
 };
 use crate::vault::{
-    BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
+    BurnTxFate, BurnTxStatus, BurnVerification, MintedLogQuery, MintedLogScan,
     NetworkVaultServices, SendableTxWithHash, TxId, VaultError, VaultService,
 };
 use crate::wrapped_transfer::{
@@ -1255,12 +1255,123 @@ async fn inspect_prior_burn(
     let issuer_request_id = &metadata.issuer_request_id;
     let detected_tx_hash = &metadata.detected_tx_hash;
 
-    let Some(bf_data) = burning_failed else {
-        return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
+    // Which transaction to inspect: the signed burn the redemption still
+    // holds whenever there is one, and the failure's own payload only when
+    // nothing is retained.
+    //
+    // The retained burn wins UNCONDITIONALLY, even when the failure names it
+    // too. `burning_failed` is the LAST `BurningFailed` in the stream —
+    // `load_reprocess_context` overwrites it on every one it walks past — so
+    // it is not necessarily about the burn this redemption still holds. It
+    // can name a transaction the aggregate has already moved past: attempt 1
+    // reverts and records its id, a resume broadcasts attempt 2, an
+    // ambiguous confirm records nothing, and an operator `MarkFailed`s it —
+    // leaving the event naming attempt 1 while `unresolved_burn_tx` is
+    // attempt 2. Classifying attempt 1 would find its old revert and license
+    // a THIRD burn while attempt 2 can still land, which is the double burn
+    // this endpoint exists to prevent. Nothing downstream catches it:
+    // `handle_resume_burn` only checks the state is `Failed`.
+    //
+    // Inspecting the retained one, rather than refusing outright, is what
+    // keeps BOTH hazards closed. A burn that can still land holds the resume
+    // off, so a second burn never starts over a live one. A burn a previous
+    // recovery already proved reverted resumes — a blanket refusal would
+    // strand it forever, because `BurnResumed` carries that dead transaction
+    // into `Burning.prior_burn_tx` and a later tx-free failure puts it
+    // straight back into `Failed.unresolved_burn_tx`.
+    let retained =
+        retained_unresolved_burn(store, aggregate_id, issuer_request_id)
+            .await?;
+    let named_tx_id = burning_failed.and_then(|data| data.tx_id.clone());
+    let named_hash = named_tx_id.as_ref().and_then(TxId::to_hash);
+
+    let (tx_id, retained_identity, planned_burns) = if let Some(retained) =
+        retained
+    {
+        let same_hash = named_hash == Some(retained.transaction.hash);
+        match named_tx_id.as_ref() {
+            Some(named) if !same_hash => {
+                warn!(target: "admin", aggregate_id = %aggregate_id,
+                    issuer_request_id = %issuer_request_id,
+                    named_tx = %named,
+                    retained_tx_hash = %retained.transaction.hash,
+                    "Recorded failure names a transaction the redemption has \
+                     moved past; classifying the retained burn instead, since \
+                     that is the one that can still land"
+                );
+            }
+            Some(_) => {
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %retained.transaction.hash,
+                    "Recorded failure names the burn this redemption still \
+                     holds; classifying it before resuming"
+                );
+            }
+            None => {
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %retained.transaction.hash,
+                    "Recorded failure names no transaction; classifying the \
+                     signed burn this redemption still holds before resuming"
+                );
+            }
+        }
+
+        match classify_retained_burn(
+            vault_service,
+            aggregate_id,
+            issuer_request_id,
+            detected_tx_hash,
+            &retained,
+            burn_retry_external_tx_id.clone(),
+        )
+        .await?
+        {
+            RetainedBurnVerdict::Resume(disposition) => {
+                return Ok(disposition);
+            }
+            RetainedBurnVerdict::Landed => {}
+        }
+
+        // The burns come from the retained state, for the reason
+        // `RetainedBurn` gives: they describe THIS transaction. The failure
+        // payload is only a fallback, and only when it names this same
+        // transaction: a `BurningFailed` can name a transaction and carry no
+        // burns — pre-enrichment streams replay it that way — and recording
+        // that empty list for a burn that landed would leave inventory
+        // holding the shares it consumed.
+        let planned_burns = if retained.planned_burns.is_empty() && same_hash {
+            burning_failed
+                .map(|data| data.planned_burns.clone())
+                .unwrap_or_default()
+        } else {
+            retained.planned_burns
+        };
+
+        (
+            TxId::Hash(retained.transaction.hash),
+            Some(BurnTransactionIdentity::from(&retained.transaction)),
+            planned_burns,
+        )
+    } else {
+        // Nothing retained: the failure's own payload names the burn being
+        // inspected, or names none and the resume proceeds.
+        let Some(named) = named_tx_id else {
+            return Ok(PriorBurnDisposition::ResumeWith(
+                burn_retry_external_tx_id,
+            ));
+        };
+
+        (
+            named,
+            None,
+            burning_failed
+                .map(|data| data.planned_burns.clone())
+                .unwrap_or_default(),
+        )
     };
-    let Some(tx_id) = bf_data.tx_id.as_ref() else {
-        return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
-    };
+    let tx_id = &tx_id;
 
     match metadata.burn_mode {
         VaultMode::VaultDirect => match vault_service.check_tx(tx_id).await {
@@ -1273,12 +1384,13 @@ async fn inspect_prior_burn(
                     return Err(Status::InternalServerError.into());
                 };
 
-                if bf_data.planned_burns.is_empty() {
+                if planned_burns.is_empty() {
                     warn!(target: "admin", aggregate_id = %aggregate_id,
                         tx_hash = ?tx_id,
-                        "BurningFailed event has no planned_burns — \
-                         burn records will be empty. Manual receipt inventory \
-                         reconciliation may be needed after recovery."
+                        "No planned burns are recorded for the inspected \
+                         transaction — burn records will be empty. Manual \
+                         receipt inventory reconciliation may be needed after \
+                         recovery."
                     );
                 }
 
@@ -1294,7 +1406,7 @@ async fn inspect_prior_burn(
                     tx_id,
                     receipt.transaction_hash(),
                     ExistingBurnProof::VaultDirect {
-                        burns: bf_data.planned_burns.clone(),
+                        burns: planned_burns.clone(),
                     },
                     block_number,
                 )
@@ -1310,6 +1422,7 @@ async fn inspect_prior_burn(
                 aggregate_id,
                 issuer_request_id,
                 tx_id,
+                retained_identity,
                 &error,
             )),
         },
@@ -1359,6 +1472,7 @@ async fn inspect_prior_burn(
                     aggregate_id,
                     issuer_request_id,
                     tx_id,
+                    retained_identity,
                     &error,
                 )),
             }
@@ -1431,13 +1545,190 @@ fn resume_after_reverted_burn(
     PriorBurnDisposition::ResumeWith(retry_external_tx_id)
 }
 
+/// What the nonce classification of a retained burn lets the resume gate do
+/// next (see [`classify_retained_burn`]).
+enum RetainedBurnVerdict {
+    /// The burn can never land, so the resume proceeds with this disposition.
+    Resume(PriorBurnDisposition),
+    /// The burn landed: the receipt lookup records it.
+    Landed,
+}
+
+/// Classifies the burn a redemption still holds by the signer's nonce before
+/// any receipt lookup.
+///
+/// A receipt lookup has only two definitive verdicts — mined, or
+/// mined-and-finalized-reverted. A signed burn that never mined (dropped from
+/// the mempool, or superseded at its nonce by another transaction from the
+/// same signer) has no receipt at all, so a lookup would time out into `422`
+/// on every retry, forever, locking the operator out of a resume that is
+/// provably safe. So the signer's nonce is asked first, exactly as the close
+/// gate does, and the verdict is matched exhaustively: a burn that can no
+/// longer land resumes; only a landed one goes on to the receipt lookup,
+/// which records it; one that can still land, or that reverted without
+/// finalizing, is refused at once naming the transaction, rather than
+/// spending a receipt wait that cannot succeed; and a classification the
+/// provider cannot answer fails closed the same way.
+async fn classify_retained_burn(
+    vault_service: &Arc<dyn VaultService>,
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    detected_tx_hash: &B256,
+    retained: &RetainedBurn,
+    burn_retry_external_tx_id: Option<BurnExternalTxId>,
+) -> Result<RetainedBurnVerdict, RecoverRedemptionError> {
+    let signer = retained
+        .transaction
+        .validate()
+        .and_then(|envelope| {
+            envelope.recover_signer().map_err(VaultError::from)
+        })
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Retained burn transaction failed validation during the \
+                 resume safety gate"
+            );
+            RecoverRedemptionError::from(Status::InternalServerError)
+        })?;
+    let identity = BurnTransactionIdentity::from(&retained.transaction);
+    match vault_service.classify_burn_tx(signer, &retained.transaction).await {
+        Ok(status) => match status.fate() {
+            BurnTxFate::Dead => {
+                Ok(RetainedBurnVerdict::Resume(resume_after_reverted_burn(
+                    aggregate_id,
+                    detected_tx_hash,
+                    &TxId::Hash(retained.transaction.hash),
+                    burn_retry_external_tx_id,
+                )))
+            }
+            BurnTxFate::Landed => Ok(RetainedBurnVerdict::Landed),
+            BurnTxFate::Live => Err(live_retained_burn_error(
+                aggregate_id,
+                issuer_request_id,
+                identity,
+                status,
+            )),
+        },
+        Err(error) => {
+            warn!(target: "admin", aggregate_id = %aggregate_id,
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %retained.transaction.hash,
+                error = %error,
+                "Retained burn classification failed; refusing the resume \
+                 rather than deciding blind"
+            );
+            Err(ambiguous_prior_burn_error(
+                aggregate_id,
+                issuer_request_id,
+                &TxId::Hash(retained.transaction.hash),
+                Some(identity),
+                &error,
+            ))
+        }
+    }
+}
+
+/// Refuses a resume over a retained burn that can still land — still
+/// mineable, or reverted in a block that is not yet finalized. The refusal
+/// names the transaction, because confirming its outcome is the operator's
+/// next step (SPEC "Recover Stuck Aggregates").
+fn live_retained_burn_error(
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    identity: BurnTransactionIdentity,
+    status: BurnTxStatus,
+) -> RecoverRedemptionError {
+    warn!(target: "admin", aggregate_id = %aggregate_id,
+        issuer_request_id = %issuer_request_id,
+        tx_hash = %identity.tx_hash,
+        nonce = identity.nonce,
+        status = ?status,
+        "Retained burn can still land; refusing to resume over it"
+    );
+    RecoverRedemptionError::new(
+        Status::UnprocessableEntity,
+        RecoverRedemptionCode::PriorBurnUnverifiable,
+        "Prior burn can still land; confirm its outcome or replace it before \
+         resuming",
+    )
+    .with_old_transaction(identity)
+}
+
+/// The signed burn this redemption still holds, with the burns that
+/// transaction planned.
+///
+/// A resume prepares and signs a FRESH burn, so it is only safe once the
+/// retained one's outcome is known. The aggregate derives the retained
+/// transaction from the state the failure interrupted rather than from the
+/// failure's payload, so it is found even for a failure recorded without a
+/// transaction id — a shape the aggregate refuses to write over an in-flight
+/// burn, but which existing streams can still carry.
+///
+/// The planned burns travel with it because they come from the same state, so
+/// they describe THIS transaction. Recording a landed retained burn with the
+/// failure event's `planned_burns` instead would terminalize the redemption
+/// with no record of the receipts the burn consumed, leaving inventory holding
+/// shares that are gone for the next burn to plan against.
+struct RetainedBurn {
+    transaction: SendableTxWithHash,
+    planned_burns: Vec<BurnRecord>,
+}
+
+async fn retained_unresolved_burn(
+    store: &Store<Redemption>,
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+) -> Result<Option<RetainedBurn>, RecoverRedemptionError> {
+    let redemption = store.load(issuer_request_id).await.map_err(|error| {
+        error!(target: "admin", aggregate_id = %aggregate_id,
+            error = %error,
+            "Failed to load redemption for the resume safety gate"
+        );
+        RecoverRedemptionError::from(Status::InternalServerError)
+    })?;
+
+    // Only a `Failed` redemption has a resume to gate. A `Closed` one also
+    // carries `unresolved_burn_tx`, and classifying it here would answer
+    // `422` (and log an existing-burn record that never happens) before the
+    // aggregate gets to reject the resume with its own `409`.
+    //
+    // The empty-bytes filter matches every other reader of this field: a
+    // defaulted `sendable_tx` (legacy or mock-prepared streams) would
+    // otherwise surface `TxId::Hash(B256::ZERO)` as a retained hash, naming
+    // transaction 0x0 in the refusal and spending an RPC receipt lookup on it.
+    Ok(redemption.and_then(|redemption| {
+        if !matches!(redemption, Redemption::Failed { .. }) {
+            return None;
+        }
+        let transaction = redemption
+            .unresolved_burn_tx()
+            .filter(|sendable_tx| !sendable_tx.tx.is_empty())
+            .cloned()?;
+        Some(RetainedBurn {
+            transaction,
+            planned_burns: redemption
+                .retained_planned_burns()
+                .unwrap_or_default(),
+        })
+    }))
+}
+
 /// Maps a non-revert confirmation error to the operator-facing status: a
 /// missing block number is an internal fault, anything else is an ambiguous
 /// outcome needing manual intervention. Shared by both modes.
+///
+/// `identity` is set when the inspected transaction is one the redemption
+/// still holds rather than one the failure named. The refusal tells the
+/// operator to confirm that transaction's outcome, so the response must name
+/// it — SPEC "Recover Stuck Aggregates" requires the identity on this refusal,
+/// and a hash that appears only in the server log is one the caller cannot act
+/// on.
 fn ambiguous_prior_burn_error(
     aggregate_id: &str,
     issuer_request_id: &IssuerRedemptionRequestId,
     tx_id: &TxId,
+    identity: Option<BurnTransactionIdentity>,
     error: &VaultError,
 ) -> RecoverRedemptionError {
     if let VaultError::MissingBlockNumber { tx_hash } = error {
@@ -1456,11 +1747,15 @@ fn ambiguous_prior_burn_error(
             error = %error,
             "Prior burn outcome is ambiguous; manual intervention required"
         );
-        RecoverRedemptionError::new(
+        let refusal = RecoverRedemptionError::new(
             Status::UnprocessableEntity,
             RecoverRedemptionCode::PriorBurnUnverifiable,
             "Prior burn outcome is ambiguous; manual intervention required",
-        )
+        );
+        match identity {
+            Some(identity) => refusal.with_old_transaction(identity),
+            None => refusal,
+        }
     }
 }
 
@@ -5820,9 +6115,9 @@ mod tests {
         (metadata, alpaca_data)
     }
 
-    /// Drives a redemption through a submitted burn that then fails, leaving
-    /// the transaction ID in event history for the admin recovery route.
-    async fn setup_burn_failure(
+    /// Drives a redemption to `BurnSubmitted` with `tx_id` as the broadcast
+    /// transaction, stopping before any failure is recorded.
+    async fn setup_burn_submitted(
         store: &Store<Redemption>,
         tx_id: TxId,
     ) -> (RedemptionMetadata, AlpacaCalledData) {
@@ -5874,11 +6169,33 @@ mod tests {
                         &metadata.detected_tx_hash,
                     ),
                     tx_id: tx_id.clone(),
-                    planned_burns: vec![],
+                    // The burns this transaction plans, as production sends
+                    // them: they are what the aggregate carries into
+                    // `Failed.burn_context`, and recovery needs them to
+                    // record which receipts a landed burn consumed.
+                    planned_burns: burns
+                        .iter()
+                        .map(|entry| BurnRecord {
+                            receipt_id: entry.receipt_id,
+                            shares_burned: entry.burn_shares,
+                        })
+                        .collect(),
                 },
             )
             .await
             .expect("BurnTxSubmitted should persist");
+
+        (metadata, alpaca_data)
+    }
+
+    /// Drives a redemption through a submitted burn that then fails, leaving
+    /// the transaction ID in event history for the admin recovery route.
+    async fn setup_burn_failure(
+        store: &Store<Redemption>,
+        tx_id: TxId,
+    ) -> (RedemptionMetadata, AlpacaCalledData) {
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(store, tx_id.clone()).await;
 
         store
             .send(
@@ -5899,6 +6216,95 @@ mod tests {
             .expect("RecordBurnFailure failed");
 
         (metadata, alpaca_data)
+    }
+
+    /// Appends a `BurningFailed` that names no transaction straight to the
+    /// event stream, bypassing the aggregate. The aggregate refuses to record
+    /// that shape while a burn is in flight, so it can only reach production
+    /// in a stream written before that guard existed — which is exactly the
+    /// history the resume path must still refuse to act on.
+    async fn seed_tx_free_burn_failure(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        seed_burn_failure_naming(pool, issuer_request_id, None).await;
+    }
+
+    /// Appends a `BurningFailed` naming `tx_id` straight to the event stream.
+    /// Raw, because both shapes it produces are ones the aggregate will not
+    /// write through a command: a transaction-free failure over an in-flight
+    /// burn, and a failure naming a transaction the stream has already moved
+    /// past.
+    async fn seed_burn_failure_naming(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_id: Option<TxId>,
+    ) {
+        let aggregate_id = issuer_request_id.to_string();
+        let payload = serde_json::to_string(&RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "historic transaction-free failure".to_string(),
+            failed_at: Utc::now(),
+            tx_id,
+            planned_burns: vec![],
+            classification: BurnFailureClassification::Unclassified,
+        })
+        .expect("BurningFailed should serialize");
+        let next_sequence: i64 = sqlx::query_scalar(
+            "
+            SELECT COALESCE(MAX(sequence), 0) + 1
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(pool)
+        .await
+        .expect("next sequence should resolve");
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Redemption',
+                ?,
+                ?,
+                'RedemptionEvent::BurningFailed',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(&aggregate_id)
+        .bind(next_sequence)
+        .bind(&payload)
+        .execute(pool)
+        .await
+        .expect("seeded failure should insert");
+
+        // The seeded event never passed through the store, so any cached
+        // snapshot predates it; drop it so the aggregate replays from events.
+        sqlx::query(
+            "
+            DELETE FROM snapshots
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .execute(pool)
+        .await
+        .expect("stale snapshot should clear");
     }
 
     async fn seed_receipt_reservation(
@@ -6100,6 +6506,714 @@ mod tests {
         ));
     }
 
+    /// Resuming a failure that names no transaction starts a fresh burn. If
+    /// the redemption still holds a signed burn capable of landing, that
+    /// burns the same shares twice. The aggregate refuses to record such a
+    /// failure over an in-flight burn; this gate covers the streams that
+    /// carry one anyway.
+    ///
+    /// The retained burn is still PENDING here, which is what an in-flight
+    /// one looks like on-chain: the inspection cannot prove it dead, so the
+    /// resume is refused.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_to_resume_over_an_unresolved_burn() {
+        let pool = setup_pool().await;
+        // Real signed bytes, as production prepares: a transaction with no
+        // bytes could never land, and the aggregate rightly ignores it.
+        let signed_burn = SendableTxWithHash::valid_for_test(
+            7,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(signed_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_pending_checked_tx());
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(
+            body.contains("\"code\":\"prior_burn_unverifiable\""),
+            "body: {body}"
+        );
+        // The operator is told to confirm a transaction, so the response has
+        // to name it rather than leaving it in the server log alone.
+        assert!(
+            body.contains(&format!("{:?}", signed_burn.hash)),
+            "the refusal must name the retained burn, body: {body}"
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "no burn may be driven while one is still unresolved"
+        );
+        let advancing_events: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type IN (
+                  'RedemptionEvent::BurnResumed',
+                  'RedemptionEvent::ExistingBurnRecovered'
+              )
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(advancing_events, 0, "the redemption must not advance");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[&aggregate_id, "Retained burn can still land"]
+        ));
+    }
+
+    /// The mirror image of the refusal above, and the reason the gate
+    /// inspects instead of refusing outright. A recovery that already proved
+    /// a burn reverted issues `ResumeBurn`, which carries that dead
+    /// transaction into `Burning.prior_burn_tx`; a later pre-submit failure
+    /// names no transaction and `apply_failure_event` puts it straight back
+    /// into `Failed.unresolved_burn_tx`. A blanket refusal would then answer
+    /// `422` forever, stranding a post-Alpaca redemption with unburned shares
+    /// behind a transaction that can never land.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_resumes_over_a_retained_burn_proven_reverted() {
+        let pool = setup_pool().await;
+        let signed_burn = SendableTxWithHash::valid_for_test(
+            7,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(signed_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // The retained burn is a FINALIZED revert: conclusively dead, so the
+        // resume is safe and must proceed.
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok, "body: {body}");
+        assert_eq!(
+            burn_recovery.calls(),
+            1,
+            "a burn proven reverted must not block the resume"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "Transaction reverted onchain"]
+        ));
+    }
+
+    /// A retained burn that turns out to have LANDED is recorded with the
+    /// burns THAT transaction planned, not the failure payload's (which is
+    /// empty whenever the failure named no transaction). Recording an empty
+    /// set terminalizes the redemption with no record of which receipts the
+    /// on-chain burn consumed, so inventory keeps shares that are gone and
+    /// the next burn plans against them.
+    #[traced_test]
+    #[tokio::test]
+    async fn landed_retained_burn_records_the_receipts_it_consumed() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            13,
+            address!("0xabababababababababababababababababababab"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // The retained burn landed: it was broadcast, which is exactly why
+        // the gate had to inspect it. The nonce classification says so, and
+        // the receipt lookup then records it.
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Mined)
+                .with_checked_tx_receipt(checked_burn_receipt(
+                    live_burn.hash,
+                    Some(4_242),
+                    true,
+                )),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+        assert_eq!(status, Status::Ok, "body: {body}");
+
+        let recorded: String = sqlx::query_scalar(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::ExistingBurnRecovered'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            recorded.contains("\"receipt_id\""),
+            "the landed burn must record the receipts it consumed, got \
+             {recorded}"
+        );
+    }
+
+    /// The same guarantee on the SAME-HASH path. A `BurningFailed` can name
+    /// the very transaction the redemption retains and still carry no burns
+    /// (pre-enrichment streams replay it that way), so the failure payload is
+    /// not a safe source just because it names the transaction: the retained
+    /// state's burns describe the transaction either way, and a landed burn
+    /// must record them rather than an empty list.
+    #[traced_test]
+    #[tokio::test]
+    async fn landed_named_burn_records_the_retained_receipts() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            14,
+            address!("0xabababababababababababababababababababab"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::Hash(live_burn.hash)).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        // Names the retained transaction, carries no burns.
+        seed_burn_failure_naming(
+            &pool,
+            &metadata.issuer_request_id,
+            Some(TxId::Hash(live_burn.hash)),
+        )
+        .await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Mined)
+                .with_checked_tx_receipt(checked_burn_receipt(
+                    live_burn.hash,
+                    Some(4_243),
+                    true,
+                )),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+        assert_eq!(status, Status::Ok, "body: {body}");
+
+        let recorded: String = sqlx::query_scalar(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::ExistingBurnRecovered'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            recorded.contains("\"receipt_id\""),
+            "a landed burn named by a burn-less failure must still record the \
+             receipts the retained state planned, got {recorded}"
+        );
+        assert!(
+            !logs_contain_at!(
+                Level::WARN,
+                &[&aggregate_id, "No planned burns are recorded"]
+            ),
+            "the retained burns must be found, not warned about as missing"
+        );
+    }
+
+    /// `burning_failed` is the LAST `BurningFailed` in the stream, so it can
+    /// name a transaction the redemption has already moved past: attempt 1
+    /// reverts and records its id, a resume broadcasts attempt 2, an
+    /// ambiguous confirm records nothing, and an operator marks it failed.
+    /// Classifying the named attempt 1 would find its old revert and license
+    /// a THIRD burn while attempt 2 can still land — the double burn this
+    /// endpoint exists to prevent, and nothing downstream catches it
+    /// (`handle_resume_burn` only checks the state is `Failed`). The retained
+    /// transaction must win.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_classifies_the_retained_burn_over_a_superseded_name() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            11,
+            address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        // `BurnSubmitted` holds the live burn, so the aggregate retains it.
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        // A failure naming a DIFFERENT, older transaction — the superseded
+        // attempt that the stream has already moved past.
+        let superseded_hash = B256::repeat_byte(0x5a);
+        seed_burn_failure_naming(
+            &pool,
+            &metadata.issuer_request_id,
+            Some(TxId::Hash(superseded_hash)),
+        )
+        .await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // A finalized revert exists for the SUPERSEDED hash only. Classifying
+        // the named transaction would find it and resume (200, one recovery
+        // call); classifying the retained one fails the receipt's hash check
+        // and refuses. The outcome therefore flips if the supersede logic
+        // regresses — a pending-for-any-hash mock could not tell the two
+        // apart.
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
+                checked_burn_receipt(superseded_hash, Some(12_345), false),
+            ));
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity, "body: {body}");
+        // The refusal names the RETAINED burn, which is only possible if that
+        // is the transaction the gate classified.
+        assert!(
+            body.contains(&format!("{:?}", live_burn.hash)),
+            "the refusal must name the retained burn, body: {body}"
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "a revert verdict on a superseded transaction must not resume"
+        );
+        assert!(logs_contain_at!(Level::WARN, &[&aggregate_id, "moved past"]));
+    }
+
+    /// A retained burn that never mined has no receipt, so a receipt lookup
+    /// alone answers `422` on every retry forever — even when the signer's
+    /// nonce has moved past it and the burn is provably dead. That is the
+    /// `BurnSubmitted` → `MarkFailed` shape with the broadcast bytes retained.
+    /// The nonce classification must run first and let the resume proceed.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_resumes_over_a_retained_burn_that_is_provably_dead() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            17,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // No receipt will ever appear (pending), but the signer's nonce says
+        // the burn can no longer land.
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_pending_checked_tx()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok, "body: {body}");
+        assert_eq!(
+            burn_recovery.calls(),
+            1,
+            "a provably dead retained burn must not block the resume"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "Transaction reverted onchain"]
+        ));
+    }
+
+    /// The ordinary production shape: the last failure names the SAME
+    /// transaction the redemption retains. Naming it does not make the
+    /// failure payload a safe source: the retained burn is still classified,
+    /// a burn that can still land is refused at once rather than after a
+    /// receipt wait that cannot succeed, and the refusal names the
+    /// transaction the operator has to confirm.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_inspects_the_named_burn_when_it_is_the_retained_one() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            19,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        // The failure names the very transaction the aggregate retains.
+        let (metadata, alpaca_data) =
+            setup_burn_failure(&store, TxId::Hash(live_burn.hash)).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_pending_checked_tx());
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity, "body: {body}");
+        assert!(
+            body.contains("\"code\":\"prior_burn_unverifiable\""),
+            "body: {body}"
+        );
+        // Same hash on both sides: the retained burn is still the one
+        // classified, and the refusal names it.
+        assert!(
+            body.contains(&format!("{:?}", live_burn.hash)),
+            "the refusal must name the retained burn, body: {body}"
+        );
+        assert_eq!(burn_recovery.calls(), 0);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[&aggregate_id, "Retained burn can still land"]
+        ));
+    }
+
+    /// The same-hash shape with a retained burn that never mined: no receipt
+    /// exists, so a receipt lookup alone would answer `422` on every retry
+    /// forever, while the signer's nonce says the burn can no longer land.
+    /// The classification must run on this path too, not only when the
+    /// failure names a superseded transaction, and let the resume proceed.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_resumes_over_a_same_hash_retained_burn_that_is_dead() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            21,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        // The failure names the very transaction the aggregate retains.
+        let (metadata, alpaca_data) =
+            setup_burn_failure(&store, TxId::Hash(live_burn.hash)).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // No receipt will ever appear (pending), but the signer's nonce says
+        // the burn can no longer land.
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_pending_checked_tx()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok, "body: {body}");
+        assert_eq!(
+            burn_recovery.calls(),
+            1,
+            "a provably dead retained burn must not block the resume, even \
+             when the failure names it"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "Transaction reverted onchain"]
+        ));
+    }
+
+    /// The tx-free gate has two entry paths and they need separate coverage:
+    /// this one has NO `BurningFailed` event at all, reached by `MarkFailed`
+    /// straight from `BurnSubmitted`, which keeps the signed burn. Without
+    /// this test, reverting that branch to an unconditional resume leaves the
+    /// suite green.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_to_resume_with_no_burning_failed_event() {
+        let pool = setup_pool().await;
+        let signed_burn = SendableTxWithHash::valid_for_test(
+            9,
+            address!("0xdddddddddddddddddddddddddddddddddddddddd"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(signed_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        // `RedemptionFailed`, not `BurningFailed`: the recovery path finds no
+        // failure payload to read a transaction from, while the aggregate
+        // still holds the submitted burn.
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "operator marked failed".to_string(),
+                },
+            )
+            .await
+            .expect("mark failed must record");
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_pending_checked_tx());
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity, "body: {body}");
+        assert!(
+            body.contains("\"code\":\"prior_burn_unverifiable\""),
+            "body: {body}"
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "no burn may be driven while the submitted one can still land"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[&aggregate_id, "Retained burn can still land"]
+        ));
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn endpoint_records_burn_receipt_block_number() {
@@ -6174,10 +7288,9 @@ mod tests {
         ));
     }
 
-    /// Drives an orchestrator-mode redemption to `BurnFailed` with the given
-    /// submitted transaction id, mirroring `setup_burn_failure` but on the
-    /// orchestrator burn path.
-    async fn setup_orchestrator_burn_failure(
+    /// Drives an orchestrator-mode redemption to `BurnSubmitted` with `tx_id`
+    /// as the broadcast transaction, stopping before any failure is recorded.
+    async fn setup_orchestrator_burn_submitted(
         store: &Store<Redemption>,
         tx_id: TxId,
     ) -> (RedemptionMetadata, AlpacaCalledData) {
@@ -6281,6 +7394,19 @@ mod tests {
             )
             .await
             .expect("BurnTxSubmitted should persist");
+
+        (metadata, alpaca_data)
+    }
+
+    /// Drives an orchestrator-mode redemption to `BurnFailed` with the given
+    /// submitted transaction id, mirroring `setup_burn_failure` but on the
+    /// orchestrator burn path.
+    async fn setup_orchestrator_burn_failure(
+        store: &Store<Redemption>,
+        tx_id: TxId,
+    ) -> (RedemptionMetadata, AlpacaCalledData) {
+        let (metadata, alpaca_data) =
+            setup_orchestrator_burn_submitted(store, tx_id.clone()).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -6297,6 +7423,255 @@ mod tests {
             .expect("RecordBurnFailure failed");
 
         (metadata, alpaca_data)
+    }
+
+    /// Orchestrator twin of the tx-free gate: a transaction-free failure over
+    /// a retained orchestrator burn that MINED, whose confirm then fails. The
+    /// nonce classification must say `Mined` for the request to reach the
+    /// `Orchestrator` confirm arm at all — the mock's default is
+    /// `StillMineable`, which stops the request at the live-burn refusal —
+    /// and that arm must attach the retained identity to its refusal exactly
+    /// as the vault-direct arm does.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_names_the_retained_orchestrator_burn_on_a_tx_free_failure()
+     {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            23,
+            address!("0x00000000000000000000000000000000000000aa"),
+            Bytes::from_static(&[0xaa, 0xbb]),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) = setup_orchestrator_burn_submitted(
+            &store,
+            TxId::Hash(live_burn.hash),
+        )
+        .await;
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // The nonce says the burn mined, but the confirm fails, so the
+        // endpoint cannot tell what it did: the ambiguous refusal path.
+        let vault_mock = Arc::new(
+            MockVaultService::new_failure()
+                .with_burn_tx_status(BurnTxStatus::Mined),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity, "body: {body}");
+        assert!(
+            body.contains("\"code\":\"prior_burn_unverifiable\""),
+            "body: {body}"
+        );
+        assert!(
+            body.contains(&format!("{:?}", live_burn.hash)),
+            "the refusal must name the retained orchestrator burn, body: \
+             {body}"
+        );
+        assert_eq!(
+            vault_mock.orchestrator_confirm_call_count(),
+            1,
+            "the request must reach the Orchestrator confirm arm"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Prior burn outcome is ambiguous",
+                &metadata.issuer_request_id.to_string(),
+            ]
+        ));
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "an unverifiable retained burn must not be resumed over"
+        );
+    }
+
+    /// Vault-direct twin: a retained burn that MINED but whose receipt check
+    /// is still pending. The `VaultDirect` confirm arm must attach the
+    /// retained identity to its refusal, so the operator is told which
+    /// transaction to confirm.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_names_the_retained_vault_burn_on_an_ambiguous_confirm() {
+        let pool = setup_pool().await;
+        let live_burn = SendableTxWithHash::valid_for_test(
+            24,
+            address!("0xabababababababababababababababababababab"),
+            Bytes::default(),
+        );
+        let store = setup_store_with_vault(
+            &pool,
+            Arc::new(
+                MockVaultService::new_success()
+                    .with_prepared_tx(live_burn.clone()),
+            ),
+        );
+        let (metadata, alpaca_data) =
+            setup_burn_submitted(&store, TxId::random()).await;
+        seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::Mined)
+                .with_pending_checked_tx(),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity, "body: {body}");
+        assert!(
+            body.contains("\"code\":\"prior_burn_unverifiable\""),
+            "body: {body}"
+        );
+        assert!(
+            body.contains(&format!("{:?}", live_burn.hash)),
+            "the refusal must name the retained burn, body: {body}"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Prior burn outcome is ambiguous",
+                &metadata.issuer_request_id.to_string(),
+            ]
+        ));
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "an unverifiable retained burn must not be resumed over"
+        );
+    }
+
+    /// The fail-closed arms of the admin gate. A revert whose block is not
+    /// finalized can still be reorganized away and the burn re-mined, and a
+    /// classification the provider cannot answer proves nothing, so neither
+    /// may license a resume: either would sign a second burn of the same
+    /// shares while the retained one can still land.
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_to_resume_over_a_retained_burn_not_proven_dead() {
+        let live_burn = SendableTxWithHash::valid_for_test(
+            25,
+            address!("0xabababababababababababababababababababab"),
+            Bytes::default(),
+        );
+        let cases = [
+            (
+                MockVaultService::new_success()
+                    .with_burn_tx_status(BurnTxStatus::Reverted),
+                "Retained burn can still land; refusing to resume over it",
+            ),
+            (
+                MockVaultService::new_success()
+                    .with_burn_tx_classification_failure(),
+                "Retained burn classification failed; refusing the resume",
+            ),
+        ];
+
+        for (vault_mock, expected_log) in cases {
+            let pool = setup_pool().await;
+            let store = setup_store_with_vault(
+                &pool,
+                Arc::new(
+                    MockVaultService::new_success()
+                        .with_prepared_tx(live_burn.clone()),
+                ),
+            );
+            let (metadata, alpaca_data) =
+                setup_burn_submitted(&store, TxId::random()).await;
+            seed_tx_free_burn_failure(&pool, &metadata.issuer_request_id).await;
+            let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+                response: PollResponse::Ok(redeem_response(
+                    RedeemRequestStatus::Completed,
+                    &metadata,
+                    &alpaca_data,
+                )),
+            });
+            let burn_recovery = Arc::new(MockBurnRecovery::default());
+            let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+                burn_recovery.clone();
+            let rocket = post_alpaca_rocket(
+                store.clone(),
+                pool.clone(),
+                alpaca,
+                Arc::new(vault_mock),
+                burn_recovery_state,
+            );
+
+            let (status, body) = dispatch_recover_redemption(
+                rocket,
+                &metadata.issuer_request_id,
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                Status::UnprocessableEntity,
+                "{expected_log}: body: {body}"
+            );
+            assert!(
+                body.contains("\"code\":\"prior_burn_unverifiable\""),
+                "{expected_log}: body: {body}"
+            );
+            assert!(
+                logs_contain_at!(
+                    Level::WARN,
+                    &[expected_log, &metadata.issuer_request_id.to_string()]
+                ),
+                "expected WARN log: {expected_log}"
+            );
+            assert_eq!(
+                burn_recovery.calls(),
+                0,
+                "{expected_log}: no burn may resume"
+            );
+        }
     }
 
     #[traced_test]

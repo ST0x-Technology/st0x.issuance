@@ -44,10 +44,10 @@ use crate::redemption::{
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
-    BurnRequestOrigin, BurnTxStatus, BurnVerification, MultiBurnEntry,
-    MultiBurnParams, NetworkVaultServices, OrchestratorBurnParams,
-    OrchestratorBurnReadiness, SendableTxWithHash, TxId,
-    UnconfiguredNetworkError, VaultError, VaultService,
+    BurnRequestOrigin, BurnTxFate, BurnTxStatus, BurnVerification,
+    MultiBurnEntry, MultiBurnParams, NetworkVaultServices,
+    OrchestratorBurnParams, OrchestratorBurnReadiness, SendableTxWithHash,
+    TxId, UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 pub(crate) const MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS: u32 = 5;
@@ -201,6 +201,20 @@ struct DefinitiveConfirmFailure<'failure> {
 enum ExistingBurnRecoveryOutcome {
     Recovered,
     Deferred,
+}
+
+/// What a `BurnFailed` recovery does with the transaction it inspected (see
+/// [`BurnManager::inspect_failed_burn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailedBurnInspection {
+    /// A transaction that was submitted, or landed: confirm it on-chain and
+    /// record the outcome through the mode's confirm path.
+    Confirm(TxId),
+    /// No transaction can still land: retry with a fresh burn.
+    Retry,
+    /// The retained burn can still land, or could not be classified: leave
+    /// the redemption for the next pass.
+    Wait,
 }
 
 /// The persisted-burn recovery inputs pulled from a `BurnSubmitted` /
@@ -1606,59 +1620,71 @@ impl BurnManager {
             return Ok(());
         }
 
-        let failed_aggregate = self.store.load(issuer_request_id).await?;
-        let anchored_vault = match failed_aggregate {
+        let retained_burn = match self.store.load(issuer_request_id).await? {
             Some(Redemption::Failed {
                 unresolved_burn_tx: Some(sendable_tx),
                 ..
-            }) => Some(self.persisted_burn_target(*burn_mode, &sendable_tx)?),
+            }) => Some(sendable_tx),
             _ => None,
         };
-        let vault = if let Some(vault) = anchored_vault {
-            vault
-        } else {
-            find_vault(&self.view_pool, underlying, network).await?.ok_or_else(
-                || BurnManagerError::AssetNotFound {
-                    underlying: underlying.clone(),
-                    network: *network,
-                },
-            )?
-        };
+        let vault = self
+            .failed_burn_vault(
+                *burn_mode,
+                retained_burn.as_ref(),
+                underlying,
+                *network,
+            )
+            .await?;
 
         let vault_service = self.vault_for(*network)?;
+
+        let inspected_tx_id = match self
+            .inspect_failed_burn(
+                issuer_request_id,
+                vault_service.as_ref(),
+                tx_id.as_ref(),
+                retained_burn.as_ref(),
+            )
+            .await
+        {
+            FailedBurnInspection::Confirm(tx_id) => Some(tx_id),
+            FailedBurnInspection::Retry => None,
+            FailedBurnInspection::Wait => return Ok(()),
+        };
 
         // If a tx was already submitted before failure, inspect it before
         // deciding whether to confirm, wait, or submit a replacement. The
         // confirm path is mode-scoped: each mode confirms via its own
         // on-chain shape and records its own success event.
-        let retry_external_tx_id = if let Some(persisted_tx_id) = tx_id {
-            match burn_mode {
-                VaultMode::VaultDirect => {
-                    self.recover_burn_failed_with_existing_tx(
-                        issuer_request_id,
-                        network,
-                        vault,
-                        persisted_tx_id,
-                        dust_quantity,
-                    )
-                    .await?;
+        let retry_external_tx_id =
+            if let Some(persisted_tx_id) = inspected_tx_id.as_ref() {
+                match burn_mode {
+                    VaultMode::VaultDirect => {
+                        self.recover_burn_failed_with_existing_tx(
+                            issuer_request_id,
+                            network,
+                            vault,
+                            persisted_tx_id,
+                            dust_quantity,
+                        )
+                        .await?;
+                    }
+                    VaultMode::Orchestrator { .. } => {
+                        self.recover_orchestrator_burn_failed_with_existing_tx(
+                            *network,
+                            issuer_request_id,
+                            persisted_tx_id,
+                            alpaca_quantity,
+                            dust_quantity,
+                        )
+                        .await?;
+                    }
                 }
-                VaultMode::Orchestrator { .. } => {
-                    self.recover_orchestrator_burn_failed_with_existing_tx(
-                        *network,
-                        issuer_request_id,
-                        persisted_tx_id,
-                        alpaca_quantity,
-                        dust_quantity,
-                    )
-                    .await?;
-                }
-            }
-            return Ok(());
-        } else {
-            self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
-                .await?
-        };
+                return Ok(());
+            } else {
+                self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
+                    .await?
+            };
 
         let replacement_already_reserved =
             self.failed_replacement_already_reserved(issuer_request_id).await?;
@@ -1937,6 +1963,117 @@ impl BurnManager {
                     "Failed to confirm previously submitted burn"
                 );
                 Ok(ExistingBurnRecoveryOutcome::Deferred)
+            }
+        }
+    }
+
+    /// The vault a `BurnFailed` recovery acts on: anchored to the burn the
+    /// redemption still holds when there is one, so recovery targets the
+    /// contract that signed transaction addresses, and resolved from the
+    /// listing view otherwise.
+    async fn failed_burn_vault(
+        &self,
+        burn_mode: VaultMode,
+        retained_burn: Option<&SendableTxWithHash>,
+        underlying: &UnderlyingSymbol,
+        network: Network,
+    ) -> Result<Address, BurnManagerError> {
+        if let Some(sendable_tx) = retained_burn {
+            return Ok(self.persisted_burn_target(burn_mode, sendable_tx)?);
+        }
+
+        find_vault(&self.view_pool, underlying, &network).await?.ok_or_else(
+            || BurnManagerError::AssetNotFound {
+                underlying: underlying.clone(),
+                network,
+            },
+        )
+    }
+
+    /// Which transaction a `BurnFailed` recovery inspects: the one the
+    /// failure named when that is the burn the redemption still holds, and
+    /// otherwise the retained burn.
+    ///
+    /// A failure that names no transaction over a retained burn is the shape
+    /// every stream written before `handle_record_burn_failure` refused it
+    /// can carry, and a tx-free failure over a resumed burn's `prior_burn_tx`
+    /// still produces it today. Resuming from it blindly signs a second burn
+    /// of the same shares while the first can still land — in vault-direct
+    /// mode a pooled wallet's balance check passes while the old transaction
+    /// is pending, so both mine. So the retained burn is classified first,
+    /// exactly as the admin resume gate does: a landed one is confirmed and
+    /// recorded, a dead one is retried, and anything else — including a
+    /// classification the provider cannot answer — waits for the next pass.
+    ///
+    /// A failure that names a DIFFERENT transaction from the retained one is
+    /// treated the same way. Confirming the named one there would act on a
+    /// burn the redemption has moved past: its revert releases the
+    /// vault-direct reservation while the retained burn can still land, and
+    /// its landing is recorded as this redemption's burn. The
+    /// `expected_tx_hash` guard keeps current paths from writing that shape,
+    /// so only older streams carry it, but nothing else catches it there.
+    async fn inspect_failed_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault_service: &dyn VaultService,
+        named_tx_id: Option<&TxId>,
+        retained_burn: Option<&SendableTxWithHash>,
+    ) -> FailedBurnInspection {
+        let sendable_tx = match (named_tx_id, retained_burn) {
+            (Some(named), Some(sendable_tx))
+                if named.to_hash() != Some(sendable_tx.hash) =>
+            {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    named_tx = %named,
+                    retained_tx_hash = %sendable_tx.hash,
+                    "Recorded failure names a transaction the redemption has \
+                     moved past; classifying the retained burn instead"
+                );
+                sendable_tx
+            }
+            (Some(persisted_tx_id), _) => {
+                return FailedBurnInspection::Confirm(persisted_tx_id.clone());
+            }
+            (None, Some(sendable_tx)) => sendable_tx,
+            (None, None) => return FailedBurnInspection::Retry,
+        };
+
+        match vault_service.classify_burn_tx(self.bot_wallet, sendable_tx).await
+        {
+            Ok(status) => match status.fate() {
+                BurnTxFate::Landed => {
+                    FailedBurnInspection::Confirm(TxId::Hash(sendable_tx.hash))
+                }
+                BurnTxFate::Dead => {
+                    info!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        tx_hash = %sendable_tx.hash,
+                        "Retained burn can no longer land; retrying with a \
+                         fresh burn"
+                    );
+                    FailedBurnInspection::Retry
+                }
+                BurnTxFate::Live => {
+                    info!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        tx_hash = %sendable_tx.hash,
+                        status = ?status,
+                        "Retained burn can still land; deferring the retry \
+                         until it is resolved"
+                    );
+                    FailedBurnInspection::Wait
+                }
+            },
+            Err(error) => {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %sendable_tx.hash,
+                    error = %error,
+                    "Failed to classify the retained burn; deferring the \
+                     retry rather than resuming blind"
+                );
+                FailedBurnInspection::Wait
             }
         }
     }
@@ -2640,6 +2777,23 @@ impl BurnManager {
             });
         };
 
+        // Every verdict below raises an operator-facing alarm and can record
+        // a terminal failure naming no transaction, so a driver that a
+        // concurrent pass has overtaken must reach none of them: its verdict
+        // is about a burn that is no longer this redemption's, which would
+        // page ops about a healthy redemption and hand recovery a failure the
+        // aggregate then has to discard. Checked here, ahead of the vault
+        // lookup and the mode split, so BOTH modes are covered — a
+        // vault-direct driver that got here late would otherwise plan a burn
+        // whose receipts the winning driver already reserved and warn
+        // "Insufficient balance" for a redemption that is perfectly healthy.
+        if !self
+            .is_burn_execution_current(issuer_request_id, "before burning")
+            .await?
+        {
+            return Ok(());
+        }
+
         let Some(vault) = find_vault(
             &self.view_pool,
             &metadata.underlying,
@@ -2752,7 +2906,10 @@ impl BurnManager {
         amount: U256,
         external_tx_id: Option<BurnExternalTxId>,
     ) -> Result<(), BurnManagerError> {
-        match self
+        // The entry check in `handle_burning_started` already covers this
+        // driver; what it cannot cover is the window the readiness read
+        // below opens, which the re-check after it closes.
+        let readiness = self
             .vaults
             .service(network)?
             .check_orchestrator_burn_readiness(
@@ -2761,8 +2918,23 @@ impl BurnManager {
                 self.bot_wallet,
                 amount,
             )
-            .await?
+            .await?;
+
+        // The read above is a network round-trip, so re-check ownership
+        // before acting on anything it found: losing the race mid-read is
+        // exactly when a stale verdict would look like a real one.
+        if !matches!(readiness, OrchestratorBurnReadiness::Ready)
+            && !self
+                .is_burn_execution_current(
+                    issuer_request_id,
+                    "after the orchestrator readiness read",
+                )
+                .await?
         {
+            return Ok(());
+        }
+
+        match readiness {
             OrchestratorBurnReadiness::Ready => {}
             OrchestratorBurnReadiness::AllowanceInsufficient {
                 required,
@@ -3173,10 +3345,6 @@ impl BurnManager {
             )
             .await?;
 
-        info!(target: "redemption", issuer_request_id = %issuer_request_id,
-            "RecordBurnFailure command executed successfully"
-        );
-
         Err(BurnManagerError::InsufficientBalance { required, available })
     }
 
@@ -3227,7 +3395,13 @@ impl BurnManager {
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
-        if !self.is_burn_execution_current(issuer_request_id).await? {
+        if !self
+            .is_burn_execution_current(
+                issuer_request_id,
+                "after acquiring wallet lock",
+            )
+            .await?
+        {
             return Ok(());
         }
 
@@ -3360,9 +3534,14 @@ impl BurnManager {
         }
     }
 
+    /// Whether this driver still owns the burn: `Burning` is the only state a
+    /// new execution may start from, so any other means a concurrent pass has
+    /// advanced the redemption and this one must stand down. `stage` names
+    /// where the check ran, so the skip log says which driver stopped.
     async fn is_burn_execution_current(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        stage: &str,
     ) -> Result<bool, BurnManagerError> {
         let Some(current) = self.store.load(issuer_request_id).await? else {
             return Err(BurnManagerError::InvalidAggregateState {
@@ -3376,7 +3555,8 @@ impl BurnManager {
         debug!(target: "redemption",
             issuer_request_id = %issuer_request_id,
             state = aggregate_state_name(&current),
-            "Skipping stale burn execution after acquiring wallet lock"
+            stage,
+            "Skipping stale burn execution"
         );
         Ok(false)
     }
@@ -4553,7 +4733,9 @@ mod tests {
     use crate::redemption::job::{
         ConfirmBurnJob, SubmitBurnContext, SubmitBurnJob,
     };
-    use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
+    use crate::redemption::view::{
+        RedemptionViewReactor, find_burn_failed, rebuild_redemption_view,
+    };
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, RedemptionError, RedemptionEvent,
@@ -5662,6 +5844,281 @@ mod tests {
         ));
     }
 
+    /// The ownership check has to sit ahead of the vault lookup and the mode
+    /// split, not inside the orchestrator branch, or a vault-direct driver
+    /// that a concurrent pass has overtaken still runs `find_vault` and
+    /// `plan_burn` — and warns the operator about a redemption whose burn is
+    /// healthy and in flight.
+    ///
+    /// No asset is registered here on purpose: a driver that reaches
+    /// `find_vault` returns `AssetNotFound`, so a clean `Ok` is the proof the
+    /// check ran first. (The aggregate guard discards the transaction-free
+    /// failure that lookup would record regardless, so "nothing recorded" is
+    /// not the discriminator — the return value is.)
+    #[traced_test]
+    #[tokio::test]
+    async fn stale_vault_direct_driver_stops_before_the_vault_lookup() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let aggregate = create_test_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+
+        // A concurrent driver broadcasts this redemption's burn while
+        // `aggregate` keeps the `Burning` snapshot this driver started from.
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        persist_test_burn_intent(
+            &harness.store,
+            &issuer_request_id,
+            vault,
+            TEST_WALLET,
+        )
+        .await;
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(&harness.store, &issuer_request_id).await
+        else {
+            panic!("expected BurnIntended");
+        };
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnTxSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
+                    external_tx_id: BurnExternalTxId::base(&sendable_tx.hash),
+                    tx_id: TxId::Hash(sendable_tx.hash),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("submission should persist");
+
+        manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .expect("a stale vault-direct driver must return cleanly");
+
+        assert!(
+            matches!(
+                load_aggregate(&harness.store, &issuer_request_id).await,
+                Redemption::BurnSubmitted { .. }
+            ),
+            "the in-flight burn must survive the stale driver"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Skipping stale burn execution", &issuer_request_id.to_string()]
+        ));
+    }
+
+    /// A driver another pass has overtaken must not spend a chain read on a
+    /// gate whose verdict can no longer apply, and must leave the in-flight
+    /// burn alone — recording that gate's transaction-free failure is what
+    /// `/admin/recover` would later resume into a second burn.
+    #[traced_test]
+    #[tokio::test]
+    async fn stale_orchestrator_gate_reads_nothing_and_records_nothing() {
+        let setup = setup_orchestrator_burning(Arc::new(
+            MockVaultService::new_success().with_orchestrator_readiness(
+                OrchestratorBurnReadiness::AllowanceInsufficient {
+                    required: uint!(100_000000000000000000_U256),
+                    current: U256::ZERO,
+                },
+            ),
+        ))
+        .await;
+
+        // A concurrent driver broadcasts this redemption's burn while
+        // `setup.aggregate` keeps the `Burning` snapshot this driver started
+        // from.
+        setup
+            .harness
+            .store
+            .send(
+                &setup.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: setup.issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token: setup.vault,
+                        amount: uint!(100_000000000000000000_U256),
+                        owner: TEST_WALLET,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("orchestrator intent should persist");
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                .await
+        else {
+            panic!("expected BurnIntended");
+        };
+        setup
+            .harness
+            .store
+            .send(
+                &setup.issuer_request_id,
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                    issuer_request_id: setup.issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
+                    external_tx_id: BurnExternalTxId::base(&sendable_tx.hash),
+                    tx_id: TxId::Hash(sendable_tx.hash),
+                },
+            )
+            .await
+            .expect("orchestrator submission should persist");
+
+        setup
+            .manager
+            .handle_burning_started(&setup.issuer_request_id, &setup.aggregate)
+            .await
+            .expect("a stale driver must return cleanly");
+
+        assert_eq!(
+            setup.vault_mock.orchestrator_readiness_call_count(),
+            0,
+            "a stale driver must not spend a chain read on a void gate"
+        );
+        assert!(
+            matches!(
+                load_aggregate(&setup.harness.store, &setup.issuer_request_id)
+                    .await,
+                Redemption::BurnSubmitted { .. }
+            ),
+            "the in-flight burn must survive the stale driver"
+        );
+        // Scoped to this redemption's id: the `tracing_test` buffer is
+        // process-global, and sibling tests emit the same line with
+        // `state=BurnSubmitted`, so a bare snippet could be satisfied by
+        // another test's output.
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Skipping stale burn execution",
+                "BurnSubmitted",
+                &setup.issuer_request_id.to_string(),
+            ]
+        ));
+    }
+
+    /// Overtaken *during* the readiness read, not before it. Every
+    /// non-`Ready` verdict raises an operator-facing alarm before it records
+    /// anything, so a driver that lost the race must be stopped between the
+    /// read and the verdict — otherwise ops is paged to approve an
+    /// orchestrator for a redemption whose burn is already in flight.
+    #[traced_test]
+    #[tokio::test]
+    async fn orchestrator_gate_overtaken_mid_read_raises_no_false_alarm() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_readiness_blocked()
+                .with_orchestrator_readiness(
+                    OrchestratorBurnReadiness::AllowanceInsufficient {
+                        required: uint!(100_000000000000000000_U256),
+                        current: U256::ZERO,
+                    },
+                ),
+        );
+        let OrchestratorTestSetup {
+            harness,
+            manager,
+            issuer_request_id,
+            aggregate,
+            vault,
+            ..
+        } = setup_orchestrator_burning(vault_mock.clone()).await;
+
+        let driver_id = issuer_request_id.clone();
+        let driver = tokio::spawn(async move {
+            manager.handle_burning_started(&driver_id, &aggregate).await
+        });
+
+        // Hold the driver inside the readiness read while a concurrent pass
+        // signs and broadcasts this redemption's burn.
+        vault_mock.wait_for_readiness_read().await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params: BurnParams::Orchestrator {
+                        token: vault,
+                        amount: uint!(100_000000000000000000_U256),
+                        owner: TEST_WALLET,
+                    },
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("orchestrator intent should persist");
+        let Redemption::BurnIntended { sendable_tx, .. } =
+            load_aggregate(&harness.store, &issuer_request_id).await
+        else {
+            panic!("expected BurnIntended");
+        };
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordOrchestratorBurnSubmitted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_tx_hash: sendable_tx.hash,
+                    external_tx_id: BurnExternalTxId::base(&sendable_tx.hash),
+                    tx_id: TxId::Hash(sendable_tx.hash),
+                },
+            )
+            .await
+            .expect("orchestrator submission should persist");
+        vault_mock.release_readiness_read();
+
+        driver
+            .await
+            .expect("driver task should not panic")
+            .expect("an overtaken driver must return cleanly");
+
+        // Both assertions name this redemption: the log buffer is shared by
+        // every test running in parallel, and a sibling gate test emits the
+        // same alarm for its own redemption.
+        let redemption_id = issuer_request_id.to_string();
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::ERROR,
+                &["Orchestrator burn allowance insufficient", &redemption_id]
+            ),
+            "an overtaken driver must not page ops about a healthy redemption"
+        );
+        assert!(
+            matches!(
+                load_aggregate(&harness.store, &issuer_request_id).await,
+                Redemption::BurnSubmitted { .. }
+            ),
+            "the in-flight burn must survive the overtaken driver"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Skipping stale burn execution",
+                "readiness read",
+                &redemption_id,
+            ]
+        ));
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn orchestrator_health_gate_defers_without_event() {
@@ -6323,12 +6780,16 @@ mod tests {
             address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         );
         let owner = persisted_tx.signer_for_test();
+        // The revert the confirm records as definitive is a finalized one,
+        // and the recovery pass re-classifies the retained transaction
+        // before it retries: the mock's verdict must agree with the receipt.
         let mut setup = setup_orchestrator_burning(Arc::new(
             MockVaultService::new_success()
                 .with_prepared_tx(persisted_tx)
                 .with_orchestrator_confirm_revert(
                     OrchestratorRevertReason::Unknown,
-                ),
+                )
+                .with_burn_tx_status(BurnTxStatus::FinalizedReverted),
         ))
         .await;
         setup.manager = BurnManager::new_for_tests(
@@ -13096,6 +13557,454 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Automatic burn recovery action accepted", "Replace"]
+        ));
+    }
+
+    /// Appends a `BurningFailed` that names no transaction straight to the
+    /// event stream, then rebuilds the view from it. The aggregate refuses to
+    /// record that shape over an in-flight burn, so it can only reach
+    /// production in a stream written before that guard existed — which is
+    /// exactly the history automatic recovery must still not resume over
+    /// blindly.
+    async fn seed_pre_guard_tx_free_failure(
+        pool: &SqlitePool,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        seed_pre_guard_burn_failure(pool, issuer_request_id, None).await;
+    }
+
+    /// Same, but the failure may name a transaction. Naming one the
+    /// redemption does not retain is the other shape the `expected_tx_hash`
+    /// guard keeps out of new streams but old ones can carry.
+    async fn seed_pre_guard_burn_failure(
+        pool: &SqlitePool,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_id: Option<TxId>,
+    ) {
+        let aggregate_id = issuer_request_id.to_string();
+        let next_sequence: i64 = sqlx::query_scalar(
+            "
+            SELECT COALESCE(MAX(sequence), 0) + 1
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(pool)
+        .await
+        .expect("next sequence should resolve");
+        let payload = serde_json::to_string(&RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "historic burn failure".to_string(),
+            failed_at: Utc::now(),
+            tx_id,
+            planned_burns: vec![],
+            classification: BurnFailureClassification::Unclassified,
+        })
+        .expect("BurningFailed should serialize");
+        insert_raw_event(
+            pool,
+            "Redemption",
+            &aggregate_id,
+            next_sequence,
+            "RedemptionEvent::BurningFailed",
+            &payload,
+        )
+        .await
+        .expect("historic failure should insert");
+        rebuild_redemption_view(pool)
+            .await
+            .expect("view should rebuild from the seeded stream");
+    }
+
+    async fn count_redemption_events(
+        pool: &SqlitePool,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        event_type: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = ?
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .expect("event count should query")
+    }
+
+    /// A failure that names no transaction over a burn the redemption still
+    /// holds must not be resumed blindly: the retained burn can still land,
+    /// and a fresh burn signed at a new nonce would burn the same shares
+    /// twice once it does — in vault-direct mode the pooled wallet's balance
+    /// check passes while the old transaction is pending. Automatic recovery
+    /// classifies the retained burn first and defers while it can still
+    /// land; the retry follows once the burn is provably dead.
+    #[traced_test]
+    #[tokio::test]
+    async fn tx_free_failure_over_a_retained_burn_retries_only_once_it_is_dead()
+    {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let signed_burn = SendableTxWithHash::valid_for_test(
+            6,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let recovery_owner = signed_burn.signer_for_test();
+        // Pass 1 finds the retained burn still live; pass 2 finds it dead.
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status_sequence(vec![
+                    BurnTxStatus::StillMineable,
+                    BurnTxStatus::ProvablyDead,
+                ]),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            recovery_owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            recovery_owner,
+        )
+        .await;
+        seed_pre_guard_tx_free_failure(pool, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(
+                &aggregate,
+                Redemption::Failed { unresolved_burn_tx: Some(retained), .. }
+                    if *retained == signed_burn
+            ),
+            "the failed redemption must retain the signed burn, got \
+             {aggregate:?}"
+        );
+
+        manager.recover_unresolved_burns().await;
+
+        assert!(
+            matches!(
+                load_aggregate(store, &issuer_request_id).await,
+                Redemption::Failed { .. }
+            ),
+            "a retained burn that can still land must not be resumed over"
+        );
+        assert_eq!(
+            count_redemption_events(
+                pool,
+                &issuer_request_id,
+                "RedemptionEvent::BurnResumed",
+            )
+            .await,
+            0,
+            "no fresh burn may start while the retained one can still land"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Retained burn can still land", &issuer_request_id.to_string()]
+        ));
+
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            count_redemption_events(
+                pool,
+                &issuer_request_id,
+                "RedemptionEvent::BurnResumed",
+            )
+            .await,
+            1,
+            "a provably dead retained burn must let the retry proceed"
+        );
+        assert!(
+            !matches!(
+                load_aggregate(store, &issuer_request_id).await,
+                Redemption::Failed { .. }
+            ),
+            "the redemption must leave Failed once the retry is authorized"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Retained burn can no longer land",
+                &issuer_request_id.to_string()
+            ]
+        ));
+    }
+
+    /// The same historic shape where the retained burn LANDED: it is
+    /// confirmed and recorded as the existing burn, exactly as a failure that
+    /// had named it would be, rather than retried.
+    #[traced_test]
+    #[tokio::test]
+    async fn tx_free_failure_over_a_landed_retained_burn_records_it() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let signed_burn = SendableTxWithHash::valid_for_test(
+            6,
+            vault,
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let recovery_owner = signed_burn.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::Mined),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            recovery_owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            recovery_owner,
+        )
+        .await;
+        seed_pre_guard_tx_free_failure(pool, &issuer_request_id).await;
+
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            count_redemption_events(
+                pool,
+                &issuer_request_id,
+                "RedemptionEvent::ExistingBurnRecovered",
+            )
+            .await,
+            1,
+            "a landed retained burn must be recorded, not retried"
+        );
+        assert_eq!(
+            count_redemption_events(
+                pool,
+                &issuer_request_id,
+                "RedemptionEvent::BurnResumed",
+            )
+            .await,
+            0,
+            "a landed retained burn must never start a fresh one"
+        );
+        assert!(matches!(
+            load_aggregate(store, &issuer_request_id).await,
+            Redemption::Completed { .. }
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Previously submitted burn confirmed on-chain",
+                &issuer_request_id.to_string()
+            ]
+        ));
+    }
+
+    /// A vault-direct redemption failed over a signed burn it still holds,
+    /// with the failure naming `named`, and a manager whose bot wallet signed
+    /// that burn.
+    async fn failed_over_a_retained_burn(
+        vault_mock: Arc<MockVaultService>,
+        signed_burn: &SendableTxWithHash,
+        named: Option<TxId>,
+    ) -> (TestHarness, BurnManager, IssuerRedemptionRequestId) {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let recovery_owner = signed_burn.signer_for_test();
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
+        let manager = BurnManager::new_for_tests(
+            vault_mock.clone(),
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            recovery_owner,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_burn_intended(
+            &harness,
+            &vault_mock,
+            vault,
+            &issuer_request_id,
+            recovery_owner,
+        )
+        .await;
+        seed_pre_guard_burn_failure(&harness.pool, &issuer_request_id, named)
+            .await;
+        let aggregate =
+            load_aggregate(&harness.store, &issuer_request_id).await;
+        assert!(
+            matches!(
+                &aggregate,
+                Redemption::Failed { unresolved_burn_tx: Some(retained), .. }
+                    if retained == signed_burn
+            ),
+            "the failed redemption must retain the signed burn, got \
+             {aggregate:?}"
+        );
+
+        (harness, manager, issuer_request_id)
+    }
+
+    fn cafe_burn() -> SendableTxWithHash {
+        SendableTxWithHash::valid_for_test(
+            6,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xca, 0xfe]),
+        )
+    }
+
+    /// The fail-closed arms of the automatic gate. A revert whose block is
+    /// not finalized can still be reorganized away and the burn re-mined, and
+    /// a classification the provider cannot answer proves nothing: in both
+    /// cases a fresh burn could burn the same shares twice, so nothing
+    /// resumes, and nothing is recorded as landed either.
+    #[traced_test]
+    #[tokio::test]
+    async fn retained_burn_that_is_not_provably_dead_is_never_resumed_over() {
+        let signed_burn = cafe_burn();
+        let cases = [
+            (
+                MockVaultService::new_success()
+                    .with_prepared_tx(signed_burn.clone())
+                    .with_burn_tx_status(BurnTxStatus::Reverted),
+                tracing::Level::INFO,
+                "Retained burn can still land",
+            ),
+            (
+                MockVaultService::new_success()
+                    .with_prepared_tx(signed_burn.clone())
+                    .with_burn_tx_classification_failure(),
+                tracing::Level::WARN,
+                "Failed to classify the retained burn",
+            ),
+        ];
+
+        for (vault_mock, level, expected_log) in cases {
+            let (harness, manager, issuer_request_id) =
+                failed_over_a_retained_burn(
+                    Arc::new(vault_mock),
+                    &signed_burn,
+                    None,
+                )
+                .await;
+
+            manager.recover_unresolved_burns().await;
+
+            for event_type in [
+                "RedemptionEvent::BurnResumed",
+                "RedemptionEvent::ExistingBurnRecovered",
+            ] {
+                assert_eq!(
+                    count_redemption_events(
+                        &harness.pool,
+                        &issuer_request_id,
+                        event_type,
+                    )
+                    .await,
+                    0,
+                    "{expected_log}: no {event_type} may follow"
+                );
+            }
+            assert!(matches!(
+                load_aggregate(&harness.store, &issuer_request_id).await,
+                Redemption::Failed { .. }
+            ));
+            assert!(
+                logs_contain_at!(
+                    level,
+                    &[expected_log, &issuer_request_id.to_string()]
+                ),
+                "expected {level} log: {expected_log}"
+            );
+        }
+    }
+
+    /// A failure that names a transaction the redemption has moved past must
+    /// not be confirmed. Its revert would release the vault-direct
+    /// reservation, and its landing would be recorded as this redemption's
+    /// burn, while the retained burn can still land. The retained burn is
+    /// classified instead, and here it can still land, so the pass waits.
+    #[traced_test]
+    #[tokio::test]
+    async fn failure_naming_a_superseded_burn_classifies_the_retained_one() {
+        let signed_burn = cafe_burn();
+        let superseded = TxId::Hash(B256::repeat_byte(0x11));
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+        let (harness, manager, issuer_request_id) =
+            failed_over_a_retained_burn(
+                vault_mock.clone(),
+                &signed_burn,
+                Some(superseded),
+            )
+            .await;
+
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            vault_mock.burn_classification_call_count(),
+            1,
+            "the retained burn must be classified, not the named one confirmed"
+        );
+        for event_type in [
+            "RedemptionEvent::ExistingBurnRecovered",
+            "RedemptionEvent::BurnResumed",
+            "RedemptionEvent::RedemptionFailed",
+        ] {
+            assert_eq!(
+                count_redemption_events(
+                    &harness.pool,
+                    &issuer_request_id,
+                    event_type,
+                )
+                .await,
+                0,
+                "no {event_type} may follow while the retained burn is live"
+            );
+        }
+        let issuer_request_id = issuer_request_id.to_string();
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "names a transaction the redemption has moved past",
+                &issuer_request_id,
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Retained burn can still land", &issuer_request_id]
         ));
     }
 

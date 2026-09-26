@@ -754,10 +754,19 @@ on-chain transfer through calling Alpaca to burning tokens.
   recovery budget is spent
 - `RecordBurnPreparationRecoveryExhausted` - Persist exhaustion when repeated
   burn preparation failures never produced a transaction identity
-- `RecordBurnFailure` - Record on-chain burn failure (from `Burning` or
-  `BurnSubmitted` state). Carries optional `tx_id` and `planned_burns` for
-  recovery. A submit job also supplies its expected transaction hash, making a
-  late failure for superseded bytes an idempotent no-op.
+- `RecordBurnFailure` - Record on-chain burn failure (from `Burning`,
+  `BurnIntended`, or `BurnSubmitted` state). Carries optional `tx_id` and
+  `planned_burns` for recovery. A submit job also supplies its expected
+  transaction hash, making a late failure for superseded bytes an idempotent
+  no-op. A failure naming no transaction at all (neither `tx_id` nor an expected
+  hash) is likewise a no-op from `BurnIntended` and `BurnSubmitted`: only the
+  gates that run before a transaction exists produce one, so once a burn is
+  signed or broadcast such a command is a lost race. The aggregate would still
+  carry the in-flight transaction into `Failed.unresolved_burn_tx`; the hazard
+  is the terminal event itself, which names no transaction and is the shape
+  operator recovery resumed from by starting a fresh burn — burning the same
+  shares twice. The redemption stays in flight instead, where recovery
+  classifies the persisted transaction on-chain.
 - `RecordExistingBurn` - Record an existing on-chain burn discovered during
   recovery via on-chain transaction lookup
 - `MarkFailed` - Mark redemption as failed
@@ -4900,18 +4909,77 @@ recovery for `JournalConfirmed`, `Minting`, `MintIntended`, `TxSubmitted`,
 automatic retry cap: when retries are `Exhausted`, the endpoint returns
 unrecoverable rather than authorizing unlimited replacement deposits.
 
-**Post-Alpaca with existing on-chain burn:** If a `BurningFailed` event carries
-a tx ID, the endpoint scans on-chain for the transaction. If the tx completed
-on-chain, dispatches `RecordExistingBurn` → `ExistingBurnRecovered` event →
-`Completed` state. This handles the scenario where burns landed on-chain but
-weren't recorded (e.g. a crash between submit and confirmation). The completed
-transaction receipt must include its block number; recovery fails without
-emitting a permanent event when that proof is incomplete. A successfully mined
-receipt without a block number returns `500`. A replacement burn is authorized
-only after the prior transaction is confirmed reverted. Pending transactions,
-RPC failures, unknown outcomes, and legacy transaction IDs that cannot be
-verified on-chain return `422`, preserve the failed state and receipt
+**Post-Alpaca with existing on-chain burn:** The endpoint inspects the burn the
+redemption can still land, not merely the one the last `BurningFailed` event
+names — see "retained burn wins" below. Whenever the aggregate retains a signed
+burn, that is the one inspected, even when the failure names the same hash; the
+named transaction is inspected only when nothing is retained. If the tx
+completed on-chain, dispatches `RecordExistingBurn` → `ExistingBurnRecovered`
+event → `Completed` state. This handles the scenario where burns landed on-chain
+but weren't recorded (e.g. a crash between submit and confirmation). The
+completed transaction receipt must include its block number; recovery fails
+without emitting a permanent event when that proof is incomplete. A successfully
+mined receipt without a block number returns `500`. A replacement burn is
+authorized only after the prior transaction is confirmed reverted. Pending
+transactions, RPC failures, unknown outcomes, and legacy transaction IDs that
+cannot be verified on-chain return `422`, preserve the failed state and receipt
 reservation, and require manual intervention instead of risking a second burn.
+
+**Post-Alpaca with no transaction named:** A resume prepares and signs a fresh
+burn, so it runs only once any burn the redemption still holds has a known
+outcome. When nothing names a transaction to inspect — no `BurningFailed` event,
+or one recorded without a tx id — but the aggregate still carries an unresolved
+signed burn, the endpoint inspects THAT transaction through the same mode-scoped
+confirmation it applies to a named one. The aggregate derives it from the state
+the failure interrupted rather than from the failure's payload, so it is found
+even for streams written before `RecordBurnFailure` began refusing to record an
+identity-free failure over an in-flight burn.
+
+Inspecting rather than refusing is what keeps both hazards closed. A burn that
+can still land reads as pending or unverifiable, so the resume is refused with
+`422 prior_burn_unverifiable` naming that transaction, and a second burn never
+starts over a live one. A burn a previous recovery already proved reverted reads
+as reverted and the resume proceeds: `BurnResumed` carries that dead transaction
+into `Burning.prior_burn_tx`, and a later pre-submit failure that names no
+transaction puts it straight back into `Failed.unresolved_burn_tx`, so a blanket
+refusal would strand such a redemption — post-Alpaca, with unburned shares —
+behind a `422` naming a transaction that can never land.
+
+**Retained burn wins.** The last `BurningFailed` in the stream is not
+necessarily about the burn the redemption still holds: attempt 1 reverts and
+records its id, a resume broadcasts attempt 2, an ambiguous confirm records
+nothing, and an operator marks it failed — leaving the event naming attempt 1
+while `Failed.unresolved_burn_tx` holds attempt 2. When the aggregate retains an
+unresolved signed burn whose hash differs from the named one, the endpoint
+inspects the RETAINED burn. This is the primary safety property of the gate: a
+revert verdict on a superseded transaction must never license a resume while the
+retained burn can still land, since `handle_resume_burn` checks only that the
+state is `Failed` and would otherwise sign a third burn. A landed retained burn
+is recorded with the burns THAT transaction planned (from the `Failed` burn
+context — the event's own `planned_burns` describe a different attempt), and an
+ambiguous result returns `422 prior_burn_unverifiable` naming the retained
+transaction in `old_tx_hash` / `old_nonce`, so the operator is told which
+transaction to confirm.
+
+Classification of the retained burn begins with the signer's nonce, not a
+receipt lookup, and runs on every retained burn — the same-hash shape included:
+a signed burn that never mined — dropped from the mempool, or superseded at its
+nonce by another transaction from the same signer — has no receipt, so a lookup
+alone would answer `422` forever. `classify_burn_tx` answers that case and its
+verdict is matched exhaustively: `ProvablyDead` (or `FinalizedReverted`)
+resumes; `Mined` proceeds to the receipt and records; `StillMineable` or an
+unfinalized `Reverted` is refused at once with `422 prior_burn_unverifiable`
+naming the transaction, without spending a receipt wait that cannot succeed; and
+a classification the provider cannot answer fails closed the same way.
+
+The automatic `BurnFailed` recovery loop applies the same rule to an
+`Unclassified` failure whose event names no transaction: it classifies the
+retained burn before deciding anything. A landed one is confirmed and recorded
+as the existing burn; a dead one (`ProvablyDead` / `FinalizedReverted`) is
+retried through `ResumeBurn`; anything else, including a classification the
+provider cannot answer, is deferred to the next pass. This is what keeps a
+pre-guard stream carrying a live signed burn plus a tx-free `Unclassified`
+failure from being re-driven into a second burn while the first can still land.
 
 **Examples:**
 
