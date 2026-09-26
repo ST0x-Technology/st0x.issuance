@@ -449,8 +449,33 @@ pub(crate) enum Mint {
         reason: String,
         /// Exact prepared deposit hash acknowledged at close, when any.
         acknowledged_unresolved_mint_tx_hash: Option<B256>,
+        /// The `(recipient, nonce)` pair this close did NOT release.
+        ///
+        /// Closing does not prove the nonce is free: the tx-hash
+        /// acknowledgement only states that a signed transaction is out there
+        /// UNRESOLVED. If it later lands and the pair has been handed to a
+        /// second mint, that mint's `Minted`-log full-match completes it —
+        /// one AP's tokens for two journaled positions. So the pair is kept
+        /// unless the operator supplied the nonce acknowledgement, which is
+        /// the one recorded claim that the nonce's absence was verified
+        /// against a chain view outside this bot.
+        ///
+        /// Absent on rows written before closes carried it, but no such row
+        /// survives a start: `mint_view` is rebuilt from events at startup
+        /// and mint snapshots are disabled, so an ordinary legacy close
+        /// replays through the close arm and holds its pair like any other.
+        #[serde(default)]
+        unreleased_nonce: Option<UnreleasedNonce>,
         closed_at: DateTime<Utc>,
     },
+}
+
+/// A `(recipient, nonce)` pair a closed mint still holds against the
+/// orchestrator's `nonceUsed[recipient][nonce]` key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UnreleasedNonce {
+    pub(crate) wallet: Address,
+    pub(crate) nonce: B256,
 }
 
 struct ConfirmedMint {
@@ -954,6 +979,54 @@ impl Mint {
                 mint_authorization.as_ref()
             }
             Self::Closed { .. } => None,
+        }
+    }
+
+    /// The `(recipient, nonce)` pair this mint still holds — the
+    /// orchestrator's on-chain uniqueness key, `nonceUsed[recipient][nonce]`,
+    /// which is scoped to the recipient ACROSS all tokens.
+    ///
+    /// A mint keeps its pair for the whole lifecycle, because a nonce its
+    /// transaction consumed stays consumed — landed or failed, including a
+    /// `MintingFailed` whose nonce outcome is unresolved. Two states release
+    /// it, on two different grounds. `JournalRejected` releases because
+    /// nothing was ever submitted: the journal never confirmed, so the nonce
+    /// is provably unconsumed. A `Closed` mint releases only when the close
+    /// supplied the nonce acknowledgement, and that is an attestation, not a
+    /// proof: it is reachable only from `MintingFailed { NonceReplayUnresolved }`,
+    /// a mint that DID submit, and it records that the operator verified the
+    /// nonce's absence against a chain view outside this bot.
+    ///
+    /// Any other close keeps holding. `handle_close_mint` otherwise demands
+    /// only that the operator echo the persisted transaction hash, which
+    /// acknowledges an unresolved transaction rather than a dead one — so an
+    /// ordinary close of a stuck submitted mint must not hand the pair on, or
+    /// a later landing of the acknowledged transaction would complete the
+    /// second mint too.
+    ///
+    /// The delivery endpoint refuses a second mint an already-held pair, which
+    /// is what keeps at most one mint able to claim the single landing that
+    /// pair can produce — the precondition
+    /// `SubmitMintJob::recover_landed_orchestrator_mint`'s full match relies
+    /// on. The match has no catch-all on purpose: a state added later must
+    /// decide here whether it holds the pair, because defaulting to `None`
+    /// is the direction that hands a pair on and double-counts.
+    pub(crate) fn held_authorization_nonce(&self) -> Option<(Address, B256)> {
+        match self {
+            Self::Initiated { wallet, mint_authorization, .. }
+            | Self::JournalConfirmed { wallet, mint_authorization, .. }
+            | Self::Minting { wallet, mint_authorization, .. }
+            | Self::TxIntended { wallet, mint_authorization, .. }
+            | Self::TxSubmitted { wallet, mint_authorization, .. }
+            | Self::CallbackPending { wallet, mint_authorization, .. }
+            | Self::MintingFailed { wallet, mint_authorization, .. }
+            | Self::Completed { wallet, mint_authorization, .. } => {
+                Some((*wallet, mint_authorization.as_ref()?.nonce))
+            }
+            Self::Closed { unreleased_nonce, .. } => {
+                unreleased_nonce.as_ref().map(|held| (held.wallet, held.nonce))
+            }
+            Self::JournalRejected { .. } => None,
         }
     }
 
@@ -2699,7 +2772,11 @@ impl EventSourced for Mint {
 
     const AGGREGATE_TYPE: &'static str = "Mint";
     const PROJECTION: Table = Table("mint_view");
-    const SCHEMA_VERSION: u64 = 4;
+    // 5: `Closed` gained `unreleased_nonce`. Bumped per SPEC "Snapshot schema
+    // versioning" so a stale `Closed` row is cleared rather than read back
+    // with the field defaulted to `None` — the direction that releases the
+    // mint's `(recipient, nonce)` pair.
+    const SCHEMA_VERSION: u64 = 5;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -3145,15 +3222,28 @@ impl Mint {
                 issuer_request_id,
                 reason,
                 acknowledged_unresolved_mint_tx_hash,
-                // The nonce acknowledgement is audit data on the event; the
-                // `Closed` state carries the lifecycle facts.
-                acknowledged_unresolved_mint_nonce: _,
+                acknowledged_unresolved_mint_nonce,
                 closed_at,
             } => {
+                // A close releases the pair only when the operator states the
+                // nonce is free. Without that statement the closed mint keeps
+                // holding it: the acknowledged transaction can still land,
+                // and handing the pair on would let a second mint claim that
+                // landing as its own.
+                let unreleased_nonce = acknowledged_unresolved_mint_nonce
+                    .is_none()
+                    .then(|| {
+                        self.held_authorization_nonce().map(
+                            |(wallet, nonce)| UnreleasedNonce { wallet, nonce },
+                        )
+                    })
+                    .flatten();
+
                 *self = Self::Closed {
                     issuer_request_id,
                     reason,
                     acknowledged_unresolved_mint_tx_hash,
+                    unreleased_nonce,
                     closed_at,
                 };
             }
@@ -3348,6 +3438,7 @@ pub(crate) mod tests {
         has_unresolved_signer_intent, orchestrator_mint_failure_classification,
     };
     use crate::config::VaultMode;
+    use crate::mint::view::authorization_nonce_candidate_query;
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
@@ -5817,6 +5908,227 @@ pub(crate) mod tests {
             ),
             "the late event must not rebind the authorization, got {mint:?}"
         );
+    }
+
+    /// Which states release their `(recipient, nonce)` pair is a safety
+    /// boundary, not a detail: the delivery endpoint hands the pair to a
+    /// second mint the moment the first lets go. Only a rejected journal, or
+    /// a close that supplied the nonce acknowledgement, releases; an ordinary
+    /// close keeps the pair. Every other state, landed or failed, keeps its
+    /// claim.
+    #[test]
+    fn only_a_mint_that_never_consumed_its_nonce_releases_the_pair() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let authorized = |tail: Vec<MintEvent>| {
+            let mut history = vec![
+                orchestrator_initiated_event(
+                    &issuer_request_id,
+                    VaultMode::Orchestrator { address: ORCHESTRATOR },
+                ),
+                MintEvent::MintAuthorizationReceived {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mint_authorization: test_authorization(),
+                    received_at: Utc::now(),
+                },
+            ];
+            history.extend(tail);
+            replay::<Mint>(history)
+                .expect("history must replay")
+                .expect("mint must exist")
+        };
+
+        let journal_confirmed = MintEvent::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            confirmed_at: Utc::now(),
+        };
+        let minting_started = MintEvent::MintingStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            started_at: Utc::now(),
+        };
+        let tx_submitted = MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: "ext-nonce".to_string(),
+            tx_id: TxId::Legacy("fb-nonce".to_string()),
+            submitted_at: Utc::now(),
+        };
+        let tokens_minted = MintEvent::TokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: B256::repeat_byte(0x0c),
+            receipt_id: uint!(42_U256),
+            shares_minted: uint!(100_000000000000000000_U256),
+            gas_used: 21_000,
+            block_number: 1_000,
+            minted_at: Utc::now(),
+        };
+        let minting = vec![journal_confirmed.clone(), minting_started];
+        let callback_pending =
+            [minting.clone(), vec![tx_submitted.clone(), tokens_minted]]
+                .concat();
+
+        let held = Some((wallet, test_authorization().nonce));
+        let cases = vec![
+            (authorized(vec![]), held),
+            (authorized(vec![journal_confirmed]), held),
+            (
+                authorized(vec![MintEvent::JournalRejected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "journal failed".to_string(),
+                    rejected_at: Utc::now(),
+                }]),
+                None,
+            ),
+            (authorized(minting.clone()), held),
+            (
+                authorized(
+                    [
+                        minting.clone(),
+                        vec![MintEvent::MintTxIntended {
+                            issuer_request_id: issuer_request_id.clone(),
+                            prepared_tx: PreparedMintTx::valid_for_test(
+                                1,
+                                "mint-nonce".to_string(),
+                            ),
+                            intended_at: Utc::now(),
+                        }],
+                    ]
+                    .concat(),
+                ),
+                held,
+            ),
+            (
+                authorized([minting.clone(), vec![tx_submitted]].concat()),
+                held,
+            ),
+            (authorized(callback_pending.clone()), held),
+            (
+                authorized(
+                    [
+                        minting,
+                        vec![MintEvent::MintingFailed {
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: "revert".to_string(),
+                            failed_at: Utc::now(),
+                            classification:
+                                MintFailureClassification::NonceReplayUnresolved,
+                        }],
+                    ]
+                    .concat(),
+                ),
+                held,
+            ),
+            (
+                authorized(
+                    [
+                        callback_pending,
+                        vec![MintEvent::MintCompleted {
+                            issuer_request_id: issuer_request_id.clone(),
+                            completed_at: Utc::now(),
+                        }],
+                    ]
+                    .concat(),
+                ),
+                held,
+            ),
+            // An ordinary close acknowledges an UNRESOLVED transaction, not a
+            // dead one, so it keeps the pair: releasing here would let a
+            // second mint claim the landing this one may still produce.
+            (
+                authorized(vec![MintEvent::MintClosed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "operator close".to_string(),
+                    acknowledged_unresolved_mint_tx_hash: None,
+                    acknowledged_unresolved_mint_nonce: None,
+                    closed_at: Utc::now(),
+                }]),
+                held,
+            ),
+        ];
+
+        // The one close that DOES release: the operator states the nonce is
+        // free, verified against a chain view outside this bot.
+        let acknowledged_close = authorized(vec![MintEvent::MintClosed {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "operator close".to_string(),
+            acknowledged_unresolved_mint_tx_hash: None,
+            acknowledged_unresolved_mint_nonce: Some(
+                test_authorization().nonce,
+            ),
+            closed_at: Utc::now(),
+        }]);
+        assert_eq!(
+            acknowledged_close.held_authorization_nonce(),
+            None,
+            "a close acknowledging the nonce releases the pair"
+        );
+
+        // The exhaustive match in `held_authorization_nonce` is what forces a
+        // state added later to decide whether it holds the pair; this list
+        // only keeps the cases here in step with the states that exist today,
+        // so the check below is not left as a sample that silently stops
+        // covering some of them.
+        let mut covered: Vec<&str> =
+            cases.iter().map(|(mint, _)| mint.state_name()).collect();
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            vec![
+                "CallbackPending",
+                "Closed",
+                "Completed",
+                "Initiated",
+                "JournalConfirmed",
+                "JournalRejected",
+                "MintIntended",
+                "Minting",
+                "MintingFailed",
+                "TxSubmitted",
+            ],
+            "every mint state must appear in the hold/release cases"
+        );
+
+        for (mint, expected) in &cases {
+            assert_eq!(
+                mint.held_authorization_nonce(),
+                *expected,
+                "wrong nonce hold for state {}",
+                mint.state_name()
+            );
+        }
+
+        // The view prunes candidates in SQL before it asks the aggregate, so
+        // a holder whose payload path is missing from that query is never
+        // offered here at all — the guard would pass a duplicate through and
+        // nothing would say so. Pin each path to `Mint`'s own serialization.
+        let candidate_query = authorization_nonce_candidate_query();
+        for (mint, expected) in &cases {
+            if expected.is_none() {
+                continue;
+            }
+
+            let serialized = serde_json::to_value(mint)
+                .expect("a mint state must serialize");
+            let variant = serialized
+                .as_object()
+                .and_then(|variants| variants.keys().next())
+                .expect("a mint state serializes as one tagged variant")
+                .clone();
+            // `Closed` keeps its pair in `unreleased_nonce` rather than in a
+            // live `mint_authorization`, so its payload path differs.
+            let field = if variant == "Closed" {
+                "unreleased_nonce"
+            } else {
+                "mint_authorization"
+            };
+            let path = format!("'$.Live.{variant}.{field}.nonce'");
+            assert!(
+                candidate_query.contains(&path),
+                "the view's candidate query must prune on {path}, or a \
+                 holder in state {} is invisible to the delivery guard",
+                mint.state_name()
+            );
+        }
     }
 
     /// `AuthorizeMint` records the authorization on an orchestrator-mode mint

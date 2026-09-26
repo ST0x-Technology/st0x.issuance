@@ -333,6 +333,71 @@ const fn tokenization_id_candidate_query() -> &'static str {
     "
 }
 
+/// Every mint that still holds `(wallet, nonce)` — the orchestrator's
+/// per-recipient nonce key. Normally empty or a single id; more than one is
+/// the collision the authorization endpoint exists to prevent.
+///
+/// Like the tokenization-id lookup above, SQL only PRUNES candidate rows
+/// (served by the `idx_mint_view_live_authorization_nonce` expression index —
+/// the query must keep the exact COALESCE expression the index is built on).
+/// Every candidate is then loaded through the type-safe projection and
+/// re-verified against [`Mint::held_authorization_nonce`], which is the sole
+/// authority on which states hold their pair and which release it, so no
+/// domain value is ever parsed out of the view JSON here.
+pub(crate) async fn find_mints_holding_nonce(
+    pool: &Pool<Sqlite>,
+    wallet: Address,
+    nonce: B256,
+) -> Result<Vec<IssuerMintRequestId>, MintViewError> {
+    let candidate_ids: Vec<String> =
+        sqlx::query_scalar(authorization_nonce_candidate_query())
+            .bind(nonce.to_string())
+            .fetch_all(pool)
+            .await?;
+
+    let projection = Projection::<Mint>::sqlite(pool.clone());
+    let mut holders = Vec::new();
+    for view_id in candidate_ids {
+        let issuer_request_id = view_id
+            .parse::<Uuid>()
+            .map(IssuerMintRequestId::new)
+            .map_err(|_| MintViewError::InvalidViewId { view_id })?;
+
+        let Some(mint) = projection.load(&issuer_request_id).await? else {
+            continue;
+        };
+        if mint.held_authorization_nonce() == Some((wallet, nonce)) {
+            holders.push(issuer_request_id);
+        }
+    }
+
+    Ok(holders)
+}
+
+/// The candidate-pruning query behind [`find_mints_holding_nonce`]. Its WHERE
+/// clause must structurally match the COALESCE expression
+/// `idx_mint_view_live_authorization_nonce` is built on, or SQLite falls back
+/// to a table scan — pinned by the query-plan test. Visible to the aggregate's
+/// tests, which pin every payload path against `Mint`'s own serialization.
+pub(super) const fn authorization_nonce_candidate_query() -> &'static str {
+    "
+    SELECT view_id
+    FROM mint_view
+    WHERE COALESCE(
+        json_extract(payload, '$.Live.Initiated.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.JournalConfirmed.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.JournalRejected.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.Minting.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.TxIntended.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.TxSubmitted.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.CallbackPending.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.MintingFailed.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.Completed.mint_authorization.nonce'),
+        json_extract(payload, '$.Live.Closed.unreleased_nonce.nonce')
+    ) = ?
+    "
+}
+
 /// Finds all mints that need recovery (not in terminal states).
 ///
 /// Returns mints in JournalConfirmed, Minting, MintingFailed, or
@@ -420,7 +485,7 @@ pub(crate) async fn find_stuck(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{Bytes, address, b256, uint};
     use event_sorcery::StoreBuilder;
     use rust_decimal::Decimal;
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
@@ -428,6 +493,7 @@ mod tests {
     use super::*;
     use crate::config::VaultMode;
     use crate::mint::{Mint, MintCommand};
+    use crate::vault::MintAuthorization;
 
     /// Inserts a `Lifecycle<Mint>`-shaped row into `mint_view` for a given
     /// query view. The adjusted variants reproduce the production `Mint`
@@ -794,6 +860,238 @@ mod tests {
                 })
             ),
             "a duplicated tokenization id must be rejected, got {result:?}"
+        );
+    }
+
+    fn orchestrator_initiate_command(
+        issuer_request_id: &IssuerMintRequestId,
+        tokenization_request_id: &str,
+        wallet: Address,
+    ) -> MintCommand {
+        MintCommand::Initiate {
+            mint_mode: VaultMode::Orchestrator {
+                address: address!("0x00000000000000000000000000000000000000aa"),
+            },
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new(
+                tokenization_request_id,
+            ),
+            quantity: Quantity::new(Decimal::from(50)),
+            underlying: UnderlyingSymbol::new("TSLA").unwrap(),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::Base,
+            client_id: ClientId::new(),
+            wallet,
+        }
+    }
+
+    fn authorization(nonce: B256) -> MintAuthorization {
+        MintAuthorization { nonce, signature: Bytes::from_static(&[0xaa; 65]) }
+    }
+
+    /// The orchestrator scopes `nonceUsed` to `(recipient, nonce)`, so the
+    /// same nonce is simultaneously taken for one recipient and free for
+    /// another. The lookup must honour that: it prunes on the nonce alone in
+    /// SQL, and the recipient is what the projection re-verification decides
+    /// on.
+    #[tokio::test]
+    async fn find_mints_holding_nonce_is_scoped_to_the_recipient() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to build mint store");
+
+        let shared_nonce = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let first_wallet =
+            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let second_wallet =
+            address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
+
+        let mut ids = Vec::new();
+        for (index, wallet) in [first_wallet, second_wallet].iter().enumerate()
+        {
+            let issuer_request_id = IssuerMintRequestId::random();
+            store
+                .send(
+                    &issuer_request_id,
+                    orchestrator_initiate_command(
+                        &issuer_request_id,
+                        &format!("alp-tok-nonce-{index}"),
+                        *wallet,
+                    ),
+                )
+                .await
+                .expect("Failed to initiate mint");
+            store
+                .send(
+                    &issuer_request_id,
+                    MintCommand::AuthorizeMint {
+                        issuer_request_id: issuer_request_id.clone(),
+                        mint_authorization: authorization(shared_nonce),
+                    },
+                )
+                .await
+                .expect("Failed to record authorization");
+            ids.push(issuer_request_id);
+        }
+
+        assert_eq!(
+            find_mints_holding_nonce(&pool, first_wallet, shared_nonce)
+                .await
+                .expect("lookup must succeed"),
+            vec![ids[0].clone()],
+            "the first recipient must hold its own pair only"
+        );
+        assert_eq!(
+            find_mints_holding_nonce(&pool, second_wallet, shared_nonce)
+                .await
+                .expect("lookup must succeed"),
+            vec![ids[1].clone()],
+            "the same nonce is a separate pair under a second recipient"
+        );
+        assert!(
+            find_mints_holding_nonce(
+                &pool,
+                first_wallet,
+                b256!(
+                    "0x3333333333333333333333333333333333333333333333333333333333333333"
+                )
+            )
+            .await
+            .expect("lookup must succeed")
+            .is_empty(),
+            "an undelivered nonce must be held by nobody"
+        );
+    }
+
+    /// SQL prunes across every live state's payload path, so a holder must
+    /// still be found after it advances past `Initiated` — and a mint that
+    /// released its pair must drop out even though its payload still carries
+    /// the nonce, because the projection, not the JSON, decides who holds.
+    #[tokio::test]
+    async fn find_mints_holding_nonce_tracks_the_lifecycle() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Mint>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to build mint store");
+
+        let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let held_nonce = b256!(
+            "0x4444444444444444444444444444444444444444444444444444444444444444"
+        );
+        let released_nonce = b256!(
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
+        );
+
+        let advanced_id = IssuerMintRequestId::random();
+        store
+            .send(
+                &advanced_id,
+                orchestrator_initiate_command(
+                    &advanced_id,
+                    "alp-tok-nonce-held",
+                    wallet,
+                ),
+            )
+            .await
+            .expect("Failed to initiate mint");
+        store
+            .send(
+                &advanced_id,
+                MintCommand::AuthorizeMint {
+                    issuer_request_id: advanced_id.clone(),
+                    mint_authorization: authorization(held_nonce),
+                },
+            )
+            .await
+            .expect("Failed to record authorization");
+        store
+            .send(
+                &advanced_id,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: advanced_id.clone(),
+                },
+            )
+            .await
+            .expect("Failed to confirm journal");
+
+        let rejected_id = IssuerMintRequestId::random();
+        store
+            .send(
+                &rejected_id,
+                orchestrator_initiate_command(
+                    &rejected_id,
+                    "alp-tok-nonce-released",
+                    wallet,
+                ),
+            )
+            .await
+            .expect("Failed to initiate mint");
+        store
+            .send(
+                &rejected_id,
+                MintCommand::AuthorizeMint {
+                    issuer_request_id: rejected_id.clone(),
+                    mint_authorization: authorization(released_nonce),
+                },
+            )
+            .await
+            .expect("Failed to record authorization");
+        store
+            .send(
+                &rejected_id,
+                MintCommand::RejectJournal {
+                    issuer_request_id: rejected_id.clone(),
+                    reason: "journal failed".to_string(),
+                },
+            )
+            .await
+            .expect("Failed to reject journal");
+
+        assert_eq!(
+            find_mints_holding_nonce(&pool, wallet, held_nonce)
+                .await
+                .expect("lookup must succeed"),
+            vec![advanced_id],
+            "a mint past Initiated must still hold its pair"
+        );
+        assert!(
+            find_mints_holding_nonce(&pool, wallet, released_nonce)
+                .await
+                .expect("lookup must succeed")
+                .is_empty(),
+            "a rejected journal must release its pair for reuse"
+        );
+    }
+
+    /// The candidate query must be served by
+    /// `idx_mint_view_live_authorization_nonce` — SQLite only uses an
+    /// expression index when the WHERE clause structurally matches the
+    /// indexed expression, so any drift between the migration and the query
+    /// silently regresses to a table scan. Pin the query plan.
+    #[tokio::test]
+    async fn find_mints_holding_nonce_uses_expression_index() {
+        let pool = setup_test_db().await;
+
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::authorization_nonce_candidate_query()
+            )))
+            .bind(B256::repeat_byte(0x06).to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("query plan must be explainable");
+
+        assert!(
+            plan.iter().any(|(_, _, _, detail)| detail
+                .contains("idx_mint_view_live_authorization_nonce")),
+            "the lookup must be served by the expression index, got plan: \
+             {plan:?}"
         );
     }
 

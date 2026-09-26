@@ -1065,6 +1065,13 @@ impl SubmitMintJob {
     /// key), sparing the full lookback scan on every ordinary first
     /// submission.
     ///
+    /// The full match identifies the landing as THIS mint's only because at
+    /// most one mint can hold a given `(to, nonce)` pair: the delivery
+    /// endpoint refuses an authorization whose pair another mint already
+    /// holds ([`Mint::held_authorization_nonce`]). Without that guard two
+    /// same-sized mints of the same asset for one recipient would both match
+    /// a single landing and both complete.
+    ///
     /// A full match also registers the receipt the landed mint created,
     /// BEFORE the recovery is recorded: `RecordOrchestratorMintRecovered`
     /// carries no `Deposit`, nothing rediscovers an orchestrator-held receipt

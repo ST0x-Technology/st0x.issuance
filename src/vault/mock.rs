@@ -276,6 +276,11 @@ struct OrchestratorMockState {
     /// for an unresponsive RPC provider so deadline handling is testable.
     #[cfg(test)]
     mint_auth_hang: Mutex<bool>,
+    /// When set, the FIRST `validate_mint_authorization` call parks in this
+    /// gate — the shape a test needs to hold one delivery inside its
+    /// on-chain reads while a second one runs to completion.
+    #[cfg(test)]
+    mint_auth_gate: Mutex<Option<MintAuthGate>>,
     #[cfg(test)]
     last_mint_params: Mutex<Option<OrchestratorMintParams>>,
     #[cfg(test)]
@@ -284,6 +289,18 @@ struct OrchestratorMockState {
     mint_auth_validation_call_count: AtomicUsize,
     #[cfg(test)]
     find_minted_log_call_count: AtomicUsize,
+}
+
+/// One-shot parking gate for the mock's `validate_mint_authorization`. The
+/// first call disarms it, signals `started` and waits on `release`; every
+/// later call runs straight through, so the test can drive a second delivery
+/// to completion while the first is still parked.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct MintAuthGate {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    armed: Arc<AtomicBool>,
 }
 
 /// Configurable failure outcomes for the mock's
@@ -742,6 +759,7 @@ impl MockVaultService {
         *self.orchestrator.find_minted_log_should_error.lock().unwrap() = false;
         *self.orchestrator.mint_auth_failure.lock().unwrap() = None;
         *self.orchestrator.mint_auth_hang.lock().unwrap() = false;
+        *self.orchestrator.mint_auth_gate.lock().unwrap() = None;
         *self.orchestrator.last_mint_params.lock().unwrap() = None;
         self.orchestrator
             .mint_preparation_call_count
@@ -1193,6 +1211,42 @@ impl MockVaultService {
     pub(crate) fn with_mint_auth_hang(self) -> Self {
         *self.orchestrator.mint_auth_hang.lock().unwrap() = true;
         self
+    }
+
+    /// Parks the FIRST `validate_mint_authorization` call until the test
+    /// releases it, so a second delivery can run to completion while the
+    /// first is still inside its on-chain reads.
+    #[cfg(test)]
+    pub(crate) fn with_mint_auth_gate(self) -> Self {
+        *self.orchestrator.mint_auth_gate.lock().unwrap() =
+            Some(MintAuthGate {
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                armed: Arc::new(AtomicBool::new(true)),
+            });
+        self
+    }
+
+    /// Resolves once the gated validation call has parked.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_mint_auth_validation(&self) {
+        self.mint_auth_gate().started.notified().await;
+    }
+
+    /// Lets the parked validation call return.
+    #[cfg(test)]
+    pub(crate) fn release_mint_auth_validation(&self) {
+        self.mint_auth_gate().release.notify_one();
+    }
+
+    #[cfg(test)]
+    fn mint_auth_gate(&self) -> MintAuthGate {
+        let Some(gate) =
+            self.orchestrator.mint_auth_gate.lock().unwrap().clone()
+        else {
+            panic!("mock does not gate the mint-authorization validation");
+        };
+        gate
     }
 
     #[cfg(test)]
@@ -2414,6 +2468,13 @@ impl VaultService for MockVaultService {
                 .fetch_add(1, Ordering::Relaxed);
             if *self.orchestrator.mint_auth_hang.lock().unwrap() {
                 std::future::pending::<()>().await;
+            }
+            let gate = self.orchestrator.mint_auth_gate.lock().unwrap().clone();
+            if let Some(gate) = gate
+                && gate.armed.swap(false, Ordering::Relaxed)
+            {
+                gate.started.notify_one();
+                gate.release.notified().await;
             }
             let failure_opt =
                 *self.orchestrator.mint_auth_failure.lock().unwrap();
