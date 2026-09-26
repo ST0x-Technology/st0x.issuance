@@ -37,6 +37,29 @@ for an already-listed asset is `docs/runbooks/orchestrator-onboarding.md`.
    `CHAIN_<NETWORK>_*` group, because an asset on an unconfigured network aborts
    the next boot in `validate_configured_asset_networks`
    (`src/tokenized_asset/api.rs`).
+5. **The symbol is not already in orchestrator mode — or engineering has signed
+   off.** `vault_mode` is set per symbol, not per chain. A new listing for a
+   symbol whose `[assets.<SYM>]` table says `vault_mode = "orchestrator"` (or
+   for any new symbol once `default_vault_mode = "orchestrator"`) runs in
+   orchestrator mode from its first mint. No cutover runs for it, so its new,
+   empty vault never gets custody recorded at the orchestrator. The first
+   orchestrator mint then puts a receipt into inventory that the custody record
+   does not cover, and every restart refuses its balance reading
+   (`Refusing to deplete receipt`), as do burn readings. Check the mode first:
+
+   ```bash
+   curl -sS -H "X-API-KEY: $ISSUER_API_KEY" \
+     "$ISSUER_BASE_URL/tokenized-assets/$UNDERLYING/status" | jq -r '.vault_mode'
+   ```
+
+   `vault_direct` means this prerequisite holds. `orchestrator` means stop and
+   escalate to engineering before listing. A `404` means the symbol is listed on
+   no chain yet; its mode is then the config's
+   `[orchestrator].default_vault_mode`, read the same way. The planned fix
+   extends `move-receipts` to record custody at the orchestrator for an empty
+   vault; once it ships, run it for the new vault right after listing, before
+   the first mint (see "Zero-supply chains" in
+   `docs/runbooks/orchestrator-onboarding.md`).
 
 ## Register the asset
 
