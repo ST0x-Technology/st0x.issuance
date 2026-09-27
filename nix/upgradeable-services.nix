@@ -10,6 +10,7 @@
 # by a previous deploy so the next switch-to-configuration can
 # complete and let deploy.nix install the fix.
 {
+  config,
   pkgs,
   lib,
   utils,
@@ -58,38 +59,55 @@ let
     else
       [ ];
 
-  mkService = name: cfg: {
-    description = cfg.description or "st0x ${name}";
+  mkService =
+    name: cfg:
+    let
+      # BEHIND_PROXY rides on the command line rather than in Environment=.
+      # systemd applies EnvironmentFile= after Environment=, so a stray
+      # BEHIND_PROXY in the agenix env file would otherwise win and let the
+      # app disagree with the nginx routes that nix/ingress.nix opens off the
+      # same option: the app would read the TCP source while nginx proxies,
+      # and every request would look like 127.0.0.1 to the IP whitelists.
+      # `env` runs after systemd has assembled the environment, so this value
+      # is the last word whatever the secrets file says.
+      behindProxy = lib.optionals (cfg.kind == "st0x") [
+        "BEHIND_PROXY=${lib.boolToString config.st0x.ingress.behindProxy}"
+      ];
+    in
+    {
+      description = cfg.description or "st0x ${name}";
 
-    # Service is started by deploy.nix profile, not by systemd on boot.
-    # This avoids coordination issues during deployments.
-    wantedBy = [ ];
+      # Service is started by deploy.nix profile, not by systemd on boot.
+      # This avoids coordination issues during deployments.
+      wantedBy = [ ];
 
-    restartIfChanged = false;
-    stopIfChanged = false;
+      restartIfChanged = false;
+      stopIfChanged = false;
 
-    unitConfig = {
-      "X-OnlyManualStart" = true;
-      StartLimitBurst = 10;
-      StartLimitIntervalSec = 300;
+      unitConfig = {
+        "X-OnlyManualStart" = true;
+        StartLimitBurst = 10;
+        StartLimitIntervalSec = 300;
 
-      # Marker file created ONLY by service profile activation.
-      # Guarantees service is SKIPPED (not failed) during system activation.
-      ConditionPathExists = cfg.markerFile;
+        # Marker file created ONLY by service profile activation.
+        # Guarantees service is SKIPPED (not failed) during system activation.
+        ConditionPathExists = cfg.markerFile;
+      };
+
+      serviceConfig = {
+        User = "st0x";
+        Group = "st0x";
+        ExecStart = utils.escapeSystemdExecArgs (
+          [ "${pkgs.coreutils}/bin/env" ] ++ behindProxy ++ [ "${cfg.profilePath}/bin/${cfg.bin}" ]
+        );
+        Environment = staticEnvironment name cfg;
+        Restart = "always";
+        RestartSec = 30;
+      }
+      // lib.optionalAttrs (cfg.kind == "st0x") {
+        EnvironmentFile = cfg.decryptedEnvPath;
+      };
     };
-
-    serviceConfig = {
-      User = "st0x";
-      Group = "st0x";
-      ExecStart = utils.escapeSystemdExecArgs [ "${cfg.profilePath}/bin/${cfg.bin}" ];
-      Environment = staticEnvironment name cfg;
-      Restart = "always";
-      RestartSec = 30;
-    }
-    // lib.optionalAttrs (cfg.kind == "st0x") {
-      EnvironmentFile = cfg.decryptedEnvPath;
-    };
-  };
 in
 {
   systemd.services = lib.mapAttrs mkService unitServices;

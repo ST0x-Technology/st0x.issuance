@@ -143,6 +143,85 @@ nix run .#stagingDeployAll -- -i "$SSH_IDENTITY"
 nix run .#prodDeployAll -- -i "$SSH_IDENTITY"
 ```
 
+**Two prerequisites, both outside the deploy scripts.** nginx needs a Let's
+Encrypt certificate, and the order fails unless each is in place. Neither is
+checked for you:
+
+1. **DNS.** An A record for the environment's FQDN, pointing at its reserved IP,
+   at the s01issuer.com registrar (GoDaddy). The names are in `nix/ingress.nix`:
+   `issuance.s01issuer.com` for prod, `issuance-staging.s01issuer.com` for
+   staging.
+2. **Firewall.** `tfApply` for that environment, opening TCP 80 and 443 on the
+   DigitalOcean firewall. `nix run .#tfPlan`/`.#tfApply` above; the deploy
+   scripts never run Terraform, and CI's deploy workflow does not either.
+
+The http-01 challenge is what needs port 80. A failed order does not always fail
+the deploy: `acme-<fqdn>.service` installs a self-signed placeholder and only
+pulls in the real order, `acme-order-renew-<fqdn>.service`, which can fail after
+activation has already succeeded. 443 then serves the placeholder. Check the
+order with `systemctl status acme-order-renew-<fqdn>`, and once the record and
+the firewall rule exist, retry it with
+`systemctl start acme-order-renew-<fqdn>`.
+
+**Flipping `st0x.ingress.behindProxy` needs `DeployAll`, not `DeployNixos`.**
+The system profile carries nginx and the firewall; only the service profile
+restarts the app, and that unit sets `restartIfChanged = false`, so a
+system-only deploy never moves the app into proxy mode. The app binds a
+different port in each mode (8000 direct, 8001 proxied), so a half-applied flip
+shows up as nginx returning 502 rather than as requests reaching the app with a
+spoofable source address. Run `nix run .#<env>DeployAll` and let both profiles
+land.
+
+The flip does not strand plaintext callers. While `st0x.ingress.legacyPlaintext`
+is on (the default), nginx also serves the same route allowlist over plain HTTP
+on 8000, so Alpaca and the liquidity bots keep working on the old URL and can
+move to the HTTPS name one at a time. Retiring plaintext is a separate step: set
+`legacyPlaintext = false`, deploy, then drop the port-8000 rule in `infra/`.
+
+### Proxy cutover, step by step
+
+Each step leaves the environment in a state that serves every caller, so it can
+pause for as long as needed between them. Only the flip itself has a short
+outage, covered in step 2. `<fqdn>` is the environment's name from
+`nix/ingress.nix`.
+
+1. **Certificate only.** With `behindProxy = false` (the default), run
+   `DeployAll`. A green deploy does not prove issuance (see above), so check
+   that the certificate was issued:
+   `openssl s_client -connect <fqdn>:443 -servername <fqdn> </dev/null | openssl x509 -noout -issuer`
+   must name Let's Encrypt, not minica. Then check that nginx is parked:
+   `curl -sI https://<fqdn>/inkind/issuance` (no `-k`) must answer `503`. The
+   app still serves 8000 itself; nothing has changed for callers.
+2. **Flip.** Set `behindProxy = true` and run `DeployAll` (never `DeployNixos`,
+   see above). On the box, `ss -tlnp` must show the app on `127.0.0.1:8001` and
+   nginx on `:443` and `:8000`. nginx cannot bind `:8000` while the direct-mode
+   app holds it, so the system profile stops the app first
+   (`st0xFreePlaintextPort` in `nix/ingress.nix`). Callers get a 502 until the
+   service profile starts the app on 8001, normally within a minute. If the
+   deploy fails after that stop, the rollback does not restart the app: run
+   `systemctl start st0x-issuance` on the box.
+3. **Verify the forwarded surface.** Over HTTPS, an allowlisted route with a bad
+   key must answer `401` (the request reached the app), an unlisted route such
+   as `/admin/stuck` must answer `403` from nginx, and `POST /tokenized-assets`
+   must answer `403` while `GET` reaches the app. Repeat the same three checks
+   against `http://<ip>:8000`: the plaintext listener is now nginx and must
+   behave identically. Also send
+   `curl --path-as-is -X POST 'https://<fqdn>/admin/reprocess/mint/x%2F..%2F..%2F..%2F..%2Finternal%2Fmints%2Fz%2Fauthorization'`:
+   it must answer `403` from nginx. This proves nginx checks the raw path that
+   it forwards, not only the decoded one.
+4. **Verify client-IP authorization.** From an address outside
+   `INTERNAL_IP_RANGES`, `GET /tokenized-assets/<u>/status` with the valid key
+   must answer `403` from the app, not `200`. A `200` means the app is reading
+   the proxy's loopback address instead of `X-Real-IP`: roll back to step 1 and
+   check the `BEHIND_PROXY` value on the running unit
+   (`systemctl show st0x-issuance -p ExecStart`).
+5. **Move callers.** Point the liquidity bots' `base_url` at `https://<fqdn>`,
+   then ask Alpaca to switch. Watch the nginx access log until nothing arrives
+   on 8000 any more.
+6. **Retire plaintext.** Set `legacyPlaintext = false`, run `DeployAll`, drop
+   the port-8000 firewall rule in `infra/` and `tfApply`. `ss -tlnp` must no
+   longer show `:8000`.
+
 ---
 
 ## Database (one-time, per environment)
