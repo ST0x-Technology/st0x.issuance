@@ -46,6 +46,9 @@ jobs:
       wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
       pam_entitlement: app-deploy
       image_tag: ${{ inputs.version || '' }}
-      ref: ${{ inputs.version || '' }}
+      # A config-only release reads the config from the merge that triggered
+      # it, not from wherever main has moved to by the time the job checks
+      # out; a rollback dispatch takes both from the version tag.
+      ref: ${{ inputs.version || github.sha }}
       config_file: config.prod.toml
       config_secret: issuance-runtime-config

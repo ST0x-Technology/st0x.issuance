@@ -205,5 +205,8 @@ jobs:
       service_account: issuance-deployer@s01-artifacts.iam.gserviceaccount.com
       wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
       image_tag: ${{ github.sha }}
+      # Config from the commit whose image this is, not from a main that may
+      # have moved on since the build started.
+      ref: ${{ github.sha }}
       config_file: config.staging.toml
       config_secret: issuance-runtime-config
