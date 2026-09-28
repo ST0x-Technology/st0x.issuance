@@ -247,11 +247,12 @@ where
         // Process reconciliation events (Withdraw + outbound transfers).
         // Once a recorded migration moved this vault's custody away from the
         // signing wallet, `balanceOf(bot_wallet)` readings mean nothing and
-        // could only be refused as `CustodyDisplaced` — the migration's own
-        // outbound transfers land here on post-cutover catch-up, so they are
+        // could only be refused as `CustodyDisplaced` — a wallet rotation's
+        // own outbound transfers land here on the next catch-up, so they are
         // skipped at INFO until the subsystem retires (RAI-1223). The
-        // discovery path above needs no gate: a zero balance returns before
-        // any command is dispatched.
+        // orchestrator cutover records no migration, so it never lands here.
+        // The discovery path above needs no gate: a zero balance returns
+        // before any command is dispatched.
         let unique_reconciliation_ids: Vec<_> =
             all_reconciliation_ids.into_iter().unique().collect();
 
@@ -1719,7 +1720,8 @@ mod tests {
         );
     }
 
-    /// Post-cutover catch-up sees the migration's own outbound transfers.
+    /// Catch-up after a wallet rotation sees the rotation's own outbound
+    /// transfers.
     /// Once recorded custody moved away from the signing wallet, those
     /// reconciliation readings are skipped at INFO instead of manufacturing
     /// `CustodyDisplaced` refusals — the mocked provider deliberately serves

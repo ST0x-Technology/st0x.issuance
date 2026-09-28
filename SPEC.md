@@ -1466,21 +1466,33 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   verifies the bot wallet's native balance covers a fixed transfer-gas ceiling
   at the current gas price (no per-transaction estimate — estimating a transfer
   of receipts the destination does not hold yet would revert), corroborates the
-  destination, and then prompts with the asset, vault, holder, destination and
-  its corroborated kind, and the tracked receipt count — the operator confirms
-  what was proven, not what was typed. A re-run after a completed move reports
-  the already-migrated observation distinctly and submits nothing.
+  destination, refuses a destination whose kind contradicts the path (see
+  "Receipt custody"), refuses a move the vault's recorded custody rules out (the
+  engine's own route checks, for example `CustodyUnobserved`), and then prompts
+  with the asset, vault, holder, destination and its corroborated kind, and the
+  tracked receipt count — the operator confirms what was proven, not what was
+  typed. A re-run after a completed move reports the already-migrated
+  observation distinctly and submits nothing. For the cutover this holds only
+  until the next service start: that start removes the moved receipts from
+  inventory, so a later re-run finds no tracked receipts. The command refuses an
+  empty inventory before the prompt, and for the cutover its message says that
+  after a cutover and a service start this is expected. The two paths differ in
+  what the move does to recorded custody (see "Receipt custody"): the
+  wallet-rotation path records the destination as the new holder, while the
+  cutover path leaves custody recorded at the bot wallet, so the moved receipts
+  leave inventory on the next startup.
 - `issuer confirm-custody <UNDERLYING>` — verifies on-chain that the Turnkey bot
   wallet holds exactly every tracked receipt balance for the asset's vault, then
-  records it as the inventory's custody holder. The rollback counterpart of
-  `move-receipts`: after an `EMERGENCY_ROLE` `withdrawReceipt` returns a token's
-  receipts to the bot wallet, recorded custody still names the old destination,
-  so reconciliation stays skipped until this re-confirmation. The holder is
-  always the Turnkey wallet (`TURNKEY_ADDRESS`) — never typed — and it cannot be
-  recorded wrongly: a wallet that does not hold every tracked balance is refused
-  with the first mismatch. Requires the deployment hold armed (the engine's
-  quiescence gates and projection rebuilds must not race a running service);
-  signs nothing and submits nothing on-chain.
+  records it as the inventory's custody holder. The counterpart of a
+  wallet-rotation `move-receipts`: after receipts return to the bot wallet from
+  a rotated wallet, recorded custody still names that wallet, so reconciliation
+  stays skipped until this re-confirmation. An orchestrator cutover never
+  records custody away from the bot wallet, so its rollback does not need this
+  command. The holder is always the Turnkey wallet (`TURNKEY_ADDRESS`) — never
+  typed — and it cannot be recorded wrongly: a wallet that does not hold every
+  tracked balance is refused with the first mismatch. Requires the deployment
+  hold armed (the engine's quiescence gates and projection rebuilds must not
+  race a running service); signs nothing and submits nothing on-chain.
 
 `burn-excess` is listing/network-scoped and takes `--network` / `--chain-id`
 (cross-checked against the RPC-reported chain); its RPC endpoint is **not** a
@@ -1796,26 +1808,90 @@ call cannot disarm the guard. An empty inventory also confirms no custody and
 leaves the vault `Unobserved`; confirmation requires at least one tracked
 receipt to be read successfully.
 
-**Custody moved by a recorded migration is expected, not displacement.** After
-`move-receipts` lands, the vault's recorded holder is the destination (e.g. the
-orchestrator), which is not the signing wallet — and that state persists until
-the receipt-inventory subsystem retires
-([RAI-1223](https://linear.app/makeitrain/issue/RAI-1223)). The periodic
-reconciliation and backfill paths therefore skip balance reads for a vault whose
-recorded custody holder differs from the signing wallet **when a recorded
+**Only a wallet rotation moves recorded custody.** The engine serves two kinds
+of move, and they differ in who owns the receipts afterwards:
+
+- **Wallet rotation** (`move-receipts --to <ADDRESS>`). The receipts still
+  belong to the bot, at a new signing wallet. Custody follows them: the engine
+  records `CustodyMigrated`, and balances are read at the new wallet from then
+  on. A zero at the outgoing wallet means "held elsewhere", not "spent", which
+  is what the custody guard protects.
+- **Orchestrator cutover** (`move-receipts --to-configured-orchestrator`). The
+  receipts now belong to the orchestrator contract. The bot cannot move them
+  (only `EMERGENCY_ROLE` can, through `withdrawReceipt`), and the orchestrator,
+  not the bot, picks which receipts each burn consumes. So the bot has nothing
+  to track, and the engine records no custody change: custody stays at the bot
+  wallet. On the next startup, reconciliation reads zero at the bot wallet for
+  every moved receipt and removes it from inventory. That zero is the truth: the
+  bot holds nothing. From then on the vault's inventory stays empty, because the
+  backfiller keeps a `Deposit` or `Withdraw` only when its owner is the bot
+  wallet, so orchestrator mints and burns never reach it. This is the drain
+  described under "Dual-Mode Operation and Cutover".
+
+Each path accepts only its own destination kind: a rotation refuses a contract
+destination, and the cutover refuses an externally owned account
+(`RecipientKindMismatch`). A rotation to the orchestrator contract would record
+custody at an address the bot never signs from, which is the state this split
+removes.
+
+**Custody moved by a recorded rotation is expected, not displacement.** After a
+wallet-rotation `move-receipts` lands, the vault's recorded holder is the new
+wallet. When the service still signs with the outgoing wallet, the periodic
+reconciliation and backfill paths skip balance reads for a vault whose recorded
+custody holder differs from the signing wallet **when a recorded
 `CustodyMigrated` from the signing wallet explains the mismatch**, logging the
 skip once at INFO — dispatching those readings would only manufacture
 `CustodyDisplaced` errors for a state the operator deliberately created. A
 holder mismatch with no recorded migration explaining it is true displacement
-and still fails loudly at ERROR.
+and still fails loudly at ERROR. After receipts return from a rotated wallet,
+`issuer confirm-custody` verifies the bot wallet holds exactly every tracked
+balance and records it as holder, and reconciliation resumes normally on the
+next startup.
 
-The skip also defines the rollback recovery: after an `EMERGENCY_ROLE`
-`withdrawReceipt` returns a token's receipts to the bot wallet, recorded custody
-still names the orchestrator, so reconciliation keeps skipping the vault (and
-cannot auto-confirm, since it never reads). The operator runs
-`issuer confirm-custody` — which verifies the bot wallet holds exactly every
-tracked balance and records it as holder — and reconciliation resumes normally
-on the next startup.
+**An orchestrator cutover rolls back without a custody step.** An
+`EMERGENCY_ROLE` `withdrawReceipt` is a plain ERC-1155 `safeTransferFrom` from
+the orchestrator to the bot wallet. The backfiller discovers inbound transfers
+to the bot wallet, and depletion removed the moved receipts from inventory at
+cutover, so on the next startup every returned receipt — the migrated ones and
+the ones orchestrator mints created — is discovered again at its real balance
+(with source `External`). Custody was never recorded away from the bot wallet,
+so nothing needs re-confirming. The rollback's completeness check is on-chain:
+every receipt id the vault has ever issued lies in `1..=highwaterId()` (new ids
+are allocated as `highwaterId + 1`, and `redeposit` refuses ids above it,
+`OffchainAssetReceiptVault`), so the orchestrator must hold zero of each id in
+that range before the service restarts.
+
+That check proves the receipts left the orchestrator, not that inventory tracks
+them again. The backfill is the only way back in, and it can miss one: it reads
+`balanceOf(bot_wallet)` at the latest block, while it fetched the logs up to an
+earlier head, so a lagging RPC node can answer zero, skip the receipt, and
+advance the checkpoint past its transfer. So the rollback also checks the bot
+side after the restart: every id it returned must be tracked at its on-chain
+balance. `confirm-custody` performs that check (the rollback in
+`docs/runbooks/orchestrator-onboarding.md`); the count it confirms must equal
+the number of ids returned.
+
+The rediscovered receipts carry no receipt information: they return by transfer,
+not by `Deposit`, so their receipt-information bytes and their link to the
+originating mint are gone. The loss is accepted. A redemption burns such a
+receipt with empty `receiptInformation`, as it does any receipt transferred in,
+and only in-flight vault-direct mints use the mint link (mint recovery and the
+admin close gate), which the rollback's freeze and drain rule out.
+
+Two states fall outside this rollback. In both, the returned receipts are read
+at a wallet that recorded custody does not name, so startup refuses the backfill
+(`CustodyDisplaced`) and the service does not start. Treat either as an
+engineering escalation:
+
+- **A cutover recorded by an earlier release.** Releases before the no-custody
+  cutover recorded custody at the orchestrator. A cutover re-run on such a store
+  refuses (`CutoverCustodyAtDestination`) instead of reporting the move as done,
+  and `issuer confirm-custody` must re-record the bot wallet before the service
+  starts. That command refuses when a tracked balance no longer matches the
+  chain.
+- **A signing-wallet rotation while an asset is in orchestrator mode.** Custody
+  still names the old wallet, and the vault's empty inventory leaves nothing to
+  migrate or re-confirm. Roll the asset back before a rotation.
 
 Freeze, unfreeze, and status address the `Underlying` aggregate, so they take no
 network argument: one freeze covers every listing of the underlying. The CLI
@@ -2574,9 +2650,11 @@ follow the same per-asset procedure (RAI-1246); the end state flips
 `[orchestrator].default_vault_mode` to `"orchestrator"` and drops the per-asset
 overrides. Rollback is the same procedure in reverse for just the affected
 asset: freeze, flip its `vault_mode` back to `"vault_direct"`, return that
-token's receipts to the bot wallet via `EMERGENCY_ROLE`, redeploy, unfreeze — no
-other asset is touched. Vault-direct mode's flows, aggregate states, and events
-are completely unchanged by this migration.
+token's receipts to the bot wallet via `EMERGENCY_ROLE`, check on-chain that the
+orchestrator holds none of the vault's receipt ids, redeploy (startup
+rediscovers the returned receipts — see "Receipt custody"), unfreeze — no other
+asset is touched. Vault-direct mode's flows, aggregate states, and events are
+completely unchanged by this migration.
 
 **Both modes run side by side for the whole rollout.** While any asset remains
 vault-direct, `ReceiptInventory` and the receipt-monitoring/backfill machinery

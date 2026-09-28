@@ -341,9 +341,9 @@ strand the vault's receipts at the old address. The vendor-neutral migration
 engine verifies exact source balances and per-identifier recipient gains.
 Custody is aggregate state: a rotated wallet reading zero is refused, not
 depleted. Quiescence gates on in-flight mints/redemptions, never on freeze
-(freeze = corporate action). The engine deliberately has no CLI driver. See
-`docs/runbooks/deploy-hold.md` when maintenance must keep issuance stopped
-across a deploy.
+(freeze = corporate action). The orchestrator cutover records no custody: the
+bot wallet stays holder. See `docs/runbooks/deploy-hold.md` when maintenance
+must keep issuance stopped across a deploy.
 
 ### Core Flows
 
