@@ -19,17 +19,6 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-# Same group as production-release.yml: the two production entrypoints
-# serialize, so a config-only run cannot capture the live digest before a
-# tag deployment and write it back stale afterwards.
-concurrency:
-  group: production-release
-  cancel-in-progress: false
-  # Keep every queued production run (default keeps one pending run and
-  # cancels it when another arrives): a config-only run must never discard
-  # a pending tag deployment.
-  queue: max
-
 permissions:
   contents: read
 
@@ -46,9 +35,20 @@ jobs:
       attestor: projects/s01-artifacts/attestors/issuance-image
       wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
 
+  # Same group as production-release.yml, on the deploy job only so the
+  # label and the GitHub release never wait behind a production run: the
+  # two production entrypoints serialize, so a config-only run cannot
+  # capture the live digest before a tag deployment and write it back
+  # stale. queue: max keeps every queued run; a queued run still fails at
+  # the PAM step while the previous release's grant is ACTIVE, so revoke it
+  # in the console and re-run.
   deploy-production:
     needs: label
     if: vars.PRODUCTION_RELEASES_ENABLED == 'true'
+    concurrency:
+      group: production-release
+      cancel-in-progress: false
+      queue: max
     permissions:
       id-token: write
       contents: read

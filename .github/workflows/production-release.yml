@@ -30,21 +30,51 @@ on:
         type: string
 
 jobs:
+  # Decides whether this run is a release at all, and holds the production
+  # group while deciding so two config merges cannot leapfrog each other.
+  # A push is a config-only release only when EVERYTHING between the commit
+  # production runs and this commit is config or Markdown: the live digest
+  # is resolved to its commit-sha tag in the registry (build-oci tags every
+  # image with its commit), so a config key added by an earlier mixed PR,
+  # or a rollback, is caught here instead of at the VM's boot. The config
+  # must also still be main's: a slower earlier run must not put an older
+  # config on production after a newer one.
   preflight:
     if: vars.PRODUCTION_RELEASES_ENABLED == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: production-release
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
+      id-token: write
     outputs:
       release: ${{ steps.check.outputs.release }}
+    env:
+      AR_REPO: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+      CONFIG_BUCKET: s01-issuance-config
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GCP (releaser, read-only here)
+        if: github.event_name == 'push'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+          service_account: issuance-releaser@s01-artifacts.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+        if: github.event_name == 'push'
+
       - name: Check the release request
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           VERSION: ${{ inputs.version }}
-          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if [ "$EVENT" = workflow_dispatch ]; then
@@ -53,15 +83,33 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
+
+          # The config this run would publish must still be main's.
+          gh api "repos/${GITHUB_REPOSITORY}/contents/config.prod.toml?ref=main" \
+            --jq .content | base64 -d > "$RUNNER_TEMP/main.toml"
+          if ! cmp -s config.prod.toml "$RUNNER_TEMP/main.toml"; then
+            echo "::error::config.prod.toml at ${GITHUB_SHA} is not main's any more; a newer config release supersedes this run"
+            exit 1
+          fi
+
+          # What production runs: live digest -> its commit-sha tag.
+          digest=$(gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" | sed -n 's/^BOT_IMAGE=.*@//p')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::could not read the live BOT_IMAGE digest from images.env (got '${digest}')"; exit 1; }
+          live=$(gcloud artifacts docker tags list "${AR_REPO}/s01-issuance" \
+            --format='csv[no-heading](tag.basename(),version.basename())' \
+            | awk -F, -v d="$digest" '$2==d && $1 ~ /^[0-9a-f]{40}$/ {print $1; exit}')
+          [ -n "$live" ] || { echo "::error::no commit-sha tag on the live digest ${digest}; refusing to reason about a config-only release"; exit 1; }
+          echo "production runs ${live}; this push is ${GITHUB_SHA}"
+
+          changed=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${live}...${GITHUB_SHA}" \
             --jq '.files[].filename')
-          printf 'changed in this push:\n%s\n' "$changed"
+          printf 'changed since the live commit:\n%s\n' "$changed"
           others=$(grep -vxE 'config\.(prod|staging)\.toml|.*\.md' <<<"$changed" || true)
-          # The compare API lists at most 300 files; a full list may hide code.
           if [ -z "$others" ] && [ "$(wc -l <<<"$changed")" -lt 300 ]; then
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::this push changes more than configs and docs; its config ships with the next version tag, not as a config-only release"
+            echo "::notice::code changed since the commit production runs; this config ships with the next version tag, not as a config-only release"
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -71,12 +119,13 @@ jobs:
     # Job level, so a push the preflight skips never takes the group's one
     # pending slot. Shared with release-tag.yml: a config-only run must not
     # capture the live digest before a tag deployment and write it back stale.
+    # Same group as preflight and release-tag.yml. queue: max keeps every
+    # queued run (the default keeps one and cancels it when another
+    # arrives); a queued run still fails at the PAM step while the previous
+    # release's grant is ACTIVE, so revoke it in the console and re-run.
     concurrency:
       group: production-release
       cancel-in-progress: false
-      # Keep every queued production run (default keeps one pending run and
-      # cancels it when another arrives): a config-only run must never
-      # discard a pending tag deployment.
       queue: max
     permissions:
       id-token: write
