@@ -19,6 +19,16 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
+# Same group as production-release.yml: the two production entrypoints
+# serialize, so a config-only run cannot capture the live digest before a
+# tag deployment and write it back stale afterwards.
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   label:
     permissions:
