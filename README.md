@@ -425,10 +425,17 @@ Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
   attestation and rolls.
 - **Production**: a `vX.Y.Z` tag (`release-tag.yml`) labels that commit's
   attested image and deploys it behind the production project's `app-deploy`
-  PAM grant (an approver activates it in the GCP console). A merge touching
-  `config.prod.toml` is a config-only release, and `production-release.yml`'s
-  dispatch with a version is a rollback. Both wait for the production stack
-  on the devops side.
+  PAM grant (an approver activates it in the GCP console). A merge that
+  changes `config.prod.toml` and nothing but configs and Markdown is a
+  config-only release on the live image; a merge that also changes code
+  ships its config with the next tag.
+  `production-release.yml`'s dispatch with a version is a rollback. All of
+  these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
+- Tags on commits older than this release path run the old `release-tag.yml`
+  and only label; deploy them with the rollback dispatch. If the releaser
+  cannot revoke a finished release's PAM grant, the grant stays open for up
+  to an hour and any other production release fails at the PAM step until
+  then; revoke it in the console before an urgent rollback.
 
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy

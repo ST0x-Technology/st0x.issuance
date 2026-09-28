@@ -64,5 +64,7 @@ jobs:
       service_account: issuance-releaser@s01-artifacts.iam.gserviceaccount.com
       wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
       pam_entitlement: app-deploy
+      # The commit that was labeled, even if the tag moves meanwhile.
+      ref: ${{ github.sha }}
       config_file: config.prod.toml
       config_secret: issuance-runtime-config

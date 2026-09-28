@@ -2,9 +2,15 @@ name: production-release
 
 # Config-only production release and rollback, behind the production
 # project's app-deploy PAM grant (same shared workflow as release-tag.yml):
-#   - a merge to main touching config.prod.toml deploys that config against
-#     the digest live in production (a config must never run ahead of its
-#     binary; the workflow redeploys the running digest);
+#   - a merge to main touching config.prod.toml, and otherwise at most
+#     config.staging.toml and Markdown, deploys that config against the
+#     digest live in production. A push that also changes anything else is
+#     skipped: its config belongs to code production does not run yet
+#     (config parsing rejects unknown keys), so it ships with the next
+#     version tag instead. Code already merged but not yet tagged
+#     is not detected: tag it before a config-only change that needs it.
+#     Likewise after a rollback: roll forward before a config-only merge,
+#     or main's config lands on the older binary;
 #   - workflow_dispatch with a version rolls production back (or forward) to
 #     that tag: images and config both from the tag.
 # Off until the production stack exists on the devops side
@@ -23,17 +29,55 @@ on:
         required: true
         type: string
 
-concurrency:
-  group: production-release
-  cancel-in-progress: false
-  # Keep every queued production run (default keeps one pending run and
-  # cancels it when another arrives): a config-only run must never discard
-  # a pending tag deployment.
-  queue: max
-
 jobs:
-  release:
+  preflight:
     if: vars.PRODUCTION_RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Check the release request
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ inputs.version }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || { echo "::error::version must be an exact vX.Y.Z tag (got '${VERSION}')"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
+            --jq '.files[].filename')
+          printf 'changed in this push:\n%s\n' "$changed"
+          others=$(grep -vxE 'config\.(prod|staging)\.toml|.*\.md' <<<"$changed" || true)
+          # The compare API lists at most 300 files; a full list may hide code.
+          if [ -z "$others" ] && [ "$(wc -l <<<"$changed")" -lt 300 ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::this push changes more than configs and docs; its config ships with the next version tag, not as a config-only release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: preflight
+    if: needs.preflight.outputs.release == 'true'
+    # Job level, so a push the preflight skips never takes the group's one
+    # pending slot. Shared with release-tag.yml: a config-only run must not
+    # capture the live digest before a tag deployment and write it back stale.
+    concurrency:
+      group: production-release
+      cancel-in-progress: false
+      # Keep every queued production run (default keeps one pending run and
+      # cancels it when another arrives): a config-only run must never
+      # discard a pending tag deployment.
+      queue: max
     permissions:
       id-token: write
       contents: read
@@ -52,7 +96,8 @@ jobs:
       image_tag: ${{ inputs.version || '' }}
       # A config-only release reads the config from the merge that triggered
       # it, not from wherever main has moved to by the time the job checks
-      # out; a rollback dispatch takes both from the version tag.
-      ref: ${{ inputs.version || github.sha }}
+      # out; a rollback dispatch takes both from the version tag (the tag
+      # ref, never a same-named branch).
+      ref: ${{ inputs.version && format('refs/tags/{0}', inputs.version) || github.sha }}
       config_file: config.prod.toml
       config_secret: issuance-runtime-config
