@@ -1,0 +1,175 @@
+name: production-release
+
+# Config-only production release and rollback, behind the production
+# project's app-deploy PAM grant (same shared workflow as release-tag.yml):
+#   - a merge to main touching config.prod.toml, and otherwise at most
+#     config.staging.toml and Markdown, deploys that config against the
+#     digest live in production. A push that also changes anything else is
+#     skipped: its config belongs to code production does not run yet
+#     (config parsing rejects unknown keys), so it ships with the next
+#     version tag instead. "Anything else" is measured from the commit
+#     production actually runs (the live digest's commit tag), so code that
+#     is merged but not yet tagged, and a rollback to an older binary, both
+#     turn a config merge into a skip rather than a bad boot;
+#   - workflow_dispatch with a version rolls production back (or forward) to
+#     that tag: images and config both from the tag.
+# Off until the production stack exists on the devops side
+# (PRODUCTION_RELEASES_ENABLED repository variable).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - config.prod.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to deploy (vX.Y.Z), images and config both from that tag"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Decides whether this run is a release at all, and holds the production
+  # group while deciding so two config merges cannot leapfrog each other.
+  # The group is released between this job and the release job (a reusable
+  # workflow call cannot carry steps of its own), so a rollback dispatch
+  # that queues exactly in that gap deploys its binary under a config this
+  # check never saw against it: the shared workflow reads the live digest
+  # under its own lock but validates nothing (the binary has no config-only
+  # validation mode yet). Closing that window means the check moving into
+  # the shared workflow, or the binary gaining the validation mode.
+  # A push is a config-only release only when EVERYTHING between the commit
+  # production runs and this commit is config or Markdown: the live digest
+  # is resolved to its commit-sha tag in the registry (build-oci tags every
+  # image with its commit), so a config key added by an earlier mixed PR,
+  # or a rollback, is caught here instead of at the VM's boot. The config
+  # must also still be main's: a slower earlier run must not put an older
+  # config on production after a newer one.
+  preflight:
+    if: vars.PRODUCTION_RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-release
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    env:
+      AR_REPO: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+      CONFIG_BUCKET: s01-issuance-config
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GCP (releaser, read-only here)
+        if: github.event_name == 'push'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          workload_identity_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+          service_account: issuance-releaser@s01-artifacts.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+        if: github.event_name == 'push'
+
+      - name: Check the release request
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || { echo "::error::version must be an exact vX.Y.Z tag (got '${VERSION}')"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The config this run would publish must still be main's.
+          gh api "repos/${GITHUB_REPOSITORY}/contents/config.prod.toml?ref=main" \
+            --jq .content | base64 -d > "$RUNNER_TEMP/main.toml"
+          if ! cmp -s config.prod.toml "$RUNNER_TEMP/main.toml"; then
+            echo "::error::config.prod.toml at ${GITHUB_SHA} is not main's any more; a newer config release supersedes this run"
+            exit 1
+          fi
+
+          # What production runs: live digest -> its commit-sha tag.
+          digest=$(gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" | sed -n 's/^BOT_IMAGE=.*@//p')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::could not read the live BOT_IMAGE digest from images.env (got '${digest}')"; exit 1; }
+          # Reproducible builds give one digest to every commit that leaves
+          # the binary unchanged, so the digest may carry several commit-sha
+          # tags. Any of them is "the code production runs"; pick the one
+          # closest to this push among those that are its ancestors, so the
+          # comparison spans the least history and never includes commits
+          # from another line.
+          mapfile -t candidates < <(gcloud artifacts docker tags list "${AR_REPO}/s01-issuance" \
+            --format='csv[no-heading](tag.basename(),version.basename())' \
+            | awk -F, -v d="$digest" '$2==d && $1 ~ /^[0-9a-f]{40}$/ {print $1}')
+          [ "${#candidates[@]}" -gt 0 ] || { echo "::error::no commit-sha tag on the live digest ${digest}; refusing to reason about a config-only release"; exit 1; }
+          live=""; best=""
+          for c in "${candidates[@]}"; do
+            cmp=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${c}...${GITHUB_SHA}" --jq '"\(.status) \(.ahead_by)"' 2>/dev/null || echo "unknown 0")
+            status=${cmp%% *}; ahead=${cmp##* }
+            case "$status" in ahead|identical) ;; *) continue ;; esac
+            if [ -z "$best" ] || [ "$ahead" -lt "$best" ]; then live=$c; best=$ahead; fi
+          done
+          [ -n "$live" ] || { echo "::error::none of the live digest's commits (${candidates[*]}) is an ancestor of ${GITHUB_SHA}; production runs code from another line, tag it before a config-only release"; exit 1; }
+          echo "production runs ${live} (${best} commits behind this push ${GITHUB_SHA})"
+
+          changed=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${live}...${GITHUB_SHA}" \
+            --jq '.files[].filename')
+          printf 'changed since the live commit:\n%s\n' "$changed"
+          others=$(grep -vxE 'config\.(prod|staging)\.toml|.*\.md' <<<"$changed" || true)
+          if [ -z "$others" ] && [ "$(wc -l <<<"$changed")" -lt 300 ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::code changed since the commit production runs; this config ships with the next version tag, not as a config-only release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: preflight
+    if: needs.preflight.outputs.release == 'true'
+    # Same group as preflight and release-tag.yml: a config-only run must
+    # not capture the live digest before a tag deployment and write it back
+    # stale. queue: max keeps every queued run (the default keeps one and
+    # cancels it when another arrives); a queued run still fails at the PAM
+    # step while the previous release's grant is ACTIVE, so revoke it in the
+    # console and re-run.
+    concurrency:
+      group: production-release
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # app-release @ .github main
+    with:
+      environment: production
+      runtime: bot-vm
+      project: s01-issuance
+      config_bucket: s01-issuance-config
+      ar_repo: europe-west3-docker.pkg.dev/s01-artifacts/s01-issuance
+      images: s01-issuance=BOT_IMAGE
+      attestor: projects/s01-artifacts/attestors/issuance-image
+      service_account: issuance-releaser@s01-artifacts.iam.gserviceaccount.com
+      wif_provider: projects/47686631938/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+      pam_entitlement: app-deploy
+      image_tag: ${{ inputs.version || '' }}
+      # A config-only release reads the config from the merge that triggered
+      # it, not from wherever main has moved to by the time the job checks
+      # out; a rollback dispatch takes both from the version tag (the tag
+      # ref, never a same-named branch).
+      ref: ${{ inputs.version && format('refs/tags/{0}', inputs.version) || github.sha }}
+      config_file: config.prod.toml
+      config_secret: issuance-runtime-config
