@@ -12,9 +12,10 @@ name: build-oci
 # VM's roll timer polls. The VM verifies the issuance-image attestation of
 # everything it adopts, so this job cannot make it run an unsigned image.
 # Its rights on the staging project come from the devops side (write on
-# images.env and deployed.env, publish runtime-config versions, read
-# attestations in the hub), all live since the staging stack applied;
-# without them the job fails at the write, which is the honest answer.
+# images.env, read deployed.env, publish runtime-config versions, read
+# attestations in the hub), all live since the staging stack applied. A
+# missing grant fails at the operation that needs it: the images.env
+# write, or the deployed.env adoption read that comes after the write.
 #
 # Auth: GitHub OIDC -> the s01-artifacts WIF provider, bound to
 # issuance-deployer (main only; the WIF binding lives in s01.devops
