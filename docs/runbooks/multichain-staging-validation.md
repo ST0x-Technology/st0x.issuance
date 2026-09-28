@@ -93,11 +93,14 @@ stop.
 
 ## 2. Issuance HTTP preflight
 
-Run from the deployment host or a bastion included in `INTERNAL_IP_RANGES`.
-Internal endpoints require both `X-API-KEY` and an allowed client IP.
+Run from the deployment host. Internal endpoints require both `X-API-KEY` and an
+allowed client IP. In direct mode a bastion included in `INTERNAL_IP_RANGES`
+also works, against `http://<ip>:8000`. Once `st0x.ingress.behindProxy` is on,
+nginx does not forward these routes, so run on the host against
+`http://localhost:8001`.
 
 ```bash
-export ISSUER_BASE_URL=https://staging-issuance.example   # deployment URL
+export ISSUER_BASE_URL=http://localhost:8000              # 8001 once behindProxy is on
 export ISSUER_API_KEY=...                                 # internal key
 export STAGING_UNDERLYING=RKLB                            # agreed canary
 

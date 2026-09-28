@@ -20,8 +20,9 @@
 #   file, no secrets.
 #   database_url stays sqlite:///mnt/data/issuance.db (the VM mounts its
 #   data disk there, byte-identical to the droplet).
-#   Rocket listens on 0.0.0.0:8000, fixed in build_rocket (src/lib.rs);
-#   there is no proxy mode or port knob on main.
+#   Rocket listens on 0.0.0.0:8000 while BEHIND_PROXY is unset
+#   (server_figment in src/lib.rs). The compose must not set it: that
+#   flag is only for the droplet's host-local nginx (nix/ingress.nix).
 {
   pkgs,
   st0x-issuance,

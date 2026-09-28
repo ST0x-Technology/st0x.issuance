@@ -46,7 +46,7 @@ the issuer host against the service's own listener.
 
 ```bash
 # On the issuer host.
-export ISSUER_BASE_URL=http://localhost:8000
+export ISSUER_BASE_URL=http://localhost:8000   # 8001 once behindProxy is on
 export ISSUER_API_KEY=…            # the service's own key; never echo it
 
 export UNDERLYING=BIRD             # equity symbol

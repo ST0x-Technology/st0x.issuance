@@ -170,6 +170,7 @@ pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
         wrapped_transfer_poll_interval:
             crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
         auth: test_auth_config()?,
+        behind_proxy: false,
         ops_api: None,
         log_level: LogLevel::Debug,
         log_format: LogFormat::Text,

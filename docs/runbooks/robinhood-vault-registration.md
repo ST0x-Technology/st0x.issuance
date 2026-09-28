@@ -48,7 +48,9 @@ and step 3 fails closed without both.
 - A database backup is recorded. Registration appends events immediately and is
   not undone by a config rollback.
 - `ISSUER_BASE_URL` and `ISSUER_API_KEY` are exported, and the call is made from
-  an allowlisted host.
+  an allowlisted host. Once `st0x.ingress.behindProxy` is on, nginx does not
+  forward these routes, so call the app on the issuer host at
+  `http://localhost:8001`.
 
 ## Request shape
 

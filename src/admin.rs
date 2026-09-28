@@ -8973,12 +8973,8 @@ mod tests {
         assert_eq!(summary.tx_id, Some(TxId::Hash(sendable_tx.hash)));
     }
 
-    fn admin_test_config() -> Config {
-        crate::test_utils::test_config().unwrap()
-    }
-
     fn health_config(vault_mode_config: VaultModeConfig) -> Config {
-        Config { vault_mode_config, ..admin_test_config() }
+        Config { vault_mode_config, ..test_config() }
     }
 
     async fn seed_enabled_asset(
@@ -9487,7 +9483,7 @@ mod tests {
                 pool.clone(), ()
             ))));
         rocket::build()
-            .manage(admin_test_config())
+            .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool.clone())
             .manage(mint_store)

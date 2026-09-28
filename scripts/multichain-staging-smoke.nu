@@ -258,6 +258,7 @@ Commands:
 
 Environment:
   ISSUER_BASE_URL           default http://localhost:8000
+                            (use http://localhost:8001 once behindProxy is on)
   ISSUER_API_KEY            required
   STAGING_UNDERLYING        required approved canary symbol
   STAGING_TOKEN             required approved canary token symbol
