@@ -12,7 +12,13 @@ permissions:
   contents: read
 
 jobs:
+  # The droplet path retires when the GCP production path is on: with the
+  # variable set, release-tag.yml and production-release.yml deploy
+  # production, and a dispatch here from an old runbook must not start a
+  # second production bot on the droplet with the same wallets and broker
+  # credentials.
   deploy:
+    if: vars.PRODUCTION_RELEASES_ENABLED != 'true'
     environment: production
     concurrency:
       group: deploy-prod

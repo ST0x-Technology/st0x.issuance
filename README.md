@@ -434,12 +434,17 @@ Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
   `production-release.yml`'s dispatch with a version is a rollback. All of
   these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
 - Tags on commits older than this release path run the old `release-tag.yml`
-  and only label; deploy them with the rollback dispatch. Queued production
-  runs are kept, but a queued run fails at the PAM step while the previous
-  release's grant is still ACTIVE (the releaser can only warn on a failed
-  revoke); revoke it in the console and re-run. After a PAM timeout, start
-  a fresh run rather than re-running the failed job: a re-run skips the
-  preflight that checks the config is still current.
+  and only label; deploy them with the rollback dispatch. Every production
+  release leaves its PAM grant ACTIVE for up to an hour: the releaser has no
+  right to revoke it, so the revoke step only warns. The next release inside
+  that hour (a queued run included) fails at "Await PAM approval" until
+  someone revokes the grant in the GCP console; that is the normal case, not
+  an error, until devops grants the releaser `grants.revoke` on
+  `app-deploy`. After a PAM timeout, start a fresh run rather than
+  re-running the failed job: a re-run skips the preflight that checks the
+  config is still current. Setting `PRODUCTION_RELEASES_ENABLED` also
+  retires the droplet path: `deploy-prod.yaml` refuses to run while it is
+  `true`.
 
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy
