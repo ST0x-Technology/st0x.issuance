@@ -26,6 +26,10 @@ on:
 concurrency:
   group: production-release
   cancel-in-progress: false
+  # Keep every queued production run (default keeps one pending run and
+  # cancels it when another arrives): a config-only run must never discard
+  # a pending tag deployment.
+  queue: max
 
 jobs:
   release:
