@@ -18,9 +18,9 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::{
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::bindings::ST0xOrchestrator;
 use st0x_issuance::receipt_inventory::migration::{
-    CorroboratedRecipient, MigrationOutcome, RecipientKind, VaultIdentity,
-    confirm_custody_holder, migrate_vault_receipts, recorded_custody_holder,
-    recorded_migration_origin,
+    CorroboratedRecipient, CustodyAfterMove, MigrationOutcome, RecipientKind,
+    VaultIdentity, confirm_custody_holder, migrate_vault_receipts,
+    recorded_custody_holder, recorded_migration_origin, tracked_receipt_count,
 };
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::tokenized_asset::UnderlyingSymbol;
@@ -126,6 +126,39 @@ async fn wait_for_discovered_receipts(
     pool.close().await;
     Err(format!("fewer than {minimum} receipts ever entered the inventory")
         .into())
+}
+
+/// Waits until the vault's inventory tracks exactly `expected` receipts with a
+/// balance, while the service runs. Startup reconciliation and the backfiller
+/// run in the background after launch, so reading once would race them.
+async fn wait_for_tracked_receipts(
+    database_url: &str,
+    chain_id: u64,
+    vault: Address,
+    expected: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
+
+    let mut tracked = usize::MAX;
+    for _ in 0..100 {
+        tracked = tracked_receipt_count(&pool, chain_id, vault).await?;
+        if tracked == expected {
+            pool.close().await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    pool.close().await;
+    Err(format!(
+        "inventory never tracked exactly {expected} receipt(s); last read \
+         {tracked}"
+    )
+    .into())
 }
 
 /// Waits until the running service has settled a redemption's burn
@@ -395,15 +428,27 @@ async fn run_custody_migration(
     .await?;
     // No bootstrap call is allowed here: success proves production startup
     // reconciliation already recorded the outgoing holder.
-    let outcome =
-        migrate_vault_receipts(&pool, provider, identity, incoming).await?;
+    let outcome = migrate_vault_receipts(
+        &pool,
+        provider,
+        identity,
+        incoming,
+        CustodyAfterMove::FollowsReceipts,
+    )
+    .await?;
     assert!(
         matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
         "the migration must report moving receipts, got {outcome:?}"
     );
 
-    let rerun =
-        migrate_vault_receipts(&pool, provider, identity, incoming).await?;
+    let rerun = migrate_vault_receipts(
+        &pool,
+        provider,
+        identity,
+        incoming,
+        CustodyAfterMove::FollowsReceipts,
+    )
+    .await?;
     assert!(
         matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
         "re-running a completed migration must be a no-op, got {rerun:?}"
@@ -810,6 +855,7 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
             incoming_wallet,
         )
         .await?,
+        CustodyAfterMove::FollowsReceipts,
     )
     .await?;
     assert!(
@@ -846,6 +892,7 @@ async fn test_receipt_custody_can_be_rolled_back_to_the_outgoing_wallet()
             derived_destination,
         )
         .await?,
+        CustodyAfterMove::FollowsReceipts,
     )
     .await?;
 
@@ -1271,15 +1318,64 @@ async fn test_holder_rotation_without_receipt_transfer_cannot_burn_historical_sh
     Ok(())
 }
 
-/// Proves the cutover's receipt move end to end against a REAL orchestrator
-/// (RAI-1681): the destination is corroborated as an ERC-1155-receiving
-/// contract via its own ERC-165 answers, the engine moves the receipts, the
-/// orchestrator's burn pointer covers the transferred id (so the burn walk
-/// can reach it without any manual `setBurnIndex`), the recorded origin
-/// supports a later rollback, a re-run submits nothing — and the service
-/// then starts cleanly against the migrated store with its custody record
-/// intact (the expected-elsewhere reconciliation skip, until RAI-1223
-/// retires the subsystem).
+/// The cutover records no custody change, on the first run or a re-run: the
+/// orchestrator owns the receipts now, so custody stays at the bot wallet and
+/// no migration is on record. A re-run still reports the completed move.
+async fn assert_cutover_records_no_custody<
+    P: Provider + Clone + Send + Sync,
+>(
+    pool: &sqlx::SqlitePool,
+    provider: P,
+    identity: VaultIdentity<'_>,
+    destination: CorroboratedRecipient,
+    chain_id: u64,
+    vault: Address,
+    bot_wallet: Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        recorded_custody_holder(pool, chain_id, vault).await?,
+        bot_wallet,
+        "the cutover must leave custody recorded at the bot wallet"
+    );
+    assert!(
+        recorded_migration_origin(pool, chain_id, vault).await.is_err(),
+        "the cutover must not record a custody migration"
+    );
+
+    let rerun = migrate_vault_receipts(
+        pool,
+        provider,
+        identity,
+        destination,
+        CustodyAfterMove::StaysWithHolder,
+    )
+    .await?;
+    assert!(
+        matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
+        "re-running a completed move must submit nothing, got {rerun:?}"
+    );
+    assert!(
+        recorded_migration_origin(pool, chain_id, vault).await.is_err(),
+        "the re-run must not record a custody migration either"
+    );
+
+    Ok(())
+}
+
+/// Proves the cutover's receipt move and its rollback end to end against a
+/// REAL orchestrator (RAI-1681): the destination is corroborated as an
+/// ERC-1155-receiving contract via its own ERC-165 answers, the engine moves
+/// the receipts, and the orchestrator's burn pointer covers the transferred
+/// id (so the burn walk can reach it without any manual `setBurnIndex`).
+///
+/// The cutover leaves custody recorded at the bot wallet: the orchestrator
+/// owns the receipts now, so the bot tracks nothing. On restart the moved
+/// receipt leaves inventory because the bot wallet reads zero for it. The
+/// asset then operates in orchestrator mode (one mint, one partial burn), and
+/// inventory stays empty. The rollback needs no custody step: `withdrawReceipt`
+/// returns every receipt the orchestrator holds, at fresh amounts, as plain
+/// transfers, and the next start rediscovers them at their on-chain balances
+/// (SPEC "Receipt custody").
 #[tokio::test]
 async fn test_receipt_custody_migrates_into_the_orchestrator()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1376,8 +1472,14 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
         "the orchestrator must corroborate as an ERC-1155-receiving contract"
     );
 
-    let outcome =
-        migrate_vault_receipts(&pool, &provider, identity, destination).await?;
+    let outcome = migrate_vault_receipts(
+        &pool,
+        &provider,
+        identity,
+        destination,
+        CustodyAfterMove::StaysWithHolder,
+    )
+    .await?;
     assert!(
         matches!(outcome, MigrationOutcome::Migrated { receipts, .. } if receipts > 0),
         "the migration must move receipts into the orchestrator, got \
@@ -1407,31 +1509,30 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
          receipt ({receipt_id})"
     );
 
-    // The rollback origin derives from the recorded migration, not a typed
-    // address — an EMERGENCY_ROLE withdrawReceipt would return receipts
-    // here.
-    assert_eq!(
-        recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
-            .await?,
+    assert_cutover_records_no_custody(
+        &pool,
+        &provider,
+        identity,
+        destination,
+        evm.chain_id,
+        evm.vault_address,
         bot_wallet,
-        "the recorded origin must support a rollback to the bot wallet"
-    );
-
-    let rerun =
-        migrate_vault_receipts(&pool, &provider, identity, destination).await?;
-    assert!(
-        matches!(rerun, MigrationOutcome::AlreadyMigrated { receipts } if receipts > 0),
-        "re-running a completed move must submit nothing, got {rerun:?}"
-    );
+    )
+    .await?;
 
     pool.close().await;
 
-    // The service starts cleanly on the migrated store: startup
-    // reconciliation skips the vault whose custody a recorded migration
-    // moved away (asserted at the log level in the reconciler's unit tests;
-    // here the whole production startup path runs against the real store)
-    // and the custody record survives untouched.
+    // The service starts cleanly on the migrated store, and the moved
+    // receipt leaves inventory: the bot wallet reads zero for it, which is
+    // the truth — the bot owns nothing now.
     let client = start_service(config.clone()).await?;
+    wait_for_tracked_receipts(
+        &databases.outgoing_url,
+        evm.chain_id,
+        evm.vault_address,
+        0,
+    )
+    .await?;
     client.terminate().await;
 
     let pool = SqlitePoolOptions::new()
@@ -1439,10 +1540,9 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
         .connect(&databases.outgoing_url)
         .await?;
     assert_eq!(
-        recorded_migration_origin(&pool, evm.chain_id, evm.vault_address)
-            .await?,
+        recorded_custody_holder(&pool, evm.chain_id, evm.vault_address).await?,
         bot_wallet,
-        "post-migration startup must not clobber the recorded custody"
+        "startup must not move the recorded custody"
     );
     pool.close().await;
 
@@ -1453,10 +1553,143 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
          untouched"
     );
 
-    // The rollback leg: an EMERGENCY_ROLE withdrawReceipt returns the
-    // receipts to the bot wallet, and confirm-custody re-records the holder
-    // so reconciliation resumes — the documented recovery a cutover
-    // rollback depends on.
+    // Operate in orchestrator mode before rolling back, as the pilot does.
+    // Nothing the orchestrator does puts a receipt at the bot wallet, so a
+    // start after operating (whose backfill and reconciliation finish before
+    // it returns) must leave inventory empty.
+    let minted_receipt_id = operate_in_orchestrator_mode(
+        &evm,
+        &provider,
+        orchestrator_address,
+        receipt_id,
+        receipt_shares,
+    )
+    .await?;
+    let client = start_service(config.clone()).await?;
+    client.terminate().await;
+    wait_for_tracked_receipts(
+        &databases.outgoing_url,
+        evm.chain_id,
+        evm.vault_address,
+        0,
+    )
+    .await?;
+
+    // The rollback leg (runbook step 14): an EMERGENCY_ROLE withdrawReceipt
+    // returns every receipt as a plain transfer, the migrated one and the
+    // one minted since the cutover, and the next start rediscovers them. No
+    // custody step is needed.
+    let returned = withdraw_every_orchestrator_receipt(
+        &provider,
+        evm.vault_address,
+        orchestrator_address,
+        bot_wallet,
+    )
+    .await?;
+    assert_eq!(
+        returned, 2,
+        "the rollback must return the migrated receipt and receipt \
+         {minted_receipt_id} minted since the cutover"
+    );
+
+    let client = start_service(config).await?;
+    wait_for_tracked_receipts(
+        &databases.outgoing_url,
+        evm.chain_id,
+        evm.vault_address,
+        2,
+    )
+    .await?;
+    client.terminate().await;
+
+    assert_rollback_tracks_returned_balances(
+        &databases.outgoing_url,
+        &provider,
+        identity,
+        evm.chain_id,
+        evm.vault_address,
+        bot_wallet,
+    )
+    .await
+}
+
+/// Runs the asset in orchestrator mode between the cutover and the rollback,
+/// as the pilot does (runbook step 13). One orchestrator mint adds a receipt
+/// the bot never tracked. One orchestrator burn drains part of the lowest
+/// (migrated) receipt, so its pre-move snapshot amount is stale. Returns the
+/// minted receipt's id.
+async fn operate_in_orchestrator_mode<P: Provider>(
+    evm: &LocalEvm,
+    provider: &P,
+    orchestrator_address: Address,
+    migrated_receipt_id: U256,
+    snapshot_shares: U256,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    let vault =
+        OffchainAssetReceiptVaultInstance::new(evm.vault_address, provider);
+    let receipt_contract: Address = vault.receipt().call().await?.0.into();
+    let receipt = ReceiptInstance::new(receipt_contract, provider);
+
+    let minted_shares = U256::from(5) * U256::from(10).pow(U256::from(18));
+    harness::orchestrator_mint_to(
+        evm,
+        orchestrator_address,
+        &PrivateKeySigner::random(),
+        minted_shares,
+        B256::with_last_byte(1),
+    )
+    .await?;
+    let minted_receipt_id = vault.highwaterId().call().await?;
+    assert!(
+        minted_receipt_id > migrated_receipt_id,
+        "the orchestrator mint must create a new receipt id"
+    );
+    assert_eq!(
+        receipt
+            .balanceOf(orchestrator_address, minted_receipt_id)
+            .call()
+            .await?,
+        minted_shares,
+        "the orchestrator must own the receipt of its own mint"
+    );
+
+    // The bot burns part of the shares its pre-cutover deposit gave it.
+    let burned_shares = U256::from(10) * U256::from(10).pow(U256::from(18));
+    harness::approve_orchestrator(evm, orchestrator_address).await?;
+    ST0xOrchestrator::new(orchestrator_address, provider)
+        .burn(evm.vault_address, burned_shares, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    assert_eq!(
+        receipt
+            .balanceOf(orchestrator_address, migrated_receipt_id)
+            .call()
+            .await?,
+        snapshot_shares - burned_shares,
+        "the burn must drain the lowest (migrated) receipt first"
+    );
+
+    Ok(minted_receipt_id)
+}
+
+/// The runbook's rollback steps 4 and 5 against the real orchestrator, with
+/// the bot wallet as the `EMERGENCY_ROLE` holder: withdraw every id in
+/// `1..=highwaterId()` the orchestrator holds, each at a balance read just
+/// before its withdrawal (never the pre-move snapshot), then prove the
+/// orchestrator holds nothing for the token. Returns how many receipts came
+/// back.
+async fn withdraw_every_orchestrator_receipt<P: Provider>(
+    provider: &P,
+    vault_address: Address,
+    orchestrator_address: Address,
+    bot_wallet: Address,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let vault = OffchainAssetReceiptVaultInstance::new(vault_address, provider);
+    let receipt_contract: Address = vault.receipt().call().await?.0.into();
+    let receipt = ReceiptInstance::new(receipt_contract, provider);
+    let orchestrator = ST0xOrchestrator::new(orchestrator_address, provider);
     let emergency_role = orchestrator.EMERGENCY_ROLE().call().await?;
     orchestrator
         .grantRole(emergency_role, bot_wallet)
@@ -1464,52 +1697,85 @@ async fn test_receipt_custody_migrates_into_the_orchestrator()
         .await?
         .get_receipt()
         .await?;
-    orchestrator
-        .withdrawReceipt(
-            evm.vault_address,
-            receipt_id,
-            receipt_shares,
-            bot_wallet,
-        )
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
 
-    assert_eq!(
-        receipt.balanceOf(bot_wallet, receipt_id).call().await?,
-        receipt_shares,
-        "the emergency withdrawal must return the receipt to the bot wallet"
-    );
-    assert_eq!(
-        receipt.balanceOf(orchestrator_address, receipt_id).call().await?,
-        U256::ZERO,
-        "the orchestrator must retain nothing after the withdrawal"
-    );
+    let highwater = u64::try_from(vault.highwaterId().call().await?)?;
+    let receipt_ids: Vec<U256> = (1..=highwater).map(U256::from).collect();
 
+    let mut returned = 0;
+    for receipt_id in &receipt_ids {
+        let amount =
+            receipt.balanceOf(orchestrator_address, *receipt_id).call().await?;
+        if amount.is_zero() {
+            continue;
+        }
+
+        let before = receipt.balanceOf(bot_wallet, *receipt_id).call().await?;
+        orchestrator
+            .withdrawReceipt(vault_address, *receipt_id, amount, bot_wallet)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        assert_eq!(
+            receipt.balanceOf(bot_wallet, *receipt_id).call().await? - before,
+            amount,
+            "the bot wallet must gain exactly the withdrawn amount of receipt \
+             {receipt_id}"
+        );
+        returned += 1;
+    }
+
+    for receipt_id in &receipt_ids {
+        assert_eq!(
+            receipt.balanceOf(orchestrator_address, *receipt_id).call().await?,
+            U256::ZERO,
+            "the orchestrator must hold nothing of receipt {receipt_id}"
+        );
+    }
+
+    Ok(returned)
+}
+
+/// The runbook's rollback step 6: custody never left the bot wallet, and
+/// inventory tracks every returned receipt at exactly the bot wallet's
+/// on-chain balance. Custody is read first, because `confirm_custody_holder`
+/// records the bot wallet as holder and would hide a displaced record. It
+/// then serves only as the exact balance check: it refuses on the first
+/// tracked balance that differs from the chain.
+async fn assert_rollback_tracks_returned_balances<P>(
+    database_url: &str,
+    provider: &P,
+    identity: VaultIdentity<'_>,
+    chain_id: u64,
+    vault: Address,
+    bot_wallet: Address,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    P: Provider + Clone + Send + Sync,
+{
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&databases.outgoing_url)
+        .connect(database_url)
         .await?;
-    let confirmed =
-        confirm_custody_holder(&pool, &provider, identity, bot_wallet).await?;
     assert_eq!(
-        confirmed, 1,
-        "re-confirmation must verify and record the returned receipt"
-    );
-    // The count above only proves verified balances; the persisted custody
-    // holder is the fact reconciliation actually reads.
-    assert_eq!(
-        recorded_custody_holder(&pool, evm.chain_id, evm.vault_address).await?,
+        recorded_custody_holder(&pool, chain_id, vault).await?,
         bot_wallet,
-        "re-confirmation must record the bot wallet as the current holder"
+        "custody must still be recorded at the bot wallet after the rollback"
+    );
+    assert!(
+        recorded_migration_origin(&pool, chain_id, vault).await.is_err(),
+        "no custody migration may be recorded across cutover and rollback"
+    );
+
+    let verified =
+        confirm_custody_holder(&pool, provider.clone(), identity, bot_wallet)
+            .await?;
+    assert_eq!(
+        verified, 2,
+        "inventory must track both returned receipts at their on-chain \
+         balances"
     );
     pool.close().await;
-
-    // With custody re-recorded at the signing wallet, the service resumes
-    // ordinary reconciliation on the same store.
-    let client = start_service(config).await?;
-    client.terminate().await;
 
     Ok(())
 }
@@ -1538,8 +1804,8 @@ struct ChunkedMigrationStage<'a, P: Provider> {
 
 impl<P: Provider> ChunkedMigrationStage<'_, P> {
     /// Phase 1: the full move must cross the bound as multiple bounded batch
-    /// transactions, each verified before the next, recording custody once —
-    /// and a re-run must report `AlreadyMigrated`.
+    /// transactions, each verified before the next, leaving custody recorded
+    /// at the bot wallet — and a re-run must report `AlreadyMigrated`.
     async fn full_move_lands_in_bounded_batches(
         &self,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1548,6 +1814,7 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
             self.provider,
             self.identity,
             self.destination,
+            CustodyAfterMove::StaysWithHolder,
         )
         .await?;
         assert!(
@@ -1585,16 +1852,10 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
                 "the bot wallet must retain nothing of receipt {receipt_id}"
             );
         }
-        assert_eq!(
-            recorded_migration_origin(
-                self.pool,
-                self.chain_id,
-                self.vault_address,
-            )
-            .await?,
-            self.bot_wallet,
-            "custody must be recorded once, with the bot wallet as origin"
-        );
+        self.assert_custody_stays_at_bot_wallet(
+            "the cutover must leave custody recorded at the bot wallet",
+        )
+        .await?;
 
         self.assert_rerun_reports_already_migrated(
             "re-running the completed move must submit nothing",
@@ -1602,10 +1863,10 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
         .await
     }
 
-    /// Phase 2: return every receipt (the rollback leg) and re-confirm
-    /// custody at the bot wallet, restoring the pre-migration state for the
-    /// interrupted-run phase.
-    async fn rollback_and_reconfirm_custody(
+    /// Phase 2: return every receipt (the rollback leg), restoring the
+    /// pre-migration state for the interrupted-run phase. Custody never left
+    /// the bot wallet, so no re-confirmation is needed.
+    async fn rollback_returns_every_receipt(
         &self,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let orchestrator =
@@ -1631,31 +1892,22 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
                 .await?;
         }
 
-        let confirmed = confirm_custody_holder(
-            self.pool,
-            self.provider,
-            self.identity,
-            self.bot_wallet,
-        )
-        .await?;
-        assert_eq!(
-            confirmed, CHUNKED_TRACKED_RECEIPTS,
-            "re-confirmation must verify every returned receipt"
-        );
-        // The count above only proves verified balances; the persisted
-        // custody holder is the fact reconciliation actually reads.
-        assert_eq!(
-            recorded_custody_holder(
-                self.pool,
-                self.chain_id,
-                self.vault_address,
-            )
-            .await?,
-            self.bot_wallet,
-            "re-confirmation must record the bot wallet as the current holder"
-        );
+        let receipt =
+            ReceiptInstance::new(self.receipt_contract, self.provider);
+        for receipt_id in self.receipt_ids {
+            assert_eq!(
+                receipt.balanceOf(self.bot_wallet, *receipt_id).call().await?,
+                self.receipt_shares,
+                "the rollback must return receipt {receipt_id} to the bot \
+                 wallet"
+            );
+        }
 
-        Ok(())
+        self.assert_custody_stays_at_bot_wallet(
+            "custody must still be recorded at the bot wallet after the \
+             rollback",
+        )
+        .await
     }
 
     /// Phase 3: fabricate the exact state a crash between chunks leaves —
@@ -1689,6 +1941,7 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
             self.provider,
             self.identity,
             self.destination,
+            CustodyAfterMove::StaysWithHolder,
         )
         .await?;
         assert!(
@@ -1730,6 +1983,35 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
         Ok(())
     }
 
+    /// The orchestrator owns the receipts after the cutover, so custody stays
+    /// recorded at the bot wallet and no migration is on record.
+    async fn assert_custody_stays_at_bot_wallet(
+        &self,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            recorded_custody_holder(
+                self.pool,
+                self.chain_id,
+                self.vault_address,
+            )
+            .await?,
+            self.bot_wallet,
+            "{message}"
+        );
+        assert!(
+            recorded_migration_origin(
+                self.pool,
+                self.chain_id,
+                self.vault_address,
+            )
+            .await
+            .is_err(),
+            "{message}: no custody migration may be recorded"
+        );
+        Ok(())
+    }
+
     async fn assert_rerun_reports_already_migrated(
         &self,
         message: &str,
@@ -1739,6 +2021,7 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
             self.provider,
             self.identity,
             self.destination,
+            CustodyAfterMove::StaysWithHolder,
         )
         .await?;
         assert!(
@@ -1756,8 +2039,8 @@ impl<P: Provider> ChunkedMigrationStage<'_, P> {
 /// RAI-1714: a vault above the proven 14-receipt single-transfer bound
 /// migrates into the orchestrator as a sequence of bounded batch
 /// transactions; a run interrupted between chunks resumes via a plain
-/// re-run, moving only the remainder and recording custody once; a further
-/// re-run reports `AlreadyMigrated` and submits nothing.
+/// re-run, moving only the remainder; custody stays recorded at the bot wallet
+/// throughout; a further re-run reports `AlreadyMigrated` and submits nothing.
 #[tokio::test]
 async fn test_receipt_custody_chunked_migration_resumes_into_the_orchestrator()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1868,7 +2151,7 @@ async fn test_receipt_custody_chunked_migration_resumes_into_the_orchestrator()
     };
 
     stage.full_move_lands_in_bounded_batches().await?;
-    stage.rollback_and_reconfirm_custody().await?;
+    stage.rollback_returns_every_receipt().await?;
     stage.crash_resume_moves_only_remainder().await?;
 
     pool.close().await;

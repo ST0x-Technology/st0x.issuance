@@ -87,9 +87,10 @@ where
             load_inventory(&self.store, self.chain_id, &self.vault).await?;
 
         // A recorded migration moved this vault's custody away from the
-        // signing wallet (receipts sit at the destination — the
-        // orchestrator, during the cutover): readings taken against this
-        // wallet mean nothing and could only be refused as
+        // signing wallet (a wallet rotation: the receipts sit at the new
+        // wallet; the orchestrator cutover records no migration, so it never
+        // lands here): readings taken against this wallet mean nothing and
+        // could only be refused as
         // `CustodyDisplaced` for a state the operator deliberately created.
         // Skipped at INFO until the subsystem retires (RAI-1223). A holder
         // mismatch with NO recorded migration from this wallet is true
@@ -870,10 +871,10 @@ mod tests {
         }
 
         /// After a recorded migration moved custody away (receipts sitting
-        /// in the orchestrator during cutover), zero readings against the
-        /// signing wallet are the EXPECTED state until RAI-1223 retires the
-        /// subsystem — the vault is skipped quietly at INFO instead of
-        /// manufacturing a `CustodyDisplaced` error every pass.
+        /// at a rotated wallet), zero readings against the signing wallet
+        /// are the EXPECTED state until RAI-1223 retires the subsystem — the
+        /// vault is skipped quietly at INFO instead of manufacturing a
+        /// `CustodyDisplaced` error every pass.
         #[traced_test]
         #[tokio::test]
         async fn a_recorded_migration_away_is_skipped_quietly() {
