@@ -1576,7 +1576,9 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
 ///
 /// Exhaustive over [`VaultError`]: new variants must choose uncertain vs
 /// definitive deliberately.
-const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
+pub(super) const fn is_uncertain_confirm_observation(
+    error: &VaultError,
+) -> bool {
     match error {
         VaultError::ConfirmationPending { .. }
         | VaultError::PendingTransaction(_)
