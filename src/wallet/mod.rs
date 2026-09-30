@@ -155,7 +155,12 @@ fn signer_config_from_turnkey(
     kms_api_key: Option<String>,
     address: Option<Address>,
 ) -> Result<SignerConfig, SignerConfigError> {
-    let credentials = match (api_private_key, kms_api_key) {
+    // An exported-but-empty variable (a `KEY=` line left behind during a
+    // credential cutover) counts as unset, not as a second credential.
+    let non_empty =
+        |value: Option<String>| value.filter(|text| !text.is_empty());
+    let credentials = match (non_empty(api_private_key), non_empty(kms_api_key))
+    {
         (Some(key), None) => {
             TurnkeyCredentials::ApiKey(TurnkeyApiPrivateKey::new(key))
         }
@@ -384,6 +389,31 @@ mod tests {
                 Err(SignerConfigError::AmbiguousTurnkeyCredential)
             ),
             "Expected AmbiguousTurnkeyCredential error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn turnkey_empty_api_private_key_is_ignored_next_to_kms() {
+        let config =
+            turnkey_env(Some(""), Some(KMS_KEY)).into_config().unwrap();
+
+        let SignerConfig::Turnkey(turnkey) = config else {
+            panic!("Expected Turnkey config, got {config:?}");
+        };
+        assert!(
+            matches!(turnkey.credentials, TurnkeyCredentials::Kms(_)),
+            "Expected KMS credentials, got {:?}",
+            turnkey.credentials
+        );
+    }
+
+    #[test]
+    fn turnkey_empty_credentials_fail_as_missing() {
+        let result = turnkey_env(Some(""), Some("")).into_config();
+
+        assert!(
+            matches!(result, Err(SignerConfigError::MissingTurnkeyCredential)),
+            "Expected MissingTurnkeyCredential error, got {result:?}"
         );
     }
 
