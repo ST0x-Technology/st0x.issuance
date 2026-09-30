@@ -815,7 +815,7 @@ async fn run_approve_orchestrator(
     }
 
     let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
-    let resolved = resolve_turnkey_signer(&turnkey_config, chain_id)?;
+    let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)

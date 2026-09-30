@@ -33,6 +33,7 @@ use turnkey_client::generated::{
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
+use crate::wallet::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::wallet::{ResolvedSigner, SignerResolveError, WalletKind};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
@@ -65,6 +66,19 @@ impl std::fmt::Debug for TurnkeyApiPrivateKey {
     }
 }
 
+/// Cloud KMS key version (`projects/.../cryptoKeyVersions/N`) whose public
+/// half is registered as the Turnkey API user. Not a secret: it names an
+/// IAM-gated key, it is not a credential itself. See
+/// [`crate::wallet::gcp_kms_stamper`].
+#[derive(Debug, Clone)]
+pub(crate) struct TurnkeyKmsApiKey(String);
+
+impl TurnkeyKmsApiKey {
+    pub const fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Errors specific to the Turnkey signing backend.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnkeyError {
@@ -79,18 +93,21 @@ pub(crate) struct TurnkeySettings {
     pub(crate) organization_id: TurnkeyOrganizationId,
 }
 
-/// Secret Turnkey credential: the P-256 API private key.
-#[derive(Clone, Deserialize)]
-pub(crate) struct TurnkeyCredentials {
-    pub(crate) api_private_key: TurnkeyApiPrivateKey,
+/// How Turnkey requests are authenticated: a stored P-256 API private key
+/// (secret), or a Cloud KMS key that stamps under the runtime's ambient GCP
+/// identity (keyless, nothing secret to store).
+#[derive(Clone)]
+pub(crate) enum TurnkeyCredentials {
+    ApiKey(TurnkeyApiPrivateKey),
+    Kms(TurnkeyKmsApiKey),
 }
 
 impl std::fmt::Debug for TurnkeyCredentials {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TurnkeyCredentials")
-            .field("api_private_key", &"[REDACTED]")
-            .finish()
+        match self {
+            Self::ApiKey(_) => formatter.write_str("ApiKey([REDACTED])"),
+            Self::Kms(key) => formatter.debug_tuple("Kms").field(key).finish(),
+        }
     }
 }
 
@@ -105,7 +122,7 @@ impl std::fmt::Debug for TurnkeyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnkeyConfig")
             .field("organization_id", &self.settings.organization_id)
-            .field("api_private_key", &"[REDACTED]")
+            .field("credentials", &self.credentials)
             .field("address", &self.settings.address)
             .finish_non_exhaustive()
     }
@@ -114,12 +131,12 @@ impl std::fmt::Debug for TurnkeyConfig {
 impl TurnkeyConfig {
     pub(crate) const fn new(
         organization_id: TurnkeyOrganizationId,
-        api_private_key: TurnkeyApiPrivateKey,
+        credentials: TurnkeyCredentials,
         address: Address,
     ) -> Self {
         Self {
             settings: TurnkeySettings { address, organization_id },
-            credentials: TurnkeyCredentials { api_private_key },
+            credentials,
         }
     }
 }
@@ -134,7 +151,8 @@ impl TurnkeyConfig {
 /// # Security
 ///
 /// Private keys never leave Turnkey's secure enclaves. All signing operations are
-/// performed remotely via API calls authenticated with a P-256 API private key.
+/// performed remotely via API calls authenticated with a P-256 API key, either
+/// a stored private key or a Cloud KMS key that never leaves KMS.
 pub(crate) struct TurnkeyWallet {
     // A TurnkeySigner that is wrapped by an alloy `EthereumWallet`
     /// so it can be used by any alloy provider
@@ -156,21 +174,23 @@ impl TurnkeyWallet {
     /// Creates a new `TurnkeyWallet` from a config containing API
     /// credentials, wallet address and chain ID.
     ///
-    /// Constructs a `TurnkeySigner` using the P-256 API private key,
-    /// wraps it in an `EthereumWallet`.
-    pub(crate) fn new(
+    /// Constructs a `TurnkeySigner` from the configured credentials and
+    /// wraps it in an `EthereumWallet`. Async because the KMS stamper
+    /// fetches and checks its public key up front, so a misconfigured key
+    /// fails at startup rather than on the first signature.
+    pub(crate) async fn new(
         config: &TurnkeyConfig,
         chain_id: u64,
     ) -> Result<Self, TurnkeyError> {
         let TurnkeySettings { address, organization_id } =
             config.settings.clone();
-        let TurnkeyCredentials { api_private_key } = &config.credentials;
-        let signer = TracingTurnkeySigner::from_api_key(
-            api_private_key,
+        let signer = TracingTurnkeySigner::from_credentials(
+            &config.credentials,
             organization_id,
             address,
             Some(chain_id),
         )
+        .await
         .map_err(TurnkeyError::from)?;
         let wallet = EthereumWallet::from(signer);
 
@@ -208,17 +228,66 @@ impl From<TurnkeyWallet> for ResolvedSigner {
     }
 }
 
-pub(crate) fn resolve_turnkey_signer(
+pub(crate) async fn resolve_turnkey_signer(
     config: &TurnkeyConfig,
     chain_id: u64,
 ) -> Result<ResolvedSigner, SignerResolveError> {
-    Ok(TurnkeyWallet::new(config, chain_id)?.into())
+    Ok(TurnkeyWallet::new(config, chain_id).await?.into())
+}
+
+/// Produces the `X-Stamp` header for a request body, from a stored API key
+/// or through Cloud KMS.
+enum ApiStamper {
+    Local(TurnkeyP256ApiKey),
+    GcpKms(GcpKmsStamper),
+}
+
+impl std::fmt::Debug for ApiStamper {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(_) => {
+                formatter.write_str("ApiStamper::Local([REDACTED])")
+            }
+            Self::GcpKms(stamper) => formatter
+                .debug_tuple("ApiStamper::GcpKms")
+                .field(stamper)
+                .finish(),
+        }
+    }
+}
+
+impl ApiStamper {
+    async fn from_credentials(
+        credentials: &TurnkeyCredentials,
+    ) -> Result<Self, TracingTurnkeyClientError> {
+        match credentials {
+            TurnkeyCredentials::ApiKey(TurnkeyApiPrivateKey(api_key_hex)) => {
+                Ok(Self::Local(TurnkeyP256ApiKey::from_strings(
+                    api_key_hex,
+                    None,
+                )?))
+            }
+            TurnkeyCredentials::Kms(TurnkeyKmsApiKey(key_version)) => {
+                Ok(Self::GcpKms(GcpKmsStamper::new(key_version.clone()).await?))
+            }
+        }
+    }
+
+    async fn stamp(
+        &self,
+        body: &[u8],
+    ) -> Result<StampHeader, TracingTurnkeyClientError> {
+        match self {
+            Self::Local(api_key) => Ok(api_key.stamp(body)?),
+            Self::GcpKms(stamper) => Ok(stamper.stamp(body).await?),
+        }
+    }
 }
 
 struct TracingTurnkeyClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: TurnkeyP256ApiKey,
+    stamper: ApiStamper,
     retry_config: RetryConfig,
 }
 
@@ -233,6 +302,8 @@ pub enum TracingTurnkeyClientError {
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     Stamper(#[from] StamperError),
+    #[error(transparent)]
+    KmsStamper(#[from] GcpKmsStamperError),
     #[error("Turnkey returned an unexpected activity result kind: {kind:?}")]
     UnexpectedInnerActivityResult { kind: Discriminant<result::Inner> },
     #[error(
@@ -260,11 +331,10 @@ impl std::fmt::Debug for TracingTurnkeyClient {
 }
 
 impl TracingTurnkeyClient {
-    fn from_api_key(
-        api_private_key: &TurnkeyApiPrivateKey,
+    async fn from_credentials(
+        credentials: &TurnkeyCredentials,
     ) -> Result<Self, TracingTurnkeyClientError> {
-        let TurnkeyApiPrivateKey(api_key_hex) = api_private_key;
-        let api_key = TurnkeyP256ApiKey::from_strings(api_key_hex, None)?;
+        let stamper = ApiStamper::from_credentials(credentials).await?;
         Ok(Self::new(
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -272,7 +342,7 @@ impl TracingTurnkeyClient {
                 .build()
                 .map_err(TurnkeyClientError::ReqwestBuilder)?,
             "https://api.turnkey.com".to_string(),
-            api_key,
+            stamper,
             RetryConfig::default(),
         ))
     }
@@ -289,7 +359,7 @@ impl TracingTurnkeyClient {
                 .build()
                 .map_err(TurnkeyClientError::ReqwestBuilder)?,
             base_url,
-            api_key,
+            ApiStamper::Local(api_key),
             RetryConfig::default(),
         ))
     }
@@ -297,10 +367,10 @@ impl TracingTurnkeyClient {
     const fn new(
         http: reqwest::Client,
         base_url: String,
-        api_key: TurnkeyP256ApiKey,
+        stamper: ApiStamper,
         retry_config: RetryConfig,
     ) -> Self {
-        Self { http, base_url, api_key, retry_config }
+        Self { http, base_url, stamper, retry_config }
     }
 
     fn current_timestamp() -> Result<u128, TracingTurnkeySignerError> {
@@ -420,7 +490,7 @@ impl TracingTurnkeyClient {
         let url = format!("{}{}", self.base_url, path);
         let post_body = serde_json::to_string(request)?;
         let StampHeader { name, value } =
-            self.api_key.stamp(post_body.as_bytes())?;
+            self.stamper.stamp(post_body.as_bytes()).await?;
         let response = self
             .http
             .post(&url)
@@ -548,13 +618,14 @@ impl TracingTurnkeySigner {
         Self { client, organization_id, address, chain_id }
     }
 
-    fn from_api_key(
-        api_private_key: &TurnkeyApiPrivateKey,
+    async fn from_credentials(
+        credentials: &TurnkeyCredentials,
         organization_id: TurnkeyOrganizationId,
         address: Address,
         chain_id: Option<ChainId>,
     ) -> Result<Self, TracingTurnkeySignerError> {
-        let client = TracingTurnkeyClient::from_api_key(api_private_key)?;
+        let client =
+            TracingTurnkeyClient::from_credentials(credentials).await?;
         Ok(Self::new(client, organization_id, address, chain_id))
     }
 
@@ -707,7 +778,7 @@ mod tests {
                 .build()
                 .unwrap(),
             server.base_url(),
-            test_api_key(),
+            ApiStamper::Local(test_api_key()),
             retry_config,
         )
     }
@@ -1374,12 +1445,13 @@ mod tests {
                     address,
                     organization_id: TurnkeyOrganizationId::new(org_id),
                 },
-                credentials: TurnkeyCredentials {
-                    api_private_key: TurnkeyApiPrivateKey::new(api_key),
-                },
+                credentials: TurnkeyCredentials::ApiKey(
+                    TurnkeyApiPrivateKey::new(api_key),
+                ),
             },
             anvil.chain_id(),
         )
+        .await
         .expect("failed to construct TurnkeyWallet from env vars");
         let provider = ProviderBuilder::new()
             .wallet(wallet.wallet)

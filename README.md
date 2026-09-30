@@ -446,6 +446,12 @@ Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
   retires the droplet path: `deploy-prod.yaml` refuses to run while it is
   `true`.
 
+The GCP deployments authenticate to Turnkey without a stored key:
+`TURNKEY_KMS_API_KEY` names a Cloud KMS P-256 key whose public half is the
+Turnkey API user, and the bot stamps each request through KMS under the VM's
+own identity (`src/wallet/gcp_kms_stamper.rs`). `TURNKEY_API_PRIVATE_KEY`
+remains for local and droplet use; set exactly one of the two.
+
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy
 unvalidated until it grows a config-only mode (boot is the gate).

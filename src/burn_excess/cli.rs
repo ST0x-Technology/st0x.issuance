@@ -195,7 +195,7 @@ async fn run_burn_excess_request(
     let resolved = match signer_config {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
         SignerConfig::Turnkey(config) => {
-            resolve_turnkey_signer(config, chain_id)?
+            resolve_turnkey_signer(config, chain_id).await?
         }
     };
 

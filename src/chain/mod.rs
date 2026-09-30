@@ -297,7 +297,9 @@ async fn build_chain_runtime(
 
     let resolved = match signer {
         SignerConfig::Local(key) => resolve_local_signer(key, chain_id)?,
-        SignerConfig::Turnkey(env) => resolve_turnkey_signer(env, chain_id)?,
+        SignerConfig::Turnkey(env) => {
+            resolve_turnkey_signer(env, chain_id).await?
+        }
     };
     info!(
         target: "startup",
