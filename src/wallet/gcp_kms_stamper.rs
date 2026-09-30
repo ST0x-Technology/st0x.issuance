@@ -33,6 +33,8 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 use tracing::info;
 use turnkey_api_key_stamper::StampHeader;
 
@@ -48,6 +50,10 @@ const METADATA_TOKEN_URL: &str = "http://metadata.google.internal/computeMetadat
 /// The algorithm the KMS key version must carry: ECDSA on P-256 over a
 /// SHA-256 digest, exactly what a Turnkey P-256 API-key stamp is.
 const REQUIRED_ALGORITHM: &str = "EC_SIGN_P256_SHA256";
+
+/// A cached metadata-server token is refreshed this long before it
+/// expires, so no request goes out with a token about to lapse.
+const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
 /// Errors from constructing or using the KMS stamper. HTTP error bodies
 /// are included only for non-2xx responses (Google error JSON, no
@@ -103,6 +109,13 @@ struct TurnkeyApiStamp {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+struct CachedToken {
+    token: String,
+    refresh_at: Instant,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +152,7 @@ pub struct GcpKmsStamper {
     /// in every stamp, and used to verify KMS's signatures before use.
     public_key_hex: String,
     verifying_key: VerifyingKey,
+    cached_token: Mutex<Option<CachedToken>>,
 }
 
 impl std::fmt::Debug for GcpKmsStamper {
@@ -174,7 +188,9 @@ impl GcpKmsStamper {
             .user_agent("st0x-turnkey-kms-stamper")
             .build()?;
 
-        let token = Self::access_token(&http, &token_source).await?;
+        let cached_token = Mutex::new(None);
+        let token =
+            Self::access_token(&http, &token_source, &cached_token).await?;
         let url = format!("{kms_base_url}/{key_version}/publicKey");
         let response = http.get(&url).bearer_auth(&token).send().await?;
         let status = response.status();
@@ -212,12 +228,16 @@ impl GcpKmsStamper {
             key_version,
             public_key_hex,
             verifying_key,
+            cached_token,
         })
     }
 
+    /// Metadata-server tokens last about an hour, so they are cached and
+    /// reused until `TOKEN_EXPIRY_MARGIN` before expiry.
     async fn access_token(
         http: &reqwest::Client,
         source: &AccessTokenSource,
+        cache: &Mutex<Option<CachedToken>>,
     ) -> Result<String, GcpKmsStamperError> {
         let token_url = match source {
             AccessTokenSource::Ambient => {
@@ -236,6 +256,13 @@ impl GcpKmsStamper {
             AccessTokenSource::Endpoint(url) => url.as_str(),
         };
 
+        let mut cached = cache.lock().await;
+        if let Some(CachedToken { token, refresh_at }) = cached.as_ref()
+            && Instant::now() < *refresh_at
+        {
+            return Ok(token.clone());
+        }
+
         let response = http
             .get(token_url)
             .header("Metadata-Flavor", "Google")
@@ -247,7 +274,15 @@ impl GcpKmsStamper {
                 status: status.as_u16(),
             });
         }
-        let TokenResponse { access_token } = response.json().await?;
+        let TokenResponse { access_token, expires_in } =
+            response.json().await?;
+        *cached = Some(CachedToken {
+            token: access_token.clone(),
+            refresh_at: Instant::now()
+                + Duration::from_secs(expires_in)
+                    .saturating_sub(TOKEN_EXPIRY_MARGIN),
+        });
+        drop(cached);
         Ok(access_token)
     }
 
@@ -261,7 +296,12 @@ impl GcpKmsStamper {
         let digest = Sha256::digest(body);
         let digest_b64 = BASE64_STANDARD.encode(digest);
 
-        let token = Self::access_token(&self.http, &self.token_source).await?;
+        let token = Self::access_token(
+            &self.http,
+            &self.token_source,
+            &self.cached_token,
+        )
+        .await?;
         let url = format!(
             "{}/{}:asymmetricSign",
             self.kms_base_url, self.key_version
@@ -294,6 +334,9 @@ impl GcpKmsStamper {
             .verify(body, &parsed)
             .map_err(|_| GcpKmsStamperError::SignatureVerification)?;
 
+        // KMS does not normalize S, so about half of these signatures are
+        // high-S. They are sent as-is: Turnkey accepts them, as the
+        // liquidity bot's identical KMS stamper has shown in production.
         let stamp = TurnkeyApiStamp {
             public_key: self.public_key_hex.clone(),
             signature: hex::encode(&der),
@@ -331,13 +374,14 @@ mod tests {
             .expect("PEM encoding of a valid P-256 key cannot fail")
     }
 
-    /// Mocks the token endpoint plus KMS publicKey GET for `key`.
-    fn mock_key_endpoints(
-        server: &MockServer,
+    /// Mocks the token endpoint plus KMS publicKey GET for `key`, and
+    /// returns the token endpoint's mock.
+    fn mock_key_endpoints<'a>(
+        server: &'a MockServer,
         key: &SigningKey,
         algorithm: &str,
-    ) {
-        server.mock(|when, then| {
+    ) -> httpmock::Mock<'a> {
+        let token_mock = server.mock(|when, then| {
             when.method("GET").path("/token");
             then.status(200)
                 .header("Content-Type", "application/json")
@@ -356,6 +400,7 @@ mod tests {
                     "algorithm": algorithm,
                 }));
         });
+        token_mock
     }
 
     async fn stamper_for(server: &MockServer) -> GcpKmsStamper {
@@ -378,12 +423,22 @@ mod tests {
         stamped_body: &[u8],
         signed_body: &[u8],
     ) {
-        let expected_digest =
-            BASE64_STANDARD.encode(Sha256::digest(stamped_body));
         let digest = Sha256::digest(signed_body);
         let signature: P256Signature = key
             .sign_prehash(&digest)
             .expect("signing a 32-byte digest with a valid key cannot fail");
+        mock_sign_response(server, stamped_body, &signature);
+    }
+
+    /// Mocks the asymmetricSign endpoint to return `signature` for the
+    /// digest of `stamped_body`.
+    fn mock_sign_response(
+        server: &MockServer,
+        stamped_body: &[u8],
+        signature: &P256Signature,
+    ) {
+        let expected_digest =
+            BASE64_STANDARD.encode(Sha256::digest(stamped_body));
         server.mock(|when, then| {
             when.method("POST")
                 .path(format!("/{KEY_VERSION}:asymmetricSign"))
@@ -458,6 +513,56 @@ mod tests {
             .expect_err("mismatched signature must be refused");
 
         assert!(matches!(error, GcpKmsStamperError::SignatureVerification));
+    }
+
+    #[tokio::test]
+    async fn stamp_passes_high_s_signature_through_unchanged() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+
+        // RustCrypto always signs low-S; KMS does not. Negate S to get
+        // the high-S twin of a valid signature, as KMS returns about half
+        // the time.
+        let body = b"high-s body";
+        let low_s: P256Signature = key
+            .sign_prehash(&Sha256::digest(body))
+            .expect("signing a 32-byte digest with a valid key cannot fail");
+        let (r, s) = low_s.split_scalars();
+        let high_s =
+            P256Signature::from_scalars(r.to_bytes(), (-*s).to_bytes())
+                .expect("negated S is a valid nonzero scalar");
+        assert!(high_s.normalize_s().is_some(), "signature must be high-S");
+        mock_sign_response(&server, body, &high_s);
+
+        let stamper = stamper_for(&server).await;
+        let StampHeader { value, .. } = stamper
+            .stamp(body)
+            .await
+            .expect("a high-S KMS signature must be stamped");
+
+        let decoded = BASE64_URL_SAFE_NO_PAD
+            .decode(value)
+            .expect("stamp value must be base64url");
+        let stamp: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("stamp must be JSON");
+        assert_eq!(stamp["signature"], hex::encode(high_s.to_der()));
+    }
+
+    #[tokio::test]
+    async fn access_token_is_reused_across_stamps() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+
+        let body = b"cached token body";
+        mock_sign_endpoint(&server, &key, body, body);
+
+        let stamper = stamper_for(&server).await;
+        stamper.stamp(body).await.expect("first stamp should succeed");
+        stamper.stamp(body).await.expect("second stamp should succeed");
+
+        token_mock.assert_calls(1);
     }
 
     #[tokio::test]
