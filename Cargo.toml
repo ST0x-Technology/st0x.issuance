@@ -94,9 +94,10 @@ rustls = { version = "0.23.40", default-features = false, features = [
   "aws_lc_rs",
   "std",
 ] }
-st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false, features = [
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", version = "0.2.0", default-features = false, features = [
+  "corporate-actions",
   "issuer",
-] }
+], rev = "e83968031bf5b640a7c0f1e8e35596cff2bf38fe" }
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.3.0", version = "0.3.0", default-features = false }
 
 [dev-dependencies]
@@ -108,9 +109,10 @@ event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", 
 httpmock = { workspace = true }
 proptest = "1.10.0"
 rust_decimal_macros = "1.40.0"
-st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false, features = [
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "e83968031bf5b640a7c0f1e8e35596cff2bf38fe", version = "0.2.0", default-features = false, features = [
   "issuer",
   "test-support",
+  "corporate-actions",
 ] }
 st0x-issuance-client = { path = "crates/client" }
 tempfile = "3.23.0"

@@ -6677,8 +6677,8 @@ dependencies = [
 
 [[package]]
 name = "st0x-alpaca"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.alpaca?tag=v0.1.0#c44f6e726486c1b6ab6c63330013f42e7fb2b13c"
+version = "0.2.0"
+source = "git+https://github.com/ST0x-Technology/st0x.alpaca?rev=e83968031bf5b640a7c0f1e8e35596cff2bf38fe#e83968031bf5b640a7c0f1e8e35596cff2bf38fe"
 dependencies = [
  "alloy-primitives",
  "async-trait",
