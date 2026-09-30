@@ -13,7 +13,8 @@
 //!     no API private key to store, rotate, or exfiltrate;
 //!   - IAM (`roles/cloudkms.signerVerifier` on the key) decides who can
 //!     authenticate to Turnkey, and every stamp lands in the KMS
-//!     data-access audit log;
+//!     data-access audit log once `DATA_READ` audit logging is enabled
+//!     for `cloudkms.googleapis.com` (it is off by default);
 //!   - per-environment isolation is a per-env key + per-env Turnkey API
 //!     user, not a shared credential.
 //!
@@ -64,11 +65,11 @@ pub enum GcpKmsStamperError {
     )]
     WrongAlgorithm { key_version: String, algorithm: String },
     #[error("failed to parse KMS public key PEM: {0}")]
-    PublicKeyParse(String),
+    Spki(#[from] p256::pkcs8::spki::Error),
     #[error("failed to decode KMS base64: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("KMS signature is not valid DER ECDSA-P256: {0}")]
-    SignatureDer(String),
+    Ecdsa(#[from] p256::ecdsa::Error),
     #[error(
         "KMS signature does not verify over the request body with the key's public half -- \
          refusing to send a stamp we cannot verify"
@@ -192,10 +193,7 @@ impl GcpKmsStamper {
             });
         }
 
-        let public_key =
-            p256::PublicKey::from_public_key_pem(&pem).map_err(|error| {
-                GcpKmsStamperError::PublicKeyParse(error.to_string())
-            })?;
+        let public_key = p256::PublicKey::from_public_key_pem(&pem)?;
         let public_key_hex =
             hex::encode(public_key.to_encoded_point(true).as_bytes());
         let verifying_key = VerifyingKey::from(&public_key);
@@ -284,9 +282,7 @@ impl GcpKmsStamper {
         let AsymmetricSignResponse { signature } = response.json().await?;
 
         let der = BASE64_STANDARD.decode(signature)?;
-        let parsed = P256Signature::from_der(&der).map_err(|error| {
-            GcpKmsStamperError::SignatureDer(error.to_string())
-        })?;
+        let parsed = P256Signature::from_der(&der)?;
 
         // Verify over the BODY (Verifier hashes with SHA-256 internally,
         // matching what KMS signed) with the public key cached at
@@ -369,19 +365,29 @@ mod tests {
         .expect("stamper construction against mocks should succeed")
     }
 
-    /// Pre-computes the deterministic (RFC 6979) signature KMS would
-    /// return for `body` and mocks the asymmetricSign endpoint with it.
+    /// Mocks the asymmetricSign endpoint: it only answers a request that
+    /// carries the test token and the standard-base64 SHA-256 digest of
+    /// `stamped_body`, and returns the deterministic (RFC 6979) signature
+    /// over `signed_body`.
     fn mock_sign_endpoint(
         server: &MockServer,
         key: &SigningKey,
+        stamped_body: &[u8],
         signed_body: &[u8],
     ) {
+        let expected_digest =
+            BASE64_STANDARD.encode(Sha256::digest(stamped_body));
         let digest = Sha256::digest(signed_body);
         let signature: P256Signature = key
             .sign_prehash(&digest)
             .expect("signing a 32-byte digest with a valid key cannot fail");
         server.mock(|when, then| {
-            when.method("POST").path(format!("/{KEY_VERSION}:asymmetricSign"));
+            when.method("POST")
+                .path(format!("/{KEY_VERSION}:asymmetricSign"))
+                .header("authorization", "Bearer test-token")
+                .json_body(serde_json::json!({
+                    "digest": { "sha256": expected_digest },
+                }));
             then.status(200)
                 .header("Content-Type", "application/json")
                 .json_body(serde_json::json!({
@@ -398,7 +404,7 @@ mod tests {
         mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
 
         let body = br#"{"type":"ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}"#;
-        mock_sign_endpoint(&server, &key, body);
+        mock_sign_endpoint(&server, &key, body, body);
 
         let stamper = stamper_for(&server).await;
         let StampHeader { name, value } =
@@ -439,11 +445,12 @@ mod tests {
 
         // KMS (or a substituted response) signs DIFFERENT content than
         // the body being stamped; the pre-send verification must refuse.
-        mock_sign_endpoint(&server, &key, b"something else entirely");
+        let body = b"the actual request body";
+        mock_sign_endpoint(&server, &key, body, b"something else entirely");
 
         let stamper = stamper_for(&server).await;
         let error = stamper
-            .stamp(b"the actual request body")
+            .stamp(body)
             .await
             .expect_err("mismatched signature must be refused");
 
