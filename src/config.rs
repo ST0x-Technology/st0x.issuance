@@ -2358,7 +2358,7 @@ mod tests {
     /// Robinhood Chain's approved tokenized-asset listing. Pinning every pair
     /// catches a missing symbol, a substituted symbol, or a wrong address in
     /// either deploy config.
-    const ROBINHOOD_WRAPPERS: [(&str, &str); 56] = [
+    const ROBINHOOD_WRAPPERS: [(&str, &str); 57] = [
         ("AAPL", "0x1B2A2C8c3621642c64cf1245016488fA0f76da78"),
         ("AIR.PA", "0xc3bc6EEf91FfAeBACB13f4c48aC0515C820d2b0c"),
         ("AMAT", "0x44DE27A07B33CD708A49fa79629fAC1df03C56d3"),
@@ -2406,6 +2406,7 @@ mod tests {
         ("SIVR", "0x2B310218001C38cf82816c2098AedDCE22D3Df27"),
         ("SKHY", "0xD13bBc46C4582246656868d32227A99A538D97E1"),
         ("SMCI", "0xa6890e89D99Fd4F275c016d89A28ec24A428846D"),
+        ("SNES", "0x06096908dBC38fc54509024674E4fd1891B5F7CA"),
         ("SPCX", "0xC32C8166164E2cA18BB5fbf3E82CB776943d97FB"),
         ("SPYM", "0x7dF3ad1ECC10DBF0296D05F91a697e4A059771c2"),
         ("TQQQ", "0xc80730995D2C53114BAaFd2736E02f4E274D5B83"),
