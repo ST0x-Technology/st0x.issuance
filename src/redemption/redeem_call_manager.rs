@@ -677,6 +677,7 @@ impl RedeemCallManager {
                 Ok(DetectedRecoveryOutcome::Recovered)
             }
             Err(err) => {
+                crate::alpaca::service::alert_credential_rejection(&err);
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Alpaca redeem API call failed"
@@ -1322,6 +1323,84 @@ mod tests {
             "redeem callback network must be a published Alpaca TokenizationNetwork \
              value — see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejected_jwt_redeem_alerts_and_preserves_terminal_failure() {
+        use p256::pkcs8::EncodePrivateKey;
+        let harness = TestHarness::new().await;
+        let server = httpmock::MockServer::start_async().await;
+        let token = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(401).body("invalid_client");
+        });
+        let key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let mut config = crate::alpaca::AlpacaConfig::test_default();
+        config.api_base_url = server.base_url();
+        let service = config
+            .service_with_auth(
+                st0x_alpaca::AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-redeem-rejected".into(),
+                    private_key_pem: key
+                        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                        .unwrap()
+                        .to_string(),
+                },
+                &server.url("/token"),
+            )
+            .unwrap();
+        let manager = harness.create_manager(service);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, &Network::Base).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &issuer_request_id,
+                &underlying,
+                &Network::Base,
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+            )
+            .await;
+        let aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            manager
+                .handle_redemption_detected(
+                    &test_alpaca_account(),
+                    &issuer_request_id,
+                    &aggregate,
+                    ClientId::new(),
+                )
+                .await
+                .unwrap_err(),
+            RedeemCallManagerError::Alpaca(crate::alpaca::AlpacaError::Jwt(_))
+        ));
+        token.assert_calls(1);
+        assert!(matches!(
+            harness
+                .redemption_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            Redemption::Failed { .. }
+        ));
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("ERROR")
+                    && line.contains("operational_alert")
+                    && line.contains("Alpaca credential rejected")
+            }) {
+                Ok(())
+            } else {
+                Err("missing redemption credential rejection alert".into())
+            }
+        });
     }
 
     #[traced_test]

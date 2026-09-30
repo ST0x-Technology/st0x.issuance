@@ -29,6 +29,12 @@ pub(crate) struct JournalManager {
     max_interval: Duration,
 }
 
+#[derive(Default)]
+struct JournalPollAlerts {
+    not_found_warned: bool,
+    credential_alerted: bool,
+}
+
 impl JournalManager {
     pub(crate) fn new(
         alpaca_service: Arc<dyn AlpacaService>,
@@ -146,7 +152,7 @@ impl JournalManager {
         let max_duration = self.max_duration;
         let mut poll_interval = self.initial_poll_interval;
         let max_interval = self.max_interval;
-        let mut not_found_warned = false;
+        let mut poll_alerts = JournalPollAlerts::default();
 
         loop {
             if start_time.elapsed() >= max_duration {
@@ -176,7 +182,7 @@ impl JournalManager {
                     &tokenization_request_id,
                     start_time.elapsed(),
                     poll_interval,
-                    &mut not_found_warned,
+                    &mut poll_alerts,
                 )
                 .await?;
 
@@ -402,7 +408,7 @@ impl JournalManager {
         tokenization_request_id: &TokenizationRequestId,
         elapsed: Duration,
         poll_interval: Duration,
-        not_found_warned: &mut bool,
+        poll_alerts: &mut JournalPollAlerts,
     ) -> Result<bool, JournalManagerError> {
         match request_result {
             Ok(request) => {
@@ -527,7 +533,7 @@ impl JournalManager {
                 }
             }
             Err(AlpacaError::RequestNotFound { ref id, .. }) => {
-                if *not_found_warned {
+                if poll_alerts.not_found_warned {
                     debug!(target: "redemption",
                         issuer_request_id = %issuer_request_id,
                         tokenization_request_id = %id,
@@ -541,7 +547,7 @@ impl JournalManager {
                         next_poll_in = ?poll_interval,
                         "Request not found at Alpaca keyed endpoint (assumed transient), will retry"
                     );
-                    *not_found_warned = true;
+                    poll_alerts.not_found_warned = true;
                 }
                 Ok(true)
             }
@@ -575,6 +581,12 @@ impl JournalManager {
                 Err(JournalManagerError::Alpaca(err))
             }
             Err(err) => {
+                if !poll_alerts.credential_alerted {
+                    poll_alerts.credential_alerted =
+                        crate::alpaca::service::alert_credential_rejection(
+                            &err,
+                        );
+                }
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     tokenization_request_id = %tokenization_request_id,
                     error = %err,
@@ -648,7 +660,7 @@ mod tests {
     use std::sync::Mutex;
     use tracing_test::traced_test;
 
-    use super::{JournalManager, JournalManagerError};
+    use super::{JournalManager, JournalManagerError, JournalPollAlerts};
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
@@ -2041,6 +2053,99 @@ mod tests {
             matches!(result, Err(JournalManagerError::AccountNotFound { .. })),
             "Expected AccountNotFound, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn rejected_credentials_alert_and_keep_journal_polling() {
+        let (store, pool) = setup_test_store().await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("s01-jwt-poll");
+        let manager = JournalManager::new(
+            Arc::new(StatefulMockAlpacaService::new(
+                vec![],
+                issuer_request_id.clone(),
+            )),
+            store.clone(),
+            pool,
+        );
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+        for first_rejection in [
+            AlpacaError::Jwt(st0x_alpaca::KmsJwtError::TokenStatus {
+                status: 401,
+                body: "invalid_client".into(),
+                retry_after: None,
+            }),
+            AlpacaError::Auth("rejected".into()),
+        ] {
+            let mut poll_alerts = JournalPollAlerts::default();
+            for (error, should_have_alerted) in [
+                (
+                    AlpacaError::Jwt(st0x_alpaca::KmsJwtError::TokenStatus {
+                        status: 503,
+                        body: "unavailable".into(),
+                        retry_after: None,
+                    }),
+                    false,
+                ),
+                (first_rejection, true),
+                (
+                    AlpacaError::Jwt(st0x_alpaca::KmsJwtError::TokenStatus {
+                        status: 401,
+                        body: "invalid_client".into(),
+                        retry_after: None,
+                    }),
+                    true,
+                ),
+                (AlpacaError::Auth("rejected".into()), true),
+            ] {
+                assert!(
+                    manager
+                        .handle_poll_result(
+                            Err(error),
+                            &issuer_request_id,
+                            &tokenization_request_id,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::from_secs(1),
+                            &mut poll_alerts,
+                        )
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(poll_alerts.credential_alerted, should_have_alerted);
+                assert!(matches!(
+                    store.load(&issuer_request_id).await.unwrap().unwrap(),
+                    Redemption::AlpacaCalled { .. }
+                ));
+            }
+        }
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Polling error, will retry", "s01-jwt-poll"]
+        ));
+        logs_assert(|lines: &[&str]| {
+            let alerts = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("ERROR")
+                        && line.contains("operational_alert")
+                        && line.contains("Alpaca credential rejected")
+                })
+                .count();
+            if alerts == 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one credential alert per polling session, got {alerts}"
+                ))
+            }
+        });
     }
 
     #[tokio::test]
