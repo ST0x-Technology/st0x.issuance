@@ -219,14 +219,16 @@ below the finalized head. A merely block-numbered, unfinalized revert never
 authorizes another signature. A mined authorized replacement in `Failed` is
 recorded as the existing completed burn only after confirmation succeeds; a
 transient confirmation error is reported as deferred recovery. Pending, unknown,
-invalid, and RPC-failure classifications fail closed without signing. For
-vault-direct burns, recovery first tries to re-reserve the retained receipt
-plan. If those released receipts are no longer available, it selects current
-inventory for the persisted Alpaca and dust quantities and reserves that fresh
-plan before signing. It does not call Alpaca again. Orchestrator burns keep
-exact-calldata replacement semantics. After the reservation and signing checks
-pass, the authorization and replacement intent commit atomically. Reservations
-are validated again before queue dispatch. A successful JSON response includes
+invalid, and RPC-failure classifications fail closed without signing. When the
+endpoint refuses a pending (`StillMineable`) transaction, it does not broadcast
+it either: send the transaction in `old_tx_hash` out of band. For vault-direct
+burns, recovery first tries to re-reserve the retained receipt plan. If those
+released receipts are no longer available, it selects current inventory for the
+persisted Alpaca and dust quantities and reserves that fresh plan before
+signing. It does not call Alpaca again. Orchestrator burns keep exact-calldata
+replacement semantics. After the reservation and signing checks pass, the
+authorization and replacement intent commit atomically. Reservations are
+validated again before queue dispatch. A successful JSON response includes
 `manual_replacement` with stable `code`, `recovery_id`, old and new transaction
 hashes and nonces, and `queue_dispatch`. A deferred dispatch is safe: the
 reconciler reconstructs the job from the committed replacement intent after
@@ -256,7 +258,7 @@ Error and manual-replacement responses use the exact code and action below:
 | `burn_replacement_already_queued`                  | 409    | An authorized replacement has an active submit job. Wait, then inspect `/admin/stuck`.                                                                                                                  |
 | `redemption_terminal`                              | 409    | The redemption is complete or closed. Do not retry.                                                                                                                                                     |
 | `recovery_refused`                                 | 422    | The Alpaca journal is pending or rejected, or the redemption network is not a published Alpaca `TokenizationNetwork`. Re-check the journal and network mapping.                                         |
-| `prior_burn_unverifiable`                          | 422    | The prior burn outcome is ambiguous or its legacy ID cannot be verified. Reconcile it manually before recovery.                                                                                         |
+| `prior_burn_unverifiable`                          | 422    | Says broadcast again or not finalized: wait, then retry. Says rebroadcast: send the transaction in `old_tx_hash` again, then retry. Says ambiguous, or a legacy ID: reconcile it manually.              |
 | `redemption_command_rejected`                      | 422    | The aggregate rejected `ResumeBurn`. Inspect its event history and state before retrying.                                                                                                               |
 | `burn_recovery_not_exhausted`                      | 422    | Automatic attempts remain. Wait for the five-attempt budget to finish, then retry. No replacement was signed.                                                                                           |
 | `burn_not_provably_dead`                           | 422    | Neither safe replacement basis was established: the transaction is not provably dead and is not a finalized revert in `Failed`. No replacement was signed.                                              |

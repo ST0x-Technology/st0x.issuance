@@ -1572,14 +1572,16 @@ enum RetainedBurnVerdict {
 ///
 /// The nonce proves a burn dead only once something else consumed it; until
 /// then the burn classifies as `StillMineable` and is refused. Nothing in the
-/// running service consumes that nonce. For a burn intended but never
-/// broadcast, the failed redemption keeps its signer intent, so no other burn
-/// or mint signs on the network. For a burn broadcast and then dropped, the
-/// intent was released, but `ResyncNonceManager` only moves forward, so the
-/// next transaction signs the following nonce and queues behind the gap. In
-/// both cases the operator broadcasts the retained signed transaction again
-/// out of band (or, for the dropped one, restarts the service), then calls
-/// this endpoint again.
+/// running service signs another transaction at that nonce. For a burn
+/// intended but never broadcast, the failed redemption keeps its signer
+/// intent, so no other burn or mint signs on the network. For a burn
+/// broadcast and then dropped, the intent was released, but
+/// `ResyncNonceManager` only moves forward, so the next transaction signs the
+/// following nonce and queues behind the gap. So the gate broadcasts a
+/// `StillMineable` burn again, unchanged, before it refuses: the burn can then
+/// mine, and the operator calls this endpoint again once it has. If that
+/// broadcast fails, the refusal tells the operator to broadcast the retained
+/// transaction out of band.
 async fn classify_retained_burn(
     vault_service: &Arc<dyn VaultService>,
     aggregate_id: &str,
@@ -1621,12 +1623,23 @@ async fn classify_retained_burn(
                 )))
             }
             BurnTxFate::Landed => Ok(RetainedBurnVerdict::Landed),
-            BurnTxFate::Live => Err(live_retained_burn_error(
-                aggregate_id,
-                issuer_request_id,
-                identity,
-                status,
-            )),
+            BurnTxFate::Live => {
+                let broadcast_again = status == BurnTxStatus::StillMineable
+                    && rebroadcast_retained_burn(
+                        vault_service,
+                        aggregate_id,
+                        issuer_request_id,
+                        &retained.transaction,
+                    )
+                    .await;
+                Err(live_retained_burn_error(
+                    aggregate_id,
+                    issuer_request_id,
+                    identity,
+                    status,
+                    broadcast_again,
+                ))
+            }
         },
         Err(error) => {
             warn!(target: "admin", aggregate_id = %aggregate_id,
@@ -1647,15 +1660,50 @@ async fn classify_retained_burn(
     }
 }
 
+/// Broadcasts a pending retained burn again, unchanged, and tells whether the
+/// node now holds it. A failure only logs: the gate refuses either way.
+async fn rebroadcast_retained_burn(
+    vault_service: &Arc<dyn VaultService>,
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    transaction: &SendableTxWithHash,
+) -> bool {
+    match vault_service.rebroadcast_burn(transaction).await {
+        Ok(()) => {
+            info!(target: "admin", aggregate_id = %aggregate_id,
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %transaction.hash,
+                nonce = transaction.nonce,
+                "Broadcast the retained burn again so a node that dropped it \
+                 can still mine it"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(target: "admin", aggregate_id = %aggregate_id,
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %transaction.hash,
+                nonce = transaction.nonce,
+                error = %error,
+                "Failed to broadcast the retained burn again"
+            );
+            false
+        }
+    }
+}
+
 /// Refuses a resume over a retained burn that can still land — still
 /// mineable, or reverted in a block that is not yet finalized. The refusal
 /// names the transaction, because the operator's next step is to wait for
-/// its outcome or to rebroadcast it (SPEC "Recover Stuck Aggregates").
+/// its outcome: for a pending burn, also to rebroadcast it when the gate
+/// could not; for an unfinalized revert, to wait for finality (SPEC "Recover
+/// Stuck Aggregates").
 fn live_retained_burn_error(
     aggregate_id: &str,
     issuer_request_id: &IssuerRedemptionRequestId,
     identity: BurnTransactionIdentity,
     status: BurnTxStatus,
+    broadcast_again: bool,
 ) -> RecoverRedemptionError {
     warn!(target: "admin", aggregate_id = %aggregate_id,
         issuer_request_id = %issuer_request_id,
@@ -1664,11 +1712,26 @@ fn live_retained_burn_error(
         status = ?status,
         "Retained burn can still land; refusing to resume over it"
     );
+    let message = match status {
+        // Already mined, so a rebroadcast cannot help: the revert becomes
+        // final, or a reorganization makes the burn live again.
+        BurnTxStatus::Reverted => {
+            "Prior burn reverted in a block that is not finalized yet; wait \
+             for finality, then retry"
+        }
+        _ if broadcast_again => {
+            "Prior burn can still land and was broadcast again; wait for its \
+             outcome, then retry"
+        }
+        _ => {
+            "Prior burn can still land; wait for its outcome, or rebroadcast \
+             the retained transaction named in old_tx_hash, then retry"
+        }
+    };
     RecoverRedemptionError::new(
         Status::UnprocessableEntity,
         RecoverRedemptionCode::PriorBurnUnverifiable,
-        "Prior burn can still land; wait for its outcome, or rebroadcast the \
-         retained transaction named in old_tx_hash, then retry",
+        message,
     )
     .with_old_transaction(identity)
 }
@@ -7128,6 +7191,143 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::ERROR,
             &["Retained burn transaction failed validation", "red-malformed"]
+        ));
+    }
+
+    /// A pending retained burn can be one the node dropped, and every later
+    /// transaction from the signer queues behind its nonce. The automatic
+    /// loop never reads the `Failed` shape that `MarkFailed` writes, so for
+    /// that shape only this gate can broadcast it again. The gate broadcasts
+    /// the exact retained bytes again, then still refuses.
+    #[traced_test]
+    #[tokio::test]
+    async fn still_mineable_retained_burn_is_broadcast_again_before_refusal() {
+        let retained = SendableTxWithHash::valid_for_test(
+            21,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let mock = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+        let vault_service: Arc<dyn VaultService> = mock.clone();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let Err(error) = super::classify_retained_burn(
+            &vault_service,
+            "red-pending",
+            &issuer_request_id,
+            &B256::repeat_byte(0x22),
+            &super::RetainedBurn {
+                transaction: retained.clone(),
+                planned_burns: vec![],
+            },
+            None,
+        )
+        .await
+        else {
+            panic!("a burn that can still land must refuse the resume");
+        };
+
+        assert_eq!(mock.rebroadcast_burn_txs(), vec![retained.clone()]);
+        assert_eq!(error.status, Status::UnprocessableEntity);
+        assert_eq!(
+            error.body.code,
+            super::RecoverRedemptionCode::PriorBurnUnverifiable
+        );
+        assert_eq!(error.body.old_tx_hash, Some(retained.hash));
+        assert_eq!(error.body.old_nonce, Some(retained.nonce));
+        assert!(
+            error.body.message.contains("was broadcast again"),
+            "message: {}",
+            error.body.message
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Broadcast the retained burn again",
+                "red-pending",
+                &retained.hash.to_string(),
+            ]
+        ));
+    }
+
+    /// Only a pending burn is broadcast again. A burn that reverted in a
+    /// block that is not finalized is already mined, so a rebroadcast cannot
+    /// help: the refusal says to wait for finality. When the broadcast of a
+    /// pending burn fails, the refusal keeps the manual advice, because the
+    /// service did not put the burn back on the node.
+    #[traced_test]
+    #[tokio::test]
+    async fn retained_burn_not_broadcast_again_gets_the_right_advice() {
+        let retained = SendableTxWithHash::valid_for_test(
+            21,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let cases = [
+            (
+                MockVaultService::new_success()
+                    .with_burn_tx_status(BurnTxStatus::Reverted),
+                0,
+                "wait for finality",
+            ),
+            (
+                MockVaultService::new_success()
+                    .with_burn_tx_status(BurnTxStatus::StillMineable)
+                    .with_rebroadcast_burn_failure(),
+                1,
+                "rebroadcast the retained transaction named in old_tx_hash",
+            ),
+        ];
+
+        for (mock, expected_attempts, expected_advice) in cases {
+            let mock = Arc::new(mock);
+            let vault_service: Arc<dyn VaultService> = mock.clone();
+
+            let Err(error) = super::classify_retained_burn(
+                &vault_service,
+                "red-live",
+                &IssuerRedemptionRequestId::random(),
+                &B256::repeat_byte(0x22),
+                &super::RetainedBurn {
+                    transaction: retained.clone(),
+                    planned_burns: vec![],
+                },
+                None,
+            )
+            .await
+            else {
+                panic!("a burn that can still land must refuse the resume");
+            };
+
+            assert_eq!(mock.rebroadcast_burn_txs().len(), expected_attempts);
+            assert_eq!(
+                error.body.code,
+                super::RecoverRedemptionCode::PriorBurnUnverifiable
+            );
+            assert!(
+                error.body.message.contains(expected_advice),
+                "message: {}",
+                error.body.message
+            );
+            if expected_attempts == 0 {
+                assert!(
+                    !error.body.message.contains("rebroadcast"),
+                    "a mined burn must not get rebroadcast advice: {}",
+                    error.body.message
+                );
+            }
+        }
+
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Failed to broadcast the retained burn again",
+                "red-live",
+                &retained.hash.to_string(),
+            ]
         ));
     }
 
