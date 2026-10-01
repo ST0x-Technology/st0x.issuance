@@ -293,15 +293,25 @@ plus enqueue of the next job), not a wallet-locked aggregate command.
 `drive_one_step` + enqueue of the matching durable job. Inventory hits use
 `RecordExistingMint`; otherwise recovery re-classifies any persisted signed mint
 intent under the wallet lock (burn-parity observation below) and only allows a
-**new** signed deposit after `MinedReverted` or `ProvablyDead` with a recheck.
-Automatic recovery submits up to four replacement transactions after 1m, 10m,
-30m, and 1h delays once the prior identity is terminal. Manual admin reprocess
-uses the **same** recovery path and **does not** bypass the automatic retry cap:
-when automatic retries are `Exhausted`, admin reprocess is `Unrecoverable`
-(operator must fix the underlying cause and/or use an explicit close/remediation
-path — not another free deposit). Correctness depends on exact-hash rebroadcast
-and classification — **not** on `external_tx_id` (the signer does not dedup on
-it).
+**new** signed deposit after `MinedReverted` or `ProvablyDead` with a recheck. A
+mint that already landed is recorded even when its retries are `Exhausted`: a
+vault-direct mint when inventory holds its receipt, and an orchestrator mint
+(which never has a receipt there) when its own stored transaction classifies as
+`MinedSuccess`, recorded as `OrchestratorMintRecovered`. The orchestrator
+landing is read from that transaction and only recorded, with no second
+classification, so a later read that disagrees cannot send `RetryMint` past the
+cap. Neither path submits a new deposit. Only the exhausted arm classifies the
+orchestrator transaction; in the ready and waiting arms the recovery step does
+that itself, so a provider outage there counts against the step's long
+no-progress budget instead of abandoning the mint early. A vault-direct receipt
+in inventory also skips the retry delay. Automatic recovery submits up to four
+replacement transactions after 1m, 10m, 30m, and 1h delays once the prior
+identity is terminal. Manual admin reprocess uses the **same** recovery path and
+**does not** bypass the automatic retry cap: when automatic retries are
+`Exhausted`, admin reprocess is `Unrecoverable` (operator must fix the
+underlying cause and/or use an explicit close/remediation path — not another
+free deposit). Correctness depends on exact-hash rebroadcast and classification
+— **not** on `external_tx_id` (the signer does not dedup on it).
 
 `ConfirmMintJob` observes a submitted `tx_id` by bounded
 `eth_getTransactionReceipt(H)` polling as `Option`, not
