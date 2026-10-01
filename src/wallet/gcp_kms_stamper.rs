@@ -195,7 +195,7 @@ impl GcpKmsStamper {
             .build()?;
 
         let cached_token = Mutex::new(None);
-        let token =
+        let AccessToken { token, .. } =
             Self::access_token(&http, &token_source, &cached_token).await?;
         let url = format!("{kms_base_url}/{key_version}/publicKey");
         let response = http.get(&url).bearer_auth(&token).send().await?;
@@ -244,12 +244,14 @@ impl GcpKmsStamper {
         http: &reqwest::Client,
         source: &AccessTokenSource,
         cache: &Mutex<Option<CachedToken>>,
-    ) -> Result<String, GcpKmsStamperError> {
+    ) -> Result<AccessToken, GcpKmsStamperError> {
         let token_url = match select_token(
             source,
             std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok(),
         ) {
-            SelectedToken::Env(token) => return Ok(token),
+            SelectedToken::Env(token) => {
+                return Ok(AccessToken { token, refetchable: false });
+            }
             SelectedToken::Fetch(url) => url,
         };
 
@@ -257,7 +259,7 @@ impl GcpKmsStamper {
         if let Some(CachedToken { token, refresh_at }) = cached.as_ref()
             && Instant::now() < *refresh_at
         {
-            return Ok(token.clone());
+            return Ok(AccessToken { token: token.clone(), refetchable: true });
         }
 
         let response = http
@@ -281,7 +283,7 @@ impl GcpKmsStamper {
                     .saturating_sub(TOKEN_EXPIRY_MARGIN),
         });
         drop(cached);
-        Ok(access_token)
+        Ok(AccessToken { token: access_token, refetchable: true })
     }
 
     /// Produces the `X-Stamp` header for `body`: SHA-256 the body, have
@@ -298,10 +300,14 @@ impl GcpKmsStamper {
         // A cached token can be rejected before its expiry (revoked early,
         // or the VM was suspended and the monotonic clock did not move).
         // Before caching, every stamp fetched a fresh token, so retry once
-        // with one now rather than fail the Turnkey request.
+        // with one now rather than fail the Turnkey request. A concurrent
+        // stamp may already have replaced the rejected token, so retry
+        // whenever the token came from the metadata server, not only when
+        // this stamp is the one that drops it.
         if response.status == reqwest::StatusCode::UNAUTHORIZED
-            && self.forget_rejected_token(&response.token).await
+            && response.refetchable
         {
+            self.forget_rejected_token(&response.token).await;
             response = self.sign_digest(&digest_b64).await?;
             if response.status == reqwest::StatusCode::UNAUTHORIZED {
                 self.forget_rejected_token(&response.token).await;
@@ -346,7 +352,7 @@ impl GcpKmsStamper {
         &self,
         digest_b64: &str,
     ) -> Result<SignAttempt, GcpKmsStamperError> {
-        let token = Self::access_token(
+        let AccessToken { token, refetchable } = Self::access_token(
             &self.http,
             &self.token_source,
             &self.cached_token,
@@ -365,12 +371,17 @@ impl GcpKmsStamper {
             })
             .send()
             .await?;
-        Ok(SignAttempt { status: response.status(), response, token })
+        Ok(SignAttempt {
+            status: response.status(),
+            response,
+            token,
+            refetchable,
+        })
     }
 
     /// Drops `token` from the cache if it is still the cached one, so a
     /// newer token cached by a concurrent stamp survives. Returns whether
-    /// it was dropped; an environment token is never cached.
+    /// it was dropped.
     async fn forget_rejected_token(&self, token: &str) -> bool {
         let mut cached = self.cached_token.lock().await;
         let is_cached =
@@ -410,10 +421,18 @@ fn select_token(
     }
 }
 
+struct AccessToken {
+    token: String,
+    /// The token came from the metadata server (cached or fetched), so a
+    /// rejected one can be replaced; an environment token cannot.
+    refetchable: bool,
+}
+
 struct SignAttempt {
     status: reqwest::StatusCode,
     response: reqwest::Response,
     token: String,
+    refetchable: bool,
 }
 
 #[cfg(test)]
@@ -766,6 +785,36 @@ mod tests {
             .expect("stamp must succeed with a refetched token");
 
         rejected_mock.assert_calls(1);
+        token_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_stamps_both_retry_after_the_same_401() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        let body = b"concurrent body";
+        mock_sign_endpoint(&server, &key, body, body);
+        // The delay makes both stamps send the revoked token before either
+        // sees its 401, so the second finds the cache already replaced.
+        let rejected_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path(format!("/{KEY_VERSION}:asymmetricSign"))
+                .header("Authorization", "Bearer revoked-token");
+            then.status(401).delay(Duration::from_millis(300));
+        });
+
+        let stamper = stamper_for(&server).await;
+        *stamper.cached_token.lock().await = Some(CachedToken {
+            token: "revoked-token".to_string(),
+            refresh_at: Instant::now() + Duration::from_secs(3000),
+        });
+        let (first, second) =
+            tokio::join!(stamper.stamp(body), stamper.stamp(body));
+
+        first.expect("first stamp must succeed after its retry");
+        second.expect("second stamp must succeed after its retry");
+        rejected_mock.assert_calls(2);
         token_mock.assert_calls(2);
     }
 
