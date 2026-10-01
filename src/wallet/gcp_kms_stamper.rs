@@ -55,6 +55,12 @@ const REQUIRED_ALGORITHM: &str = "EC_SIGN_P256_SHA256";
 /// expires, so no request goes out with a token about to lapse.
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
+/// The metadata server is link-local, so a token fetch slower than this
+/// means it is unhealthy. Fetches run under the cache lock, one after
+/// another, so a short limit keeps queued stamps from waiting on the
+/// client's 20s timeout each.
+const METADATA_TOKEN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Errors from constructing or using the KMS stamper. HTTP error bodies
 /// are included only for non-2xx responses (Google error JSON, no
 /// tokens or signatures); success bodies are never embedded in errors.
@@ -266,6 +272,7 @@ impl GcpKmsStamper {
         let response = http
             .get(token_url)
             .header("Metadata-Flavor", "Google")
+            .timeout(METADATA_TOKEN_TIMEOUT)
             .send()
             .await?;
         let status = response.status();
@@ -296,36 +303,20 @@ impl GcpKmsStamper {
         let digest = Sha256::digest(body);
         let digest_b64 = BASE64_STANDARD.encode(digest);
 
-        let token = Self::access_token(
-            &self.http,
-            &self.token_source,
-            &self.cached_token,
-        )
-        .await?;
-        let url = format!(
-            "{}/{}:asymmetricSign",
-            self.kms_base_url, self.key_version
-        );
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&AsymmetricSignRequest {
-                digest: DigestBody { sha256: &digest_b64 },
-            })
-            .send()
-            .await?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            // Stop pinning a token KMS rejected, so later stamps ask the
-            // metadata server again (it may serve the same token until it
-            // rotates). Only the rejected token is dropped, so a newer one
-            // cached by a concurrent stamp survives.
-            let mut cached = self.cached_token.lock().await;
-            if cached.as_ref().is_some_and(|entry| entry.token == token) {
-                *cached = None;
+        let mut response = self.sign_digest(&digest_b64).await?;
+        // A cached token can be rejected before its expiry (revoked early,
+        // or the VM was suspended and the monotonic clock did not move).
+        // Before caching, every stamp fetched a fresh token, so retry once
+        // with one now rather than fail the Turnkey request.
+        if response.status == reqwest::StatusCode::UNAUTHORIZED
+            && self.forget_rejected_token(&response.token).await
+        {
+            response = self.sign_digest(&digest_b64).await?;
+            if response.status == reqwest::StatusCode::UNAUTHORIZED {
+                self.forget_rejected_token(&response.token).await;
             }
         }
+        let SignAttempt { status, response, .. } = response;
         if !status.is_success() {
             return Err(GcpKmsStamperError::UnexpectedStatus {
                 status: status.as_u16(),
@@ -359,6 +350,52 @@ impl GcpKmsStamper {
             value: BASE64_URL_SAFE_NO_PAD.encode(stamp_json.as_bytes()),
         })
     }
+
+    async fn sign_digest(
+        &self,
+        digest_b64: &str,
+    ) -> Result<SignAttempt, GcpKmsStamperError> {
+        let token = Self::access_token(
+            &self.http,
+            &self.token_source,
+            &self.cached_token,
+        )
+        .await?;
+        let url = format!(
+            "{}/{}:asymmetricSign",
+            self.kms_base_url, self.key_version
+        );
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&AsymmetricSignRequest {
+                digest: DigestBody { sha256: digest_b64 },
+            })
+            .send()
+            .await?;
+        Ok(SignAttempt { status: response.status(), response, token })
+    }
+
+    /// Drops `token` from the cache if it is still the cached one, so a
+    /// newer token cached by a concurrent stamp survives. Returns whether
+    /// it was dropped; an environment token is never cached.
+    async fn forget_rejected_token(&self, token: &str) -> bool {
+        let mut cached = self.cached_token.lock().await;
+        let is_cached =
+            cached.as_ref().is_some_and(|entry| entry.token == token);
+        if is_cached {
+            *cached = None;
+        }
+        drop(cached);
+        is_cached
+    }
+}
+
+struct SignAttempt {
+    status: reqwest::StatusCode,
+    response: reqwest::Response,
+    token: String,
 }
 
 #[cfg(test)]
@@ -614,21 +651,105 @@ mod tests {
         token_mock.assert_calls(3);
     }
 
+    /// Returns how many times the token endpoint is called for
+    /// construction plus two stamps when it answers with `expires_in`.
+    async fn token_fetches_with_expiry(expires_in: u64) -> usize {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_token_endpoint(
+            &server,
+            serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": expires_in,
+            }),
+        );
+        mock_public_key_endpoint(&server, &key, REQUIRED_ALGORITHM);
+        let body = b"expiry margin body";
+        mock_sign_endpoint(&server, &key, body, body);
+
+        let stamper = stamper_for(&server).await;
+        stamper.stamp(body).await.expect("first stamp should succeed");
+        stamper.stamp(body).await.expect("second stamp should succeed");
+        token_mock.calls()
+    }
+
     #[tokio::test]
-    async fn rejected_token_is_dropped_from_cache() {
+    async fn token_within_expiry_margin_is_not_reused() {
+        assert_eq!(token_fetches_with_expiry(300).await, 3);
+        assert_eq!(token_fetches_with_expiry(301).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stamp_retries_once_with_fresh_token_after_401() {
         let key = test_signing_key();
         let server = MockServer::start();
         let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
-        server.mock(|when, then| {
+        let body = b"retried body";
+        mock_sign_endpoint(&server, &key, body, body);
+        let rejected_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path(format!("/{KEY_VERSION}:asymmetricSign"))
+                .header("Authorization", "Bearer revoked-token");
+            then.status(401);
+        });
+
+        let stamper = stamper_for(&server).await;
+        *stamper.cached_token.lock().await = Some(CachedToken {
+            token: "revoked-token".to_string(),
+            refresh_at: Instant::now() + Duration::from_secs(3000),
+        });
+        stamper
+            .stamp(body)
+            .await
+            .expect("stamp must succeed with a refetched token");
+
+        rejected_mock.assert_calls(1);
+        token_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn stamp_fails_when_fresh_token_is_also_rejected() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        let sign_mock = server.mock(|when, then| {
             when.method("POST").path(format!("/{KEY_VERSION}:asymmetricSign"));
             then.status(401);
         });
 
         let stamper = stamper_for(&server).await;
-        stamper.stamp(b"body").await.expect_err("KMS rejects the token");
-        stamper.stamp(b"body").await.expect_err("KMS rejects the token");
+        let error =
+            stamper.stamp(b"body").await.expect_err("KMS rejects the token");
 
+        assert!(matches!(
+            error,
+            GcpKmsStamperError::UnexpectedStatus { status: 401, .. }
+        ));
+        sign_mock.assert_calls(2);
         token_mock.assert_calls(2);
+        assert!(stamper.cached_token.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_rejected_token_keeps_a_newer_one() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        let stamper = stamper_for(&server).await;
+        *stamper.cached_token.lock().await = Some(CachedToken {
+            token: "token-b".to_string(),
+            refresh_at: Instant::now() + Duration::from_secs(3000),
+        });
+
+        assert!(!stamper.forget_rejected_token("token-a").await);
+
+        let cached_token = stamper
+            .cached_token
+            .lock()
+            .await
+            .as_ref()
+            .map(|entry| entry.token.clone());
+        assert_eq!(cached_token.as_deref(), Some("token-b"));
     }
 
     #[tokio::test]
