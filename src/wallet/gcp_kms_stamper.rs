@@ -316,6 +316,16 @@ impl GcpKmsStamper {
             .send()
             .await?;
         let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            // Stop pinning a token KMS rejected, so later stamps ask the
+            // metadata server again (it may serve the same token until it
+            // rotates). Only the rejected token is dropped, so a newer one
+            // cached by a concurrent stamp survives.
+            let mut cached = self.cached_token.lock().await;
+            if cached.as_ref().is_some_and(|entry| entry.token == token) {
+                *cached = None;
+            }
+        }
         if !status.is_success() {
             return Err(GcpKmsStamperError::UnexpectedStatus {
                 status: status.as_u16(),
@@ -381,16 +391,35 @@ mod tests {
         key: &SigningKey,
         algorithm: &str,
     ) -> httpmock::Mock<'a> {
-        let token_mock = server.mock(|when, then| {
+        let token_mock = mock_token_endpoint(
+            server,
+            serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3599,
+                "token_type": "Bearer",
+            }),
+        );
+        mock_public_key_endpoint(server, key, algorithm);
+        token_mock
+    }
+
+    fn mock_token_endpoint(
+        server: &MockServer,
+        body: serde_json::Value,
+    ) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
             when.method("GET").path("/token");
             then.status(200)
                 .header("Content-Type", "application/json")
-                .json_body(serde_json::json!({
-                    "access_token": "test-token",
-                    "expires_in": 3599,
-                    "token_type": "Bearer",
-                }));
-        });
+                .json_body(body);
+        })
+    }
+
+    fn mock_public_key_endpoint(
+        server: &MockServer,
+        key: &SigningKey,
+        algorithm: &str,
+    ) {
         server.mock(|when, then| {
             when.method("GET").path(format!("/{KEY_VERSION}/publicKey"));
             then.status(200)
@@ -400,7 +429,6 @@ mod tests {
                     "algorithm": algorithm,
                 }));
         });
-        token_mock
     }
 
     async fn stamper_for(server: &MockServer) -> GcpKmsStamper {
@@ -521,13 +549,14 @@ mod tests {
         let server = MockServer::start();
         mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
 
-        // RustCrypto always signs low-S; KMS does not. Negate S to get
-        // the high-S twin of a valid signature, as KMS returns about half
-        // the time.
+        // p256 does not normalize S either, so normalize first and then
+        // negate S to get the high-S twin of a valid signature, as KMS
+        // returns about half the time.
         let body = b"high-s body";
-        let low_s: P256Signature = key
+        let signature: P256Signature = key
             .sign_prehash(&Sha256::digest(body))
             .expect("signing a 32-byte digest with a valid key cannot fail");
+        let low_s = signature.normalize_s().unwrap_or(signature);
         let (r, s) = low_s.split_scalars();
         let high_s =
             P256Signature::from_scalars(r.to_bytes(), (-*s).to_bytes())
@@ -563,6 +592,43 @@ mod tests {
         stamper.stamp(body).await.expect("second stamp should succeed");
 
         token_mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn token_without_expiry_is_refetched_for_every_stamp() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_token_endpoint(
+            &server,
+            serde_json::json!({ "access_token": "test-token" }),
+        );
+        mock_public_key_endpoint(&server, &key, REQUIRED_ALGORITHM);
+
+        let body = b"uncached token body";
+        mock_sign_endpoint(&server, &key, body, body);
+
+        let stamper = stamper_for(&server).await;
+        stamper.stamp(body).await.expect("first stamp should succeed");
+        stamper.stamp(body).await.expect("second stamp should succeed");
+
+        token_mock.assert_calls(3);
+    }
+
+    #[tokio::test]
+    async fn rejected_token_is_dropped_from_cache() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        server.mock(|when, then| {
+            when.method("POST").path(format!("/{KEY_VERSION}:asymmetricSign"));
+            then.status(401);
+        });
+
+        let stamper = stamper_for(&server).await;
+        stamper.stamp(b"body").await.expect_err("KMS rejects the token");
+        stamper.stamp(b"body").await.expect_err("KMS rejects the token");
+
+        token_mock.assert_calls(2);
     }
 
     #[tokio::test]
