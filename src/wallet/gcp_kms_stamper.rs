@@ -224,7 +224,10 @@ impl GcpKmsStamper {
                 // Human/local runs (integration tests, break-glass CLI use)
                 // carry a token in the environment; the VM uses its
                 // metadata server.
-                if let Ok(token) = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN") {
+                if let Some(token) = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN")
+                    .ok()
+                    .filter(|token| !token.is_empty())
+                {
                     return Ok(token);
                 }
                 METADATA_TOKEN_URL
