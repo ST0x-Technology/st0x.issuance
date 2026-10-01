@@ -1,3 +1,4 @@
+pub(crate) mod gcp_kms_stamper;
 pub(crate) mod local;
 pub(crate) mod turnkey;
 
@@ -7,7 +8,8 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::{Args, Parser};
 use serde::Deserialize;
 use turnkey::{
-    TurnkeyApiPrivateKey, TurnkeyConfig, TurnkeyError, TurnkeyOrganizationId,
+    TurnkeyApiPrivateKey, TurnkeyConfig, TurnkeyCredentials, TurnkeyError,
+    TurnkeyKmsApiKey, TurnkeyOrganizationId,
 };
 
 /// Wallet backend discriminant. Deserialized from a `kind` field in wallet config sections
@@ -76,6 +78,18 @@ struct TurnkeyEnv {
         env = "TURNKEY_ADDRESS"
     )]
     address: Option<Address>,
+
+    /// Cloud KMS key version whose public half is registered as the Turnkey
+    /// API user (`projects/.../cryptoKeyVersions/N`). Requests are stamped
+    /// by KMS under the runtime's ambient GCP identity, so no API private
+    /// key is stored. Not a secret: it names an IAM-gated key. Exclusive
+    /// with `TURNKEY_API_PRIVATE_KEY`.
+    #[clap(
+        id = "turnkey_kms_api_key",
+        long = "turnkey-kms-api-key",
+        env = "TURNKEY_KMS_API_KEY"
+    )]
+    kms_api_key: Option<String>,
 }
 
 /// Validated signer configuration.
@@ -92,8 +106,20 @@ pub enum SignerConfigError {
     NeitherConfigured,
     #[error("both EVM_PRIVATE_KEY and TURNKEY_ORG_ID are set; use only one")]
     BothConfigured,
-    #[error("TURNKEY_API_PRIVATE_KEY is required when TURNKEY_ORG_ID is set")]
-    MissingApiPrivateKey,
+    #[error(
+        "exactly one of TURNKEY_API_PRIVATE_KEY or TURNKEY_KMS_API_KEY is \
+         required when TURNKEY_ORG_ID is set"
+    )]
+    MissingTurnkeyCredential,
+    #[error(
+        "both TURNKEY_API_PRIVATE_KEY and TURNKEY_KMS_API_KEY are set; use only one"
+    )]
+    AmbiguousTurnkeyCredential,
+    #[error(
+        "TURNKEY_KMS_API_KEY must be a Cloud KMS key version \
+         (projects/.../cryptoKeyVersions/N), got {0:?}"
+    )]
+    InvalidKmsApiKey(String),
     #[error("TURNKEY_ADDRESS is required when TURNKEY_ORG_ID is set")]
     MissingAddress,
 }
@@ -116,6 +142,7 @@ impl SignerEnv {
             (None, Some(org_id)) => signer_config_from_turnkey(
                 org_id,
                 self.turnkey.api_private_key,
+                self.turnkey.kms_api_key,
                 self.turnkey.address,
             ),
         }
@@ -125,18 +152,57 @@ impl SignerEnv {
 fn signer_config_from_turnkey(
     org_id: String,
     api_private_key: Option<String>,
+    kms_api_key: Option<String>,
     address: Option<Address>,
 ) -> Result<SignerConfig, SignerConfigError> {
-    let api_private_key = TurnkeyApiPrivateKey::new(
-        api_private_key.ok_or(SignerConfigError::MissingApiPrivateKey)?,
-    );
+    // An exported-but-empty variable (a `KEY=` line left behind during a
+    // credential cutover) counts as unset, not as a second credential.
+    let non_empty =
+        |value: Option<String>| value.filter(|text| !text.is_empty());
+    let credentials = match (non_empty(api_private_key), non_empty(kms_api_key))
+    {
+        (Some(key), None) => {
+            TurnkeyCredentials::ApiKey(TurnkeyApiPrivateKey::new(key))
+        }
+        (None, Some(key_version)) => {
+            TurnkeyCredentials::Kms(parse_kms_api_key(key_version)?)
+        }
+        (Some(_), Some(_)) => {
+            return Err(SignerConfigError::AmbiguousTurnkeyCredential);
+        }
+        (None, None) => {
+            return Err(SignerConfigError::MissingTurnkeyCredential);
+        }
+    };
     let address = address.ok_or(SignerConfigError::MissingAddress)?;
 
     Ok(SignerConfig::Turnkey(TurnkeyConfig::new(
         TurnkeyOrganizationId::new(org_id),
-        api_private_key,
+        credentials,
         address,
     )))
+}
+
+/// Shape check only, so a typo fails `validate-config` and startup parsing
+/// instead of the first Turnkey request; KMS itself validates the key and
+/// its algorithm when the stamper is built.
+fn parse_kms_api_key(
+    key_version: String,
+) -> Result<TurnkeyKmsApiKey, SignerConfigError> {
+    let segments: Vec<&str> = key_version.split('/').collect();
+    let well_formed = segments.len() == 10
+        && segments[0] == "projects"
+        && segments[2] == "locations"
+        && segments[4] == "keyRings"
+        && segments[6] == "cryptoKeys"
+        && segments[8] == "cryptoKeyVersions"
+        && segments.iter().all(|segment| !segment.is_empty());
+
+    if well_formed {
+        Ok(TurnkeyKmsApiKey::new(key_version))
+    } else {
+        Err(SignerConfigError::InvalidKmsApiKey(key_version))
+    }
 }
 
 impl SignerConfig {
@@ -168,6 +234,7 @@ mod tests {
                 org_id: None,
                 api_private_key: None,
                 address: None,
+                kms_api_key: None,
             },
         };
 
@@ -186,6 +253,7 @@ mod tests {
                 org_id: None,
                 api_private_key: None,
                 address: None,
+                kms_api_key: None,
             },
         };
 
@@ -204,6 +272,7 @@ mod tests {
                 org_id: Some("test-user-id".to_string()),
                 api_private_key: Some("some-key".to_string()),
                 address: Some(Address::random()),
+                kms_api_key: None,
             },
         };
 
@@ -215,20 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn turnkey_missing_api_private_key_fails() {
+    fn turnkey_missing_credential_fails() {
         let env = SignerEnv {
             local: LocalSignerEnv { evm_private_key: None },
             turnkey: TurnkeyEnv {
                 org_id: Some("test-user-id".to_string()),
                 api_private_key: None,
                 address: Some(Address::random()),
+                kms_api_key: None,
             },
         };
 
         let result = env.into_config();
         assert!(
-            matches!(result, Err(SignerConfigError::MissingApiPrivateKey)),
-            "Expected MissingApiPrivateKey error, got {result:?}"
+            matches!(result, Err(SignerConfigError::MissingTurnkeyCredential)),
+            "Expected MissingTurnkeyCredential error, got {result:?}"
         );
     }
 
@@ -240,6 +310,7 @@ mod tests {
                 org_id: Some("test-user-id".to_string()),
                 api_private_key: Some("some-key".to_string()),
                 address: None,
+                kms_api_key: None,
             },
         };
 
@@ -260,6 +331,7 @@ mod tests {
                 org_id: Some("org-abc123".to_string()),
                 api_private_key: Some("some-api-key".to_string()),
                 address: Some(expected_address),
+                kms_api_key: None,
             },
         };
 
@@ -273,6 +345,92 @@ mod tests {
             expected_address,
             "Turnkey config must carry the address supplied at construction"
         );
+    }
+
+    const KMS_KEY: &str =
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1";
+
+    fn turnkey_env(
+        api_private_key: Option<&str>,
+        kms_api_key: Option<&str>,
+    ) -> SignerEnv {
+        SignerEnv {
+            local: LocalSignerEnv { evm_private_key: None },
+            turnkey: TurnkeyEnv {
+                org_id: Some("org-abc123".to_string()),
+                api_private_key: api_private_key.map(str::to_string),
+                address: Some(Address::from([0xbbu8; 20])),
+                kms_api_key: kms_api_key.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn turnkey_kms_api_key_produces_kms_credentials() {
+        let config = turnkey_env(None, Some(KMS_KEY)).into_config().unwrap();
+
+        let SignerConfig::Turnkey(turnkey) = config else {
+            panic!("Expected Turnkey config, got {config:?}");
+        };
+        assert!(
+            matches!(turnkey.credentials, TurnkeyCredentials::Kms(_)),
+            "Expected KMS credentials, got {:?}",
+            turnkey.credentials
+        );
+    }
+
+    #[test]
+    fn turnkey_both_credentials_fail() {
+        let result = turnkey_env(Some("some-key"), Some(KMS_KEY)).into_config();
+
+        assert!(
+            matches!(
+                result,
+                Err(SignerConfigError::AmbiguousTurnkeyCredential)
+            ),
+            "Expected AmbiguousTurnkeyCredential error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn turnkey_empty_api_private_key_is_ignored_next_to_kms() {
+        let config =
+            turnkey_env(Some(""), Some(KMS_KEY)).into_config().unwrap();
+
+        let SignerConfig::Turnkey(turnkey) = config else {
+            panic!("Expected Turnkey config, got {config:?}");
+        };
+        assert!(
+            matches!(turnkey.credentials, TurnkeyCredentials::Kms(_)),
+            "Expected KMS credentials, got {:?}",
+            turnkey.credentials
+        );
+    }
+
+    #[test]
+    fn turnkey_empty_credentials_fail_as_missing() {
+        let result = turnkey_env(Some(""), Some("")).into_config();
+
+        assert!(
+            matches!(result, Err(SignerConfigError::MissingTurnkeyCredential)),
+            "Expected MissingTurnkeyCredential error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn turnkey_malformed_kms_api_key_fails() {
+        for malformed in [
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+            "projects//locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+            "//cloudkms.googleapis.com/v1/projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+        ] {
+            let result = turnkey_env(None, Some(malformed)).into_config();
+
+            assert!(
+                matches!(result, Err(SignerConfigError::InvalidKmsApiKey(_))),
+                "Expected InvalidKmsApiKey for {malformed:?}, got {result:?}"
+            );
+        }
     }
 
     #[tokio::test]

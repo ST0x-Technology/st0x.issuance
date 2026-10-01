@@ -324,13 +324,17 @@ resolving into a `ResolvedSigner` holding an `EthereumWallet`, which `config.rs`
 wraps into a signing `Provider` for `RealBlockchainService`:
 
 - **Local**: `EVM_PRIVATE_KEY` → raw private key signer (dev/test)
-- **Turnkey**: `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS`
-  → remote signing via Turnkey's AWS Nitro secure enclaves;
-  `TURNKEY_API_PRIVATE_KEY` is a P-256 key authenticating requests to Turnkey,
-  not the wallet signing key (prod)
+- **Turnkey**: `TURNKEY_ORG_ID` + `TURNKEY_ADDRESS` + exactly one of
+  `TURNKEY_API_PRIVATE_KEY` or `TURNKEY_KMS_API_KEY` → remote signing via
+  Turnkey's AWS Nitro secure enclaves. Both credentials are P-256 keys
+  authenticating requests to Turnkey, not the wallet signing key:
+  `TURNKEY_API_PRIVATE_KEY` is stored key material (local, droplet);
+  `TURNKEY_KMS_API_KEY` names a Cloud KMS key version that stamps requests under
+  the runtime's GCP identity (GCP deployments)
 
 Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
-`wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
+`wallet/turnkey.rs`, `wallet/gcp_kms_stamper.rs` (KMS-backed Turnkey stamps),
+`config.rs` (backend selection, Provider construction)
 
 **Receipt custody (`receipt_inventory/migration.rs`):** rotating a holder can
 strand the vault's receipts at the old address. The vendor-neutral migration

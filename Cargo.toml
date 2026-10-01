@@ -57,6 +57,15 @@ ipnetwork = "0.21.1"
 subtle = "2.6.1"
 governor = "0.10.2"
 turnkey_api_key_stamper = "0.7.0"
+# KMS-stamped (keyless) Turnkey authentication: p256 parses the KMS public
+# key and verifies its signature before a stamp is sent, sha2 digests the
+# request body for AsymmetricSign.
+p256 = { version = "0.13", default-features = false, features = [
+  "ecdsa",
+  "pkcs8",
+  "pem",
+] }
+sha2 = "0.10"
 turnkey_client = "0.7.0"
 mime = { version = "0.3.17" }
 ciborium = "0.2.2"
@@ -97,11 +106,6 @@ event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", 
   "test-support",
 ] }
 httpmock = { workspace = true }
-p256 = { version = "0.13", default-features = false, features = [
-  "ecdsa",
-  "pkcs8",
-  "pem",
-] }
 proptest = "1.10.0"
 rust_decimal_macros = "1.40.0"
 st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false, features = [

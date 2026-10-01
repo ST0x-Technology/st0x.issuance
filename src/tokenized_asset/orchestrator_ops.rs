@@ -118,7 +118,7 @@ pub(crate) async fn orchestrator_verify_signing_ops(
         .ok_or(Status::NotFound)?;
 
     let resolved =
-        resolve_turnkey_signer(turnkey, chain_id).map_err(|error| {
+        resolve_turnkey_signer(turnkey, chain_id).await.map_err(|error| {
             error!(target: "asset", %error, "Failed to resolve Turnkey signer");
             Status::InternalServerError
         })?;
@@ -198,7 +198,7 @@ pub(crate) async fn orchestrator_approve_ops(
         .ok_or(Status::NotFound)?;
 
     let resolved =
-        resolve_turnkey_signer(turnkey, chain_id).map_err(|error| {
+        resolve_turnkey_signer(turnkey, chain_id).await.map_err(|error| {
             error!(target: "asset", %error, "Failed to resolve Turnkey signer");
             Status::InternalServerError
         })?;

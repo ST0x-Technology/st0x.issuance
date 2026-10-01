@@ -2939,13 +2939,15 @@ handlers, making aggregates testable with mock services.
 RPC client for on-chain vault (and, in orchestrator mode, `ST0xOrchestrator`)
 interaction, implemented by `RealBlockchainService`. Which signing backend is
 active is controlled by `SignerConfig` (`Local` — `EVM_PRIVATE_KEY` — or
-`Turnkey` — `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS`,
-prod), **independently** of `VaultMode` (`VaultDirect` |
-`Orchestrator {
-address }`) — the signing backend and the contract target are
-orthogonal axes, so orchestrator mode still needs local signing on Anvil and a
-policy-gated backend in production, exactly like vault-direct mode today; the
-orchestrator methods below do not care which backend signs.
+`Turnkey` — `TURNKEY_ORG_ID` + `TURNKEY_ADDRESS` + exactly one of
+`TURNKEY_API_PRIVATE_KEY` (stored key) or `TURNKEY_KMS_API_KEY` (Cloud KMS key
+version stamping under the runtime's GCP identity), prod), **independently** of
+`VaultMode` (`VaultDirect` | `Orchestrator {
+address }`) — the signing backend
+and the contract target are orthogonal axes, so orchestrator mode still needs
+local signing on Anvil and a policy-gated backend in production, exactly like
+vault-direct mode today; the orchestrator methods below do not care which
+backend signs.
 
 Turnkey transaction signing uses `ACTIVITY_TYPE_SIGN_TRANSACTION_V2` with the
 exact unsigned EIP-2718 transaction bytes. The returned signed envelope is
