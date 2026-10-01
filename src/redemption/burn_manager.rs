@@ -2005,6 +2005,8 @@ impl BurnManager {
     /// exactly as the admin resume gate does: a landed one is confirmed and
     /// recorded, a dead one is retried, and anything else — including a
     /// classification the provider cannot answer — waits for the next pass.
+    /// A burn that is still pending is broadcast again before the wait (see
+    /// `rebroadcast_retained_burn`).
     ///
     /// A failure that names a DIFFERENT transaction from the retained one is
     /// treated the same way. Confirming the named one there would act on a
@@ -2076,6 +2078,14 @@ impl BurnManager {
                     FailedBurnInspection::Retry
                 }
                 BurnTxFate::Live => {
+                    if status == BurnTxStatus::StillMineable {
+                        self.rebroadcast_retained_burn(
+                            issuer_request_id,
+                            vault_service,
+                            sendable_tx,
+                        )
+                        .await;
+                    }
                     debug!(target: "redemption",
                         issuer_request_id = %issuer_request_id,
                         tx_hash = %sendable_tx.hash,
@@ -2096,6 +2106,66 @@ impl BurnManager {
                 );
                 FailedBurnInspection::Wait
             }
+        }
+    }
+
+    /// Broadcasts a pending retained burn again, unchanged. The node may have
+    /// dropped it, and `ResyncNonceManager` only moves forward, so every later
+    /// transaction from the signer queues behind its nonce until it mines or
+    /// another transaction takes that nonce. A failure only logs: the pass
+    /// waits either way, and the next pass tries again.
+    ///
+    /// The rebroadcast records no event, queues no job and signs nothing, so
+    /// it spends no recovery budget. Like all automatic recovery, it stops
+    /// once the budget is exhausted. `/admin/recover` does not broadcast it
+    /// then either: an exhausted redemption goes to the manual replacement,
+    /// which refuses a burn that can still mine. The operator broadcasts the
+    /// retained burn out of band.
+    async fn rebroadcast_retained_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault_service: &dyn VaultService,
+        sendable_tx: &SendableTxWithHash,
+    ) {
+        let budget = match self.burn_recovery_budget(issuer_request_id).await {
+            Ok(budget) => budget,
+            Err(error) => {
+                warn!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %sendable_tx.hash,
+                    error = %error,
+                    "Failed to read the automatic recovery budget; not \
+                     broadcasting the retained burn again"
+                );
+                return;
+            }
+        };
+        if budget.is_exhausted() {
+            debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                "Not broadcasting the retained burn again after exhausting \
+                 the automatic budget"
+            );
+            return;
+        }
+
+        match vault_service.rebroadcast_burn(sendable_tx).await {
+            Ok(()) => debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                "Broadcast the retained burn again so a node that dropped it \
+                 can still mine it"
+            ),
+            Err(error) => warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                error = %error,
+                "Failed to broadcast the retained burn again; the next pass \
+                 tries again"
+            ),
         }
     }
 
@@ -13926,15 +13996,21 @@ mod tests {
         ];
 
         for (vault_mock, level, expected_log) in cases {
+            let vault_mock = Arc::new(vault_mock);
             let (harness, manager, issuer_request_id) =
                 failed_over_a_retained_burn(
-                    Arc::new(vault_mock),
+                    vault_mock.clone(),
                     &signed_burn,
                     None,
                 )
                 .await;
 
             manager.recover_unresolved_burns().await;
+
+            assert!(
+                vault_mock.rebroadcast_burn_txs().is_empty(),
+                "{expected_log}: only a pending burn is broadcast again"
+            );
 
             for event_type in [
                 "RedemptionEvent::BurnResumed",
@@ -13963,6 +14039,211 @@ mod tests {
                 "expected {level} log: {expected_log}"
             );
         }
+    }
+
+    /// The resend of a retained burn records no budget event and queues no
+    /// submit job. A spent budget would stop the resend after five passes, and
+    /// `/admin/recover` would then refuse the live burn.
+    async fn assert_resend_spends_no_budget(
+        harness: &TestHarness,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        submit_jobs_before: i64,
+    ) {
+        for event_type in [
+            "RedemptionEvent::BurnRecoveryAttempted",
+            "RedemptionEvent::BurnRecoveryExhausted",
+        ] {
+            assert_eq!(
+                count_redemption_events(
+                    &harness.pool,
+                    issuer_request_id,
+                    event_type,
+                )
+                .await,
+                0,
+                "the resend must record no {event_type}"
+            );
+        }
+        assert_eq!(
+            submit_burn_job_count(harness).await,
+            submit_jobs_before,
+            "the resend must queue no submit job"
+        );
+    }
+
+    async fn submit_burn_job_count(harness: &TestHarness) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(job_type::<SubmitBurnJob>())
+            .fetch_one(&harness.pool)
+            .await
+            .expect("submit job count should load")
+    }
+
+    /// A pending retained burn can be one the node dropped from its mempool.
+    /// The nonce counter only moves forward, so every later transaction from
+    /// the signer queues behind that nonce and stalls. Each pass broadcasts
+    /// the exact retained bytes again, and still waits for the burn's outcome.
+    #[traced_test]
+    #[tokio::test]
+    async fn still_mineable_retained_burn_is_rebroadcast() {
+        let signed_burn = cafe_burn();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+        let (harness, manager, issuer_request_id) =
+            failed_over_a_retained_burn(vault_mock.clone(), &signed_burn, None)
+                .await;
+        let submit_jobs_before = submit_burn_job_count(&harness).await;
+
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            vault_mock.rebroadcast_burn_txs(),
+            vec![signed_burn.clone()],
+            "the pass must broadcast the retained bytes again, unchanged"
+        );
+        for event_type in [
+            "RedemptionEvent::BurnResumed",
+            "RedemptionEvent::ExistingBurnRecovered",
+        ] {
+            assert_eq!(
+                count_redemption_events(
+                    &harness.pool,
+                    &issuer_request_id,
+                    event_type,
+                )
+                .await,
+                0,
+                "no {event_type} may follow while the retained burn is live"
+            );
+        }
+        assert_resend_spends_no_budget(
+            &harness,
+            &issuer_request_id,
+            submit_jobs_before,
+        )
+        .await;
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
+        let issuer_request_id = issuer_request_id.to_string();
+        let tx_hash = signed_burn.hash.to_string();
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Broadcast the retained burn again",
+                &issuer_request_id,
+                &tx_hash
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Retained burn can still land", &issuer_request_id]
+        ));
+    }
+
+    /// Automatic recovery stops once its budget is exhausted, so the pass no
+    /// longer broadcasts the retained burn again. It still classifies the
+    /// burn and waits; the operator broadcasts it out of band.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_budget_stops_the_retained_burn_rebroadcast() {
+        let signed_burn = cafe_burn();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+        let (harness, manager, issuer_request_id) =
+            failed_over_a_retained_burn(vault_mock.clone(), &signed_burn, None)
+                .await;
+        harness
+            .store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnRecoveryExhausted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: signed_burn.hash,
+                    nonce: signed_burn.nonce,
+                    attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                },
+            )
+            .await
+            .expect("a failed redemption over its burn should exhaust");
+
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            vault_mock.burn_classification_call_count(),
+            1,
+            "the pass must still classify the retained burn"
+        );
+        assert!(
+            vault_mock.rebroadcast_burn_txs().is_empty(),
+            "an exhausted budget must stop the automatic rebroadcast"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Not broadcasting the retained burn again",
+                &issuer_request_id.to_string(),
+                &signed_burn.hash.to_string(),
+            ]
+        ));
+    }
+
+    /// A failed rebroadcast proves nothing about the burn: the node may
+    /// already hold it. The pass still waits and tries again on the next one.
+    #[traced_test]
+    #[tokio::test]
+    async fn failed_rebroadcast_of_a_retained_burn_still_waits() {
+        let signed_burn = cafe_burn();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::StillMineable)
+                .with_rebroadcast_burn_failure(),
+        );
+        let (harness, manager, issuer_request_id) =
+            failed_over_a_retained_burn(vault_mock.clone(), &signed_burn, None)
+                .await;
+        let submit_jobs_before = submit_burn_job_count(&harness).await;
+
+        manager.recover_unresolved_burns().await;
+        manager.recover_unresolved_burns().await;
+
+        assert_eq!(
+            vault_mock.rebroadcast_burn_txs(),
+            vec![signed_burn.clone(), signed_burn.clone()],
+            "every pass must try the rebroadcast again"
+        );
+        assert_eq!(
+            count_redemption_events(
+                &harness.pool,
+                &issuer_request_id,
+                "RedemptionEvent::BurnResumed",
+            )
+            .await,
+            0,
+            "a failed rebroadcast must never resume over a live burn"
+        );
+        assert_resend_spends_no_budget(
+            &harness,
+            &issuer_request_id,
+            submit_jobs_before,
+        )
+        .await;
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Failed to broadcast the retained burn again",
+                &issuer_request_id.to_string(),
+                &signed_burn.hash.to_string(),
+            ]
+        ));
     }
 
     /// A failure that names a transaction the redemption has moved past must

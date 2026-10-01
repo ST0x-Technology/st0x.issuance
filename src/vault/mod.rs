@@ -18,6 +18,7 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::burn_excess::BurnExcessId;
@@ -196,6 +197,19 @@ pub(crate) trait VaultService: Send + Sync {
     ) -> Result<BurnTxStatus, VaultError> {
         Ok(BurnTxStatus::StillMineable)
     }
+
+    /// Broadcasts a persisted signed burn again, unchanged, so a node that
+    /// dropped it from its mempool (or never received it) holds it again.
+    ///
+    /// The bytes are already signed, so this can never create a second burn:
+    /// either the transaction mines, or another transaction already holds its
+    /// nonce and the node refuses it, after which classification proves it
+    /// dead once that nonce is finalized. A node that already holds the
+    /// transaction counts as success.
+    async fn rebroadcast_burn(
+        &self,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<(), VaultError>;
 
     /// Re-signs the persisted burn's exact call at a fresh nonce.
     ///
@@ -1127,6 +1141,13 @@ pub(crate) enum VaultError {
         "Node returned transaction hash {returned:?} for persisted transaction {expected:?}"
     )]
     BroadcastHashMismatch { expected: B256, returned: B256 },
+    /// Broadcasting a persisted burn again got no answer in time. The node
+    /// may still hold the bytes, so this proves nothing about the burn; the
+    /// caller tries again later.
+    #[error(
+        "Rebroadcast of persisted burn {tx_hash:?} got no answer in {timeout:?}"
+    )]
+    BurnRebroadcastTimedOut { tx_hash: B256, timeout: Duration },
     /// The node rejected this exact persisted burn because its account nonce
     /// has already advanced past the signed nonce.
     #[error("Persisted burn transaction {tx_hash:?} has a spent nonce {nonce}")]

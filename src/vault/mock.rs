@@ -348,6 +348,11 @@ pub(crate) struct MockVaultService {
     #[cfg(test)]
     submitted_burn_txs: Arc<Mutex<Vec<SendableTxWithHash>>>,
     #[cfg(test)]
+    rebroadcast_burn_txs: Arc<Mutex<Vec<SendableTxWithHash>>>,
+    /// Fails every `rebroadcast_burn` after it records the call.
+    #[cfg(test)]
+    rebroadcast_burn_fails: Arc<AtomicBool>,
+    #[cfg(test)]
     burn_classification_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
     mint_classification_call_count: Arc<AtomicUsize>,
@@ -418,6 +423,10 @@ impl MockVaultService {
             mint_tx_status_sequence: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             submitted_burn_txs: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            rebroadcast_burn_txs: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            rebroadcast_burn_fails: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             burn_classification_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -669,6 +678,12 @@ impl MockVaultService {
         self.burn_classification_call_count.load(Ordering::Relaxed)
     }
 
+    /// The persisted burns broadcast again, unchanged, in call order.
+    #[cfg(test)]
+    pub(crate) fn rebroadcast_burn_txs(&self) -> Vec<SendableTxWithHash> {
+        self.rebroadcast_burn_txs.lock().unwrap().clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn burn_preparation_call_count(&self) -> usize {
         self.burn_preparation_call_count.load(Ordering::Relaxed)
@@ -905,6 +920,12 @@ impl MockVaultService {
     pub(crate) fn with_burn_tx_classification_failure(self) -> Self {
         *self.burn_tx_status.lock().unwrap() =
             MockBurnTxClassification::RpcError;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rebroadcast_burn_failure(self) -> Self {
+        self.rebroadcast_burn_fails.store(true, Ordering::Relaxed);
         self
     }
 
@@ -1783,6 +1804,23 @@ impl VaultService for MockVaultService {
         }
         #[cfg(not(test))]
         Ok(BurnTxStatus::StillMineable)
+    }
+
+    async fn rebroadcast_burn(
+        &self,
+        _sendable_tx: &SendableTxWithHash,
+    ) -> Result<(), VaultError> {
+        #[cfg(test)]
+        {
+            self.rebroadcast_burn_txs
+                .lock()
+                .unwrap()
+                .push(_sendable_tx.clone());
+            if self.rebroadcast_burn_fails.load(Ordering::Relaxed) {
+                return Err(VaultError::InvalidReceipt);
+            }
+        }
+        Ok(())
     }
 
     async fn prepare_replacement_burn_tx(

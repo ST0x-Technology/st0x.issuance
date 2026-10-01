@@ -127,6 +127,27 @@ enum NonceReservation {
     ReserveNext,
 }
 
+/// What a failed broadcast does to the transaction's nonce.
+#[derive(Clone, Copy)]
+enum BroadcastKind {
+    /// Bytes signed for this send. A definitive rejection frees the nonce for
+    /// the next transaction, and an ambiguous failure reserves it.
+    New,
+    /// Bytes signed earlier, sent again. A node accepted them before, so a
+    /// failure proves only that this send failed, not that the transaction is
+    /// dead. Unless the node answers that the nonce is already used, a resend
+    /// only keeps the nonce out of reuse and never moves the counter, so
+    /// `pending` decides the next nonce. Before a restart this process already
+    /// gave the nonce out, so the counter is usually past it. An earlier
+    /// definitive rejection can have released it, though: if it sits in
+    /// `reusable`, the resend takes it out; if the counter moved back to it,
+    /// the resend leaves it, and the next transaction can take it, as after a
+    /// restart. After a restart the cache is empty, and a lower nonce can be
+    /// missing as well: the next transaction must take the lowest missing
+    /// nonce from `pending`, as the restart remedy relies on.
+    Resend,
+}
+
 impl ResyncNonceManager {
     fn snapshot(&self, address: Address) -> Option<NonceState> {
         self.nonces
@@ -166,6 +187,18 @@ impl ResyncNonceManager {
             .entry(address)
             .or_insert_with(|| NonceState::new(nonce.saturating_add(1)))
             .mark_used(nonce);
+    }
+
+    /// Keeps `nonce` out of reuse without moving the counter past it.
+    fn withhold(&self, address: Address, nonce: u64) {
+        if let Some(state) = self
+            .nonces
+            .lock()
+            .expect("nonce cache lock poisoned")
+            .get_mut(&address)
+        {
+            state.reusable.remove(&nonce);
+        }
     }
 
     fn observe_pending(&self, address: Address, pending: u64) {
@@ -272,6 +305,12 @@ const BURN_GAS_FLOOR: u64 = 1_000_000;
 /// sits on the signing path, so a hung estimate must fall back to the
 /// formula instead of blocking every later signature.
 const BURN_GAS_ESTIMATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on one burn rebroadcast: the broadcast and its hash lookup together.
+/// The production HTTP transport has no request timeout, and both callers
+/// wait on it: a pass of the automatic failed-burn loop, and an
+/// `/admin/recover` request.
+const BURN_REBROADCAST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Gas limit for a burn multicall with `call_count` legs, computed from
 /// the transaction's own shape instead of estimating (same reason as
@@ -619,11 +658,21 @@ impl RealBlockchainService {
             })
     }
 
+    /// Books a nonce whose bytes a node may hold: a new transaction marks it
+    /// used, and a resend only withholds it (see [`BroadcastKind::Resend`]).
+    fn reserve_nonce(&self, signer: Address, nonce: u64, kind: BroadcastKind) {
+        match kind {
+            BroadcastKind::New => self.nonce_manager.mark_used(signer, nonce),
+            BroadcastKind::Resend => self.nonce_manager.withhold(signer, nonce),
+        }
+    }
+
     async fn try_broadcast_tx(
         &self,
         tx: &[u8],
         hash: B256,
         nonce: u64,
+        kind: BroadcastKind,
     ) -> Result<Option<()>, VaultError> {
         match self.provider.send_raw_transaction(tx).await {
             Ok(pending_tx) => {
@@ -632,8 +681,11 @@ impl RealBlockchainService {
                 // impossible returned-hash mismatch is therefore uncertain:
                 // a negative lookup from another backend cannot prove that
                 // reusing this nonce is safe.
-                self.nonce_manager
-                    .mark_used(self.provider.default_signer_address(), nonce);
+                self.reserve_nonce(
+                    self.provider.default_signer_address(),
+                    nonce,
+                    kind,
+                );
                 let returned = *pending_tx.tx_hash();
                 if returned != hash {
                     return Err(VaultError::BroadcastHashMismatch {
@@ -656,12 +708,32 @@ impl RealBlockchainService {
                     });
                 }
 
+                // A resend that the node answers "already known" is held by
+                // that node. The hash lookup below can reach another
+                // load-balanced backend that does not hold it, so it does not
+                // decide this case.
+                if matches!(kind, BroadcastKind::Resend)
+                    && let alloy::transports::RpcError::ErrorResp(response) =
+                        &error
+                    && is_already_known_message(&response.message)
+                {
+                    self.reserve_nonce(signer, nonce, kind);
+                    return Ok(None);
+                }
+
                 if let alloy::transports::RpcError::ErrorResp(response) = &error
                     && is_definitive_broadcast_rejection(response.code)
                 {
                     // Protocol-level parse/request errors prove the raw bytes
                     // were never accepted. Server errors remain ambiguous.
-                    self.nonce_manager.release(signer, nonce);
+                    match kind {
+                        BroadcastKind::New => {
+                            self.nonce_manager.release(signer, nonce);
+                        }
+                        BroadcastKind::Resend => {
+                            self.nonce_manager.withhold(signer, nonce);
+                        }
+                    }
                     return Err(VaultError::SubmitRejected {
                         tx_hash: hash,
                         nonce,
@@ -674,7 +746,7 @@ impl RealBlockchainService {
                 // the nonce before the best-effort lookup because a
                 // load-balanced second backend returning `None` cannot prove
                 // rejection.
-                self.nonce_manager.mark_used(signer, nonce);
+                self.reserve_nonce(signer, nonce, kind);
                 if self.provider.get_transaction_by_hash(hash).await?.is_some()
                 {
                     return Ok(None);
@@ -780,6 +852,12 @@ fn is_nonce_too_low_message(message: &str) -> bool {
         .any(|indicator| message.contains(indicator))
 }
 
+/// The node's answer when its pool already holds the exact transaction
+/// (geth and op-geth: "already known").
+fn is_already_known_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("already known")
+}
+
 const fn is_definitive_broadcast_rejection(code: i64) -> bool {
     matches!(code, -32700 | -32600 | -32601 | -32602)
 }
@@ -855,6 +933,7 @@ impl VaultService for RealBlockchainService {
                 &prepared_tx.tx,
                 prepared_tx.hash,
                 prepared_tx.nonce,
+                BroadcastKind::New,
             )
             .await?
             .is_none()
@@ -1105,6 +1184,7 @@ impl VaultService for RealBlockchainService {
                 &sendable_tx.tx,
                 sendable_tx.hash,
                 sendable_tx.nonce,
+                BroadcastKind::New,
             )
             .await
             .map_err(|error| {
@@ -1390,6 +1470,43 @@ impl VaultService for RealBlockchainService {
         Ok(status)
     }
 
+    /// Refuses a burn another signer signed before any RPC call, because the
+    /// broadcast books its nonce against this service's signer. The whole
+    /// broadcast is bounded by [`BURN_REBROADCAST_TIMEOUT`].
+    async fn rebroadcast_burn(
+        &self,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<(), VaultError> {
+        let signer = self.provider.default_signer_address();
+        sendable_tx.validate_for_owner(signer)?;
+        let Ok(broadcast) = tokio::time::timeout(
+            BURN_REBROADCAST_TIMEOUT,
+            self.try_broadcast_tx(
+                &sendable_tx.tx,
+                sendable_tx.hash,
+                sendable_tx.nonce,
+                BroadcastKind::Resend,
+            ),
+        )
+        .await
+        else {
+            // As ambiguous as a transport failure, so the nonce is withheld
+            // the same way (see `BroadcastKind::Resend`).
+            self.nonce_manager.withhold(signer, sendable_tx.nonce);
+            return Err(VaultError::BurnRebroadcastTimedOut {
+                tx_hash: sendable_tx.hash,
+                timeout: BURN_REBROADCAST_TIMEOUT,
+            });
+        };
+        if broadcast?.is_none() {
+            debug!(target: "vault", tx_hash = %sendable_tx.hash,
+                "Burn rebroadcast errored but the node holds the persisted \
+                 transaction"
+            );
+        }
+        Ok(())
+    }
+
     /// Re-signs a persisted burn with a gas limit recalculated from vault
     /// multicall calldata, preserving the original limit for other calls.
     async fn prepare_replacement_burn_tx(
@@ -1581,6 +1698,7 @@ impl VaultService for RealBlockchainService {
                 &sendable_tx.tx,
                 sendable_tx.hash,
                 sendable_tx.nonce,
+                BroadcastKind::New,
             )
             .await
             .map_err(|error| classify_burn_broadcast_error(error, sendable_tx))?
@@ -2070,8 +2188,8 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BURN_GAS_FLOOR, BurnRange, MINT_GAS_LIMIT, MintAuthorization,
-        MintedLogQuery, NonceState, OrchestratorBurnParams,
+        BURN_GAS_FLOOR, BroadcastKind, BurnRange, MINT_GAS_LIMIT,
+        MintAuthorization, MintedLogQuery, NonceState, OrchestratorBurnParams,
         OrchestratorBurnReadiness, OrchestratorMintParams,
         OrchestratorMintedLog, OrchestratorRevertReason, RealBlockchainService,
         RealBlockchainServiceProvider, ResyncNonceManager, burn_call_count,
@@ -3660,7 +3778,7 @@ mod tests {
         service.nonce_manager.observe_pending(owner, nonce);
 
         service
-            .try_broadcast_tx(&[0xde, 0xad], hash, nonce)
+            .try_broadcast_tx(&[0xde, 0xad], hash, nonce, BroadcastKind::New)
             .await
             .expect("mock node should accept replacement");
 
@@ -3689,7 +3807,7 @@ mod tests {
         service.nonce_manager.observe_pending(owner, nonce);
 
         service
-            .try_broadcast_tx(&[0xde, 0xad], hash, nonce)
+            .try_broadcast_tx(&[0xde, 0xad], hash, nonce, BroadcastKind::New)
             .await
             .expect_err("ambiguous broadcast should remain an error");
 
@@ -4275,6 +4393,372 @@ mod tests {
             matches!(result, Err(VaultError::Rpc(_))),
             "a negative lookup cannot prove rejection across RPC backends"
         );
+    }
+
+    #[tokio::test]
+    async fn rebroadcast_burn_sends_the_persisted_transaction() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let asserter = Asserter::new();
+        asserter.push_success(&persisted.hash);
+        let service = create_service_with_signer(asserter.clone(), signer);
+
+        service
+            .rebroadcast_burn(&persisted)
+            .await
+            .expect("the node should accept the persisted burn again");
+
+        assert!(
+            asserter.read_q().is_empty(),
+            "the persisted bytes must reach the node"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rebroadcast_burn_succeeds_when_the_node_already_holds_it() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "internal error".into(),
+            data: None,
+        });
+        asserter.push_success(&Some(rpc_transaction(&persisted.tx, owner)));
+        let service = create_service_with_signer(asserter, signer);
+
+        service
+            .rebroadcast_burn(&persisted)
+            .await
+            .expect("a node that holds the burn should count as a success");
+
+        assert!(
+            service.nonce_manager.snapshot(owner).is_none(),
+            "a resend must leave the next nonce to pending"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "Burn rebroadcast errored but the node holds the persisted",
+                &persisted.hash.to_string(),
+            ]
+        ));
+    }
+
+    /// "Already known" means the answering node holds the burn. With a
+    /// load-balanced RPC, a hash lookup can reach another backend that does
+    /// not, so the resend counts as a success without one.
+    #[traced_test]
+    #[tokio::test]
+    async fn already_known_rebroadcast_succeeds_without_a_lookup() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "already known".into(),
+            data: None,
+        });
+        let service = create_service_with_signer(asserter.clone(), signer);
+
+        service
+            .rebroadcast_burn(&persisted)
+            .await
+            .expect("an already known resend should count as a success");
+
+        assert!(asserter.read_q().is_empty(), "the node's answer must be read");
+        assert!(
+            service.nonce_manager.snapshot(owner).is_none(),
+            "a resend must leave the next nonce to pending"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "Burn rebroadcast errored but the node holds the persisted",
+                &persisted.hash.to_string(),
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebroadcast_burn_refuses_a_corrupt_persisted_burn_before_rpc() {
+        let mut persisted = persisted_burn_tx(1858);
+        persisted.hash = B256::ZERO;
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(Asserter::new(), signer);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedBurnHashMismatch { .. })
+        ));
+    }
+
+    /// The production HTTP transport has no request timeout, and both callers
+    /// wait on the rebroadcast: the automatic loop pass and an admin request.
+    /// A hung node must end the rebroadcast with a retryable error. The nonce
+    /// cache is empty here, as after a restart, so the timeout must not move
+    /// the counter past the dropped burn's nonce.
+    #[tokio::test(start_paused = true)]
+    async fn rebroadcast_burn_times_out_on_a_hung_transport() {
+        use tokio::io::AsyncReadExt;
+
+        // Accepts and reads each request, and never answers.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let nonce_manager = ResyncNonceManager::default();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller::default())
+            .filler(NonceFiller::new(nonce_manager.clone()))
+            .filler(ChainIdFiller::default())
+            .wallet(EthereumWallet::from(signer))
+            .connect_http(format!("http://{addr}").parse().unwrap());
+        let service = RealBlockchainService::new(provider, nonce_manager);
+        let persisted = persisted_burn_tx(1858);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::BurnRebroadcastTimedOut { tx_hash, .. })
+                    if tx_hash == persisted.hash
+            ),
+            "a hung node must end the rebroadcast, got {result:?}"
+        );
+        assert!(
+            service.nonce_manager.snapshot(owner).is_none(),
+            "a timed-out resend must not move the counter past its nonce"
+        );
+    }
+
+    /// A definitive rejection of a resend proves only that this send failed,
+    /// not that the retained burn is dead. When this process already gave the
+    /// nonce out, it stays reserved, so the next transaction from the signer
+    /// cannot take it and race the burn.
+    #[tokio::test]
+    async fn rejected_rebroadcast_keeps_the_retained_nonce_reserved() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        });
+        // The node dropped the burn, so its pending count is the burn's nonce.
+        asserter.push_success(&persisted.nonce);
+        let service = create_service_with_signer(asserter, signer);
+        service.nonce_manager.mark_used(owner, persisted.nonce);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::SubmitRejected { tx_hash, .. })
+                    if tx_hash == persisted.hash
+            ),
+            "a rejected resend must stay an error, got {result:?}"
+        );
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next fill should read the pending count"),
+            persisted.nonce + 1,
+            "the next transaction must not take the retained burn's nonce"
+        );
+    }
+
+    /// An earlier rejection can leave the burn's nonce in `reusable`: here
+    /// the process took N and N + 1, then released N. A rejected resend of the
+    /// burn at N must take N out of reuse, so the next transaction does not
+    /// sign at the nonce of bytes that a node may still hold.
+    #[tokio::test]
+    async fn rejected_rebroadcast_withholds_a_reusable_nonce() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        });
+        asserter.push_success(&persisted.nonce);
+        let service = create_service_with_signer(asserter, signer);
+        let nonces = &service.nonce_manager;
+        nonces.observe_pending_and_take_next(owner, persisted.nonce);
+        nonces.observe_pending_and_take_next(owner, persisted.nonce);
+        nonces.release(owner, persisted.nonce);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(
+            matches!(result, Err(VaultError::SubmitRejected { .. })),
+            "a rejected resend must stay an error, got {result:?}"
+        );
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next fill should read the pending count"),
+            persisted.nonce + 2,
+            "the next transaction must not take the withheld nonce"
+        );
+    }
+
+    /// After a restart the nonce cache is empty and no node holds the dropped
+    /// burn. A rejected resend must leave its nonce to the next transaction,
+    /// which takes it from `pending` and closes the gap.
+    #[tokio::test]
+    async fn rejected_rebroadcast_after_a_restart_leaves_the_nonce_free() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        });
+        asserter.push_success(&persisted.nonce);
+        let service = create_service_with_signer(asserter, signer);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::SubmitRejected { tx_hash, .. })
+                    if tx_hash == persisted.hash
+            ),
+            "a rejected resend must stay an error, got {result:?}"
+        );
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next fill should read the pending count"),
+            persisted.nonce,
+            "the next transaction must take the dropped burn's nonce"
+        );
+    }
+
+    /// The same after an ambiguous failure the node does not confirm, such as
+    /// an underpriced resend of a burn dropped for its fee: no node holds the
+    /// bytes, so the next transaction must still take the nonce.
+    #[tokio::test]
+    async fn unconfirmed_rebroadcast_after_a_restart_leaves_the_nonce_free() {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "transaction underpriced".into(),
+            data: None,
+        });
+        asserter.push_success(&Option::<RpcTransaction>::None);
+        asserter.push_success(&persisted.nonce);
+        let service = create_service_with_signer(asserter, signer);
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(
+            matches!(result, Err(VaultError::Rpc(_))),
+            "an unconfirmed resend must stay an error, got {result:?}"
+        );
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next fill should read the pending count"),
+            persisted.nonce,
+            "the next transaction must take the dropped burn's nonce"
+        );
+    }
+
+    /// After a restart a lower nonce can be missing too: here the burn at
+    /// N + 1 is resent while nothing holds N. The node takes the resend into
+    /// its queue, and the next transaction must still take N from `pending`,
+    /// or it signs behind the gap.
+    #[tokio::test]
+    async fn accepted_rebroadcast_after_a_restart_does_not_skip_a_lower_nonce()
+    {
+        let persisted = persisted_burn_tx(1858);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let owner = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_success(&persisted.hash);
+        asserter.push_success(&(persisted.nonce - 1));
+        let service = create_service_with_signer(asserter, signer);
+
+        service
+            .rebroadcast_burn(&persisted)
+            .await
+            .expect("the node should take the resend into its queue");
+
+        assert_eq!(
+            service
+                .nonce_manager
+                .get_next_nonce(&service.provider, owner)
+                .await
+                .expect("next fill should read the pending count"),
+            persisted.nonce - 1,
+            "the next transaction must take the missing lower nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebroadcast_burn_refuses_a_burn_another_signer_signed() {
+        let persisted = persisted_burn_tx(1858);
+        let service = create_service_with_asserter(Asserter::new());
+
+        let result = service.rebroadcast_burn(&persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedBurnSignerMismatch { .. })
+        ));
     }
 
     #[tokio::test]
