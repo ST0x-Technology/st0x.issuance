@@ -245,21 +245,12 @@ impl GcpKmsStamper {
         source: &AccessTokenSource,
         cache: &Mutex<Option<CachedToken>>,
     ) -> Result<String, GcpKmsStamperError> {
-        let token_url = match source {
-            AccessTokenSource::Ambient => {
-                // Human/local runs (integration tests, break-glass CLI use)
-                // carry a token in the environment; the VM uses its
-                // metadata server.
-                if let Some(token) = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN")
-                    .ok()
-                    .filter(|token| !token.is_empty())
-                {
-                    return Ok(token);
-                }
-                METADATA_TOKEN_URL
-            }
-            #[cfg(test)]
-            AccessTokenSource::Endpoint(url) => url.as_str(),
+        let token_url = match select_token(
+            source,
+            std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok(),
+        ) {
+            SelectedToken::Env(token) => return Ok(token),
+            SelectedToken::Fetch(url) => url,
         };
 
         let mut cached = cache.lock().await;
@@ -392,6 +383,33 @@ impl GcpKmsStamper {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SelectedToken<'a> {
+    Env(String),
+    Fetch(&'a str),
+}
+
+/// Human/local runs (integration tests, break-glass CLI use) carry a token
+/// in `GOOGLE_OAUTH_ACCESS_TOKEN`; the VM uses its metadata server. An
+/// empty variable counts as unset, the same as the Turnkey credential
+/// variables, so a leftover `KEY=` line falls back to the metadata server
+/// instead of sending an empty bearer token.
+fn select_token(
+    source: &AccessTokenSource,
+    env_token: Option<String>,
+) -> SelectedToken<'_> {
+    match source {
+        AccessTokenSource::Ambient => {
+            env_token.filter(|token| !token.is_empty()).map_or(
+                SelectedToken::Fetch(METADATA_TOKEN_URL),
+                SelectedToken::Env,
+            )
+        }
+        #[cfg(test)]
+        AccessTokenSource::Endpoint(url) => SelectedToken::Fetch(url),
+    }
+}
+
 struct SignAttempt {
     status: reqwest::StatusCode,
     response: reqwest::Response,
@@ -405,6 +423,7 @@ mod tests {
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePublicKey;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -518,6 +537,49 @@ mod tests {
                     "signature": BASE64_STANDARD.encode(signature.to_der()),
                 }));
         });
+    }
+
+    #[test]
+    fn ambient_source_uses_env_token_when_set() {
+        assert_eq!(
+            select_token(
+                &AccessTokenSource::Ambient,
+                Some("env-token".to_string())
+            ),
+            SelectedToken::Env("env-token".to_string())
+        );
+    }
+
+    #[test]
+    fn ambient_source_uses_metadata_server_when_env_token_unset() {
+        assert_eq!(
+            select_token(&AccessTokenSource::Ambient, None),
+            SelectedToken::Fetch(METADATA_TOKEN_URL)
+        );
+    }
+
+    #[test]
+    fn ambient_source_treats_empty_env_token_as_unset() {
+        assert_eq!(
+            select_token(&AccessTokenSource::Ambient, Some(String::new())),
+            SelectedToken::Fetch(METADATA_TOKEN_URL)
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn construction_logs_key_version_and_public_key() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+
+        let stamper = stamper_for(&server).await;
+
+        assert!(logs_contain(
+            "Turnkey KMS stamper initialized (keyless authentication)"
+        ));
+        assert!(logs_contain(KEY_VERSION));
+        assert!(logs_contain(&stamper.public_key_hex));
     }
 
     #[tokio::test]

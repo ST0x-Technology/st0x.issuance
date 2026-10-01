@@ -74,10 +74,51 @@ impl std::fmt::Debug for TurnkeyApiPrivateKey {
 pub(crate) struct TurnkeyKmsApiKey(String);
 
 impl TurnkeyKmsApiKey {
-    pub const fn new(value: String) -> Self {
-        Self(value)
+    /// Shape check only, so a typo fails `validate-config` and startup
+    /// parsing instead of the first Turnkey request; KMS itself validates
+    /// the key and its algorithm when the stamper is built. The version
+    /// must be a number: an alias such as `latest` is not a key version,
+    /// and the stamp must name the exact key Turnkey registered.
+    pub(crate) fn parse(value: String) -> Result<Self, InvalidKmsApiKey> {
+        let segments: Vec<&str> = value.split('/').collect();
+        let well_formed = matches!(
+            segments.as_slice(),
+            [
+                "projects", project,
+                "locations", location,
+                "keyRings", key_ring,
+                "cryptoKeys", crypto_key,
+                "cryptoKeyVersions", version,
+            ] if is_resource_id(project, &['.', ':'])
+                && is_resource_id(location, &[])
+                && is_resource_id(key_ring, &[])
+                && is_resource_id(crypto_key, &[])
+                && !version.is_empty()
+                && version.bytes().all(|byte| byte.is_ascii_digit())
+        );
+
+        if well_formed { Ok(Self(value)) } else { Err(InvalidKmsApiKey(value)) }
     }
 }
+
+/// GCP resource IDs use ASCII letters, digits, `-` and `_` (plus `.` and
+/// `:` in domain-scoped project IDs), so this rejects whitespace, URL
+/// fragments and query strings.
+fn is_resource_id(segment: &str, extra: &[char]) -> bool {
+    !segment.is_empty()
+        && segment.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_')
+                || extra.contains(&character)
+        })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "TURNKEY_KMS_API_KEY must be a Cloud KMS key version \
+     (projects/.../cryptoKeyVersions/N), got {0:?}"
+)]
+pub struct InvalidKmsApiKey(String);
 
 /// Errors specific to the Turnkey signing backend.
 #[derive(Debug, thiserror::Error)]
