@@ -276,11 +276,13 @@ impl GcpKmsStamper {
         }
         let TokenResponse { access_token, expires_in } =
             response.json().await?;
-        *cached = Some(CachedToken {
+        // A token with no `expires_in`, or one inside the margin, can never
+        // be reused, so it is not stored; this also clears an expired entry.
+        let reusable_for =
+            Duration::from_secs(expires_in).saturating_sub(TOKEN_EXPIRY_MARGIN);
+        *cached = (!reusable_for.is_zero()).then(|| CachedToken {
             token: access_token.clone(),
-            refresh_at: Instant::now()
-                + Duration::from_secs(expires_in)
-                    .saturating_sub(TOKEN_EXPIRY_MARGIN),
+            refresh_at: Instant::now() + reusable_for,
         });
         drop(cached);
         Ok(AccessToken { token: access_token, refetchable: true })
@@ -730,6 +732,7 @@ mod tests {
         stamper.stamp(body).await.expect("second stamp should succeed");
 
         token_mock.assert_calls(3);
+        assert!(stamper.cached_token.lock().await.is_none());
     }
 
     /// Returns how many times the token endpoint is called for
