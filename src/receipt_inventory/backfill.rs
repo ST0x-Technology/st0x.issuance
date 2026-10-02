@@ -1,3 +1,4 @@
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
@@ -157,8 +158,8 @@ where
     /// receipts the bot owns.
     ///
     /// For each receipt discovered:
-    /// 1. Checks current on-chain balance (not just transfer amount, since
-    ///    receipts may have been partially burned)
+    /// 1. Checks the on-chain balance at `head_block` (not just transfer
+    ///    amount, since receipts may have been partially burned)
     /// 2. If balance > 0 and not already tracked, emits DiscoverReceipt command
     ///
     /// `from_block` is the block to start scanning from. On first run, pass
@@ -166,9 +167,10 @@ where
     /// previous checkpoint via
     /// `load_receipt_backfill(pool, network, vault)`.
     ///
-    /// `head_block` is the chain head to scan up to. The caller fetches it so
-    /// a single `eth_blockNumber` can be shared across every vault in one
-    /// reconciliation pass rather than one call per vault.
+    /// `head_block` is the chain head to scan up to. The caller fetches it for
+    /// this vault right before the call, so the window in which a settled
+    /// burn can outrun these reads (see `reconcile_receipt`) is this vault's
+    /// own scan.
     ///
     /// Queries are chunked to avoid RPC response size limits.
     ///
@@ -230,7 +232,7 @@ where
             .unique_by(|discovery| discovery.receipt_id);
 
         let results: Vec<_> = stream::iter(discoveries)
-            .map(|discovery| self.process_discovery(discovery))
+            .map(|discovery| self.process_discovery(discovery, current_block))
             .buffer_unordered(MAX_CONCURRENT_BALANCE_CHECKS)
             .collect()
             .await;
@@ -273,7 +275,7 @@ where
         } else {
             let reconciled = u64::try_from(unique_reconciliation_ids.len())?;
             for receipt_id in unique_reconciliation_ids {
-                self.reconcile_receipt(receipt_id).await?;
+                self.reconcile_receipt(receipt_id, current_block).await?;
             }
             reconciled
         };
@@ -498,12 +500,23 @@ where
     async fn process_discovery(
         &self,
         discovery: ReceiptDiscovery,
+        head_block: u64,
     ) -> Result<ProcessOutcome, BackfillError> {
         let receipt_contract =
             Receipt::new(self.receipt_contract, &self.provider);
 
+        // Read at the pass head, the block the logs reach. A read at `latest`
+        // can reach a node that is behind the node that served the logs: a
+        // receipt that just arrived then reads zero, is skipped, and the
+        // checkpoint moves past its block for good. A node that does not have
+        // `head_block` yet fails the call, so the pass fails without moving
+        // the checkpoint, and the next pass retries. At startup, a failed
+        // pass stops startup, as any backfill RPC error does, and the service
+        // restarts. This reading also reconciles a receipt that inventory
+        // already tracks, with the side effect `reconcile_receipt` describes.
         let current_balance = receipt_contract
             .balanceOf(self.bot_wallet, discovery.receipt_id.inner())
+            .block(BlockId::number(head_block))
             .call()
             .await?;
 
@@ -667,16 +680,27 @@ where
         ItnDepositCheck::Conflict
     }
 
-    /// Queries the on-chain balance of a receipt and reconciles the aggregate.
+    /// Queries the on-chain balance of a receipt at the pass head and
+    /// reconciles the aggregate.
+    ///
+    /// The read is pinned for the same reason as in `process_discovery`. A
+    /// burn of ours that lands after `head_block` can settle in inventory
+    /// before this read, so the read can briefly restore the shares that
+    /// burn consumed. The next pass scans the burn's block and reconciles
+    /// the receipt again. The caller fetches `head_block` for each vault right
+    /// before its scan, so this window is that vault's own scan, not the whole
+    /// pass over every vault.
     async fn reconcile_receipt(
         &self,
         receipt_id: ReceiptId,
+        head_block: u64,
     ) -> Result<(), BackfillError> {
         let receipt_contract =
             Receipt::new(self.receipt_contract, &self.provider);
 
         let on_chain_balance = receipt_contract
             .balanceOf(self.bot_wallet, receipt_id.inner())
+            .block(BlockId::number(head_block))
             .call()
             .await?;
 
@@ -819,8 +843,8 @@ pub(crate) fn transfer_batch_filter(
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::primitives::{Address, B256, Bytes, U256, address, b256};
-    use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolEvent;
@@ -839,7 +863,7 @@ mod tests {
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
         ReceiptVaultKey, Shares, load_inventory,
     };
-    use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm, logs_contain_at};
     use crate::tokenized_asset::Network;
 
     async fn setup_test_pool() -> Pool<Sqlite> {
@@ -2028,5 +2052,184 @@ mod tests {
             Shares::from(new_on_chain_balance),
             "Backfill should reconcile known receipt balance upward"
         );
+    }
+
+    /// A `LocalEvm` whose wallet can deposit into and redeem from the vault.
+    async fn local_evm_with_vault_roles() -> LocalEvm {
+        let evm = LocalEvm::new().await.unwrap();
+        evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+        evm.grant_withdraw_role(evm.wallet_address).await.unwrap();
+        evm.grant_certify_role(evm.wallet_address).await.unwrap();
+        evm.certify_vault(U256::MAX).await.unwrap();
+        evm
+    }
+
+    async fn local_evm_wallet_provider(
+        evm: &LocalEvm,
+    ) -> impl Provider + Clone {
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap()
+    }
+
+    /// Burns `shares` of the wallet's receipt through the vault's `redeem`,
+    /// the call a vault-direct burn makes, in a new block.
+    async fn redeem_on_chain(
+        evm: &LocalEvm,
+        provider: &impl Provider,
+        receipt_id: U256,
+        shares: U256,
+    ) {
+        let receipt =
+            OffchainAssetReceiptVault::new(evm.vault_address, provider)
+                .redeem(
+                    shares,
+                    evm.wallet_address,
+                    evm.wallet_address,
+                    receipt_id,
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+        assert!(receipt.status(), "the test redeem must succeed");
+    }
+
+    /// A pass reads each balance at its own head block, the block its logs
+    /// reach. A read at `latest` can reach a node that is behind the node
+    /// that served the logs. A receipt that just arrived then reads zero, the
+    /// pass skips it, and the checkpoint moves past its block for good. Anvil
+    /// cannot lag, so here a block after the pass head burns the receipt
+    /// instead: only a read pinned to the pass head sees the balance that the
+    /// pass's logs prove.
+    #[traced_test]
+    #[tokio::test]
+    async fn discovery_reads_the_balance_at_the_pass_head_block() {
+        let evm = local_evm_with_vault_roles().await;
+        let deposited = U256::from(100) * U256::from(10).pow(U256::from(18));
+        let (receipt_id, shares) =
+            evm.mint_directly(deposited, evm.wallet_address).await.unwrap();
+        let provider = local_evm_wallet_provider(&evm).await;
+        let head_block = provider.get_block_number().await.unwrap();
+        redeem_on_chain(&evm, &provider, receipt_id, shares).await;
+        let receipt_contract = Address::from(
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .receipt()
+                .call()
+                .await
+                .unwrap()
+                .0,
+        );
+        let (store, pool) = setup_store().await;
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider,
+            receipt_contract,
+            bot_wallet: evm.wallet_address,
+            chain_id: evm.chain_id,
+            network: Network::Base,
+            vault: evm.vault_address,
+            store: store.clone(),
+            pool,
+            handler: NoOpItnHandler,
+        });
+
+        let result = backfiller.backfill_receipts(0, head_block).await.unwrap();
+
+        assert_eq!(
+            result.processed_count, 1,
+            "the receipt the wallet held at the pass head must be discovered"
+        );
+        assert_eq!(result.skipped_zero_balance, 0);
+        let inventory =
+            load_inventory(&store, evm.chain_id, &evm.vault_address)
+                .await
+                .unwrap();
+        let receipts = inventory.receipts_with_balance();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].receipt_id, ReceiptId::from(receipt_id));
+        assert_eq!(receipts[0].available_balance, Shares::from(shares));
+        assert!(logs_contain_at!(
+            tracing::Level::TRACE,
+            &[
+                "Processed receipt",
+                &ReceiptId::from(receipt_id).to_string(),
+                &shares.to_string(),
+            ]
+        ));
+    }
+
+    /// Reconciliation reads at the pass head too. A burn inside the pass
+    /// range puts the receipt in the reconciliation set. A second burn after
+    /// the pass head belongs to the next pass, which scans its block.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciliation_reads_the_balance_at_the_pass_head_block() {
+        let evm = local_evm_with_vault_roles().await;
+        let deposited = U256::from(100) * U256::from(10).pow(U256::from(18));
+        let (receipt_id, shares) =
+            evm.mint_directly(deposited, evm.wallet_address).await.unwrap();
+        let provider = local_evm_wallet_provider(&evm).await;
+        let receipt_contract = Address::from(
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .receipt()
+                .call()
+                .await
+                .unwrap()
+                .0,
+        );
+        let (store, pool) = setup_store().await;
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider: provider.clone(),
+            receipt_contract,
+            bot_wallet: evm.wallet_address,
+            chain_id: evm.chain_id,
+            network: Network::Base,
+            vault: evm.vault_address,
+            store: store.clone(),
+            pool,
+            handler: NoOpItnHandler,
+        });
+        let discovery_head = provider.get_block_number().await.unwrap();
+        backfiller.backfill_receipts(0, discovery_head).await.unwrap();
+
+        let half = shares / U256::from(2);
+        redeem_on_chain(&evm, &provider, receipt_id, half).await;
+        let head_block = provider.get_block_number().await.unwrap();
+        let quarter = shares / U256::from(4);
+        redeem_on_chain(&evm, &provider, receipt_id, quarter).await;
+
+        let result = backfiller
+            .backfill_receipts(discovery_head + 1, head_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciled_count, 1);
+        let held_at_head = shares - half;
+        let inventory =
+            load_inventory(&store, evm.chain_id, &evm.vault_address)
+                .await
+                .unwrap();
+        let receipts = inventory.receipts_with_balance();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].available_balance,
+            Shares::from(held_at_head),
+            "the reading must be the balance at the pass head, before the \
+             later burn"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::TRACE,
+            &[
+                "Receipt balance reconciled",
+                &ReceiptId::from(receipt_id).to_string(),
+                &held_at_head.to_string(),
+            ]
+        ));
     }
 }

@@ -1664,7 +1664,8 @@ fn next_receipt_backfill_block(
 
 /// Dependencies shared by every vault in a single periodic receipt-backfill
 /// pass. Constant across the pass; only `config` varies per vault. `head_block`
-/// is fetched once per pass and passed separately to each per-vault call.
+/// is fetched for each vault, right before its scan, and passed separately to
+/// each per-vault call.
 struct PeriodicBackfillCtx<'a, P, H> {
     pool: &'a Pool<Sqlite>,
     provider: &'a P,
@@ -1832,29 +1833,12 @@ where
                 continue;
             }
 
-            // Fetch the chain head once per pass and reuse it for every vault.
-            // The receipt backfill scans the same block range across all
-            // vaults, so a single `eth_blockNumber` per pass replaces one call
-            // per vault.
-            let head_block = match provider.get_block_number().await {
-                Ok(head_block) => head_block,
-                Err(error) => {
-                    warn!(
-                        target: "receipt",
-                        error = %error,
-                        "Failed to fetch chain head; skipping this receipt \
-                         backfill pass"
-                    );
-                    telemetry.record_receipt_backfill_failure(network);
-                    continue;
-                }
-            };
-
             // Per-vault failures log at DEBUG (loop-body rule); the pass emits a
             // single WARN summary below if any vault failed.
             let mut failed_vaults: Vec<Address> = Vec::new();
             let mut lag_blocks = 0_u64;
             let mut checkpoint_read_failed = false;
+            let mut head_read_failed = false;
 
             for asset in &assets {
                 // Read the vault's start block first so its backlog counts
@@ -1879,6 +1863,27 @@ where
                              skipping vault this pass"
                         );
                         checkpoint_read_failed = true;
+                        failed_vaults.push(asset.vault);
+                        continue;
+                    }
+                };
+
+                // A head for this vault, fetched right before its scan, never
+                // one shared by the whole pass. The scan reads balances at the
+                // head, and a burn that settles between the head and that read
+                // has its shares restored until the next pass. A shared head
+                // would stretch that window across every vault before this one.
+                let head_block = match provider.get_block_number().await {
+                    Ok(head_block) => head_block,
+                    Err(error) => {
+                        debug!(
+                            target: "receipt",
+                            error = %error,
+                            vault = %asset.vault,
+                            "Failed to fetch chain head; skipping vault this \
+                             pass"
+                        );
+                        head_read_failed = true;
                         failed_vaults.push(asset.vault);
                         continue;
                     }
@@ -1946,10 +1951,13 @@ where
             // A pass where nothing progressed is a telemetry failure. Partial
             // vault failures whose start block was read keep the pass
             // successful and surface through `lag_blocks`, mirroring the
-            // transfer poller. A checkpoint read failure is different: its
-            // backlog is never counted, so it forces the pass to failure rather
-            // than reporting a success whose lag omits that vault.
-            if failed_vaults.len() == assets.len() || checkpoint_read_failed {
+            // transfer poller. A checkpoint or head read failure is different:
+            // its backlog is never counted, so it forces the pass to failure
+            // rather than reporting a success whose lag omits that vault.
+            if failed_vaults.len() == assets.len()
+                || checkpoint_read_failed
+                || head_read_failed
+            {
                 telemetry.record_receipt_backfill_failure(network);
             } else {
                 telemetry.record_receipt_backfill_success(network, lag_blocks);
