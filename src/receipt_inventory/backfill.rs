@@ -1,3 +1,4 @@
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
@@ -28,6 +29,14 @@ const BLOCK_CHUNK_SIZE: u64 = 2000;
 /// Maximum concurrent RPC calls for balance checks.
 /// Limits parallelism to avoid overwhelming the RPC provider.
 const MAX_CONCURRENT_BALANCE_CHECKS: usize = 4;
+
+/// Blocks the balance reads stay behind a fresh head when the chain moved on
+/// during a long log scan. A pooled RPC can answer `eth_blockNumber` from a
+/// backend a block or two ahead of the backend that then serves a read. The
+/// reads never go below the block the logs reach, so after a short scan they
+/// read at the pass head itself. A backend behind the pass head then fails
+/// the pass, and the next pass, or the restart at startup, retries.
+const READ_BLOCK_MARGIN: u64 = 2;
 
 /// Generates inclusive block ranges of at most `chunk_size` blocks.
 fn block_ranges(
@@ -157,8 +166,9 @@ where
     /// receipts the bot owns.
     ///
     /// For each receipt discovered:
-    /// 1. Checks current on-chain balance (not just transfer amount, since
-    ///    receipts may have been partially burned)
+    /// 1. Checks the on-chain balance at the read block, never below
+    ///    `head_block` (not just transfer amount, since receipts may have been
+    ///    partially burned)
     /// 2. If balance > 0 and not already tracked, emits DiscoverReceipt command
     ///
     /// `from_block` is the block to start scanning from. On first run, pass
@@ -166,9 +176,7 @@ where
     /// previous checkpoint via
     /// `load_receipt_backfill(pool, network, vault)`.
     ///
-    /// `head_block` is the chain head to scan up to. The caller fetches it so
-    /// a single `eth_blockNumber` can be shared across every vault in one
-    /// reconciliation pass rather than one call per vault.
+    /// `head_block` is the chain head to scan up to. The caller fetches it.
     ///
     /// Queries are chunked to avoid RPC response size limits.
     ///
@@ -220,6 +228,35 @@ where
             all_reconciliation_ids.extend(fetched.reconciliation_receipt_ids);
         }
 
+        // Read balances at the block the logs reach, or, when the chain moved
+        // on during the scan, at a fresh head less `READ_BLOCK_MARGIN`. A read
+        // at `latest` can reach a node that is behind the node that served
+        // the logs: a receipt that just arrived then reads zero, is skipped,
+        // and the checkpoint moves past its block for good. An explicit block
+        // fails on a node that does not have it yet, so the pass fails
+        // without moving the checkpoint, and the next pass retries. At
+        // startup, a failed pass stops startup, as any backfill RPC error
+        // does, and the service restarts. After a long scan, the margin keeps
+        // a backend that is a block or two behind the fresh head from failing
+        // the pass; after a short scan, the reads stay at the pass head. The
+        // fresh head keeps the reads at recent state, which a node that is
+        // not an archive node still serves after a long scan.
+        // It also makes the window in which a settled burn can outrun these
+        // reads (see `reconcile_receipt`) the margin plus the time from this
+        // call to the reads, not the whole scan. A pass with no logs reads
+        // nothing, so it skips the call.
+        let read_block = if all_discovery_logs.is_empty()
+            && all_reconciliation_ids.is_empty()
+        {
+            current_block
+        } else {
+            self.provider
+                .get_block_number()
+                .await?
+                .saturating_sub(READ_BLOCK_MARGIN)
+                .max(current_block)
+        };
+
         // Process discovery logs (Deposit + inbound transfers)
         let discoveries = all_discovery_logs
             .iter()
@@ -230,7 +267,7 @@ where
             .unique_by(|discovery| discovery.receipt_id);
 
         let results: Vec<_> = stream::iter(discoveries)
-            .map(|discovery| self.process_discovery(discovery))
+            .map(|discovery| self.process_discovery(discovery, read_block))
             .buffer_unordered(MAX_CONCURRENT_BALANCE_CHECKS)
             .collect()
             .await;
@@ -273,7 +310,7 @@ where
         } else {
             let reconciled = u64::try_from(unique_reconciliation_ids.len())?;
             for receipt_id in unique_reconciliation_ids {
-                self.reconcile_receipt(receipt_id).await?;
+                self.reconcile_receipt(receipt_id, read_block).await?;
             }
             reconciled
         };
@@ -290,6 +327,7 @@ where
             skipped_zero_balance,
             reconciled_count,
             checkpoint_block = current_block,
+            read_block,
             "Receipt backfill complete"
         );
 
@@ -498,12 +536,18 @@ where
     async fn process_discovery(
         &self,
         discovery: ReceiptDiscovery,
+        read_block: u64,
     ) -> Result<ProcessOutcome, BackfillError> {
         let receipt_contract =
             Receipt::new(self.receipt_contract, &self.provider);
 
+        // Pinned to `read_block`, never below the block the logs reach (see
+        // `backfill_receipts`). This reading also reconciles a receipt that
+        // inventory already tracks, with the side effect `reconcile_receipt`
+        // describes.
         let current_balance = receipt_contract
             .balanceOf(self.bot_wallet, discovery.receipt_id.inner())
+            .block(BlockId::number(read_block))
             .call()
             .await?;
 
@@ -667,16 +711,27 @@ where
         ItnDepositCheck::Conflict
     }
 
-    /// Queries the on-chain balance of a receipt and reconciles the aggregate.
+    /// Queries the on-chain balance of a receipt at `read_block` and
+    /// reconciles the aggregate.
+    ///
+    /// The read is pinned for the same reason as in `process_discovery`. A
+    /// burn of ours that lands after `read_block` can settle in inventory
+    /// before this read, so the read can briefly restore the shares that
+    /// burn consumed. The next pass scans the burn's block and reconciles
+    /// the receipt again. `backfill_receipts` fetches `read_block` after the
+    /// log scan, so this window is `READ_BLOCK_MARGIN` plus the time from that
+    /// fetch to this read.
     async fn reconcile_receipt(
         &self,
         receipt_id: ReceiptId,
+        read_block: u64,
     ) -> Result<(), BackfillError> {
         let receipt_contract =
             Receipt::new(self.receipt_contract, &self.provider);
 
         let on_chain_balance = receipt_contract
             .balanceOf(self.bot_wallet, receipt_id.inner())
+            .block(BlockId::number(read_block))
             .call()
             .await?;
 
@@ -819,8 +874,9 @@ pub(crate) fn transfer_batch_filter(
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::primitives::{Address, B256, Bytes, U256, address, b256};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi;
     use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolEvent;
@@ -830,7 +886,10 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::{NoOpItnHandler, ReceiptBackfillDeps, ReceiptBackfiller};
+    use super::{
+        BackfillError, NoOpItnHandler, READ_BLOCK_MARGIN, ReceiptBackfillDeps,
+        ReceiptBackfiller,
+    };
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::poll_checkpoint::{
         load_checkpoint_block, receipt_backfill_name,
@@ -839,7 +898,7 @@ mod tests {
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
         ReceiptVaultKey, Shares, load_inventory,
     };
-    use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm, logs_contain_at};
     use crate::tokenized_asset::Network;
 
     async fn setup_test_pool() -> Pool<Sqlite> {
@@ -954,6 +1013,8 @@ mod tests {
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1025,6 +1086,7 @@ mod tests {
         let asserter1 = Asserter::new();
         asserter1.push_success(&vec![deposit_log.clone()]);
         push_empty_non_deposit_logs(&asserter1);
+        asserter1.push_success(&U256::from(current_block));
         asserter1.push_success(&balance.to_be_bytes::<32>());
 
         let provider1 = ProviderBuilder::new()
@@ -1071,6 +1133,7 @@ mod tests {
         let asserter2 = Asserter::new();
         asserter2.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter2);
+        asserter2.push_success(&U256::from(current_block));
         asserter2.push_success(&balance.to_be_bytes::<32>());
 
         let provider2 = ProviderBuilder::new()
@@ -1145,6 +1208,8 @@ mod tests {
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf) - zero because receipt was fully burned
         asserter.push_success(&U256::ZERO.to_be_bytes::<32>());
 
@@ -1217,6 +1282,8 @@ mod tests {
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf) - returns current balance, not original deposit
         asserter.push_success(&current_balance.to_be_bytes::<32>());
 
@@ -1294,6 +1361,8 @@ mod tests {
         // eth_getLogs (Deposit filter) - both deposits returned, filtered client-side
         asserter.push_success(&vec![deposit_for_bot, deposit_for_other]);
         push_empty_non_deposit_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf) - only called for bot's receipt
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1349,6 +1418,8 @@ mod tests {
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1596,6 +1667,8 @@ mod tests {
         // eth_getLogs (TransferBatch filter) - no batch transfers
         asserter.push_success(&Vec::<Log>::new());
         push_empty_reconciliation_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1684,6 +1757,8 @@ mod tests {
         // eth_getLogs (TransferBatch filter) - no batch transfers
         asserter.push_success(&Vec::<Log>::new());
         push_empty_reconciliation_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // No balanceOf calls since both transfers are filtered
 
         let provider = ProviderBuilder::new()
@@ -1798,6 +1873,8 @@ mod tests {
         asserter.push_success(&Vec::<Log>::new());
         asserter.push_success(&vec![outbound_log]);
         asserter.push_success(&Vec::<Log>::new());
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(200u64));
         // Deliberately NO balanceOf response.
 
         let provider = ProviderBuilder::new()
@@ -1892,6 +1969,8 @@ mod tests {
         // eth_getLogs (TransferBatch filter)
         asserter.push_success(&Vec::<Log>::new());
         push_empty_reconciliation_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf) — only one call since deduplicated
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1995,6 +2074,8 @@ mod tests {
         // eth_getLogs (TransferBatch filter) — none
         asserter.push_success(&Vec::<Log>::new());
         push_empty_reconciliation_logs(&asserter);
+        // eth_blockNumber (the read block)
+        asserter.push_success(&U256::from(current_block));
         // eth_call (balanceOf) — returns the new higher balance
         asserter.push_success(&new_on_chain_balance.to_be_bytes::<32>());
 
@@ -2028,5 +2109,207 @@ mod tests {
             Shares::from(new_on_chain_balance),
             "Backfill should reconcile known receipt balance upward"
         );
+    }
+
+    /// A `LocalEvm` whose wallet can deposit into and redeem from the vault.
+    async fn local_evm_with_vault_roles() -> LocalEvm {
+        let evm = LocalEvm::new().await.unwrap();
+        evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+        evm.grant_withdraw_role(evm.wallet_address).await.unwrap();
+        evm.grant_certify_role(evm.wallet_address).await.unwrap();
+        evm.certify_vault(U256::MAX).await.unwrap();
+        evm
+    }
+
+    async fn local_evm_wallet_provider(
+        evm: &LocalEvm,
+    ) -> impl Provider + Clone {
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap()
+    }
+
+    /// Burns `shares` of the wallet's receipt through the vault's `redeem`,
+    /// the call a vault-direct burn makes, in a new block.
+    async fn redeem_on_chain(
+        evm: &LocalEvm,
+        provider: &impl Provider,
+        receipt_id: U256,
+        shares: U256,
+    ) {
+        let receipt =
+            OffchainAssetReceiptVault::new(evm.vault_address, provider)
+                .redeem(
+                    shares,
+                    evm.wallet_address,
+                    evm.wallet_address,
+                    receipt_id,
+                    Bytes::new(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+        assert!(receipt.status(), "the test redeem must succeed");
+    }
+
+    /// The logs can come from a node that is ahead of the node that answers
+    /// the balance reads. A read at `latest` would then miss a receipt that
+    /// just arrived, and the checkpoint would move past its block for good.
+    /// Here the pass head is past Anvil's head, and Anvil's head is the fresh
+    /// head: the read stays at the pass head, Anvil does not have that block
+    /// yet, and the pass fails with the checkpoint unmoved.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_read_node_behind_the_logs_fails_the_pass() {
+        let evm = local_evm_with_vault_roles().await;
+        let deposited = U256::from(100) * U256::from(10).pow(U256::from(18));
+        evm.mint_directly(deposited, evm.wallet_address).await.unwrap();
+        let provider = local_evm_wallet_provider(&evm).await;
+        let head_block = provider.get_block_number().await.unwrap() + 5;
+        let receipt_contract = Address::from(
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .receipt()
+                .call()
+                .await
+                .unwrap()
+                .0,
+        );
+        let (store, pool) = setup_store().await;
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider,
+            receipt_contract,
+            bot_wallet: evm.wallet_address,
+            chain_id: evm.chain_id,
+            network: Network::Base,
+            vault: evm.vault_address,
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
+
+        let error =
+            backfiller.backfill_receipts(0, head_block).await.unwrap_err();
+
+        assert!(
+            matches!(error, BackfillError::ContractCall(_)),
+            "the balance read must fail, got {error:?}"
+        );
+        assert_eq!(
+            load_checkpoint_block(
+                &pool,
+                &receipt_backfill_name(Network::Base, evm.vault_address),
+            )
+            .await
+            .unwrap(),
+            None,
+            "a failed pass must not move the checkpoint"
+        );
+        let inventory =
+            load_inventory(&store, evm.chain_id, &evm.vault_address)
+                .await
+                .unwrap();
+        assert!(inventory.receipts_with_balance().is_empty());
+        assert!(logs_contain_at!(
+            tracing::Level::TRACE,
+            &["Processed block range", "discovery_logs=1"]
+        ));
+    }
+
+    /// A burn inside the pass range puts the receipt in the reconciliation
+    /// set. A second burn lands after the pass head, during the scan, and
+    /// more blocks follow it. The read goes to the fresh head less
+    /// `READ_BLOCK_MARGIN`, which is the second burn's block here, so the
+    /// reading includes the second burn and does not restore the shares it
+    /// consumed. The checkpoint still stops at the pass head, so the next
+    /// pass scans the second burn's block.
+    #[traced_test]
+    #[tokio::test]
+    async fn reconciliation_reads_a_burn_after_the_pass_head() {
+        let evm = local_evm_with_vault_roles().await;
+        let deposited = U256::from(100) * U256::from(10).pow(U256::from(18));
+        let (receipt_id, shares) =
+            evm.mint_directly(deposited, evm.wallet_address).await.unwrap();
+        let provider = local_evm_wallet_provider(&evm).await;
+        let receipt_contract = Address::from(
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .receipt()
+                .call()
+                .await
+                .unwrap()
+                .0,
+        );
+        let (store, pool) = setup_store().await;
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider: provider.clone(),
+            receipt_contract,
+            bot_wallet: evm.wallet_address,
+            chain_id: evm.chain_id,
+            network: Network::Base,
+            vault: evm.vault_address,
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
+        let discovery_head = provider.get_block_number().await.unwrap();
+        backfiller.backfill_receipts(0, discovery_head).await.unwrap();
+
+        let half = shares / U256::from(2);
+        redeem_on_chain(&evm, &provider, receipt_id, half).await;
+        let head_block = provider.get_block_number().await.unwrap();
+        let quarter = shares / U256::from(4);
+        redeem_on_chain(&evm, &provider, receipt_id, quarter).await;
+        let second_burn_block = provider.get_block_number().await.unwrap();
+        provider.anvil_mine(Some(READ_BLOCK_MARGIN), None).await.unwrap();
+
+        let result = backfiller
+            .backfill_receipts(discovery_head + 1, head_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciled_count, 1);
+        let held_now = shares - half - quarter;
+        let inventory =
+            load_inventory(&store, evm.chain_id, &evm.vault_address)
+                .await
+                .unwrap();
+        let receipts = inventory.receipts_with_balance();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].available_balance,
+            Shares::from(held_now),
+            "the reading must include the burn after the pass head"
+        );
+        assert_eq!(
+            load_checkpoint_block(
+                &pool,
+                &receipt_backfill_name(Network::Base, evm.vault_address),
+            )
+            .await
+            .unwrap(),
+            Some(head_block),
+            "the checkpoint must stop at the pass head"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::TRACE,
+            &[
+                "Receipt balance reconciled",
+                &ReceiptId::from(receipt_id).to_string(),
+                &held_now.to_string(),
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::TRACE,
+            &[
+                "Receipt backfill complete",
+                &format!("checkpoint_block={head_block}"),
+                &format!("read_block={second_burn_block}"),
+            ]
+        ));
     }
 }
