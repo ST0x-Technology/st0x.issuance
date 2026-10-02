@@ -8,6 +8,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::fmt::{Debug, Formatter};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::jobs::{Job, job_type};
@@ -28,6 +29,7 @@ pub(crate) enum NotificationKind {
     RedemptionResumed,
     RedemptionResumeFailed,
     LowGasBalance,
+    LowFillRate,
     InboundWrappedTransfer,
 }
 
@@ -44,6 +46,7 @@ impl NotificationKind {
             Self::RedemptionResumed => "redemption_resumed",
             Self::RedemptionResumeFailed => "redemption_resume_failed",
             Self::LowGasBalance => "low_gas_balance",
+            Self::LowFillRate => "low_fill_rate",
             Self::InboundWrappedTransfer => "inbound_wrapped_transfer",
         }
     }
@@ -87,6 +90,13 @@ pub(crate) enum LifecycleNotification {
         balance: U256,
         threshold: U256,
     },
+    /// Accepted mint and redemption requests fell below the configured
+    /// average over the trailing window.
+    LowFillRate {
+        fills: u64,
+        required_fills: u64,
+        window_hours: NonZeroU32,
+    },
     /// A transfer of a configured wrapped token into the issuer wallet; not
     /// redeemable automatically, so the operator must recover it by hand.
     InboundWrappedTransfer {
@@ -125,6 +135,7 @@ impl LifecycleNotification {
                 NotificationKind::RedemptionResumeFailed
             }
             Self::LowGasBalance { .. } => NotificationKind::LowGasBalance,
+            Self::LowFillRate { .. } => NotificationKind::LowFillRate,
             Self::InboundWrappedTransfer { .. } => {
                 NotificationKind::InboundWrappedTransfer
             }
@@ -181,6 +192,14 @@ impl LifecycleNotification {
                      {currency} (threshold {} {currency})",
                     format_ether(*balance),
                     format_ether(*threshold)
+                )
+            }
+            Self::LowFillRate { fills, required_fills, window_hours } => {
+                format!(
+                    "Low fill rate: {fills} accepted mint and redemption \
+                     requests in the last {window_hours}h (minimum \
+                     {required_fills}); check that Alpaca can reach the \
+                     issuer and that the transfer poller is running"
                 )
             }
             Self::InboundWrappedTransfer {
@@ -727,6 +746,23 @@ mod tests {
              0xABcdEFABcdEFabcdEfAbCdefabcdeFABcDEFabCD holds \
              0.050000000000000000 BNB (threshold 0.100000000000000000 BNB)"
         );
+    }
+
+    #[test]
+    fn low_fill_rate_message_states_count_minimum_and_window() {
+        let notification = LifecycleNotification::LowFillRate {
+            fills: 4,
+            required_fills: 18,
+            window_hours: NonZeroU32::new(6).unwrap(),
+        };
+
+        assert_eq!(
+            notification.message(),
+            "Low fill rate: 4 accepted mint and redemption requests in the \
+             last 6h (minimum 18); check that Alpaca can reach the issuer \
+             and that the transfer poller is running"
+        );
+        assert_eq!(notification.kind().as_str(), "low_fill_rate");
     }
 
     /// The amount is the raw on-chain value. ERC-4626 does not fix a share

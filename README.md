@@ -291,6 +291,14 @@ Telegram lifecycle notification, deduplicated to at most one repeat alert per
 hour. Thresholds are all or nothing across configured chains; with none set,
 monitoring is disabled with a startup WARN.
 
+A fill rate monitor alerts when accepted mint and redemption requests average
+fewer than `FILL_RATE_ALERT_MIN_FILLS_PER_HOUR` over the trailing
+`FILL_RATE_ALERT_WINDOW_HOURS` (default 6), on the same ERROR log, Telegram, and
+hourly repeat cadence. It only speaks during the US extended-hours session
+(Mon-Fri 04:00-20:00 New York time, minus NYSE full holidays) and once the
+session has been open for the whole window. Unset, it is disabled. See SPEC.md
+"Fill rate monitoring".
+
 `GET /admin/network-telemetry` reports per network telemetry: transfer poller,
 receipt backfill, and inbound wrapped-token transfer pass counters with failure
 rate and block lag, plus the gas monitor's latest reading. See SPEC.md "Per

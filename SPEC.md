@@ -5385,6 +5385,74 @@ Alert state lives in process memory; a restart alerts once more for a wallet
 still below the threshold, which is the desired behavior for an unresolved
 condition.
 
+### Fill rate monitoring
+
+A fill is a request the issuer accepted: a `Mint` `Initiated` event (Alpaca's
+mint request passed validation) or a `Redemption` `Detected` event (an AP's
+transfer to the redemption wallet was recognised). Intake is the signal because
+it is what stops when the issuer stops taking work, independent of where a
+request later stalls. If fills dry up while the service otherwise looks healthy
+(Alpaca no longer calling, an endpoint unreachable from Alpaca, the transfer
+poller silently stuck), nothing else alerts, so the bot watches the rate itself.
+
+**Configuration:** both optional, read from the environment:
+
+- `FILL_RATE_ALERT_MIN_FILLS_PER_HOUR`: the minimum average fills per hour.
+  Unset disables the monitor with a startup INFO log, so development and staging
+  need no extra variables. Zero or malformed is a startup error.
+- `FILL_RATE_ALERT_WINDOW_HOURS`: the trailing window the average is taken over,
+  default 6. Zero, malformed, or longer than the 16 hour session is a startup
+  error: a longer window could never fill, so the monitor would be silent
+  forever. A window of one hour would page on ordinary variance (a Poisson
+  process averaging 3 an hour sees fewer than 3 in a given hour about 42% of the
+  time); the longer window makes the alert mean "the average really is below the
+  floor".
+
+**Session:** fills follow the US extended-hours trading day, so the monitor only
+speaks while that session is open. The session, in `America/New_York` wall-clock
+time, is Monday to Friday from 04:00 up to but excluding 20:00, minus NYSE full
+holidays. Overnight, Saturday, Sunday, and a full holiday are closed. Early
+closes are out of scope: the session still ends at 20:00. The holiday list is
+checked in at `src/fill_rate_monitor/nyse_holidays.txt`, transcribed from NYSE's
+published calendar (https://www.nyse.com/trade/hours-calendars), declares the
+years it `covers`, and holds those years only. It must cover the current year
+and the next one: a unit test fails once it does not, which gives a year of
+notice to add the next year's dates. Observed holidays (a holiday on a Saturday
+closes the Friday before, one on a Sunday the Monday after) are listed on the
+day the market is closed.
+
+**Behavior:** one monitor task polls every 5 minutes. Each poll first places
+`now` relative to the session:
+
+- Closed: no count, no alert, no repeat. The alert state is left unchanged, so
+  an alert still pending when the session ends carries into the next session.
+- Open for less than the window: the window is not yet full, and a shortfall is
+  not an alert. No count, alert state unchanged. With the default window the
+  earliest page of a session is 10:00.
+- Open for at least the window: the window is the trailing `window_hours` ending
+  at `now`. It lies wholly inside the current session, so the overnight and
+  weekend gap is never part of it and the previous session's fills never fill
+  it.
+- The date is outside the holiday list's coverage: WARN log, alert state
+  unchanged. Treating the date as an ordinary trading day would page on a
+  holiday, so the monitor stays silent and says why on every poll.
+
+With a full window the monitor counts the fills whose event timestamp
+(`initiated_at` / `detected_at`) falls within it and compares the count with
+`min_fills_per_hour * window_hours`:
+
+- Count below the minimum: ERROR log plus a `LowFillRate` lifecycle notification
+  (Telegram when configured) carrying the count, the minimum, and the window.
+- Still below the minimum: alert again at most once per hour. A delivery that
+  fails leaves the alert state unchanged, so the next poll retries immediately.
+- Back at or above the minimum: INFO log only, and the repeat timer clears so a
+  later shortfall pages immediately.
+- Count query fails: WARN log, alert state unchanged.
+
+The monitor counts from the event store, so a restart neither loses history nor
+needs a warm-up beyond the session's own; alert state lives in process memory,
+so a restart alerts once more for a rate still below the minimum.
+
 ### Inbound wrapped-token transfer alerts
 
 The transfer poller watches each asset's vault, i.e. the unwrapped share token,
