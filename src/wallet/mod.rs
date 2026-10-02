@@ -8,8 +8,8 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::{Args, Parser};
 use serde::Deserialize;
 use turnkey::{
-    TurnkeyApiPrivateKey, TurnkeyConfig, TurnkeyCredentials, TurnkeyError,
-    TurnkeyKmsApiKey, TurnkeyOrganizationId,
+    InvalidKmsApiKey, TurnkeyApiPrivateKey, TurnkeyConfig, TurnkeyCredentials,
+    TurnkeyError, TurnkeyKmsApiKey, TurnkeyOrganizationId,
 };
 
 /// Wallet backend discriminant. Deserialized from a `kind` field in wallet config sections
@@ -115,11 +115,8 @@ pub enum SignerConfigError {
         "both TURNKEY_API_PRIVATE_KEY and TURNKEY_KMS_API_KEY are set; use only one"
     )]
     AmbiguousTurnkeyCredential,
-    #[error(
-        "TURNKEY_KMS_API_KEY must be a Cloud KMS key version \
-         (projects/.../cryptoKeyVersions/N), got {0:?}"
-    )]
-    InvalidKmsApiKey(String),
+    #[error(transparent)]
+    InvalidKmsApiKey(#[from] InvalidKmsApiKey),
     #[error("TURNKEY_ADDRESS is required when TURNKEY_ORG_ID is set")]
     MissingAddress,
 }
@@ -165,7 +162,7 @@ fn signer_config_from_turnkey(
             TurnkeyCredentials::ApiKey(TurnkeyApiPrivateKey::new(key))
         }
         (None, Some(key_version)) => {
-            TurnkeyCredentials::Kms(parse_kms_api_key(key_version)?)
+            TurnkeyCredentials::Kms(TurnkeyKmsApiKey::parse(key_version)?)
         }
         (Some(_), Some(_)) => {
             return Err(SignerConfigError::AmbiguousTurnkeyCredential);
@@ -181,28 +178,6 @@ fn signer_config_from_turnkey(
         credentials,
         address,
     )))
-}
-
-/// Shape check only, so a typo fails `validate-config` and startup parsing
-/// instead of the first Turnkey request; KMS itself validates the key and
-/// its algorithm when the stamper is built.
-fn parse_kms_api_key(
-    key_version: String,
-) -> Result<TurnkeyKmsApiKey, SignerConfigError> {
-    let segments: Vec<&str> = key_version.split('/').collect();
-    let well_formed = segments.len() == 10
-        && segments[0] == "projects"
-        && segments[2] == "locations"
-        && segments[4] == "keyRings"
-        && segments[6] == "cryptoKeys"
-        && segments[8] == "cryptoKeyVersions"
-        && segments.iter().all(|segment| !segment.is_empty());
-
-    if well_formed {
-        Ok(TurnkeyKmsApiKey::new(key_version))
-    } else {
-        Err(SignerConfigError::InvalidKmsApiKey(key_version))
-    }
 }
 
 impl SignerConfig {
@@ -418,11 +393,33 @@ mod tests {
     }
 
     #[test]
+    fn turnkey_kms_api_key_accepts_domain_scoped_project() {
+        let key = "projects/example.com:my-project/locations/global/keyRings/r_1/cryptoKeys/k-1/cryptoKeyVersions/12";
+
+        let config = turnkey_env(None, Some(key)).into_config().unwrap();
+
+        assert!(
+            matches!(
+                config,
+                SignerConfig::Turnkey(TurnkeyConfig {
+                    credentials: TurnkeyCredentials::Kms(_),
+                    ..
+                })
+            ),
+            "Expected KMS credentials, got {config:?}"
+        );
+    }
+
+    #[test]
     fn turnkey_malformed_kms_api_key_fails() {
         for malformed in [
             "projects/p/locations/l/keyRings/r/cryptoKeys/k",
             "projects//locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
             "//cloudkms.googleapis.com/v1/projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1#fragment",
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1 ",
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/latest",
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1/extra",
         ] {
             let result = turnkey_env(None, Some(malformed)).into_config();
 
