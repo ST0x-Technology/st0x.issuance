@@ -6,6 +6,7 @@ use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{Level, warn};
@@ -231,6 +232,9 @@ pub struct Config {
     /// `gas_monitor::GAS_POLL_INTERVAL` in production; tests lower it so
     /// they don't have to wait a full production interval for a reading.
     pub gas_poll_interval: Duration,
+    /// Floor on the rate of accepted mint and redemption requests; `None`
+    /// disables the fill rate monitor. See [`crate::fill_rate_monitor`].
+    pub fill_rate_alert: Option<FillRateAlertConfig>,
     /// Wrapped-token contracts to watch per network for inbound transfers to
     /// the issuer wallet; see [`crate::wrapped_transfer`].
     pub wrapped_tokens: WrappedTokenConfig,
@@ -406,6 +410,46 @@ impl Audience {
     }
 }
 
+/// When the fill rate monitor alerts: fewer than `min_fills_per_hour` fills on
+/// average over the trailing `window_hours`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillRateAlertConfig {
+    pub min_fills_per_hour: NonZeroU32,
+    pub window_hours: NonZeroU32,
+}
+
+/// The raw `FILL_RATE_ALERT_*` environment group. The window only matters
+/// once a minimum is set, so [`FillRateAlertEnv::into_config`] drops it
+/// otherwise.
+#[derive(Args, Clone)]
+struct FillRateAlertEnv {
+    #[arg(
+        long = "fill-rate-alert-min-fills-per-hour",
+        env = "FILL_RATE_ALERT_MIN_FILLS_PER_HOUR",
+        help = "Alert when accepted mint and redemption requests average \
+                fewer than this many per hour over the window; unset \
+                disables the fill rate monitor"
+    )]
+    min_fills_per_hour: Option<NonZeroU32>,
+
+    #[arg(
+        long = "fill-rate-alert-window-hours",
+        env = "FILL_RATE_ALERT_WINDOW_HOURS",
+        default_value = "6",
+        help = "Trailing window, in hours, the fill rate is averaged over"
+    )]
+    window_hours: NonZeroU32,
+}
+
+impl FillRateAlertEnv {
+    fn into_config(self) -> Option<FillRateAlertConfig> {
+        self.min_fills_per_hour.map(|min_fills_per_hour| FillRateAlertConfig {
+            min_fills_per_hour,
+            window_hours: self.window_hours,
+        })
+    }
+}
+
 /// The raw `OPS_API_*_AUDIENCE` environment group. Each is optional at the clap
 /// layer; [`resolve_ops_api`] enforces the all-or-none, non-blank, unpadded,
 /// and distinct rules that [`OpsApiConfig`] then embodies.
@@ -521,6 +565,9 @@ struct Env {
                 when CHAIN_BASE_* overrides the flat Base configuration"
     )]
     low_gas_threshold: Option<String>,
+
+    #[clap(flatten)]
+    fill_rate_alert: FillRateAlertEnv,
 
     #[clap(flatten)]
     auth: AuthConfig,
@@ -833,6 +880,7 @@ impl Env {
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
+            fill_rate_alert: self.fill_rate_alert.into_config(),
             wrapped_tokens,
             wrapped_transfer_poll_interval:
                 crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
@@ -1728,6 +1776,72 @@ mod tests {
         assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(chain.rpc_url, config.rpc_url);
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
+    }
+
+    #[test]
+    fn fill_rate_alert_is_disabled_unless_a_minimum_is_set() {
+        let config =
+            Env::try_parse_from(minimal_args()).unwrap().into_config().unwrap();
+
+        assert_eq!(config.fill_rate_alert, None);
+
+        let mut window_only = minimal_args();
+        window_only
+            .extend_from_slice(&["--fill-rate-alert-window-hours", "12"]);
+        let config =
+            Env::try_parse_from(window_only).unwrap().into_config().unwrap();
+
+        assert_eq!(
+            config.fill_rate_alert, None,
+            "a window without a minimum must not enable the monitor"
+        );
+    }
+
+    #[test]
+    fn fill_rate_alert_parses_minimum_with_default_and_explicit_window() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--fill-rate-alert-min-fills-per-hour", "3"]);
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert_eq!(
+            config.fill_rate_alert,
+            Some(FillRateAlertConfig {
+                min_fills_per_hour: NonZeroU32::new(3).unwrap(),
+                window_hours: NonZeroU32::new(6).unwrap(),
+            })
+        );
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--fill-rate-alert-min-fills-per-hour",
+            "3",
+            "--fill-rate-alert-window-hours",
+            "12",
+        ]);
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert_eq!(
+            config.fill_rate_alert.map(|alert| alert.window_hours),
+            NonZeroU32::new(12)
+        );
+    }
+
+    #[test]
+    fn fill_rate_alert_rejects_zero_and_malformed_values() {
+        for (argument, value) in [
+            ("--fill-rate-alert-min-fills-per-hour", "0"),
+            ("--fill-rate-alert-min-fills-per-hour", "three"),
+            ("--fill-rate-alert-window-hours", "0"),
+            ("--fill-rate-alert-window-hours", "-1"),
+        ] {
+            let mut args = minimal_args();
+            args.extend_from_slice(&[argument, value]);
+
+            assert!(
+                Env::try_parse_from(args).is_err(),
+                "{argument} {value} must be a startup error"
+            );
+        }
     }
 
     #[test]

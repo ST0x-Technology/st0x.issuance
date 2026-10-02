@@ -166,6 +166,7 @@ pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
         backfill_start_block: 0,
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
+        fill_rate_alert: None,
         wrapped_tokens: crate::wrapped_transfer::WrappedTokenConfig::default(),
         wrapped_transfer_poll_interval:
             crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
@@ -1042,6 +1043,9 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
 
     if module.contains("::gas_monitor") {
         return "gas";
+    }
+    if module.contains("::fill_rate_monitor") {
+        return "fill_rate";
     }
     if module.contains("::network_telemetry") {
         return "network_telemetry";

@@ -179,6 +179,23 @@ fn log_delivery_failure(
                 "notification_delivery_failed"
             );
         }
+        LifecycleNotification::LowFillRate {
+            fills,
+            required_fills,
+            window_hours,
+        } => {
+            tracing::error!(
+                target: "notifications",
+                event = "notification_delivery_failed",
+                notification_kind = notification.kind().as_str(),
+                fills,
+                required_fills,
+                window_hours,
+                error = %error,
+                cause = ?cause,
+                "notification_delivery_failed"
+            );
+        }
         LifecycleNotification::InboundWrappedTransfer {
             network,
             underlying,

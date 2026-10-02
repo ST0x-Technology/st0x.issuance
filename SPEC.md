@@ -5383,6 +5383,45 @@ Alert state lives in process memory; a restart alerts once more for a wallet
 still below the threshold, which is the desired behavior for an unresolved
 condition.
 
+### Fill rate monitoring
+
+A fill is a request the issuer accepted: a `Mint` `Initiated` event (Alpaca's
+mint request passed validation) or a `Redemption` `Detected` event (an AP's
+transfer to the redemption wallet was recognised). Intake is the signal because
+it is what stops when the issuer stops taking work, independent of where a
+request later stalls. If fills dry up while the service otherwise looks healthy
+(Alpaca no longer calling, an endpoint unreachable from Alpaca, the transfer
+poller silently stuck), nothing else alerts, so the bot watches the rate itself.
+
+**Configuration:** both optional, read from the environment:
+
+- `FILL_RATE_ALERT_MIN_FILLS_PER_HOUR`: the minimum average fills per hour.
+  Unset disables the monitor with a startup INFO log, so development and staging
+  need no extra variables. Zero or malformed is a startup error.
+- `FILL_RATE_ALERT_WINDOW_HOURS`: the trailing window the average is taken over,
+  default 6. Zero or malformed is a startup error. A window of one hour would
+  page on ordinary variance (a Poisson process averaging 3 an hour sees fewer
+  than 3 in a given hour about 42% of the time); the longer window makes the
+  alert mean "the average really is below the floor".
+
+**Behavior:** one monitor task polls every 5 minutes. It counts the fills whose
+event timestamp (`initiated_at` / `detected_at`) falls within the trailing
+window and compares the count with `min_fills_per_hour * window_hours`:
+
+- Count below the minimum: ERROR log plus a `LowFillRate` lifecycle notification
+  (Telegram when configured) carrying the count, the minimum, and the window.
+- Still below the minimum: alert again at most once per hour. A delivery that
+  fails leaves the alert state unchanged, so the next poll retries immediately.
+- Back at or above the minimum: INFO log only, and the repeat timer clears so a
+  later shortfall pages immediately.
+- Count query fails: WARN log, alert state unchanged.
+
+The monitor counts from the event store, so a restart neither loses history nor
+needs a warm-up; alert state lives in process memory, so a restart alerts once
+more for a rate still below the minimum. The rate is not market-hours aware: a
+deployment whose traffic follows the trading day must pick a floor and window
+that the quiet hours do not breach, or accept the overnight alert.
+
 ### Inbound wrapped-token transfer alerts
 
 The transfer poller watches each asset's vault, i.e. the unwrapped share token,
