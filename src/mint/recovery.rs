@@ -3,6 +3,7 @@ use apalis::prelude::AbortError;
 use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
 use chrono::Utc;
+use cqrs_es::AggregateError;
 use event_sorcery::{SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
@@ -12,7 +13,10 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::job::{ConfirmMintJob, SendCallbackJob, SubmitMintJob};
+use super::job::{
+    ConfirmMintJob, SendCallbackJob, SubmitMintJob,
+    is_uncertain_confirm_observation,
+};
 use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand,
     MintFailureClassification, MintView, Network, UnderlyingSymbol,
@@ -24,7 +28,7 @@ use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::vault::{
     MintTxStatus, MintedLogQuery, MintedLogScan, NetworkVaultServices, TxId,
-    UnconfiguredNetworkError,
+    UnconfiguredNetworkError, VaultService,
 };
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
@@ -1418,6 +1422,17 @@ async fn drive_minting_failed_step(
             authorize_resubmit(ctx, issuer_request_id, vault).await?;
         }
         MintTxStatus::MinedSuccess => {
+            if let Some(VaultMode::Orchestrator { .. }) = mint.mint_mode() {
+                drop(wallet_guard);
+                return recover_mined_orchestrator_mint(
+                    ctx,
+                    vault_service.as_ref(),
+                    issuer_request_id,
+                    TxId::from(prepared.hash),
+                )
+                .await;
+            }
+
             // Receipt exists: observe via confirm while still MintingFailed
             // (ConfirmMintJob::confirm_while_minting_failed → RecordExistingMint).
             // Do not re-enter submit — a mined deposit must not rebroadcast.
@@ -1484,6 +1499,106 @@ async fn drive_minting_failed_step(
     }
 
     Ok(())
+}
+
+/// Records the landing of an orchestrator mint whose own prepared tx mined
+/// while the mint sat in `MintingFailed` (e.g. its confirm timed out before
+/// the tx landed). It must never take the vault-direct confirm path: the
+/// orchestrator holds the receipt, so that path would register a receipt the
+/// bot does not own and then fail `RecordExistingMint` with
+/// `MintModeMismatch` on every pass. The aggregate checks the recovered nonce
+/// and amount against the mint's authorization.
+async fn recover_mined_orchestrator_mint(
+    ctx: &MintRecoveryContext,
+    vault_service: &dyn VaultService,
+    issuer_request_id: &IssuerMintRequestId,
+    tx_id: TxId,
+) -> Result<(), MintRecoveryStepError> {
+    let minted = match vault_service.confirm_orchestrator_mint(&tx_id).await {
+        Ok(minted) => minted,
+        Err(error) if is_uncertain_confirm_observation(&error) => {
+            warn!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_id = %tx_id,
+                error = %error,
+                "Could not read the mined orchestrator mint; the mint stays \
+                 MintingFailed for the next recovery pass"
+            );
+            return Ok(());
+        }
+        // A definitive answer (no `Minted` event from the orchestrator, or a
+        // revert) contradicts the `MinedSuccess` classification, so the
+        // next pass would only repeat it: an operator has to look.
+        Err(error) => {
+            error!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_id = %tx_id,
+                error = %error,
+                "Mined orchestrator mint's transaction contradicts its \
+                 MinedSuccess classification; the mint stays MintingFailed \
+                 and needs manual reconciliation"
+            );
+            return Ok(());
+        }
+    };
+
+    info!(
+        target: "mint",
+        issuer_request_id = %issuer_request_id,
+        tx_hash = %minted.tx_hash,
+        nonce = %minted.nonce,
+        shares_minted = %minted.shares_minted,
+        "Orchestrator mint landed while MintingFailed; recovering the landing"
+    );
+
+    match ctx
+        .mint_store
+        .send(
+            issuer_request_id,
+            MintCommand::RecordOrchestratorMintRecovered {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: minted.tx_hash,
+                nonce: minted.nonce,
+                shares_minted: minted.shares_minted,
+                block_number: minted.block_number,
+            },
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        // The transaction is this mint's own, so a domain refusal (a nonce
+        // or amount that disagrees with the authorization) is an integrity
+        // anomaly for an operator; the loop itself reports step errors only
+        // at DEBUG.
+        Err(error @ AggregateError::UserError(_)) => {
+            error!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %minted.tx_hash,
+                nonce = %minted.nonce,
+                shares_minted = %minted.shares_minted,
+                error = %error,
+                "Could not record the mined orchestrator mint's landing; the \
+                 mint stays MintingFailed and needs manual reconciliation"
+            );
+            Err(error.into())
+        }
+        // A conflict with a concurrent writer or a store error clears on a
+        // later pass, which then records the landing.
+        Err(error) => {
+            warn!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %minted.tx_hash,
+                error = %error,
+                "Could not record the mined orchestrator mint's landing yet; \
+                 retrying on the next recovery pass"
+            );
+            Err(error.into())
+        }
+    }
 }
 
 /// Widened backward window for reconciling an unresolved replay: the
@@ -1815,7 +1930,8 @@ mod tests {
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MintTxStatus, OrchestratorMintedLog, PreparedMintTx, VaultService,
+        MintTxStatus, OrchestratorMintResult, OrchestratorMintedLog,
+        OrchestratorRevertReason, PreparedMintTx, VaultService,
     };
 
     /// Configurable `ReceiptService` stub for recovery tests. Only
@@ -2116,6 +2232,37 @@ mod tests {
         events.push(MintEvent::MintingFailed {
             issuer_request_id: issuer_request_id.clone(),
             error: "prior confirm uncertain or reverted".to_string(),
+            failed_at,
+            classification: MintFailureClassification::Unclassified,
+        });
+        events
+    }
+
+    /// Orchestrator counterpart of `tx_failed_with_prepared_events`: an
+    /// authorized orchestrator mint whose persisted signed tx was submitted,
+    /// then failed `Unclassified` (e.g. its confirm timed out).
+    fn orchestrator_failed_with_prepared_events(
+        issuer_request_id: &IssuerMintRequestId,
+        failed_at: chrono::DateTime<Utc>,
+        prepared_tx: PreparedMintTx,
+    ) -> Vec<MintEvent> {
+        let hash = prepared_tx.hash;
+        let mut events =
+            orchestrator_events_through_minting_authorized(issuer_request_id);
+        events.push(MintEvent::MintTxIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            prepared_tx,
+            intended_at: failed_at - chrono::Duration::minutes(2),
+        });
+        events.push(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            tx_id: TxId::from(hash),
+            submitted_at: failed_at - chrono::Duration::minutes(1),
+        });
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "receipt polling timed out".to_string(),
             failed_at,
             classification: MintFailureClassification::Unclassified,
         });
@@ -3893,6 +4040,350 @@ mod tests {
             0,
             "must not enqueue submit after MinedSuccess"
         );
+    }
+
+    /// An orchestrator mint whose confirm failed but whose tx then landed
+    /// must not take the vault-direct confirm path: that path registers a
+    /// receipt the orchestrator holds and then fails `RecordExistingMint`
+    /// with `MintModeMismatch`, leaving the mint stuck. Recovery records the
+    /// landing from the mined tx instead and carries the mint on to its
+    /// callback.
+    #[traced_test]
+    #[tokio::test]
+    async fn recovery_drives_mined_orchestrator_mint_to_callback() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mined_hash = prepared.hash;
+        let events = orchestrator_failed_with_prepared_events(
+            &issuer_request_id,
+            Utc::now() - chrono::Duration::hours(24),
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::MinedSuccess)
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: mined_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: U256::from(100u64)
+                        * U256::from(10u64).pow(U256::from(18u64)),
+                    gas_used: 50_000,
+                    block_number: 777,
+                }),
+        );
+        let fixture = MintRecoveryFixture::new().await.with_vault(vault);
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            2,
+            false,
+        )
+        .await;
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::CallbackPending { .. }),
+            "the landed orchestrator mint must be recovered forward, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SendCallbackJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "the recovered mint must be carried on to its Alpaca callback"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<ConfirmMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "an orchestrator mint must never reach the vault-direct confirm"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "a landed mint must not be resubmitted"
+        );
+
+        let test = "recovery_drives_mined_orchestrator_mint_to_callback";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                test,
+                "Orchestrator mint landed while MintingFailed",
+                &mined_hash.to_string(),
+            ]
+        ));
+    }
+
+    /// A mined orchestrator mint whose own transaction disagrees with the
+    /// mint's authorization is an integrity anomaly: the aggregate refuses
+    /// the landing, the mint stays `MintingFailed`, and the refusal is
+    /// logged at ERROR for an operator instead of only at the loop's DEBUG.
+    #[traced_test]
+    #[tokio::test]
+    async fn refused_orchestrator_mint_landing_is_logged_at_error() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mined_hash = prepared.hash;
+        let events = orchestrator_failed_with_prepared_events(
+            &issuer_request_id,
+            Utc::now() - chrono::Duration::hours(24),
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::MinedSuccess)
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: mined_hash,
+                    nonce: B256::repeat_byte(0x99),
+                    shares_minted: U256::from(100u64)
+                        * U256::from(10u64).pow(U256::from(18u64)),
+                    gas_used: 50_000,
+                    block_number: 777,
+                }),
+        );
+        let fixture = MintRecoveryFixture::new().await.with_vault(vault);
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        let error = drive_one_step(
+            &fixture.context(),
+            &mint_before,
+            &issuer_request_id,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintRecoveryStepError::Store(_)),
+            "the aggregate must refuse the mismatched landing, got {error:?}"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "a refused landing must leave the mint parked, got: {}",
+            mint.state_name()
+        );
+
+        let test = "refused_orchestrator_mint_landing_is_logged_at_error";
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                test,
+                "Could not record the mined orchestrator mint's landing",
+                &mined_hash.to_string(),
+            ]
+        ));
+    }
+
+    /// A store failure while recording the landing (here an insert the
+    /// database aborts) is not an integrity anomaly: a later pass records the
+    /// landing, so it is a WARN, never the ERROR that asks for manual
+    /// reconciliation.
+    #[traced_test]
+    #[tokio::test]
+    async fn store_failure_recording_orchestrator_landing_is_a_warning() {
+        let issuer_request_id = test_issuer_request_id();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mined_hash = prepared.hash;
+        let events = orchestrator_failed_with_prepared_events(
+            &issuer_request_id,
+            Utc::now() - chrono::Duration::hours(24),
+            prepared,
+        );
+
+        let vault = Arc::new(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::MinedSuccess)
+                .with_orchestrator_mint_result(OrchestratorMintResult {
+                    tx_hash: mined_hash,
+                    nonce: test_mint_authorization().nonce,
+                    shares_minted: U256::from(100u64)
+                        * U256::from(10u64).pow(U256::from(18u64)),
+                    gas_used: 50_000,
+                    block_number: 777,
+                }),
+        );
+        let fixture = MintRecoveryFixture::new().await.with_vault(vault);
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+        sqlx::query(
+            "
+            CREATE TRIGGER refuse_event_inserts
+            BEFORE INSERT ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'event store unavailable');
+            END
+            ",
+        )
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let mint_before =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        let error = drive_one_step(
+            &fixture.context(),
+            &mint_before,
+            &issuer_request_id,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, MintRecoveryStepError::Store(_)),
+            "the aborted insert must surface as a store error, got {error:?}"
+        );
+        let test = "store_failure_recording_orchestrator_landing_is_a_warning";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                test,
+                "Could not record the mined orchestrator mint's landing yet",
+                &mined_hash.to_string(),
+            ]
+        ));
+        assert!(
+            !logs_contain_at!(
+                Level::ERROR,
+                &[test, "needs manual reconciliation"]
+            ),
+            "a store failure must not ask for manual reconciliation"
+        );
+    }
+
+    /// A mined orchestrator mint whose tx cannot be recorded stays parked in
+    /// `MintingFailed` for the next recovery pass. It must not fall back to
+    /// the vault-direct confirm, and a landed mint must not be resubmitted.
+    /// An uncertain read is a WARN. A definitive answer that contradicts the
+    /// `MinedSuccess` classification needs an operator, so it is an ERROR.
+    #[traced_test]
+    #[tokio::test]
+    async fn unreadable_mined_orchestrator_mint_stays_parked() {
+        let cases = [
+            (
+                MockVaultService::new_confirm_pending(),
+                Level::WARN,
+                "Could not read the mined orchestrator mint",
+            ),
+            (
+                MockVaultService::new_success()
+                    .with_orchestrator_mint_confirm_revert(
+                        OrchestratorRevertReason::Unknown,
+                    ),
+                Level::ERROR,
+                "contradicts its MinedSuccess classification",
+            ),
+        ];
+
+        for (vault, level, expected_log) in cases {
+            let issuer_request_id = IssuerMintRequestId::random();
+            let prepared = PreparedMintTx::valid_for_test(
+                5,
+                format!("mint-{issuer_request_id}"),
+            );
+            let mined_tx_id = TxId::from(prepared.hash);
+            let events = orchestrator_failed_with_prepared_events(
+                &issuer_request_id,
+                Utc::now() - chrono::Duration::hours(24),
+                prepared,
+            );
+
+            let vault =
+                Arc::new(vault.with_mint_tx_status(MintTxStatus::MinedSuccess));
+            let fixture = MintRecoveryFixture::new().await.with_vault(vault);
+            fixture.seed_mint_events(&issuer_request_id, events).await;
+
+            let mint_before = fixture
+                .mint_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            drive_one_step(
+                &fixture.context(),
+                &mint_before,
+                &issuer_request_id,
+            )
+            .await
+            .unwrap();
+
+            let mint = fixture
+                .mint_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    mint,
+                    Mint::MintingFailed {
+                        classification: MintFailureClassification::Unclassified,
+                        ..
+                    }
+                ),
+                "{expected_log}: the mint must stay parked, got: {}",
+                mint.state_name()
+            );
+            assert_eq!(
+                count_jobs_for_mint(
+                    &fixture.pool,
+                    job_type::<ConfirmMintJob>(),
+                    &issuer_request_id,
+                )
+                .await,
+                0,
+                "{expected_log}: no fallback to the vault-direct confirm"
+            );
+            assert_eq!(
+                count_jobs_for_mint(
+                    &fixture.pool,
+                    job_type::<SubmitMintJob>(),
+                    &issuer_request_id,
+                )
+                .await,
+                0,
+                "{expected_log}: a landed mint must not be resubmitted"
+            );
+
+            let test = "unreadable_mined_orchestrator_mint_stays_parked";
+            assert!(
+                logs_contain_at!(
+                    level,
+                    &[test, expected_log, &mined_tx_id.to_string()]
+                ),
+                "expected {level} log: {expected_log}"
+            );
+        }
     }
 
     /// MinedReverted allows RetryMint + SubmitMintJob (replacement after
