@@ -797,6 +797,8 @@ struct Env {
 
 impl Env {
     fn into_config(self) -> Result<Config, ConfigError> {
+        self.alpaca.auth()?;
+        self.alpaca.token_url()?;
         let log_level_tracing = (&self.log_level).into();
         let (base, chains) = self.chain_configs()?;
         let LifecycleNotificationsEnv { bot_token, chat_id, message_thread_id } =
@@ -1252,6 +1254,8 @@ impl HyperDxEnv {
 /// Errors encountered during configuration parsing and validation.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("Alpaca authentication configuration error: {0}")]
+    AlpacaAuth(#[from] crate::alpaca::service::AlpacaAuthConfigError),
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to parse configuration: {0}")]
@@ -1689,6 +1693,7 @@ const DOMAIN_TARGETS: &[&str] = &[
     "admin",
     "vault",
     "notifications",
+    "operational_alert",
 ];
 
 /// Builds a default `EnvFilter` string that includes both the crate module
@@ -1772,6 +1777,146 @@ mod tests {
         let position =
             args.iter().position(|candidate| *candidate == argument).unwrap();
         args.drain(position..=position + 1);
+    }
+
+    #[test]
+    fn rejects_invalid_alpaca_auth_at_config_boundary() {
+        let mut env = Env::try_parse_from(minimal_args()).unwrap();
+        env.alpaca.api_secret = None;
+        assert!(matches!(env.into_config(), Err(ConfigError::AlpacaAuth(_))));
+
+        let mut env = Env::try_parse_from(minimal_args()).unwrap();
+        env.alpaca.client_id = Some("client".into());
+        env.alpaca.kms_key_version = Some("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".into());
+        assert!(matches!(env.into_config(), Err(ConfigError::AlpacaAuth(_))));
+
+        for version in [
+            None,
+            Some("invalid"),
+            Some(
+                "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/0",
+            ),
+        ] {
+            let mut env = Env::try_parse_from(minimal_args()).unwrap();
+            env.alpaca.api_key = None;
+            env.alpaca.api_secret = None;
+            env.alpaca.client_id = Some("client".into());
+            env.alpaca.kms_key_version = version.map(str::to_owned);
+            assert!(matches!(
+                env.into_config(),
+                Err(ConfigError::AlpacaAuth(_))
+            ));
+        }
+        let mut env = Env::try_parse_from(minimal_args()).unwrap();
+        env.alpaca.api_key = None;
+        env.alpaca.api_secret = None;
+        assert!(matches!(env.into_config(), Err(ConfigError::AlpacaAuth(_))));
+    }
+
+    #[test]
+    fn rejects_empty_and_partial_alpaca_credentials() {
+        for (key, secret, client, version) in [
+            (Some(""), Some("secret"), None, None),
+            (Some("key"), Some(""), None, None),
+            (None, Some("secret"), None, None),
+            (
+                None,
+                None,
+                Some(""),
+                Some(
+                    "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+                ),
+            ),
+            (None, None, Some("client"), Some("")),
+            (
+                None,
+                None,
+                None,
+                Some(
+                    "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+                ),
+            ),
+            (
+                Some("key"),
+                None,
+                Some("client"),
+                Some(
+                    "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+                ),
+            ),
+        ] {
+            let mut env = Env::try_parse_from(minimal_args()).unwrap();
+            env.alpaca.api_key = key.map(str::to_owned);
+            env.alpaca.api_secret = secret.map(str::to_owned);
+            env.alpaca.client_id = client.map(str::to_owned);
+            env.alpaca.kms_key_version = version.map(str::to_owned);
+            assert!(matches!(
+                env.into_config(),
+                Err(ConfigError::AlpacaAuth(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn selects_alpaca_token_audience_at_config_boundary() {
+        for (url, token_url) in [
+            (
+                "https://broker-api.alpaca.markets",
+                st0x_alpaca::ALPACA_TOKEN_URL,
+            ),
+            (
+                "https://broker-api.sandbox.alpaca.markets",
+                st0x_alpaca::ALPACA_SANDBOX_TOKEN_URL,
+            ),
+        ] {
+            let mut args = minimal_args();
+            remove_argument(&mut args, "--alpaca-api-key");
+            remove_argument(&mut args, "--alpaca-api-secret");
+            args.extend([
+                "--alpaca-client-id", "client", "--alpaca-kms-key-version",
+                "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+                "--alpaca-api-base-url", url,
+            ]);
+            let config =
+                Env::try_parse_from(args).unwrap().into_config().unwrap();
+            assert!(matches!(
+                config.alpaca.auth().unwrap(),
+                st0x_alpaca::AlpacaAuth::KmsJwt { .. }
+            ));
+            assert_eq!(config.alpaca.token_url().unwrap(), token_url);
+        }
+        for url in [
+            "https://unknown.example",
+            "http://broker-api.alpaca.markets",
+            "https://broker-api.alpaca.markets:8443",
+            "https://user:password@broker-api.alpaca.markets",
+            "https://broker-api.alpaca.markets?query=value",
+            "https://broker-api.alpaca.markets#fragment",
+        ] {
+            let mut env = Env::try_parse_from(minimal_args()).unwrap();
+            env.alpaca.api_key = None;
+            env.alpaca.api_secret = None;
+            env.alpaca.client_id = Some("client".into());
+            env.alpaca.kms_key_version = Some("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".into());
+            env.alpaca.api_base_url = url.into();
+            assert!(matches!(
+                env.into_config(),
+                Err(ConfigError::AlpacaAuth(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn default_filter_includes_credential_rejection_alerts() {
+        let filter = tracing_subscriber::EnvFilter::new(default_log_filter(
+            Level::ERROR,
+        ));
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                tracing::enabled!(target: "operational_alert", Level::ERROR)
+            );
+        });
     }
 
     #[test]

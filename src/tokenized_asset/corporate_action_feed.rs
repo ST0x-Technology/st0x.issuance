@@ -143,6 +143,9 @@ async fn alert_on_reconnect_threshold(
     notifier.notify(&LifecycleNotification::CorporateActionsSyncFailed).await;
 }
 
+#[cfg(test)]
+use st0x_alpaca::ALPACA_TOKEN_URL;
+use st0x_alpaca::AlpacaAuth;
 pub(crate) use st0x_alpaca::corporate_actions::CorporateActionMutationKind;
 use st0x_alpaca::corporate_actions::{
     CorporateActionDecodeBatch, CorporateActionEndpointError,
@@ -155,7 +158,6 @@ use st0x_alpaca::corporate_actions::{
 use st0x_alpaca::corporate_actions::{
     CorporateActionDecodeError, CorporateActionSseDecoder,
 };
-use st0x_alpaca::{ALPACA_TOKEN_URL, AlpacaAuth};
 
 pub(crate) struct CorporateActionFeed {
     client: CorporateActionStreamClient,
@@ -173,6 +175,8 @@ pub(crate) enum CorporateActionFeedBuildError {
     Endpoint(#[from] CorporateActionEndpointError),
     #[error(transparent)]
     Client(#[from] CorporateActionStreamBuildError),
+    #[error(transparent)]
+    AuthConfig(#[from] crate::alpaca::service::AlpacaAuthConfigError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -310,15 +314,33 @@ impl CorporateActionFeed {
                 DevelopmentLoopback::Deny
             },
         )?;
+        Self::with_auth(
+            config,
+            endpoint,
+            pool,
+            apalis_pool,
+            underlying_store,
+            notifier,
+            (config.auth()?, config.token_url()?),
+        )
+    }
+
+    fn with_auth(
+        config: &AlpacaConfig,
+        endpoint: CorporateActionStreamEndpoint,
+        pool: Pool<Sqlite>,
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        underlying_store: Arc<Store<Underlying>>,
+        notifier: Arc<dyn LifecycleNotifier>,
+        auth: (AlpacaAuth, &str),
+    ) -> Result<Self, CorporateActionFeedBuildError> {
+        let (auth, token_url) = auth;
         let stream_transport = endpoint.transport();
         Ok(Self {
             client: CorporateActionStreamClient::new(
                 endpoint,
-                AlpacaAuth::Basic {
-                    api_key: config.api_key.clone(),
-                    api_secret: config.api_secret.clone(),
-                },
-                ALPACA_TOKEN_URL,
+                auth,
+                token_url,
                 Duration::from_secs(config.connect_timeout_secs),
                 Duration::from_secs(config.corporate_actions_read_timeout_secs),
             )?,
@@ -555,18 +577,17 @@ impl CorporateActionFeed {
                     return Err(error);
                 }
                 Err(CorporateActionFeedError::Auth(error)) if error.is_deterministic() => {
-                    self.notifier.notify(&LifecycleNotification::CorporateActionsSyncFailed).await;
                     return Err(CorporateActionFeedError::Auth(error));
                 }
                 Err(CorporateActionFeedError::HttpStatus(status))
                     if status.is_client_error()
                         && status != reqwest::StatusCode::TOO_MANY_REQUESTS =>
                 {
-                    self.notifier
-                        .notify(
-                            &LifecycleNotification::CorporateActionsSyncFailed,
-                        )
-                        .await;
+                    if !matches!(status, reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) {
+                        self.notifier
+                            .notify(&LifecycleNotification::CorporateActionsSyncFailed)
+                            .await;
+                    }
                     return Err(CorporateActionFeedError::HttpStatus(status));
                 }
                 Err(error) => {
@@ -638,6 +659,23 @@ impl CorporateActionFeed {
             .consume_connection_result(cursor, bootstrap_window, &mut progress)
             .await;
 
+        let credential_rejection = match &result {
+            Err(CorporateActionFeedError::Auth(error)) => {
+                error.is_deterministic()
+            }
+            Err(CorporateActionFeedError::HttpStatus(status)) => matches!(
+                *status,
+                reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::FORBIDDEN
+            ),
+            _ => false,
+        };
+        if credential_rejection && let Err(error) = &result {
+            error!(target: "operational_alert", error = %error, "Alpaca credential rejected");
+            self.notifier
+                .notify(&LifecycleNotification::CorporateActionsSyncFailed)
+                .await;
+        }
         ConnectionConsumption { progress, result }
     }
 
@@ -1447,6 +1485,279 @@ mod tests {
         AssetStatus, FreezeHoldId, Underlying, UnderlyingCommand,
         load_freeze_status,
     };
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deterministic_stream_credential_rejection_is_fatal_and_alerts() {
+        use p256::pkcs8::EncodePrivateKey;
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(401).body("invalid_client");
+        });
+        let mut config = AlpacaConfig::test_default();
+        config.corporate_actions_bootstrap_since =
+            Some("2026-08-31T00:00:00Z".parse().unwrap());
+        let key = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let pem =
+            key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string();
+        let endpoint = CorporateActionStreamEndpoint::authenticated_loopback(
+            &format!("{}/corporate-actions", server.base_url()),
+        )
+        .unwrap();
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let feed = CorporateActionFeed::with_auth(
+            &config,
+            endpoint,
+            harness.pool.clone(),
+            &harness.apalis_pool,
+            harness.underlying_store.clone(),
+            notifier.clone(),
+            (
+                AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-test-client".to_string(),
+                    private_key_pem: pem,
+                },
+                &format!("{}/token", server.base_url()),
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(feed.run().await.unwrap_err(), CorporateActionFeedError::Auth(error) if error.is_deterministic())
+        );
+        token.assert_calls(1);
+        assert_eq!(
+            notifier.notifications(),
+            vec![LifecycleNotification::CorporateActionsSyncFailed]
+        );
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("ERROR")
+                    && line.contains(
+                        "operational_alert: Alpaca credential rejected",
+                    )
+            }) {
+                Ok(())
+            } else {
+                Err("credential rejection did not emit its operational alert"
+                    .to_string())
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn bootstrap_credential_rejection_alerts_without_advancing_cursor() {
+        use p256::pkcs8::EncodePrivateKey;
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(401).body("invalid_client");
+        });
+        let mut config = AlpacaConfig::test_default();
+        config.corporate_actions_bootstrap_since =
+            Some("2026-08-31T00:00:00Z".parse().unwrap());
+        let key = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let pem =
+            key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string();
+        let endpoint = CorporateActionStreamEndpoint::authenticated_loopback(
+            &format!("{}/corporate-actions", server.base_url()),
+        )
+        .unwrap();
+        let notifier = Arc::new(CapturingLifecycleNotifier::default());
+        let mut feed = CorporateActionFeed::with_auth(
+            &config,
+            endpoint,
+            harness.pool.clone(),
+            &harness.apalis_pool,
+            harness.underlying_store.clone(),
+            notifier.clone(),
+            (
+                AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-test-client".to_string(),
+                    private_key_pem: pem,
+                },
+                &format!("{}/token", server.base_url()),
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(feed.establish_authenticated_baseline_at(Utc::now()).await.unwrap_err(), CorporateActionFeedError::Auth(error) if error.is_deterministic())
+        );
+        token.assert_calls(1);
+        assert!(load_cursor(&harness.pool).await.unwrap().is_none());
+        assert_eq!(
+            notifier.notifications(),
+            vec![LifecycleNotification::CorporateActionsSyncFailed]
+        );
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("ERROR")
+                    && line.contains(
+                        "operational_alert: Alpaca credential rejected",
+                    )
+            }) {
+                Ok(())
+            } else {
+                Err("credential rejection did not emit its operational alert"
+                    .to_string())
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn minted_bearer_rejected_by_stream_alerts_once_in_bootstrap_and_run()
+    {
+        use p256::pkcs8::EncodePrivateKey;
+        for status in [401, 403] {
+            for bootstrap in [true, false] {
+                let harness = TestHarness::new().await;
+                let server = MockServer::start();
+                let token = server.mock(|when, then| {
+                    when.method(POST).path("/token");
+                    then.status(200).json_body(serde_json::json!({
+                        "access_token":"rejected-stream-bearer", "token_type":"Bearer", "expires_in":900
+                    }));
+                });
+                let stream = server.mock(|when, then| {
+                    when.method(GET)
+                        .path("/corporate-actions")
+                        .header(
+                            "Authorization",
+                            "Bearer rejected-stream-bearer",
+                        )
+                        .header_missing("APCA-API-KEY-ID")
+                        .header_missing("APCA-API-SECRET-KEY");
+                    then.status(status);
+                });
+                let mut config = AlpacaConfig::test_default();
+                config.corporate_actions_bootstrap_since =
+                    Some("2026-08-31T00:00:00Z".parse().unwrap());
+                let key = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+                let pem = key
+                    .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                    .unwrap()
+                    .to_string();
+                let endpoint =
+                    CorporateActionStreamEndpoint::authenticated_loopback(
+                        &format!("{}/corporate-actions", server.base_url()),
+                    )
+                    .unwrap();
+                let notifier = Arc::new(CapturingLifecycleNotifier::default());
+                let mut feed = CorporateActionFeed::with_auth(
+                    &config,
+                    endpoint,
+                    harness.pool.clone(),
+                    &harness.apalis_pool,
+                    harness.underlying_store.clone(),
+                    notifier.clone(),
+                    (
+                        AlpacaAuth::PrivateKeyJwt {
+                            client_id: "s01-test-client".to_string(),
+                            private_key_pem: pem,
+                        },
+                        &format!("{}/token", server.base_url()),
+                    ),
+                )
+                .unwrap();
+                let result = if bootstrap {
+                    feed.establish_authenticated_baseline_at(Utc::now()).await
+                } else {
+                    feed.run().await
+                };
+                assert!(
+                    matches!(result.unwrap_err(), CorporateActionFeedError::HttpStatus(observed) if observed.as_u16() == status)
+                );
+                token.assert_calls(1);
+                stream.assert_calls(1);
+                assert!(load_cursor(&harness.pool).await.unwrap().is_none());
+                assert_eq!(
+                    notifier.notifications(),
+                    vec![LifecycleNotification::CorporateActionsSyncFailed]
+                );
+            }
+        }
+        logs_assert(|lines: &[&str]| {
+            let alerts = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("ERROR")
+                        && line.contains(
+                            "operational_alert: Alpaca credential rejected",
+                        )
+                })
+                .count();
+            if alerts == 4 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one rejection alert per connection, got {alerts}"
+                ))
+            }
+        });
+        assert!(!logs_contain("rejected-stream-bearer"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn feed_builder_uses_bearer_without_apca_headers() {
+        use p256::pkcs8::EncodePrivateKey;
+        let harness = TestHarness::new().await;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({"access_token":"feed-bearer", "token_type":"Bearer", "expires_in":900}));
+        });
+        let stream = server.mock(|when, then| {
+            when.method(GET)
+                .path("/corporate-actions")
+                .header("Authorization", "Bearer feed-bearer")
+                .header_missing("APCA-API-KEY-ID")
+                .header_missing("APCA-API-SECRET-KEY")
+                .query_param("since", "2026-08-31T00:00:00Z");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("");
+        });
+        let mut config = AlpacaConfig::test_default();
+        config.corporate_actions_bootstrap_since =
+            Some("2026-08-31T00:00:00Z".parse().unwrap());
+        let key = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let pem =
+            key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string();
+        let endpoint = CorporateActionStreamEndpoint::authenticated_loopback(
+            &format!("{}/corporate-actions", server.base_url()),
+        )
+        .unwrap();
+        let mut feed = CorporateActionFeed::with_auth(
+            &config,
+            endpoint,
+            harness.pool.clone(),
+            &harness.apalis_pool,
+            harness.underlying_store.clone(),
+            Arc::new(NoopLifecycleNotifier),
+            (
+                AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-test-client".to_string(),
+                    private_key_pem: pem,
+                },
+                &format!("{}/token", server.base_url()),
+            ),
+        )
+        .unwrap();
+        feed.consume_connection(None).await.result.unwrap();
+        feed.consume_connection(None).await.result.unwrap();
+        token.assert_calls(1);
+        stream.assert_calls(2);
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Connected to Alpaca corporate-action stream"]
+        ));
+        assert!(!logs_contain("feed-bearer"));
+    }
 
     #[test]
     fn corporate_action_endpoint_rejects_userinfo_fragments_and_until_id() {
