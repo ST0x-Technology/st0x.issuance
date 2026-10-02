@@ -365,6 +365,12 @@ on-chain testing:
 E2E tests validate complete flows from HTTP request through CQRS to on-chain
 execution.
 
+`tests/fork_rehearsal.rs` runs the orchestrator cutover cycle on a local Anvil
+fork of Base, against the real contracts. It is ignored by default and needs a
+Base RPC:
+`FORK_RPC_URL=<url> FORK_BLOCK=<block> cargo test --test
+fork_rehearsal -- --ignored --nocapture`.
+
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Detailed specification of the system

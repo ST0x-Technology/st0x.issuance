@@ -333,6 +333,12 @@ pub enum LocalEvmError {
     PendingTransaction(#[from] PendingTransactionError),
     #[error("Event not found in logs")]
     EventNotFound,
+    /// Carries no cause, so this error never repeats the fork URL, which can
+    /// carry an RPC API key. Anvil's own stderr is inherited, so a failed
+    /// start can still print the URL there, and the process list shows the
+    /// URL while Anvil runs.
+    #[error("Anvil fork did not start")]
+    AnvilForkStart,
 }
 
 /// Local EVM instance for end-to-end testing with deployed contracts.
@@ -413,6 +419,69 @@ impl LocalEvm {
             _anvil: anvil,
             vault_address,
             authorizer_address,
+            wallet_address,
+            private_key,
+            endpoint,
+            chain_id,
+        })
+    }
+
+    /// Starts Anvil as a fork of `fork_url` at `fork_block`, and points this
+    /// [`LocalEvm`] at the existing `vault` there. Nothing is deployed.
+    ///
+    /// The wallet is a new random key, funded on the fork only. The fork keeps
+    /// the forked chain's ID, so a transaction signed here is also valid on
+    /// the real chain; a random key has no history or roles there. The
+    /// helpers that sign as a vault admin (`grant_*_role`, `certify_vault`)
+    /// do not work on a fork, because the real chain's admins hold those
+    /// roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalEvmError::AnvilForkStart`] if Anvil does not start, and
+    /// an RPC or contract error if funding the wallet or reading the vault's
+    /// authorizer fails.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Anvil test clients connect by URL"
+    )]
+    pub async fn fork(
+        fork_url: &str,
+        fork_block: u64,
+        vault: Address,
+    ) -> Result<Self, LocalEvmError> {
+        // A fork reads its starting state over the network, so its startup
+        // can take longer than a local chain's.
+        let anvil = test_anvil()
+            .fork(fork_url)
+            .fork_block_number(fork_block)
+            .timeout(60_000)
+            .try_spawn()
+            .map_err(|_| LocalEvmError::AnvilForkStart)?;
+        let endpoint = anvil.ws_endpoint();
+
+        let signer = PrivateKeySigner::random();
+        let wallet_address = signer.address();
+        let private_key = signer.to_bytes();
+
+        let provider = ProviderBuilder::new().connect(&endpoint).await?;
+        let chain_id = provider.get_chain_id().await?;
+        let gas_balance = U256::from(100) * U256::from(10).pow(U256::from(18));
+        provider
+            .raw_request::<_, ()>(
+                "anvil_setBalance".into(),
+                (wallet_address, gas_balance),
+            )
+            .await?;
+        let authorizer = OffchainAssetReceiptVault::new(vault, &provider)
+            .authorizer()
+            .call()
+            .await?;
+
+        Ok(Self {
+            _anvil: anvil,
+            vault_address: vault,
+            authorizer_address: Address::from(authorizer.0),
             wallet_address,
             private_key,
             endpoint,
