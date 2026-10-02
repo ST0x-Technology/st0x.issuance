@@ -3230,7 +3230,12 @@ would move past its block for good. A node that does not have the read block yet
 fails the pass, so the checkpoint stays and the next pass retries. At startup, a
 failed pass stops startup, as any backfill RPC error does, and the service
 restarts. The fresh head keeps the reads at recent state after a long scan,
-which a node that is not an archive node still serves. Live monitoring processes
+which a node that is not an archive node still serves. A pass reads its balances
+concurrently, but records its discoveries one at a time, in the order it
+collected them: every discovery writes to the vault's one inventory aggregate,
+and concurrent writes race on its optimistic concurrency check. A pass with many
+discoveries (the restart after a rollback finds every returned receipt) could
+otherwise lose that race on every retry and fail. Live monitoring processes
 observed logs opportunistically but does not advance the durable checkpoint,
 because WebSocket logs can arrive out of order within or across blocks. This
 prevents long-running services from restarting with a stale receipt checkpoint
