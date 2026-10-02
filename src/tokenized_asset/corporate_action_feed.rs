@@ -3,14 +3,11 @@
 use backon::{BackoffBuilder, ExponentialBuilder};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use event_sorcery::Store;
-use futures::StreamExt;
-use serde::Deserialize;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
-use url::{Host, Url};
 
 use super::schedule::{
     AlignCorporateActionFreeze, CorporateActionFreezeCtx,
@@ -38,6 +35,9 @@ const BLOCKED_REASON_POISON: &str = "poison";
 const BLOCKED_REASON_REPLAY_GAP: &str = "replay_gap";
 const STREAM_RECONNECT_MIN_BACKOFF: Duration = Duration::from_secs(5);
 const STREAM_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Longest reconnect wait a server-supplied `Retry-After` can impose. The
+/// header is unbounded, so a hostile or broken value must not park the feed.
+const STREAM_RECONNECT_MAX_RETRY_AFTER: Duration = Duration::from_mins(5);
 const STREAM_RECONNECT_ALERT_THRESHOLD: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +116,15 @@ fn next_reconnect_delay(
         .min(STREAM_RECONNECT_MAX_BACKOFF)
 }
 
+fn honor_retry_after(
+    backoff: Duration,
+    retry_after: Option<Duration>,
+) -> Duration {
+    backoff.max(
+        retry_after.unwrap_or_default().min(STREAM_RECONNECT_MAX_RETRY_AFTER),
+    )
+}
+
 async fn alert_on_reconnect_threshold(
     notifier: &dyn LifecycleNotifier,
     attempt: ReconnectAttempt,
@@ -134,265 +143,22 @@ async fn alert_on_reconnect_threshold(
     notifier.notify(&LifecycleNotification::CorporateActionsSyncFailed).await;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CorporateActionMutationKind {
-    Insert,
-    Update,
-    Delete,
-}
-
-impl CorporateActionMutationKind {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "insert" => Some(Self::Insert),
-            "update" => Some(Self::Update),
-            "delete" => Some(Self::Delete),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Insert => "insert",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CorporateActionIdentityEnvelope {
-    event_id: Option<CorporateActionEventId>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CorporateActionEnvelope {
-    event_id: Option<String>,
-    action: Option<String>,
-    event_type: DividendCorporateActionEventType,
-    region: CorporateActionRegion,
-    ca: DividendCorporateActionPayload,
-}
-
-#[derive(Debug, Deserialize)]
-enum DividendCorporateActionEventType {
-    #[serde(rename = "cash_dividend_corporateaction_event")]
-    CashDividend,
-    #[serde(rename = "stock_dividend_corporateaction_event")]
-    StockDividend,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CorporateActionRegion {
-    Us,
-    NonUs,
-}
-
-#[derive(Debug, Deserialize)]
-struct DividendCorporateActionPayload {
-    id: String,
-    symbol: String,
-    ex_date: NaiveDate,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum CorporateActionDecodeError {
-    #[error("corporate-action SSE frame is missing its event id")]
-    MissingEventId,
-    #[error("invalid corporate-action event id {0}")]
-    InvalidEventId(String),
-    #[error("corporate-action SSE frame is missing its mutation event")]
-    MissingMutation,
-    #[error("unsupported corporate-action mutation {0}")]
-    UnsupportedMutation(String),
-    #[error(
-        "corporate-action SSE event id {sse_event_id} does not match payload event id {payload_event_id}"
-    )]
-    EventIdMismatch {
-        sse_event_id: CorporateActionEventId,
-        payload_event_id: String,
-    },
-    #[error(
-        "corporate-action SSE mutation {sse_mutation} does not match payload action {payload_action}"
-    )]
-    MutationMismatch { sse_mutation: String, payload_action: String },
-    #[error("corporate-action SSE field was not UTF-8")]
-    InvalidFieldUtf8(#[source] std::str::Utf8Error),
-    #[error("corporate-action SSE frame is missing its data payload")]
-    MissingData,
-    #[error("invalid corporate-action payload for event {event_id}: {source}")]
-    InvalidPayload {
-        event_id: CorporateActionEventId,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("invalid corporate-action payload without an event id: {0}")]
-    InvalidPayloadWithoutEventId(#[source] serde_json::Error),
-    #[error("corporate-action stream returned non-US event")]
-    NonUsRegion,
-    #[error("invalid corporate-action id {0}")]
-    InvalidActionId(String),
-    #[error("invalid corporate-action symbol {0}")]
-    InvalidUnderlying(String),
-}
-
-const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
-const MAX_SSE_SEPARATOR_BYTES: usize = 4;
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum CorporateActionStreamDecodeError {
-    #[error("corporate-action SSE frame exceeded {MAX_SSE_FRAME_BYTES} bytes")]
-    FrameTooLarge,
-    #[error("corporate-action SSE frame for event {event_id:?} was not UTF-8")]
-    InvalidUtf8 {
-        event_id: Option<CorporateActionEventId>,
-        #[source]
-        source: std::str::Utf8Error,
-    },
-    #[error("{source}")]
-    Event {
-        event_id: Option<CorporateActionEventId>,
-        #[source]
-        source: CorporateActionDecodeError,
-    },
-}
-
-impl CorporateActionStreamDecodeError {
-    const fn event_id(&self) -> Option<&CorporateActionEventId> {
-        match self {
-            Self::InvalidUtf8 { event_id, .. }
-            | Self::Event { event_id, .. } => event_id.as_ref(),
-            Self::FrameTooLarge => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum CorporateActionDecodeBatch {
-    Complete(Vec<CorporateActionMutation>),
-    Poison {
-        completed: Vec<CorporateActionMutation>,
-        error: CorporateActionStreamDecodeError,
-    },
-}
-
-#[derive(Debug, Clone)]
-enum SseEventIdentity {
-    Absent,
-    Valid(CorporateActionEventId),
-    Invalid,
-}
-
-#[derive(Default)]
-pub(crate) struct CorporateActionSseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl CorporateActionSseDecoder {
-    const fn has_pending_frame(&self) -> bool {
-        !self.buffer.is_empty()
-    }
-
-    /// Incrementally decodes bounded SSE frames without retaining poisoned
-    /// input. Complete frames preceding a poison boundary are returned so the
-    /// caller can commit them before stopping at the rejected event.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> CorporateActionDecodeBatch {
-        let mut remaining = chunk;
-        let mut mutations = Vec::new();
-
-        while !remaining.is_empty() {
-            let buffer_limit = MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES;
-            let available = buffer_limit.saturating_sub(self.buffer.len());
-            if available == 0 {
-                self.buffer = Vec::new();
-                return CorporateActionDecodeBatch::Poison {
-                    completed: mutations,
-                    error: CorporateActionStreamDecodeError::FrameTooLarge,
-                };
-            }
-            let accepted = remaining.len().min(available);
-            self.buffer.extend_from_slice(&remaining[..accepted]);
-            remaining = &remaining[accepted..];
-
-            while let Some((frame_end, separator_len)) =
-                frame_boundary(&self.buffer)
-            {
-                if frame_end > MAX_SSE_FRAME_BYTES {
-                    self.buffer = Vec::new();
-                    return CorporateActionDecodeBatch::Poison {
-                        completed: mutations,
-                        error: CorporateActionStreamDecodeError::FrameTooLarge,
-                    };
-                }
-                let frame = self.buffer[..frame_end].to_vec();
-                self.buffer.drain(..frame_end + separator_len);
-                let event_identity = sse_event_identity(&frame);
-                let frame = match std::str::from_utf8(&frame) {
-                    Ok(frame) => frame,
-                    Err(source) => {
-                        self.buffer = Vec::new();
-                        let event_id = match event_identity {
-                            SseEventIdentity::Valid(event_id) => Some(event_id),
-                            SseEventIdentity::Absent
-                            | SseEventIdentity::Invalid => None,
-                        };
-                        return CorporateActionDecodeBatch::Poison {
-                            completed: mutations,
-                            error:
-                                CorporateActionStreamDecodeError::InvalidUtf8 {
-                                    event_id,
-                                    source,
-                                },
-                        };
-                    }
-                };
-                if sse_lines(frame.as_bytes())
-                    .all(|line| line.is_empty() || line.starts_with(b":"))
-                {
-                    continue;
-                }
-                let event_id = match event_identity {
-                    SseEventIdentity::Absent => {
-                        validated_payload_event_id(frame)
-                    }
-                    SseEventIdentity::Valid(event_id) => Some(event_id),
-                    SseEventIdentity::Invalid => None,
-                };
-                let mutation = match decode_sse_frame(frame) {
-                    Ok(mutation) => mutation,
-                    Err(source) => {
-                        self.buffer = Vec::new();
-                        return CorporateActionDecodeBatch::Poison {
-                            completed: mutations,
-                            error: CorporateActionStreamDecodeError::Event {
-                                event_id,
-                                source,
-                            },
-                        };
-                    }
-                };
-                mutations.push(mutation);
-            }
-
-            if !can_still_terminate_within_limit(&self.buffer) {
-                self.buffer = Vec::new();
-                return CorporateActionDecodeBatch::Poison {
-                    completed: mutations,
-                    error: CorporateActionStreamDecodeError::FrameTooLarge,
-                };
-            }
-        }
-
-        CorporateActionDecodeBatch::Complete(mutations)
-    }
-}
+pub(crate) use st0x_alpaca::corporate_actions::CorporateActionMutationKind;
+use st0x_alpaca::corporate_actions::{
+    CorporateActionDecodeBatch, CorporateActionEndpointError,
+    CorporateActionReplay, CorporateActionStreamBuildError,
+    CorporateActionStreamClient, CorporateActionStreamDecodeError,
+    CorporateActionStreamEndpoint, CorporateActionStreamError,
+    CorporateActionStreamTransport, DevelopmentLoopback,
+};
+#[cfg(test)]
+use st0x_alpaca::corporate_actions::{
+    CorporateActionDecodeError, CorporateActionSseDecoder,
+};
+use st0x_alpaca::{ALPACA_TOKEN_URL, AlpacaAuth};
 
 pub(crate) struct CorporateActionFeed {
-    client: reqwest::Client,
-    endpoint: String,
-    api_key: String,
-    api_secret: String,
+    client: CorporateActionStreamClient,
     stream_transport: CorporateActionStreamTransport,
     bootstrap_since: Option<CorporateActionBootstrapSince>,
     pool: Pool<Sqlite>,
@@ -401,28 +167,12 @@ pub(crate) struct CorporateActionFeed {
     notifier: Arc<dyn LifecycleNotifier>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CorporateActionStreamTransport {
-    AuthenticatedAlpaca,
-    CredentialFreeDevelopment,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CorporateActionFeedBuildError {
-    #[error("invalid corporate-action stream URL")]
-    InvalidEndpoint(#[from] url::ParseError),
-    #[error("corporate-action stream URL must use HTTPS, got {0}")]
-    InsecureEndpointScheme(String),
-    #[error(
-        "corporate-action stream URL must target stream.data.alpaca.markets"
-    )]
-    UnexpectedEndpointHost,
-    #[error(
-        "corporate-action stream URL contains reserved replay query parameter {0}"
-    )]
-    ReservedReplayQueryParameter(String),
-    #[error("failed to build corporate-action HTTP client")]
-    Client(#[from] reqwest::Error),
+    #[error(transparent)]
+    Endpoint(#[from] CorporateActionEndpointError),
+    #[error(transparent)]
+    Client(#[from] CorporateActionStreamBuildError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -436,7 +186,9 @@ pub(crate) enum CorporateActionPostProjectionError {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CorporateActionFeedError {
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    Http(Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    Auth(#[from] st0x_alpaca::KmsJwtError),
     #[error("corporate-action stream returned HTTP {0}")]
     HttpStatus(reqwest::StatusCode),
     #[error("corporate-action stream returned content type {0}")]
@@ -467,10 +219,28 @@ pub(crate) enum CorporateActionFeedError {
     },
 }
 
+impl From<CorporateActionStreamError> for CorporateActionFeedError {
+    fn from(error: CorporateActionStreamError) -> Self {
+        match error {
+            CorporateActionStreamError::Http(error) => {
+                Self::Http(Box::new(error))
+            }
+            CorporateActionStreamError::HttpStatus(status) => {
+                Self::HttpStatus(status)
+            }
+            CorporateActionStreamError::InvalidContentType(value) => {
+                Self::InvalidContentType(value)
+            }
+            CorporateActionStreamError::Auth(error) => Self::Auth(error),
+        }
+    }
+}
+
 impl CorporateActionFeedError {
     const fn kind(&self) -> &'static str {
         match self {
             Self::Http(_) => "transport",
+            Self::Auth(_) => "auth",
             Self::HttpStatus(_) => "http_status",
             Self::InvalidContentType(_) => "content_type",
             Self::BaselineRequired => "baseline_required",
@@ -508,7 +278,8 @@ impl CorporateActionFeedError {
             Self::Projection(
                 CorporateActionProjectionError::BlockedPoison { event_id },
             ) => event_id.as_ref(),
-            Self::Http(_)
+            Self::Auth(_)
+            | Self::Http(_)
             | Self::HttpStatus(_)
             | Self::InvalidContentType(_)
             | Self::Projection(_)
@@ -531,23 +302,26 @@ impl CorporateActionFeed {
         underlying_store: Arc<Store<Underlying>>,
         notifier: Arc<dyn LifecycleNotifier>,
     ) -> Result<Self, CorporateActionFeedBuildError> {
-        let stream_transport = validate_corporate_action_endpoint(
+        let endpoint = CorporateActionStreamEndpoint::parse(
             &config.corporate_actions_stream_url,
-            environment,
+            if environment == Environment::Development {
+                DevelopmentLoopback::Allow
+            } else {
+                DevelopmentLoopback::Deny
+            },
         )?;
+        let stream_transport = endpoint.transport();
         Ok(Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(
-                    config.connect_timeout_secs,
-                ))
-                .read_timeout(Duration::from_secs(
-                    config.corporate_actions_read_timeout_secs,
-                ))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
-            endpoint: config.corporate_actions_stream_url.clone(),
-            api_key: config.api_key.clone(),
-            api_secret: config.api_secret.clone(),
+            client: CorporateActionStreamClient::new(
+                endpoint,
+                AlpacaAuth::Basic {
+                    api_key: config.api_key.clone(),
+                    api_secret: config.api_secret.clone(),
+                },
+                ALPACA_TOKEN_URL,
+                Duration::from_secs(config.connect_timeout_secs),
+                Duration::from_secs(config.corporate_actions_read_timeout_secs),
+            )?,
             stream_transport,
             bootstrap_since: config.corporate_actions_bootstrap_since.clone(),
             scheduler: CorporateActionFreezeScheduler::new(
@@ -780,6 +554,10 @@ impl CorporateActionFeed {
                         .await;
                     return Err(error);
                 }
+                Err(CorporateActionFeedError::Auth(error)) if error.is_deterministic() => {
+                    self.notifier.notify(&LifecycleNotification::CorporateActionsSyncFailed).await;
+                    return Err(CorporateActionFeedError::Auth(error));
+                }
                 Err(CorporateActionFeedError::HttpStatus(status))
                     if status.is_client_error()
                         && status != reqwest::StatusCode::TOO_MANY_REQUESTS =>
@@ -807,6 +585,12 @@ impl CorporateActionFeed {
             }
             let attempt = reconnect_failures.record(progress);
             let backoff = next_reconnect_delay(&mut reconnect_backoff);
+            let backoff = match &disconnect_error {
+                Some(CorporateActionFeedError::Auth(error)) => {
+                    honor_retry_after(backoff, error.retry_after())
+                }
+                _ => backoff,
+            };
             debug!(
                 target: "asset",
                 state = "reconnecting",
@@ -876,60 +660,43 @@ impl CorporateActionFeed {
             return Err(CorporateActionFeedError::BaselineRequired);
         }
         let mut replay_anchor = cursor.cloned();
-        let request = self.client.get(&self.endpoint);
-        let request = match self.stream_transport {
-            CorporateActionStreamTransport::AuthenticatedAlpaca => request
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret),
-            CorporateActionStreamTransport::CredentialFreeDevelopment => {
-                request
-            }
-        };
-        let request = if let Some(cursor) = cursor {
-            request.query(&[("since_id", cursor.as_str())])
+        let replay = if let Some(cursor) = cursor {
+            CorporateActionReplay::SinceId(cursor.clone())
         } else if let Some((since, until)) = bootstrap_window {
-            request.query(&[
-                ("since", since.query_value()),
-                ("until", until.query_value()),
-            ])
-        } else if let Some(bootstrap_since) = self.bootstrap_since.as_ref()
+            CorporateActionReplay::Window {
+                since: since.clone(),
+                until: st0x_alpaca::corporate_actions::CorporateActionReplayUntil::at(until.0),
+            }
+        } else if let Some(since) = self.bootstrap_since.as_ref()
             && self.stream_transport
                 == CorporateActionStreamTransport::AuthenticatedAlpaca
         {
-            request.query(&[("since", bootstrap_since.query_value())])
+            CorporateActionReplay::Since(since.clone())
         } else {
-            request
+            CorporateActionReplay::Live
         };
-
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(CorporateActionFeedError::HttpStatus(
-                response.status(),
-            ));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type.starts_with("text/event-stream") {
-            return Err(CorporateActionFeedError::InvalidContentType(
-                content_type.to_string(),
-            ));
-        }
+        let mut stream = self
+            .client
+            .connect(&replay)
+            .await
+            .map_err(CorporateActionFeedError::from)?;
         info!(
             target: "asset",
             state = "connected",
             "Connected to Alpaca corporate-action stream"
         );
 
-        let mut chunks = response.bytes_stream();
-        let mut decoder = CorporateActionSseDecoder::default();
         let mut applied_mutations = 0_usize;
         let mut last_accepted_event_id = None;
-        while let Some(chunk) = chunks.next().await {
-            let chunk = chunk?;
-            let (mutations, decode_error) = match decoder.push(&chunk) {
+        loop {
+            let batch = stream
+                .next_batch()
+                .await
+                .map_err(CorporateActionStreamError::Http)?;
+            let Some(batch) = batch else {
+                break;
+            };
+            let (mutations, decode_error) = match batch {
                 CorporateActionDecodeBatch::Complete(mutations) => {
                     (mutations, None)
                 }
@@ -938,6 +705,7 @@ impl CorporateActionFeed {
                 }
             };
             for mutation in mutations {
+                let mutation = projection_mutation(mutation)?;
                 if let Some(expected) = replay_anchor.take()
                     && mutation.event_id != expected
                 {
@@ -972,7 +740,7 @@ impl CorporateActionFeed {
                 return Err(error.into());
             }
         }
-        if bounded_replay && decoder.has_pending_frame() {
+        if bounded_replay && stream.has_pending_frame() {
             return Err(CorporateActionFeedError::BoundedReplayEndedMidFrame);
         }
         if let Some(expected) = replay_anchor {
@@ -995,51 +763,6 @@ impl CorporateActionFeed {
             );
         }
         Ok(())
-    }
-}
-
-fn validate_corporate_action_endpoint(
-    endpoint: &str,
-    environment: Environment,
-) -> Result<CorporateActionStreamTransport, CorporateActionFeedBuildError> {
-    let endpoint = Url::parse(endpoint)?;
-    if let Some((parameter, _)) =
-        endpoint.query_pairs().find(|(parameter, _)| {
-            matches!(parameter.as_ref(), "since" | "since_id" | "until")
-        })
-    {
-        return Err(
-            CorporateActionFeedBuildError::ReservedReplayQueryParameter(
-                parameter.into_owned(),
-            ),
-        );
-    }
-    if is_development_loopback_endpoint(&endpoint, environment) {
-        return Ok(CorporateActionStreamTransport::CredentialFreeDevelopment);
-    }
-    if endpoint.scheme() != "https" {
-        return Err(CorporateActionFeedBuildError::InsecureEndpointScheme(
-            endpoint.scheme().to_string(),
-        ));
-    }
-    if endpoint.host_str() != Some("stream.data.alpaca.markets") {
-        return Err(CorporateActionFeedBuildError::UnexpectedEndpointHost);
-    }
-    Ok(CorporateActionStreamTransport::AuthenticatedAlpaca)
-}
-
-fn is_development_loopback_endpoint(
-    endpoint: &Url,
-    environment: Environment,
-) -> bool {
-    if environment != Environment::Development || endpoint.scheme() != "http" {
-        return false;
-    }
-
-    match endpoint.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) | None => false,
     }
 }
 
@@ -1090,212 +813,93 @@ fn log_corporate_action_feed_failure(error: &CorporateActionFeedError) {
     );
 }
 
-fn sse_event_identity(frame: &[u8]) -> SseEventIdentity {
-    let Some(value) = sse_lines(frame)
-        .filter_map(|line| {
-            let (field, value) = sse_field(line);
-            (field == b"id").then_some(value)
-        })
-        .last()
-    else {
-        return SseEventIdentity::Absent;
-    };
-    let value = value.strip_prefix(b" ").unwrap_or(value);
-    let Ok(value) = std::str::from_utf8(value) else {
-        return SseEventIdentity::Invalid;
-    };
-
-    CorporateActionEventId::new(value)
-        .map_or(SseEventIdentity::Invalid, SseEventIdentity::Valid)
-}
-
-fn validated_payload_event_id(frame: &str) -> Option<CorporateActionEventId> {
-    let data = sse_lines(frame.as_bytes())
-        .filter_map(|line| {
-            let (field, value) = sse_field(line);
-            (field == b"data").then_some(value)
-        })
-        .map(|value| value.strip_prefix(b" ").unwrap_or(value))
-        .map(std::str::from_utf8)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?
-        .join("\n");
-    if data.is_empty() {
-        return None;
-    }
-
-    serde_json::from_str::<CorporateActionIdentityEnvelope>(&data)
-        .ok()
-        .and_then(|envelope| envelope.event_id)
-}
-
-fn sse_lines(frame: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut remaining = frame;
-
-    std::iter::from_fn(move || {
-        if remaining.is_empty() {
-            return None;
-        }
-        let Some(line_end) =
-            remaining.iter().position(|byte| matches!(*byte, b'\r' | b'\n'))
-        else {
-            let line = remaining;
-            remaining = &[];
-            return Some(line);
-        };
-        let line = &remaining[..line_end];
-        let ending_len = line_ending_len(&remaining[line_end..])?;
-        remaining = &remaining[line_end + ending_len..];
-        Some(line)
-    })
-}
-
-fn sse_field(line: &[u8]) -> (&[u8], &[u8]) {
-    line.iter()
-        .position(|byte| *byte == b':')
-        .map_or((line, &[]), |colon| (&line[..colon], &line[colon + 1..]))
-}
-
-fn line_ending_len(input: &[u8]) -> Option<usize> {
-    match input {
-        [b'\r', b'\n', ..] => Some(2),
-        [b'\r' | b'\n', ..] => Some(1),
-        _ => None,
-    }
-}
-
-fn can_still_terminate_within_limit(buffer: &[u8]) -> bool {
-    const SEPARATORS: [&[u8]; 7] = [
-        b"\n\n",
-        b"\n\r",
-        b"\n\r\n",
-        b"\r\r",
-        b"\r\n\n",
-        b"\r\n\r",
-        b"\r\n\r\n",
-    ];
-
-    if buffer.len() <= MAX_SSE_FRAME_BYTES {
-        return true;
-    }
-
-    let separator_prefix = &buffer[MAX_SSE_FRAME_BYTES..];
-    SEPARATORS.iter().any(|separator| separator.starts_with(separator_prefix))
-}
-
-fn frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    (0..buffer.len()).find_map(|frame_end| {
-        let first_len = line_ending_len(&buffer[frame_end..])?;
-        let second_start = frame_end + first_len;
-        let second_len = line_ending_len(buffer.get(second_start..)?)?;
-        Some((frame_end, first_len + second_len))
-    })
-}
-
-pub(crate) fn decode_sse_frame(
-    frame: &str,
-) -> Result<CorporateActionMutation, CorporateActionDecodeError> {
-    let mut event_id = None;
-    let mut mutation = None;
-    let mut data = Vec::new();
-
-    for line in sse_lines(frame.as_bytes()) {
-        if line.is_empty() || line.starts_with(b":") {
-            continue;
-        }
-        let (field, value) = sse_field(line);
-        let value = value.strip_prefix(b" ").unwrap_or(value);
-        let value = std::str::from_utf8(value)
-            .map_err(CorporateActionDecodeError::InvalidFieldUtf8)?;
-        match field {
-            b"id" => event_id = Some(value.to_string()),
-            b"event" => mutation = Some(value.to_string()),
-            b"data" => data.push(value),
-            _ => {}
-        }
-    }
-
-    if data.is_empty() {
-        return Err(CorporateActionDecodeError::MissingData);
-    }
-    let sse_event_id = event_id
-        .map(|event_id| {
-            CorporateActionEventId::new(&event_id)
-                .ok_or(CorporateActionDecodeError::InvalidEventId(event_id))
-        })
-        .transpose()?;
-    let envelope: CorporateActionEnvelope =
-        serde_json::from_str(&data.join("\n")).map_err(|source| {
-            if let Some(event_id) = sse_event_id.clone() {
-                CorporateActionDecodeError::InvalidPayload { event_id, source }
-            } else {
-                CorporateActionDecodeError::InvalidPayloadWithoutEventId(source)
-            }
-        })?;
-    let event_id = match (sse_event_id, envelope.event_id) {
-        (Some(sse_event_id), Some(payload_event_id))
-            if sse_event_id.as_str() != payload_event_id =>
-        {
-            return Err(CorporateActionDecodeError::EventIdMismatch {
-                sse_event_id,
-                payload_event_id,
-            });
-        }
-        (Some(sse_event_id), _) => sse_event_id,
-        (None, Some(payload_event_id)) => CorporateActionEventId::new(
-            &payload_event_id,
-        )
-        .ok_or(CorporateActionDecodeError::InvalidEventId(payload_event_id))?,
-        (None, None) => {
-            return Err(CorporateActionDecodeError::MissingEventId);
-        }
-    };
-    let mutation = match (mutation, envelope.action) {
-        (Some(sse_mutation), Some(payload_action))
-            if sse_mutation != payload_action =>
-        {
-            return Err(CorporateActionDecodeError::MutationMismatch {
-                sse_mutation,
-                payload_action,
-            });
-        }
-        (Some(sse_mutation), _) => sse_mutation,
-        (None, Some(payload_action)) => payload_action,
-        (None, None) => {
-            return Err(CorporateActionDecodeError::MissingMutation);
-        }
-    };
-    let kind =
-        CorporateActionMutationKind::parse(&mutation).ok_or_else(|| {
-            CorporateActionDecodeError::UnsupportedMutation(mutation.clone())
-        })?;
-    match envelope.event_type {
-        DividendCorporateActionEventType::CashDividend
-        | DividendCorporateActionEventType::StockDividend => {}
-    }
-    if matches!(envelope.region, CorporateActionRegion::NonUs) {
-        return Err(CorporateActionDecodeError::NonUsRegion);
-    }
-    let action_id =
-        CorporateActionId::new(&envelope.ca.id).ok_or_else(|| {
-            CorporateActionDecodeError::InvalidActionId(envelope.ca.id.clone())
-        })?;
-    let underlying =
-        UnderlyingSymbol::new(&envelope.ca.symbol).map_err(|_| {
-            CorporateActionDecodeError::InvalidUnderlying(
-                envelope.ca.symbol.clone(),
-            )
-        })?;
-
+fn projection_mutation(
+    mutation: st0x_alpaca::corporate_actions::CorporateActionMutation,
+) -> Result<CorporateActionMutation, CorporateActionFeedError> {
+    let symbol = mutation.action.underlying.as_str();
+    let underlying = UnderlyingSymbol::new(symbol).map_err(|_| CorporateActionStreamDecodeError::Event {
+        event_id: Some(mutation.event_id.clone()),
+        source: st0x_alpaca::corporate_actions::CorporateActionDecodeError::InvalidUnderlying(symbol.to_string()),
+    })?;
     Ok(CorporateActionMutation {
-        event_id,
-        kind,
+        event_id: mutation.event_id,
+        kind: mutation.kind,
         action: DividendCorporateAction {
-            id: action_id,
+            id: mutation.action.id,
             underlying,
-            ex_date: envelope.ca.ex_date,
+            ex_date: mutation.action.ex_date,
         },
     })
+}
+
+#[cfg(test)]
+const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+fn validate_corporate_action_endpoint(
+    endpoint: &str,
+    environment: Environment,
+) -> Result<CorporateActionStreamTransport, CorporateActionEndpointError> {
+    CorporateActionStreamEndpoint::parse(
+        endpoint,
+        if environment == Environment::Development {
+            DevelopmentLoopback::Allow
+        } else {
+            DevelopmentLoopback::Deny
+        },
+    )
+    .map(|endpoint| endpoint.transport())
+}
+
+#[cfg(test)]
+fn test_stream_client(
+    endpoint: &str,
+    transport: CorporateActionStreamTransport,
+) -> CorporateActionStreamClient {
+    let endpoint = match transport {
+        CorporateActionStreamTransport::AuthenticatedAlpaca => {
+            CorporateActionStreamEndpoint::authenticated_loopback(endpoint)
+                .unwrap()
+        }
+        CorporateActionStreamTransport::CredentialFreeDevelopment => {
+            CorporateActionStreamEndpoint::parse(
+                endpoint,
+                DevelopmentLoopback::Allow,
+            )
+            .unwrap()
+        }
+    };
+    CorporateActionStreamClient::new(
+        endpoint,
+        AlpacaAuth::Basic {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+        },
+        ALPACA_TOKEN_URL,
+        Duration::from_secs(10),
+        Duration::from_secs(90),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+fn decode_sse_frame(
+    frame: &str,
+) -> Result<CorporateActionMutation, CorporateActionDecodeError> {
+    let mut decoder = CorporateActionSseDecoder::default();
+    match decoder.push(format!("{frame}\n\n").as_bytes()) {
+        CorporateActionDecodeBatch::Complete(mut mutations) => {
+            let mutation = mutations.remove(0);
+            Ok(projection_mutation(mutation).unwrap())
+        }
+        CorporateActionDecodeBatch::Poison {
+            error: CorporateActionStreamDecodeError::Event { source, .. },
+            ..
+        } => Err(source),
+        other @ CorporateActionDecodeBatch::Poison { .. } => {
+            panic!("unexpected decode result: {other:?}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1845,6 +1449,24 @@ mod tests {
     };
 
     #[test]
+    fn corporate_action_endpoint_rejects_userinfo_fragments_and_until_id() {
+        for endpoint in [
+            "https://user:secret@stream.data.alpaca.markets/events",
+            "https://stream.data.alpaca.markets/events#fragment",
+            "https://stream.data.alpaca.markets/events?until_id=cursor",
+            "http://user:secret@127.0.0.1/events",
+        ] {
+            assert!(
+                validate_corporate_action_endpoint(
+                    endpoint,
+                    Environment::Development
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn corporate_action_endpoint_restricts_credentials_to_trusted_hosts() {
         assert_eq!(
             validate_corporate_action_endpoint(
@@ -1859,14 +1481,14 @@ mod tests {
                 "http://stream.data.alpaca.markets/v1beta1/events/corporate-actions",
                 Environment::Production,
             ),
-            Err(CorporateActionFeedBuildError::InsecureEndpointScheme(_))
+            Err(CorporateActionEndpointError::InsecureEndpointScheme(_))
         ));
         assert!(matches!(
             validate_corporate_action_endpoint(
                 "https://attacker.example/v1beta1/events/corporate-actions",
                 Environment::Production,
             ),
-            Err(CorporateActionFeedBuildError::UnexpectedEndpointHost)
+            Err(CorporateActionEndpointError::UnexpectedEndpointHost)
         ));
         assert_eq!(
             validate_corporate_action_endpoint(
@@ -1881,16 +1503,16 @@ mod tests {
                 "http://127.0.0.1:12345/v1beta1/events/corporate-actions",
                 Environment::Staging,
             ),
-            Err(CorporateActionFeedBuildError::InsecureEndpointScheme(_))
+            Err(CorporateActionEndpointError::InsecureEndpointScheme(_))
         ));
         assert!(matches!(
             validate_corporate_action_endpoint(
                 "http://attacker.example/v1beta1/events/corporate-actions",
                 Environment::Development,
             ),
-            Err(CorporateActionFeedBuildError::InsecureEndpointScheme(_))
+            Err(CorporateActionEndpointError::InsecureEndpointScheme(_))
         ));
-        for parameter in ["since", "since_id", "until"] {
+        for parameter in ["since", "since_id", "until", "until_id"] {
             let endpoint = format!(
                 "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?{parameter}=reserved"
             );
@@ -1900,7 +1522,7 @@ mod tests {
                     Environment::Production,
                 ),
                 Err(
-                    CorporateActionFeedBuildError::ReservedReplayQueryParameter(
+                    CorporateActionEndpointError::ReservedReplayQueryParameter(
                         value
                     )
                 ) if value == parameter
@@ -2001,6 +1623,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reconnect_honors_retry_after_up_to_the_cap() {
+        assert_eq!(
+            honor_retry_after(STREAM_RECONNECT_MIN_BACKOFF, None),
+            STREAM_RECONNECT_MIN_BACKOFF
+        );
+        assert_eq!(
+            honor_retry_after(
+                STREAM_RECONNECT_MIN_BACKOFF,
+                Some(Duration::from_secs(90))
+            ),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            honor_retry_after(
+                STREAM_RECONNECT_MIN_BACKOFF,
+                Some(Duration::from_hours(24))
+            ),
+            STREAM_RECONNECT_MAX_RETRY_AFTER
+        );
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn reconnect_threshold_warns_and_notifies_the_operator_once() {
@@ -2063,7 +1707,10 @@ mod tests {
         batch: CorporateActionDecodeBatch,
     ) -> Vec<CorporateActionMutation> {
         match batch {
-            CorporateActionDecodeBatch::Complete(mutations) => mutations,
+            CorporateActionDecodeBatch::Complete(mutations) => mutations
+                .into_iter()
+                .map(|mutation| projection_mutation(mutation).unwrap())
+                .collect(),
             CorporateActionDecodeBatch::Poison { error, .. } => {
                 panic!("expected a complete decode batch, got {error}")
             }
@@ -2109,10 +1756,10 @@ mod tests {
                 .body(body);
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2370,13 +2017,8 @@ mod tests {
             CorporateActionStreamDecodeError::FrameTooLarge
         ));
         assert!(
-            decoder.buffer.is_empty(),
-            "an oversized untrusted frame must not remain allocated"
-        );
-        assert_eq!(
-            decoder.buffer.capacity(),
-            0,
-            "rejecting an oversized frame must release its retained capacity"
+            !decoder.has_pending_frame(),
+            "an oversized untrusted frame must not remain buffered"
         );
     }
 
@@ -2400,7 +2042,7 @@ mod tests {
 
         assert!(complete(decoder.push(&first_chunk)).is_empty());
         assert!(complete(decoder.push(b"\r\n")).is_empty());
-        assert!(decoder.buffer.is_empty());
+        assert!(!decoder.has_pending_frame());
     }
 
     #[traced_test]
@@ -2463,7 +2105,7 @@ mod tests {
                 ..
             } if event_id.as_str() == poison_event_id
         ));
-        assert_eq!(decoder.buffer.capacity(), 0);
+        assert!(!decoder.has_pending_frame());
     }
 
     #[test]
@@ -2548,10 +2190,10 @@ mod tests {
                 .body("{}");
         });
         let feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2601,10 +2243,10 @@ mod tests {
                 .body(body);
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2663,10 +2305,10 @@ mod tests {
                 .body(vec![b'x'; MAX_SSE_FRAME_BYTES + 1]);
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2725,10 +2367,10 @@ mod tests {
                 .body("");
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2787,10 +2429,10 @@ mod tests {
                 .body(body);
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2870,10 +2512,10 @@ mod tests {
                 .body(body);
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(bootstrap_since),
@@ -2947,10 +2589,10 @@ mod tests {
             connection.shutdown().await.unwrap();
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("http://{address}/corporate-actions"),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("http://{address}/corporate-actions"),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -2994,10 +2636,10 @@ mod tests {
             );
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -3044,10 +2686,10 @@ mod tests {
             );
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(bootstrap_since),
@@ -3113,10 +2755,10 @@ mod tests {
             );
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(bootstrap_since),
@@ -3183,10 +2825,10 @@ mod tests {
             );
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(bootstrap_since.clone()),
@@ -3221,10 +2863,10 @@ mod tests {
                 .body("id: 01J9RPMV5TKB8WX3M4F1KZ7QH2\nevent: insert\ndata: {");
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(
@@ -3282,10 +2924,10 @@ mod tests {
                 .body("");
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: Some(
@@ -3342,10 +2984,10 @@ mod tests {
             );
         });
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -3389,10 +3031,10 @@ mod tests {
             );
         });
         let feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::CredentialFreeDevelopment,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::CredentialFreeDevelopment,
             bootstrap_since: None,
@@ -3446,10 +3088,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let server = MockServer::start();
         let feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: None,
@@ -3479,10 +3121,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let server = MockServer::start();
         let mut feed = CorporateActionFeed {
-            client: reqwest::Client::new(),
-            endpoint: format!("{}/corporate-actions", server.base_url()),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            client: test_stream_client(
+                &format!("{}/corporate-actions", server.base_url()),
+                CorporateActionStreamTransport::AuthenticatedAlpaca,
+            ),
             stream_transport:
                 CorporateActionStreamTransport::AuthenticatedAlpaca,
             bootstrap_since: None,

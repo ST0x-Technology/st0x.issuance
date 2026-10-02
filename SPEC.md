@@ -5501,3 +5501,16 @@ aggregates what each per network loop reports; `GET /admin/network-telemetry`
 
 The registry is deliberately not persisted: it describes the running process,
 and the durable signals (checkpoints, event store) already survive restarts.
+
+### S01 Alpaca corporate-action transport
+
+The corporate-action feed uses the shared Alpaca crate stream client for
+endpoint validation, credential headers, and bounded SSE decoding. Issuance
+retains durable cursors, bounded bootstrap, projection, reconnect policy, and
+freeze alignment. URLs containing userinfo, fragments, or the reserved replay
+parameters `since`, `since_id`, `until`, or `until_id` are refused. Only
+development permits a credential-free HTTP loopback endpoint. During the
+continuous feed, deterministic authentication failures stop the feed and notify
+the operator; transient authentication failures reconnect with backoff, honoring
+Retry-After for at most five minutes. Bounded bootstrap retains its existing
+error propagation policy.
