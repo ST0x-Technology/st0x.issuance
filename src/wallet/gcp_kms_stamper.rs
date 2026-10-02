@@ -278,12 +278,17 @@ impl GcpKmsStamper {
             response.json().await?;
         // A token with no `expires_in`, or one inside the margin, can never
         // be reused, so it is not stored; this also clears an expired entry.
+        // An `expires_in` too large for `Instant` is malformed, so that
+        // token is not stored either.
         let reusable_for =
             Duration::from_secs(expires_in).saturating_sub(TOKEN_EXPIRY_MARGIN);
-        *cached = (!reusable_for.is_zero()).then(|| CachedToken {
-            token: access_token.clone(),
-            refresh_at: Instant::now() + reusable_for,
-        });
+        *cached = Instant::now()
+            .checked_add(reusable_for)
+            .filter(|_| !reusable_for.is_zero())
+            .map(|refresh_at| CachedToken {
+                token: access_token.clone(),
+                refresh_at,
+            });
         drop(cached);
         Ok(AccessToken { token: access_token, refetchable: true })
     }
@@ -760,7 +765,12 @@ mod tests {
     #[tokio::test]
     async fn token_within_expiry_margin_is_not_reused() {
         assert_eq!(token_fetches_with_expiry(300).await, 3);
-        assert_eq!(token_fetches_with_expiry(301).await, 1);
+        assert_eq!(token_fetches_with_expiry(400).await, 1);
+    }
+
+    #[tokio::test]
+    async fn token_with_overflowing_expiry_is_not_reused() {
+        assert_eq!(token_fetches_with_expiry(u64::MAX).await, 3);
     }
 
     #[tokio::test]
