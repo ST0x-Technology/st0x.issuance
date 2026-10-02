@@ -78,6 +78,11 @@ in
   # PasswordAuthentication=false, brute-force noise curbed by fail2ban.
   networking.firewall.enable = true;
 
+  # Prod serves the API through nginx (step 2 of the proxy cutover in
+  # docs/nixos-provisioning.md). Staging has no running droplet, so it stays
+  # in direct mode.
+  st0x.ingress.behindProxy = environment == "prod";
+
   fileSystems."/mnt/data" = {
     device = "/dev/disk/by-id/scsi-0DO_Volume_${volumeName}";
     fsType = "ext4";
