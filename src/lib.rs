@@ -2201,10 +2201,13 @@ async fn cached_receipt_contract<P: Provider>(
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
-    // WAL lets the apalis (sqlx 0.8) and event-store (sqlx 0.9) pools read and
-    // write the same SQLite file concurrently; busy_timeout makes a writer wait
-    // out the single-writer lock instead of failing with "database is locked".
+    // `create_if_missing` lets the bot start on a fresh disk, because the
+    // production URL has no `mode=rwc`. WAL lets the apalis (sqlx 0.8) and
+    // event-store (sqlx 0.9) pools read and write the same SQLite file
+    // concurrently; busy_timeout makes a writer wait out the single-writer
+    // lock instead of failing with "database is locked".
     let options = SqliteConnectOptions::from_str(&config.database_url)?
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(5));
 
@@ -2226,6 +2229,7 @@ async fn create_apalis_pool(
 ) -> Result<ApalisSqlitePool, anyhow::Error> {
     let options =
         apalis_sqlite::SqliteConnectOptions::from_str(&config.database_url)?
+            .create_if_missing(true)
             .pragma("journal_mode", "WAL")
             .busy_timeout(Duration::from_secs(5));
 
