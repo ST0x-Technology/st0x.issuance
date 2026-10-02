@@ -7,13 +7,17 @@
 //! trailing window straight from the event store and alerts when the count is
 //! below the configured average.
 //!
+//! Fills follow the US extended-hours trading day, so the monitor only speaks
+//! while the [`session`] is open and only once the session has been open for
+//! the whole window. Outside that it leaves the alert state alone.
+//!
 //! Spam control mirrors the gas monitor: alert once when the count drops below
 //! the minimum, again at most once per [`FILL_RATE_REALERT_INTERVAL`] while it
 //! stays low, and only log recovery. A failed alert delivery or count query
 //! leaves the alert state unchanged, so the former retries on the next poll and
 //! the latter neither fires nor clears an alert.
 
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{Pool, Sqlite};
 use std::num::TryFromIntError;
 use std::sync::Arc;
@@ -23,6 +27,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::FillRateAlertConfig;
 use crate::notifications::{LifecycleNotification, LifecycleNotifier};
+
+mod session;
+
+use session::SessionState;
+pub(crate) use session::{CalendarError, NyseCalendar, SESSION_HOURS};
 
 /// Interval between fill counts. The window is hours long, so a shortfall is
 /// worth noticing within minutes but never needs sub-minute resolution.
@@ -35,6 +44,7 @@ const FILL_RATE_REALERT_INTERVAL: Duration = Duration::from_secs(3600);
 pub(crate) struct FillRateMonitor {
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) alert: FillRateAlertConfig,
+    pub(crate) calendar: NyseCalendar,
     pub(crate) poll_interval: Duration,
     pub(crate) notifier: Arc<dyn LifecycleNotifier>,
 }
@@ -69,10 +79,42 @@ impl FillRateMonitor {
         now: DateTime<Utc>,
         instant: Instant,
     ) -> Option<Instant> {
+        let window_start = match self
+            .calendar
+            .session_state(now, self.alert.window_hours)
+        {
+            Ok(SessionState::WindowFull { window_start }) => window_start,
+            Ok(SessionState::Closed) => {
+                debug!(
+                    target: "fill_rate",
+                    "Outside the session; fill rate not evaluated"
+                );
+                return last_alerted;
+            }
+            Ok(SessionState::WarmingUp) => {
+                debug!(
+                    target: "fill_rate",
+                    window_hours = self.alert.window_hours,
+                    "The session window is not yet full; fill rate not \
+                     evaluated"
+                );
+                return last_alerted;
+            }
+            Err(session_error) => {
+                warn!(
+                    target: "fill_rate",
+                    error = %session_error,
+                    "Cannot place this poll in the session, so the fill rate \
+                     is not evaluated; check the holiday list"
+                );
+                return last_alerted;
+            }
+        };
+
         let required_fills = u64::from(self.alert.min_fills_per_hour.get())
             * u64::from(self.alert.window_hours.get());
 
-        let fills = match count_fills(&self.pool, self.alert, now).await {
+        let fills = match count_fills(&self.pool, window_start).await {
             Ok(fills) => fills,
             Err(count_error) => {
                 warn!(
@@ -187,29 +229,22 @@ fn evaluate(
 
 #[derive(Debug, thiserror::Error)]
 enum CountFillsError {
-    #[error("fill window of {window_hours} hours does not fit a timestamp")]
-    WindowOutOfRange { window_hours: u32 },
     #[error("database error")]
     Database(#[from] sqlx::Error),
     #[error("fill count is out of range")]
     Count(#[from] TryFromIntError),
 }
 
-/// Counts accepted mint and redemption requests whose event timestamp falls
-/// within the trailing window ending at `now`.
+/// Counts accepted mint and redemption requests whose event timestamp is at or
+/// after `since`.
 ///
 /// Timestamps are compared as Julian days because the persisted RFC 3339
 /// strings vary in fractional digits, which makes a text comparison wrong.
 async fn count_fills(
     pool: &Pool<Sqlite>,
-    alert: FillRateAlertConfig,
-    now: DateTime<Utc>,
+    since: DateTime<Utc>,
 ) -> Result<u64, CountFillsError> {
-    let window_hours = alert.window_hours.get();
-    let since = TimeDelta::try_hours(i64::from(window_hours))
-        .and_then(|window| now.checked_sub_signed(window))
-        .ok_or(CountFillsError::WindowOutOfRange { window_hours })?
-        .to_rfc3339_opts(SecondsFormat::Micros, true);
+    let since = since.to_rfc3339_opts(SecondsFormat::Micros, true);
 
     let fills: i64 = sqlx::query_scalar(
         "
@@ -240,7 +275,8 @@ async fn count_fills(
 mod tests {
     use alloy::primitives::B256;
     use async_trait::async_trait;
-    use chrono::{DateTime, TimeDelta, Utc};
+    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+    use chrono_tz::America::New_York;
     use cqrs_es::DomainEvent;
     use parking_lot::Mutex;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -252,6 +288,7 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
+    use super::session::NyseCalendar;
     use super::{
         FILL_RATE_REALERT_INTERVAL, FillRateMonitor, PollOutcome, count_fills,
         evaluate,
@@ -336,9 +373,31 @@ mod tests {
         FillRateMonitor {
             pool,
             alert: three_per_hour_over_six(),
+            calendar: NyseCalendar::embedded().unwrap(),
             poll_interval: Duration::from_secs(300),
             notifier,
         }
+    }
+
+    /// New York wall-clock time as the instant it names.
+    fn new_york(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+    ) -> DateTime<Utc> {
+        New_York
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// A Monday, 11:00 New York time: the session has been open for seven
+    /// hours, so the six hour window is full and starts at 05:00.
+    fn full_window_now() -> DateTime<Utc> {
+        new_york(2026, 10, 5, 11, 0)
     }
 
     async fn insert_event(
@@ -491,7 +550,7 @@ mod tests {
         insert_redemption_detected(&pool, outside).await;
 
         let fills =
-            count_fills(&pool, three_per_hour_over_six(), now).await.unwrap();
+            count_fills(&pool, now - TimeDelta::hours(6)).await.unwrap();
 
         assert_eq!(fills, 2, "one mint and one redemption are in the window");
     }
@@ -516,7 +575,7 @@ mod tests {
         .await;
 
         let fills =
-            count_fills(&pool, three_per_hour_over_six(), now).await.unwrap();
+            count_fills(&pool, now - TimeDelta::hours(6)).await.unwrap();
 
         assert_eq!(fills, 0);
     }
@@ -548,7 +607,7 @@ mod tests {
         .await;
 
         let fills =
-            count_fills(&pool, three_per_hour_over_six(), now).await.unwrap();
+            count_fills(&pool, now - TimeDelta::hours(6)).await.unwrap();
 
         assert_eq!(fills, 1, "only the fill at the cutoff is in the window");
     }
@@ -557,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn poll_below_minimum_alerts_with_count_and_window() {
         let pool = migrated_pool().await;
-        let now = Utc::now();
+        let now = full_window_now();
         seed_mints(&pool, 17, now - TimeDelta::hours(1)).await;
         let notifier = FlakyNotifier::new(0);
         let monitor = monitor(pool, notifier.clone());
@@ -587,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn poll_at_minimum_is_healthy() {
         let pool = migrated_pool().await;
-        let now = Utc::now();
+        let now = full_window_now();
         seed_mints(&pool, 18, now - TimeDelta::hours(1)).await;
         let notifier = FlakyNotifier::new(0);
         let monitor = monitor(pool, notifier.clone());
@@ -606,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn poll_recovery_logs_without_notifying() {
         let pool = migrated_pool().await;
-        let now = Utc::now();
+        let now = full_window_now();
         seed_mints(&pool, 20, now - TimeDelta::hours(1)).await;
         let notifier = FlakyNotifier::new(0);
         let monitor = monitor(pool, notifier.clone());
@@ -626,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn failed_alert_retries_on_the_next_poll() {
         let pool = migrated_pool().await;
-        let now = Utc::now();
+        let now = full_window_now();
         let notifier = FlakyNotifier::new(1);
         let monitor = monitor(pool, notifier.clone());
 
@@ -661,8 +720,9 @@ mod tests {
         let monitor = monitor(pool, notifier.clone());
         let alerted_at = Some(Instant::now());
 
-        let state =
-            monitor.poll_once(alerted_at, Utc::now(), Instant::now()).await;
+        let state = monitor
+            .poll_once(alerted_at, full_window_now(), Instant::now())
+            .await;
 
         assert_eq!(state, alerted_at);
         assert!(notifier.delivered().is_empty());
@@ -670,5 +730,134 @@ mod tests {
             Level::WARN,
             &["Failed to count fills in the trailing window"]
         ));
+    }
+
+    /// Polls at `now` with a pending alert and with none, over a database
+    /// with no fills at all, and asserts the poll neither counts, alerts, nor
+    /// touches the state.
+    async fn assert_poll_is_silent(now: DateTime<Utc>, label: &str) {
+        let pool = migrated_pool().await;
+        let notifier = FlakyNotifier::new(0);
+        let monitor = monitor(pool, notifier.clone());
+        let pending = Some(Instant::now());
+
+        let healthy_state = monitor.poll_once(None, now, Instant::now()).await;
+        let pending_state =
+            monitor.poll_once(pending, now, Instant::now()).await;
+
+        assert_eq!(healthy_state, None, "{label}: state must be unchanged");
+        assert_eq!(pending_state, pending, "{label}: state must be unchanged");
+        assert!(
+            notifier.delivered().is_empty(),
+            "{label}: a shortfall must not alert"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn weekend_polls_are_silent() {
+        // 2026-10-03 is a Saturday, 2026-10-04 a Sunday.
+        assert_poll_is_silent(new_york(2026, 10, 3, 12, 0), "Saturday").await;
+        assert_poll_is_silent(new_york(2026, 10, 4, 12, 0), "Sunday").await;
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Outside the session", "fill rate not evaluated"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn overnight_polls_are_silent() {
+        assert_poll_is_silent(new_york(2026, 10, 5, 3, 0), "before the open")
+            .await;
+        assert_poll_is_silent(new_york(2026, 10, 5, 20, 0), "at the close")
+            .await;
+        assert_poll_is_silent(new_york(2026, 10, 6, 2, 0), "after midnight")
+            .await;
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Outside the session", "fill rate not evaluated"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn holiday_polls_are_silent() {
+        // Thanksgiving 2026, a Thursday, at a time that is mid-session on any
+        // ordinary weekday.
+        assert_poll_is_silent(new_york(2026, 11, 26, 14, 0), "Thanksgiving")
+            .await;
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Outside the session", "fill rate not evaluated"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_session_open_for_less_than_the_window_is_silent() {
+        // Monday 09:59: nine fewer minutes than the six hour window needs.
+        assert_poll_is_silent(new_york(2026, 10, 5, 9, 59), "warming up").await;
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["window is not yet full", "fill rate not evaluated"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn the_first_poll_with_a_full_window_can_alert() {
+        let pool = migrated_pool().await;
+        let notifier = FlakyNotifier::new(0);
+        let monitor = monitor(pool, notifier.clone());
+
+        let state = monitor
+            .poll_once(None, new_york(2026, 10, 5, 10, 0), Instant::now())
+            .await;
+
+        assert!(state.is_some(), "10:00 is the first page of a session");
+        assert_eq!(notifier.delivered().len(), 1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn fridays_fills_do_not_count_toward_mondays_window() {
+        let pool = migrated_pool().await;
+        // Plenty of fills on Friday evening, none yet on Monday.
+        seed_mints(&pool, 40, new_york(2026, 10, 2, 18, 0)).await;
+        let notifier = FlakyNotifier::new(0);
+        let monitor = monitor(pool, notifier.clone());
+
+        let state = monitor
+            .poll_once(None, new_york(2026, 10, 5, 10, 0), Instant::now())
+            .await;
+
+        assert!(state.is_some());
+        assert_eq!(
+            notifier.delivered(),
+            vec![LifecycleNotification::LowFillRate {
+                fills: 0,
+                required_fills: 18,
+                window_hours: NonZeroU32::new(6).unwrap(),
+            }]
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_date_outside_the_holiday_list_is_silent_and_says_why() {
+        let pool = migrated_pool().await;
+        let notifier = FlakyNotifier::new(0);
+        let monitor = monitor(pool, notifier.clone());
+        let pending = Some(Instant::now());
+
+        // Midday on a weekday in a year the list does not cover.
+        let state = monitor
+            .poll_once(pending, new_york(2029, 7, 4, 12, 0), Instant::now())
+            .await;
+
+        assert_eq!(state, pending);
+        assert!(notifier.delivered().is_empty());
+        assert!(logs_contain_at!(Level::WARN, &["holiday list", "2029-07-04"]));
     }
 }

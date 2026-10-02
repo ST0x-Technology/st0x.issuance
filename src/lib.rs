@@ -32,7 +32,9 @@ use crate::burn_excess::{
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
 };
-use crate::fill_rate_monitor::{FILL_RATE_POLL_INTERVAL, FillRateMonitor};
+use crate::fill_rate_monitor::{
+    CalendarError, FILL_RATE_POLL_INTERVAL, FillRateMonitor, NyseCalendar,
+};
 use crate::gas_monitor::GasMonitor;
 use crate::jobs::{JobQueue, work};
 use crate::mint::job::{
@@ -433,7 +435,7 @@ pub async fn initialize_rocket(
         &pool,
         &lifecycle_notifier,
         &shutdown_rx,
-    ));
+    )?);
 
     background_task_handles.push(spawn_terminal_unfreeze_recovery(
         pool.clone(),
@@ -2126,36 +2128,39 @@ where
 }
 
 /// Spawns the fill rate monitor when a minimum fill rate is configured. The
-/// INFO makes the disabled state operator visible.
+/// INFO makes the disabled state operator visible. A holiday list that fails
+/// to parse is a build defect, so it fails startup rather than disabling the
+/// monitor.
 fn spawn_fill_rate_monitor(
     config: &Config,
     pool: &Pool<Sqlite>,
     lifecycle_notifier: &Arc<dyn LifecycleNotifier>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
-) -> Option<JoinHandle<()>> {
+) -> Result<Option<JoinHandle<()>>, CalendarError> {
     let Some(alert) = config.fill_rate_alert else {
         info!(
             target: "fill_rate",
             "No minimum fill rate configured; fill rate monitoring is \
              disabled"
         );
-        return None;
+        return Ok(None);
     };
 
     let monitor = FillRateMonitor {
         pool: pool.clone(),
         alert,
+        calendar: NyseCalendar::embedded()?,
         poll_interval: FILL_RATE_POLL_INTERVAL,
         notifier: lifecycle_notifier.clone(),
     };
 
     let mut monitor_shutdown = shutdown.clone();
-    Some(tokio::spawn(async move {
+    Ok(Some(tokio::spawn(async move {
         tokio::select! {
             () = monitor.run() => {}
             _ = monitor_shutdown.changed() => {}
         }
-    }))
+    })))
 }
 
 /// A vault's own address, as opposed to the address of the ERC-1155 receipt

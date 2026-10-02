@@ -89,6 +89,7 @@ st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v
   "issuer",
 ] }
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.3.0", version = "0.3.0", default-features = false }
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 alloy-node-bindings = "1.8.3"

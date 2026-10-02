@@ -19,6 +19,7 @@ use crate::auth::AuthConfig;
 use crate::chain::{
     ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
 };
+use crate::fill_rate_monitor::SESSION_HOURS;
 use crate::notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
 };
@@ -442,11 +443,25 @@ struct FillRateAlertEnv {
 }
 
 impl FillRateAlertEnv {
-    fn into_config(self) -> Option<FillRateAlertConfig> {
-        self.min_fills_per_hour.map(|min_fills_per_hour| FillRateAlertConfig {
+    /// A window longer than the session could never fill inside one, which
+    /// would leave the monitor silent forever, so it is refused up front.
+    const fn into_config(
+        self,
+    ) -> Result<Option<FillRateAlertConfig>, ConfigError> {
+        let Some(min_fills_per_hour) = self.min_fills_per_hour else {
+            return Ok(None);
+        };
+
+        if self.window_hours.get() > SESSION_HOURS {
+            return Err(ConfigError::FillRateWindowExceedsSession {
+                window_hours: self.window_hours.get(),
+            });
+        }
+
+        Ok(Some(FillRateAlertConfig {
             min_fills_per_hour,
             window_hours: self.window_hours,
-        })
+        }))
     }
 }
 
@@ -880,7 +895,7 @@ impl Env {
             backfill_start_block,
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             gas_poll_interval: crate::gas_monitor::GAS_POLL_INTERVAL,
-            fill_rate_alert: self.fill_rate_alert.into_config(),
+            fill_rate_alert: self.fill_rate_alert.into_config()?,
             wrapped_tokens,
             wrapped_transfer_poll_interval:
                 crate::wrapped_transfer::WRAPPED_TRANSFER_POLL_INTERVAL,
@@ -1290,6 +1305,12 @@ pub enum ConfigError {
          alerts, so it reads as monitored while monitoring nothing"
     )]
     ZeroLowGasThreshold { network: Network },
+    #[error(
+        "fill rate window of {window_hours} hours is longer than the \
+         {SESSION_HOURS} hour session, so it could never fill and the monitor \
+         would stay silent"
+    )]
+    FillRateWindowExceedsSession { window_hours: u32 },
     #[error(
         "low gas threshold '{value}' for {network} is negative; a threshold \
          must be a positive native token amount"
@@ -1824,6 +1845,26 @@ mod tests {
             config.fill_rate_alert.map(|alert| alert.window_hours),
             NonZeroU32::new(12)
         );
+    }
+
+    #[test]
+    fn fill_rate_alert_window_may_not_exceed_the_session() {
+        let accepted = |window: &'static str| {
+            let mut args = minimal_args();
+            args.extend_from_slice(&[
+                "--fill-rate-alert-min-fills-per-hour",
+                "3",
+                "--fill-rate-alert-window-hours",
+                window,
+            ]);
+            Env::try_parse_from(args).unwrap().into_config()
+        };
+
+        assert!(accepted("16").is_ok(), "a session-long window is allowed");
+        assert!(matches!(
+            accepted("17"),
+            Err(ConfigError::FillRateWindowExceedsSession { window_hours: 17 })
+        ));
     }
 
     #[test]
