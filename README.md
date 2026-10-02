@@ -365,6 +365,12 @@ on-chain testing:
 E2E tests validate complete flows from HTTP request through CQRS to on-chain
 execution.
 
+`tests/fork_rehearsal.rs` runs the orchestrator cutover cycle on a local Anvil
+fork of Base, against the real contracts. It is ignored by default and needs a
+Base RPC:
+`FORK_RPC_URL=<url> FORK_BLOCK=<block> cargo test --test
+fork_rehearsal -- --ignored --nocapture`.
+
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Detailed specification of the system
@@ -416,35 +422,32 @@ For detailed architectural patterns and design decisions, see
 ## GCP release path
 
 Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
-`st0x-issuance` binary (`nix build .#bot-oci`, contract in
-`nix/oci-image.nix`). This repo deploys itself:
+`st0x-issuance` binary (`nix build .#bot-oci`, contract in `nix/oci-image.nix`).
+This repo deploys itself:
 
-- **Staging**: a merge to main (`build-oci.yml`) pushes and attests the
-  image, publishes `config.staging.toml` as a runtime-config version, and
-  writes both into the staging VM's deploy state; the VM verifies the
-  attestation and rolls.
+- **Staging**: a merge to main (`build-oci.yml`) pushes and attests the image,
+  publishes `config.staging.toml` as a runtime-config version, and writes both
+  into the staging VM's deploy state; the VM verifies the attestation and rolls.
 - **Production**: a `vX.Y.Z` tag (`release-tag.yml`) labels that commit's
-  attested image and deploys it behind the production project's `app-deploy`
-  PAM grant (an approver activates it in the GCP console). A merge that
-  changes `config.prod.toml` is a config-only release on the live image
-  when nothing but configs and Markdown changed since the commit production
-  runs (the live digest's commit tag); otherwise the config ships with the
-  next tag. A slower run whose config is no longer main's fails instead of
-  publishing an older config.
-  `production-release.yml`'s dispatch with a version is a rollback. All of
-  these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
-- Tags on commits older than this release path run the old `release-tag.yml`
-  and only label; deploy them with the rollback dispatch. Every production
-  release leaves its PAM grant ACTIVE for up to an hour: the releaser has no
-  right to revoke it, so the revoke step only warns. The next release inside
-  that hour (a queued run included) fails at "Await PAM approval" until
-  someone revokes the grant in the GCP console; that is the normal case, not
-  an error, until devops grants the releaser `grants.revoke` on
-  `app-deploy`. After a PAM timeout, start a fresh run rather than
-  re-running the failed job: a re-run skips the preflight that checks the
-  config is still current. Setting `PRODUCTION_RELEASES_ENABLED` also
-  retires the droplet path: `deploy-prod.yaml` refuses to run while it is
-  `true`.
+  attested image and deploys it behind the production project's `app-deploy` PAM
+  grant (an approver activates it in the GCP console). A merge that changes
+  `config.prod.toml` is a config-only release on the live image when nothing but
+  configs and Markdown changed since the commit production runs (the live
+  digest's commit tag); otherwise the config ships with the next tag. A slower
+  run whose config is no longer main's fails instead of publishing an older
+  config. `production-release.yml`'s dispatch with a version is a rollback. All
+  of these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
+- Tags on commits older than this release path run the old `release-tag.yml` and
+  only label; deploy them with the rollback dispatch. Every production release
+  leaves its PAM grant ACTIVE for up to an hour: the releaser has no right to
+  revoke it, so the revoke step only warns. The next release inside that hour (a
+  queued run included) fails at "Await PAM approval" until someone revokes the
+  grant in the GCP console; that is the normal case, not an error, until devops
+  grants the releaser `grants.revoke` on `app-deploy`. After a PAM timeout,
+  start a fresh run rather than re-running the failed job: a re-run skips the
+  preflight that checks the config is still current. Setting
+  `PRODUCTION_RELEASES_ENABLED` also retires the droplet path:
+  `deploy-prod.yaml` refuses to run while it is `true`.
 
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy
