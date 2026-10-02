@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 use turnkey_api_key_stamper::StampHeader;
 
 /// Header name and scheme string from Turnkey's stamp specification.
@@ -55,10 +55,15 @@ const REQUIRED_ALGORITHM: &str = "EC_SIGN_P256_SHA256";
 /// expires, so no request goes out with a token about to lapse.
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
+/// Timeout for every KMS call, and for the token fetch at construction:
+/// a booting VM's metadata server can be slow to answer the first one,
+/// and that fetch has no retry, so it keeps the longer limit.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The metadata server is link-local, so a token fetch slower than this
-/// means it is unhealthy. Fetches run under the cache lock, one after
-/// another, so a short limit keeps queued stamps from waiting on the
-/// client's 20s timeout each.
+/// during stamping means it is unhealthy. Those fetches run under the
+/// cache lock, one after another, so a short limit keeps queued stamps
+/// from waiting `HTTP_TIMEOUT` each.
 const METADATA_TOKEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Errors from constructing or using the KMS stamper. HTTP error bodies
@@ -100,6 +105,10 @@ enum AccessTokenSource {
     /// Fixed token endpoint, tests only.
     #[cfg(test)]
     Endpoint(String),
+    /// Fixed token, tests only: takes the `GOOGLE_OAUTH_ACCESS_TOKEN` path
+    /// without changing the process environment.
+    #[cfg(test)]
+    EnvToken(String),
 }
 
 /// JSON shape of the `X-Stamp` value (camelCase per Turnkey's spec,
@@ -190,13 +199,18 @@ impl GcpKmsStamper {
         token_source: AccessTokenSource,
     ) -> Result<Self, GcpKmsStamperError> {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(HTTP_TIMEOUT)
             .user_agent("st0x-turnkey-kms-stamper")
             .build()?;
 
         let cached_token = Mutex::new(None);
-        let AccessToken { token, .. } =
-            Self::access_token(&http, &token_source, &cached_token).await?;
+        let AccessToken { token, .. } = Self::access_token(
+            &http,
+            &token_source,
+            &cached_token,
+            HTTP_TIMEOUT,
+        )
+        .await?;
         let url = format!("{kms_base_url}/{key_version}/publicKey");
         let response = http.get(&url).bearer_auth(&token).send().await?;
         let status = response.status();
@@ -244,6 +258,7 @@ impl GcpKmsStamper {
         http: &reqwest::Client,
         source: &AccessTokenSource,
         cache: &Mutex<Option<CachedToken>>,
+        fetch_timeout: Duration,
     ) -> Result<AccessToken, GcpKmsStamperError> {
         let token_url = match select_token(
             source,
@@ -265,7 +280,7 @@ impl GcpKmsStamper {
         let response = http
             .get(token_url)
             .header("Metadata-Flavor", "Google")
-            .timeout(METADATA_TOKEN_TIMEOUT)
+            .timeout(fetch_timeout)
             .send()
             .await?;
         let status = response.status();
@@ -363,6 +378,7 @@ impl GcpKmsStamper {
             &self.http,
             &self.token_source,
             &self.cached_token,
+            METADATA_TOKEN_TIMEOUT,
         )
         .await?;
         let url = format!(
@@ -397,6 +413,13 @@ impl GcpKmsStamper {
             *cached = None;
         }
         drop(cached);
+        if is_cached {
+            warn!(
+                target: "wallet",
+                key_version = %self.key_version,
+                "KMS rejected a cached access token before its expiry; refetching"
+            );
+        }
         is_cached
     }
 }
@@ -425,6 +448,8 @@ fn select_token(
         }
         #[cfg(test)]
         AccessTokenSource::Endpoint(url) => SelectedToken::Fetch(url),
+        #[cfg(test)]
+        AccessTokenSource::EnvToken(token) => SelectedToken::Env(token.clone()),
     }
 }
 
@@ -832,6 +857,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_token_rejected_by_kms_is_not_retried() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        let sign_mock = server.mock(|when, then| {
+            when.method("POST").path(format!("/{KEY_VERSION}:asymmetricSign"));
+            then.status(401);
+        });
+        let stamper = GcpKmsStamper::with_endpoints(
+            KEY_VERSION.to_string(),
+            server.base_url(),
+            AccessTokenSource::EnvToken("env-token".to_string()),
+        )
+        .await
+        .expect("stamper construction against mocks should succeed");
+
+        let error =
+            stamper.stamp(b"body").await.expect_err("KMS rejects the token");
+
+        assert!(matches!(
+            error,
+            GcpKmsStamperError::UnexpectedStatus { status: 401, .. }
+        ));
+        sign_mock.assert_calls(1);
+        token_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn non_401_kms_error_is_not_retried() {
+        let key = test_signing_key();
+        let server = MockServer::start();
+        let token_mock = mock_key_endpoints(&server, &key, REQUIRED_ALGORITHM);
+        let sign_mock = server.mock(|when, then| {
+            when.method("POST").path(format!("/{KEY_VERSION}:asymmetricSign"));
+            then.status(500);
+        });
+
+        let stamper = stamper_for(&server).await;
+        let error =
+            stamper.stamp(b"body").await.expect_err("KMS fails the call");
+
+        assert!(matches!(
+            error,
+            GcpKmsStamperError::UnexpectedStatus { status: 500, .. }
+        ));
+        sign_mock.assert_calls(1);
+        token_mock.assert_calls(1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn stamp_fails_when_fresh_token_is_also_rejected() {
         let key = test_signing_key();
         let server = MockServer::start();
@@ -852,6 +928,9 @@ mod tests {
         sign_mock.assert_calls(2);
         token_mock.assert_calls(2);
         assert!(stamper.cached_token.lock().await.is_none());
+        assert!(logs_contain(
+            "KMS rejected a cached access token before its expiry"
+        ));
     }
 
     #[tokio::test]
