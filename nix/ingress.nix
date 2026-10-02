@@ -245,7 +245,7 @@ in
 
     security.acme = {
       acceptTerms = true;
-      defaults.email = "kais@rainlang.xyz";
+      defaults.email = "devops@s01issuer.com";
     };
 
     services.nginx = {
