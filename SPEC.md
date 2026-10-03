@@ -1874,14 +1874,13 @@ are allocated as `highwaterId + 1`, and `redeposit` refuses ids above it,
 that range before the service restarts.
 
 That check proves the receipts left the orchestrator, not that inventory tracks
-them again. The backfill is the only way back in, and it can miss one: it reads
-`balanceOf(bot_wallet)` at the latest block, while it fetched the logs up to an
-earlier head, so a lagging RPC node can answer zero, skip the receipt, and
-advance the checkpoint past its transfer. So the rollback also checks the bot
-side after the restart: every id it returned must be tracked at its on-chain
-balance. `confirm-custody` performs that check (the rollback in
-`docs/runbooks/orchestrator-onboarding.md`); the count it confirms must equal
-the number of ids returned.
+them again. The backfill is the only way back in. It reads each
+`balanceOf(bot_wallet)` at the block its logs reach, so a lagging RPC node fails
+the pass instead of skipping a receipt (see "Receipt Inventory"). The rollback
+still checks the bot side after the restart: every id it returned must be
+tracked at its on-chain balance. `confirm-custody` performs that check (the
+rollback in `docs/runbooks/orchestrator-onboarding.md`); the count it confirms
+must equal the number of ids returned.
 
 The rediscovered receipts carry no receipt information: they return by transfer,
 not by `Deposit`, so their receipt-information bytes and their link to the
@@ -3210,12 +3209,19 @@ monitoring (WebSocket subscription to Deposit and ERC-1155 transfer events at
 runtime), or direct registration after a mint. After startup backfill succeeds,
 periodic receipt backfill safely scans the small runtime range from the durable
 checkpoint to the current block and advances the checkpoint row only after
-ordered range processing succeeds. Live monitoring processes observed logs
-opportunistically but does not advance the durable checkpoint, because WebSocket
-logs can arrive out of order within or across blocks. This prevents long-running
-services from restarting with a stale receipt checkpoint that forces a large
-historical scan before Rocket can serve requests without allowing one live log
-to checkpoint past another unprocessed log in the same block.
+ordered range processing succeeds. Each pass reads every `balanceOf` at the
+block its logs reach, not at `latest`. A read at `latest` can reach an RPC node
+that is behind the node that served the logs: a receipt that just arrived would
+read zero and be skipped, and the checkpoint would move past its block for good.
+A node that does not have that block yet fails the pass, so the checkpoint stays
+and the next pass retries. At startup, a failed pass stops startup, as any
+backfill RPC error does, and the service restarts. Live monitoring processes
+observed logs opportunistically but does not advance the durable checkpoint,
+because WebSocket logs can arrive out of order within or across blocks. This
+prevents long-running services from restarting with a stale receipt checkpoint
+that forces a large historical scan before Rocket can serve requests without
+allowing one live log to checkpoint past another unprocessed log in the same
+block.
 
 The Receipt contract is an ERC-1155 token that emits `TransferSingle` and
 `TransferBatch` events on all token movements. The receipt monitor and
