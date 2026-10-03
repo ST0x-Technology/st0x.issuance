@@ -1120,33 +1120,36 @@ redemption's complete event history, including preparation retries,
 re-broadcasts, and fresh-nonce replacements. The initial live submission is not
 a recovery action. Once the budget is exhausted, `BurnRecoveryExhausted` or
 `BurnPreparationRecoveryExhausted` is persisted once and automatic recovery
-stops. An accepted action is resumed after restart without consuming another
-budget slot until its side effect is complete: an accepted re-broadcast
-resubmits the same bytes, and a persisted replacement intent is submitted as the
-continuation of the action that created it only while it remains mineable. If
-its nonce became finalized while the service was down, signing a further
-replacement requires another budgeted action. Classification and confirmation of
-a transaction produced by the fifth action remain allowed because they do not
-create another side effect. If that transaction is still non-terminal or
-provably dead, the history check persists exhaustion before accepting any
-further action. A failed fifth replacement preparation retains the preceding
-exact transaction identity long enough to persist exhaustion safely. An
-exhausted persisted intent can be re-armed only through
-`POST /admin/recover/redemption/<id>`. The endpoint authorizes one replacement
-per operator request. `BurnManager` selects the persisted network, takes its
-wallet lock, reloads the aggregate, and requires a valid `BurnIntended`,
-`BurnSubmitted`, or retained `Failed` transaction signed by the bot wallet whose
-decoded chain id matches that network's configured chain id. It signs only when
-the live classification returns `ProvablyDead`, or when the transaction is
-retained in `Failed` and its failed receipt's exact block is canonical at or
-below the finalized head (`FinalizedReverted`). An unfinalized `Reverted`
-receipt cannot authorize a signature because a reorganization can remove it. A
-finalized revert is safe because the transaction permanently consumed its nonce
-without making burn state changes. Before signing, the manager refuses any
-signer intent on the network other than the current redemption. The aggregate
-command re-checks the exact hash, nonce, signer, and terminal classification
-while the lock remains held. `StillMineable`, invalid identities, RPC
-uncertainty, invalid states, and competing intents produce no signature.
+stops. One rebroadcast is not a counted action: the failed-state rebroadcast of
+a retained burn (see "Retained burn wins"). It records no event, queues no job
+and signs nothing, but it also stops once the budget is exhausted. An accepted
+action is resumed after restart without consuming another budget slot until its
+side effect is complete: an accepted re-broadcast resubmits the same bytes, and
+a persisted replacement intent is submitted as the continuation of the action
+that created it only while it remains mineable. If its nonce became finalized
+while the service was down, signing a further replacement requires another
+budgeted action. Classification and confirmation of a transaction produced by
+the fifth action remain allowed because they do not create another side effect.
+If that transaction is still non-terminal or provably dead, the history check
+persists exhaustion before accepting any further action. A failed fifth
+replacement preparation retains the preceding exact transaction identity long
+enough to persist exhaustion safely. An exhausted persisted intent can be
+re-armed only through `POST /admin/recover/redemption/<id>`. The endpoint
+authorizes one replacement per operator request. `BurnManager` selects the
+persisted network, takes its wallet lock, reloads the aggregate, and requires a
+valid `BurnIntended`, `BurnSubmitted`, or retained `Failed` transaction signed
+by the bot wallet whose decoded chain id matches that network's configured chain
+id. It signs only when the live classification returns `ProvablyDead`, or when
+the transaction is retained in `Failed` and its failed receipt's exact block is
+canonical at or below the finalized head (`FinalizedReverted`). An unfinalized
+`Reverted` receipt cannot authorize a signature because a reorganization can
+remove it. A finalized revert is safe because the transaction permanently
+consumed its nonce without making burn state changes. Before signing, the
+manager refuses any signer intent on the network other than the current
+redemption. The aggregate command re-checks the exact hash, nonce, signer, and
+terminal classification while the lock remains held. `StillMineable`, invalid
+identities, RPC uncertainty, invalid states, and competing intents produce no
+signature.
 
 For vault-direct recovery, the manager first tries to reserve the retained
 receipt plan. A successful reservation proves the plan remains executable and
@@ -5054,7 +5057,8 @@ for it (`ProvablyDead`, see the classification below), and a named burn with
 nothing retained when its revert is confirmed. Pending transactions, RPC
 failures, unknown outcomes, and legacy transaction IDs that cannot be verified
 on-chain return `422`, preserve the failed state and receipt reservation, and
-require manual intervention instead of risking a second burn.
+require manual intervention instead of risking a second burn. A pending retained
+burn is first broadcast again (see "Retained burn wins" below).
 
 **Post-Alpaca with no transaction named:** A resume prepares and signs a fresh
 burn, so it runs only once any burn the redemption still holds has a known
@@ -5106,19 +5110,32 @@ closed the same way.
 
 The nonce proves a burn dead only once something else consumed it. Until then
 the retained burn classifies as `StillMineable` and is refused. In both shapes
-below, nothing in the running service consumes that nonce, so the operator
-broadcasts the retained signed transaction again out of band — the `422` names
-its hash and nonce, and its signed bytes are in the redemption's event stream.
-Either it mines, or another transaction already took its nonce, the node rejects
-it, and the burn then classifies as `ProvablyDead`.
+below, nothing in the running service signs another transaction at that nonce.
+So the service broadcasts the retained signed transaction again, unchanged, each
+time it classifies as `StillMineable`: the automatic loop on each pass over an
+`Unclassified` `BurnFailed` redemption until the automatic recovery budget is
+exhausted, and `/admin/recover` before its `422`, for any failed redemption
+whose budget is not exhausted. The same signed bytes cannot make a second burn.
+Either the burn mines, or another transaction already took its nonce, the node
+rejects it, and the burn then classifies as `ProvablyDead`. The `422` message
+tells whether the rebroadcast succeeded. For an unfinalized `Reverted` burn,
+which is already mined and gets no rebroadcast, it says to wait for finality. If
+the rebroadcast failed (for example, the provider is down, or a different wallet
+signed the burn), the operator broadcasts the retained signed transaction out of
+band. The `422` names its hash and nonce, and its signed bytes are in the
+redemption's event stream. After the budget is exhausted, `/admin/recover` goes
+to the manual replacement instead. When that refuses a `StillMineable` burn with
+`422 burn_not_provably_dead`, it does not broadcast the burn, and the operator
+broadcasts it out of band the same way.
 
 - **Broadcast, then dropped from the mempool.** `BurnTxSubmitted` released the
   redemption's signer intent, but the service's nonce counter
   (`ResyncNonceManager`) only moves forward: the next burn or mint signs the
-  following nonce and cannot mine behind the gap. A restart also clears the gap,
-  because the next signer then takes the dropped nonce. This shape reaches
-  `Failed` through `MarkFailed`, and the automatic loop reads only `BurnFailed`
-  redemptions, so the operator calls `/admin/recover` again afterwards.
+  following nonce and cannot mine behind the gap. The rebroadcast closes the
+  gap. A restart also clears it, because the next signer then takes the dropped
+  nonce. This shape reaches `Failed` through `MarkFailed`, and the automatic
+  loop reads only `BurnFailed` redemptions, so `/admin/recover` does the
+  rebroadcast. The operator calls it again after the burn mines.
 - **Intended, never broadcast.** The redemption keeps its signer intent
   (`BurnIntended`, `BurningFailed` and `RedemptionFailed` do not release it), so
   no other burn or mint signs on that network. After the rebroadcast, the next
@@ -5131,12 +5148,13 @@ transaction, a transaction the redemption has moved past, or the retained burn
 itself: it classifies the retained burn before deciding anything. A landed one
 is confirmed and recorded as the existing burn; a dead one (`ProvablyDead` /
 `FinalizedReverted`) is retried through `ResumeBurn`; anything else, including a
-classification the provider cannot answer, is deferred to the next pass. One
-exception keeps the loop's earlier revert handling: when the failure names the
-retained burn itself and it is `FinalizedReverted`, the loop confirms it, which
-releases the reservation and marks the redemption failed for an operator. Only
-when nothing is retained does the loop confirm the named transaction otherwise.
-This is what keeps a pre-guard stream carrying a live signed burn plus a tx-free
+classification the provider cannot answer, is deferred to the next pass, and a
+`StillMineable` one is broadcast again first, as above. One exception keeps the
+loop's earlier revert handling: when the failure names the retained burn itself
+and it is `FinalizedReverted`, the loop confirms it, which releases the
+reservation and marks the redemption failed for an operator. Only when nothing
+is retained does the loop confirm the named transaction otherwise. This is what
+keeps a pre-guard stream carrying a live signed burn plus a tx-free
 `Unclassified` failure from being re-driven into a second burn while the first
 can still land.
 
