@@ -21,10 +21,22 @@ There is no testnet or staging chain for this: every step below runs against
 prod (Base mainnet) and is verified by on-chain reads. The first live end-to-end
 mint/burn through Turnkey is the RKLB pilot's manual exercise (step 13), which
 everything before it must fully precede. The full cutover cycle — migrate,
-operate, roll back, resume — is rehearsed by the Anvil end-to-end suite
-(`tests/receipt_custody.rs`,
-`test_receipt_custody_migrates_into_the_orchestrator`), the only pre-prod
-environment.
+operate, roll back, resume — is rehearsed twice before prod. The Anvil
+end-to-end suite (`tests/receipt_custody.rs`,
+`test_receipt_custody_migrates_into_the_orchestrator`) runs it on contracts it
+deploys itself. The fork rehearsal (`tests/fork_rehearsal.rs`) runs it on a
+local Anvil fork of Base, against the real RKLB vault, receipts and
+orchestrator. It is ignored by default; run it, as a gate before the pilot, with
+a Base RPC that can serve state at the fork block:
+
+```
+FORK_RPC_URL=<Base RPC> FORK_BLOCK=<recent block> \
+  cargo test --test fork_rehearsal -- --ignored --nocapture
+```
+
+The fork signs nothing with a real key and changes nothing on Base. It does not
+exercise Turnkey signing or the `issuer` commands below, which accept only the
+Turnkey signer.
 
 ## Prerequisites
 
