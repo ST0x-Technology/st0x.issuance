@@ -28,7 +28,7 @@ use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::vault::{
     MintTxStatus, MintedLogQuery, MintedLogScan, NetworkVaultServices, TxId,
-    UnconfiguredNetworkError, VaultService,
+    UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
@@ -948,7 +948,9 @@ fn oldest_wait(
 enum AbandonReason {
     /// The mint could not be loaded after the maximum load-failure backoffs.
     FailedToLoadMint,
-    /// Receipt inventory remained unreadable after transient backoffs.
+    /// Whether the mint landed stayed unknown after transient backoffs:
+    /// receipt inventory was unreadable, or an exhausted orchestrator mint's
+    /// transaction could not be classified.
     FailedToLoadReceipt,
     /// The aggregate's automatic-retry attempts ran out.
     AutomaticRetriesExhausted,
@@ -961,7 +963,9 @@ impl fmt::Display for AbandonReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             Self::FailedToLoadMint => "failed to load mint",
-            Self::FailedToLoadReceipt => "failed to load receipt inventory",
+            Self::FailedToLoadReceipt => {
+                "could not tell whether the mint landed"
+            }
             Self::AutomaticRetriesExhausted => "automatic retries exhausted",
             Self::NoProgressBudgetExhausted => "no-progress budget exhausted",
         };
@@ -983,14 +987,30 @@ enum RecoveryConclusion {
     Abandoned { reason: AbandonReason },
 }
 
-async fn minting_failed_receipt_exists_with_backoff(
+/// What counts as proof that a failed mint landed, chosen per recovery arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandedCheck {
+    /// Receipt inventory only. The ready and waiting arms drive or wait
+    /// anyway, and the step classifies an orchestrator mint's transaction
+    /// itself, tolerating a provider outage; a classification here would turn
+    /// that outage into an early abandon.
+    Inventory,
+    /// Receipt inventory, or an orchestrator mint's own stored transaction.
+    /// Only the exhausted arm needs it: an orchestrator mint never has a
+    /// receipt in inventory, so without it a landed one is abandoned for
+    /// retry exhaustion.
+    InventoryOrOwnTransaction,
+}
+
+async fn minting_failed_landed_with_backoff(
     ctx: &MintRecoveryContext,
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
+    check: LandedCheck,
     backoff: Duration,
     failure_backoffs: &mut usize,
 ) -> Result<Option<bool>, AbandonReason> {
-    match minting_failed_receipt_exists(ctx, mint, issuer_request_id).await {
+    match minting_failed_landed(ctx, mint, issuer_request_id, check).await {
         Ok(exists) => {
             *failure_backoffs = 0;
             Ok(Some(exists))
@@ -1000,7 +1020,8 @@ async fn minting_failed_receipt_exists_with_backoff(
             if *failure_backoffs > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS {
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     error = %error,
-                    "Failed to read receipt inventory after maximum backoffs"
+                    "Failed to check whether the failed mint landed after \
+                     maximum backoffs"
                 );
                 return Err(AbandonReason::FailedToLoadReceipt);
             }
@@ -1008,7 +1029,7 @@ async fn minting_failed_receipt_exists_with_backoff(
             debug!(target: "mint", issuer_request_id = %issuer_request_id,
                 error = %error,
                 backoff_ms = backoff.as_millis(),
-                "Failed to read receipt inventory; backing off"
+                "Failed to check whether the failed mint landed; backing off"
             );
             tokio::time::sleep(backoff).await;
             Ok(None)
@@ -1094,25 +1115,27 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 return RecoveryConclusion::Resolved;
             }
             AutomaticRetryDecision::Exhausted => {
-                let receipt_exists =
-                    match minting_failed_receipt_exists_with_backoff(
-                        ctx,
-                        &mint,
-                        issuer_request_id,
-                        backoff,
-                        &mut receipt_load_failure_backoffs,
-                    )
-                    .await
-                    {
-                        Ok(Some(exists)) => exists,
-                        Ok(None) => continue,
-                        Err(reason) => {
-                            return RecoveryConclusion::Abandoned { reason };
-                        }
-                    };
-                // A confirmed receipt outranks retry exhaustion: the mint
-                // succeeded on-chain after attempts ran out, so keep driving
-                // toward TokensMinted / callback instead of abandoning.
+                let receipt_exists = match minting_failed_landed_with_backoff(
+                    ctx,
+                    &mint,
+                    issuer_request_id,
+                    LandedCheck::InventoryOrOwnTransaction,
+                    backoff,
+                    &mut receipt_load_failure_backoffs,
+                )
+                .await
+                {
+                    Ok(Some(exists)) => exists,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        return RecoveryConclusion::Abandoned { reason };
+                    }
+                };
+                // A landed mint outranks retry exhaustion (a receipt in
+                // inventory, or an orchestrator mint's own mined transaction):
+                // the mint succeeded on-chain after attempts ran out, so keep
+                // driving toward TokensMinted / callback instead of
+                // abandoning.
                 if receipt_exists {
                     info!(target: "mint", issuer_request_id = %issuer_request_id,
                         "Automatic mint retries exhausted but on-chain receipt exists; continuing recovery"
@@ -1128,9 +1151,20 @@ async fn recover_mint_until_automatic_budget_exhausted(
                         };
                     }
 
-                    if let Err(error) =
+                    let step = if matches!(
+                        mint.mint_mode(),
+                        Some(VaultMode::Orchestrator { .. })
+                    ) {
+                        record_exhausted_orchestrator_landing(
+                            ctx,
+                            &mint,
+                            issuer_request_id,
+                        )
+                        .await
+                    } else {
                         drive_one_step(ctx, &mint, issuer_request_id).await
-                    {
+                    };
+                    if let Err(error) = step {
                         debug!(target: "mint", issuer_request_id = %issuer_request_id,
                             error = %error,
                             "Scheduled recovery step failed after exhausted retries with receipt; backing off"
@@ -1255,22 +1289,22 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 }
             }
             AutomaticRetryDecision::Wait(wait) => {
-                let receipt_exists =
-                    match minting_failed_receipt_exists_with_backoff(
-                        ctx,
-                        &mint,
-                        issuer_request_id,
-                        backoff,
-                        &mut receipt_load_failure_backoffs,
-                    )
-                    .await
-                    {
-                        Ok(Some(exists)) => exists,
-                        Ok(None) => continue,
-                        Err(reason) => {
-                            return RecoveryConclusion::Abandoned { reason };
-                        }
-                    };
+                let receipt_exists = match minting_failed_landed_with_backoff(
+                    ctx,
+                    &mint,
+                    issuer_request_id,
+                    LandedCheck::Inventory,
+                    backoff,
+                    &mut receipt_load_failure_backoffs,
+                )
+                .await
+                {
+                    Ok(Some(exists)) => exists,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        return RecoveryConclusion::Abandoned { reason };
+                    }
+                };
                 // The retry backoff only spaces out re-submissions. If a receipt
                 // already exists, the mint actually succeeded on-chain, so there
                 // is nothing to wait for — drive immediately to record the
@@ -1310,14 +1344,15 @@ async fn recover_mint_until_automatic_budget_exhausted(
             // The state is recoverable and due: enqueue the per-state job that
             // advances it, then poll for progress on the next iteration.
             AutomaticRetryDecision::Ready => {
-                // Same inventory gate as Wait/Exhausted for MintingFailed: fail
+                // Same inventory-only gate as Wait for MintingFailed: fail
                 // closed while inventory is unreadable (may free-prepare), and
                 // surface an existing receipt so SubmitMintJob records it.
                 if matches!(&mint, Mint::MintingFailed { .. }) {
-                    match minting_failed_receipt_exists_with_backoff(
+                    match minting_failed_landed_with_backoff(
                         ctx,
                         &mint,
                         issuer_request_id,
+                        LandedCheck::Inventory,
                         backoff,
                         &mut receipt_load_failure_backoffs,
                     )
@@ -1382,6 +1417,8 @@ enum MintRecoveryStepError {
     UnconfiguredNetwork(#[from] UnconfiguredNetworkError),
     #[error(transparent)]
     ReceiptLookup(#[from] crate::receipt_inventory::ReceiptLookupError),
+    #[error(transparent)]
+    Vault(#[from] VaultError),
     #[error("no vault configured for {underlying} on {network}")]
     VaultNotFound { underlying: UnderlyingSymbol, network: Network },
 }
@@ -1480,10 +1517,11 @@ async fn drive_minting_failed_step(
         // may still record an existing mint via SubmitMintJob; otherwise only
         // confirm-poll the known tx_id and leave MintingFailed for ops.
         if mint.has_unclassifiable_post_intent_identity() {
-            let receipt_exists = match minting_failed_receipt_exists(
+            let receipt_exists = match minting_failed_landed(
                 ctx,
                 mint,
                 issuer_request_id,
+                LandedCheck::Inventory,
             )
             .await
             {
@@ -1674,6 +1712,40 @@ async fn drive_minting_failed_step(
     }
 
     Ok(())
+}
+
+/// Records an exhausted orchestrator mint's landing, and nothing else.
+///
+/// The exhausted arm found the mint's own transaction mined. The general
+/// [`drive_one_step`] would classify it again, and a different second answer
+/// (a lagging RPC node, or a shallow reorg) sends `RetryMint`, which does not
+/// check the retry cap, so the mint would be resubmitted past it. This step
+/// reads the landing from the transaction itself and records it. When that
+/// read does not confirm the landing, the mint stays `MintingFailed` for the
+/// next poll.
+async fn record_exhausted_orchestrator_landing(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), MintRecoveryStepError> {
+    let (Mint::MintingFailed { network, .. }, Some(prepared)) =
+        (mint, mint.pending_prepared_tx())
+    else {
+        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+            state = mint.state_name(),
+            "Exhausted orchestrator mint has no failed prepared transaction \
+             to record; nothing to do"
+        );
+        return Ok(());
+    };
+    let vault_service = ctx.vault_services.service(*network)?;
+    recover_mined_orchestrator_mint(
+        ctx,
+        vault_service.as_ref(),
+        issuer_request_id,
+        TxId::from(prepared.hash),
+    )
+    .await
 }
 
 /// Records the landing of an orchestrator mint whose own prepared tx mined
@@ -1956,22 +2028,47 @@ async fn resolve_vault(
     Ok(ResolvedVault { address, chain_id })
 }
 
-/// Whether a `MintingFailed` mint already has a discovered receipt — i.e. its
-/// on-chain transaction actually succeeded after the mint was marked failed.
-/// When true, recovery should record the existing mint now rather than wait out
-/// the re-submission backoff. Only a non-`MintingFailed` state answers a
-/// definite "no receipt"; an unresolved vault or an unreadable inventory is
-/// "cannot tell" and must surface as an error. Answering `false` there would
-/// abandon a mint whose deposit already succeeded, since retry exhaustion reads
-/// `false` as proof that nothing was minted.
-async fn minting_failed_receipt_exists(
+/// Whether a `MintingFailed` mint already landed — i.e. its on-chain
+/// transaction actually succeeded after the mint was marked failed. When true,
+/// recovery should record the existing mint now rather than wait out the
+/// re-submission backoff. Only a non-`MintingFailed` state answers a definite
+/// "not landed"; an unresolved vault, an unreadable inventory, or a
+/// classification the provider cannot answer is "cannot tell" and must surface
+/// as an error. Answering `false` there would abandon a mint whose deposit
+/// already succeeded, since retry exhaustion reads `false` as proof that
+/// nothing was minted.
+///
+/// A vault-direct mint landed when receipt inventory holds its receipt. An
+/// orchestrator mint never has one there (the orchestrator holds it); under
+/// [`LandedCheck::InventoryOrOwnTransaction`] it landed when its own stored
+/// transaction classifies as mined, and the step that follows records it from
+/// that transaction and never resubmits.
+async fn minting_failed_landed(
     ctx: &MintRecoveryContext,
     mint: &Mint,
     issuer_request_id: &IssuerMintRequestId,
+    check: LandedCheck,
 ) -> Result<bool, MintRecoveryStepError> {
     let Mint::MintingFailed { underlying, network, .. } = mint else {
         return Ok(false);
     };
+
+    if let (
+        LandedCheck::InventoryOrOwnTransaction,
+        Some(VaultMode::Orchestrator { .. }),
+    ) = (check, mint.mint_mode())
+    {
+        let Some(prepared) = mint.pending_prepared_tx() else {
+            return Ok(false);
+        };
+        let owner = prepared.recover_signer()?;
+        let status = ctx
+            .vault_services
+            .service(*network)?
+            .classify_mint_tx(owner, &prepared)
+            .await?;
+        return Ok(matches!(status, MintTxStatus::MinedSuccess));
+    }
 
     let vault = resolve_vault(ctx, underlying, *network).await?;
 
@@ -3089,7 +3186,7 @@ mod tests {
                 Level::WARN,
                 &[
                     test,
-                    "Failed to read receipt inventory after maximum backoffs"
+                    "Failed to check whether the failed mint landed after maximum backoffs"
                 ]
             ) >= 1,
             "giving up on an unreadable inventory must log the WARN"
@@ -5012,6 +5109,337 @@ mod tests {
                 "expected {level} log: {expected_log}"
             );
         }
+    }
+
+    /// An orchestrator mint has no receipt in inventory, so "did it land" is
+    /// its own transaction's fate. Seeds a failed orchestrator mint with
+    /// `failures` `MintingFailed` events in total, over `vault`, whose
+    /// classification of the stored signed tx the caller configures.
+    async fn failed_orchestrator_mint(
+        vault: MockVaultService,
+        failed_at: chrono::DateTime<Utc>,
+        failures: usize,
+    ) -> (MintRecoveryFixture, IssuerMintRequestId, B256) {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared = PreparedMintTx::valid_for_test(
+            5,
+            format!("mint-{issuer_request_id}"),
+        );
+        let mined_hash = prepared.hash;
+        let mut events = orchestrator_failed_with_prepared_events(
+            &issuer_request_id,
+            failed_at,
+            prepared,
+        );
+        for _ in 1..failures {
+            events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "receipt polling timed out".to_string(),
+                failed_at,
+                classification: MintFailureClassification::Unclassified,
+            });
+        }
+
+        let vault = Arc::new(vault.with_orchestrator_mint_result(
+            OrchestratorMintResult {
+                tx_hash: mined_hash,
+                nonce: test_mint_authorization().nonce,
+                shares_minted: U256::from(100u64)
+                    * U256::from(10u64).pow(U256::from(18u64)),
+                gas_used: 50_000,
+                block_number: 777,
+            },
+        ));
+        let fixture = MintRecoveryFixture::new().await.with_vault(vault);
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        (fixture, issuer_request_id, mined_hash)
+    }
+
+    /// An orchestrator mint whose transaction lands only after its automatic
+    /// retries ran out must still be recorded and called back, not abandoned:
+    /// the "already landed" gate must not read receipt inventory for it.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_orchestrator_mint_that_landed_is_recovered() {
+        let (fixture, issuer_request_id, mined_hash) =
+            failed_orchestrator_mint(
+                MockVaultService::new_success()
+                    .with_mint_tx_status(MintTxStatus::MinedSuccess),
+                Utc::now() - chrono::Duration::hours(2),
+                5,
+            )
+            .await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            2,
+            false,
+        )
+        .await;
+
+        assert!(
+            !matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::AutomaticRetriesExhausted
+                }
+            ),
+            "a landed orchestrator mint must not be abandoned for retry \
+             exhaustion, got {conclusion:?}"
+        );
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::CallbackPending { .. }),
+            "the landing must be recorded, got: {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SendCallbackJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            1,
+            "the recovered mint must be carried on to its callback"
+        );
+        assert_eq!(
+            count_jobs_for_mint(
+                &fixture.pool,
+                job_type::<SubmitMintJob>(),
+                &issuer_request_id,
+            )
+            .await,
+            0,
+            "an exhausted mint must never be resubmitted"
+        );
+
+        let test = "exhausted_orchestrator_mint_that_landed_is_recovered";
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                test,
+                "Orchestrator mint landed while MintingFailed",
+                &mined_hash.to_string(),
+            ]
+        ));
+    }
+
+    /// The exhausted arm decides from one classification that the mint's own
+    /// transaction landed. What follows must only record that landing: a later
+    /// classification that disagrees (a lagging RPC node, or a shallow reorg)
+    /// must never authorize a resubmission past the retry cap, because
+    /// `RetryMint` does not check the cap.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_orchestrator_mint_is_not_resubmitted_when_observations_disagree()
+     {
+        for later in [MintTxStatus::StillMineable, MintTxStatus::ProvablyDead] {
+            let (fixture, issuer_request_id, mined_hash) =
+                failed_orchestrator_mint(
+                    MockVaultService::new_success()
+                        .with_mint_tx_status(later)
+                        .with_mint_tx_status_sequence(vec![
+                            MintTxStatus::MinedSuccess,
+                            later,
+                            later,
+                        ]),
+                    Utc::now() - chrono::Duration::hours(2),
+                    5,
+                )
+                .await;
+
+            recover_mint_until_automatic_budget_exhausted(
+                &fixture.context(),
+                &issuer_request_id,
+                Duration::from_millis(5),
+                2,
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                count_jobs_for_mint(
+                    &fixture.pool,
+                    job_type::<SubmitMintJob>(),
+                    &issuer_request_id,
+                )
+                .await,
+                0,
+                "an exhausted mint must never be resubmitted, even when a \
+                 later classification reads {later:?}"
+            );
+            let retries: i64 = sqlx::query_scalar(
+                "
+                SELECT COUNT(*)
+                FROM events
+                WHERE aggregate_type = 'Mint'
+                  AND aggregate_id = ?
+                  AND event_type = 'MintEvent::MintRetryStarted'
+                ",
+            )
+            .bind(issuer_request_id.to_string())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                retries, 0,
+                "no RetryMint may follow the landed decision ({later:?})"
+            );
+            // Keyed on the mint id: every `failed_orchestrator_mint` signs
+            // the same transaction, so the hash alone would also match the
+            // first case's line or a sibling test's.
+            assert!(logs_contain_at!(
+                Level::INFO,
+                &[
+                    "Orchestrator mint landed while MintingFailed",
+                    &issuer_request_id.to_string(),
+                    &mined_hash.to_string(),
+                ]
+            ));
+        }
+    }
+
+    /// The landed check must not turn a still-pending exhausted orchestrator
+    /// mint into a resubmission: it is abandoned for retry exhaustion as
+    /// before.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_orchestrator_mint_still_pending_is_abandoned() {
+        let (fixture, issuer_request_id, _) = failed_orchestrator_mint(
+            MockVaultService::new_success()
+                .with_mint_tx_status(MintTxStatus::StillMineable),
+            Utc::now() - chrono::Duration::hours(2),
+            5,
+        )
+        .await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(5),
+            2,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::AutomaticRetriesExhausted
+                }
+            ),
+            "a pending exhausted mint must be abandoned, got {conclusion:?}"
+        );
+        for job in [job_type::<SubmitMintJob>(), job_type::<ConfirmMintJob>()] {
+            assert_eq!(
+                count_jobs_for_mint(&fixture.pool, job, &issuer_request_id)
+                    .await,
+                0,
+                "a pending exhausted mint must not enqueue {job}"
+            );
+        }
+
+        let test = "exhausted_orchestrator_mint_still_pending_is_abandoned";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Automatic mint retries exhausted"]
+        ));
+    }
+
+    /// In the exhausted arm, a classification the provider cannot answer
+    /// proves nothing about whether the mint landed. It must not be read as
+    /// "not landed" and reported as retry exhaustion: the arm backs off and
+    /// gives up as "cannot tell" instead.
+    #[traced_test]
+    #[tokio::test]
+    async fn exhausted_orchestrator_mint_unclassifiable_is_not_reported_exhausted()
+     {
+        let (fixture, issuer_request_id, _) = failed_orchestrator_mint(
+            MockVaultService::new_success()
+                .with_mint_tx_classification_failure(),
+            Utc::now() - chrono::Duration::hours(2),
+            5,
+        )
+        .await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(1),
+            2,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::FailedToLoadReceipt
+                }
+            ),
+            "an unanswerable classification must end as \"cannot tell\", \
+             got {conclusion:?}"
+        );
+
+        let test = "exhausted_orchestrator_mint_unclassifiable_is_not_reported_exhausted";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                test,
+                "Failed to check whether the failed mint landed after \
+                 maximum backoffs"
+            ]
+        ));
+    }
+
+    /// A ready orchestrator mint is driven by the step, which classifies its
+    /// transaction under the wallet lock and tolerates an unanswerable
+    /// classification. The gate in front of it must not classify too: a
+    /// provider outage would then abandon the mint after a few backoffs
+    /// instead of the step's much longer no-progress budget.
+    #[traced_test]
+    #[tokio::test]
+    async fn ready_orchestrator_mint_gate_does_not_classify() {
+        let (fixture, issuer_request_id, _) = failed_orchestrator_mint(
+            MockVaultService::new_success()
+                .with_mint_tx_classification_failure(),
+            Utc::now() - chrono::Duration::hours(24),
+            1,
+        )
+        .await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(1),
+            2,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::NoProgressBudgetExhausted
+                }
+            ),
+            "the outage must reach the step's no-progress budget, not the \
+             gate's backoff, got {conclusion:?}"
+        );
+
+        let test = "ready_orchestrator_mint_gate_does_not_classify";
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[test, "Mint recovery classification uncertain; not replacing"]
+        ));
     }
 
     /// MinedReverted allows RetryMint + SubmitMintJob (replacement after
