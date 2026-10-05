@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Args;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
@@ -13,48 +11,9 @@ use super::{
 
 pub(crate) const DEFAULT_CORPORATE_ACTIONS_STREAM_URL: &str = "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us";
 
-/// An operator-approved lower bound for an authenticated corporate-action feed
-/// that has no durable cursor.
-///
-/// Parsing accepts non-future RFC3339 timestamps and normalizes them to UTC for
-/// the Alpaca `since` query.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CorporateActionBootstrapSince(DateTime<Utc>);
-
-impl CorporateActionBootstrapSince {
-    pub(crate) fn try_from_instant(
-        instant: DateTime<Utc>,
-    ) -> Result<Self, CorporateActionBootstrapSinceError> {
-        if instant > Utc::now() {
-            return Err(CorporateActionBootstrapSinceError::Future(instant));
-        }
-        Ok(Self(instant))
-    }
-
-    pub(crate) fn query_value(&self) -> String {
-        self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true)
-    }
-}
-
-/// An error returned when validating a corporate-action bootstrap boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum CorporateActionBootstrapSinceError {
-    /// The configured value is not a valid RFC3339 timestamp.
-    #[error("invalid corporate-action bootstrap timestamp")]
-    Parse(#[from] chrono::ParseError),
-    /// The configured timestamp is later than the current time.
-    #[error("corporate-action bootstrap timestamp {0} is in the future")]
-    Future(DateTime<Utc>),
-}
-
-impl FromStr for CorporateActionBootstrapSince {
-    type Err = CorporateActionBootstrapSinceError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let instant = DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc);
-        Self::try_from_instant(instant)
-    }
-}
+pub use st0x_alpaca::corporate_actions::{
+    CorporateActionBootstrapSince, CorporateActionBootstrapSinceError,
+};
 
 /// Configuration for Alpaca API integration including credentials and endpoints.
 #[derive(Args, Clone)]
