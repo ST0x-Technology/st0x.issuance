@@ -5108,11 +5108,15 @@ SERVER_PORT=8080
 ISSUER_API_KEY=<api_key_that_alpaca_uses_to_authenticate>
 ALPACA_IP_RANGES=<comma_separated_cidr_ranges>  # e.g., "1.2.3.0/24,5.6.7.8/32"
 
-# Alpaca Configuration
+# Alpaca Configuration: exactly one complete credential pair
+# Basic (development, rollback, and the production droplet):
 ALPACA_API_KEY=<api_key>
 ALPACA_API_SECRET=<api_secret>
-ALPACA_BASE_URL=https://broker-api.alpaca.markets
-ALPACA_TOKENIZATION_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
+# KMS JWT on GCP (remove both Basic variables):
+# ALPACA_CLIENT_ID=<private_key_JWT_client_id>
+# ALPACA_KMS_KEY_VERSION=projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>/cryptoKeyVersions/1
+ALPACA_API_BASE_URL=https://broker-api.alpaca.markets
+ALPACA_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
 # Optional first-install boundary; omission keeps production bootstrap disabled.
 ALPACA_CORPORATE_ACTIONS_BOOTSTRAP_SINCE=<non_future_RFC3339_timestamp>
 
@@ -5514,3 +5518,23 @@ continuous feed, deterministic authentication failures stop the feed and notify
 the operator; transient authentication failures reconnect with backoff, honoring
 Retry-After for at most five minutes. Bounded bootstrap retains its existing
 error propagation policy.
+
+### S01 Alpaca broker authentication
+
+`validate-config` rejects absent, partial, empty, or mixed Basic and KMS
+credentials and malformed KMS key-version paths. KMS JWT uses the live token
+endpoint for the HTTPS `broker-api.alpaca.markets` origin and the sandbox token
+endpoint for `broker-api.sandbox.alpaca.markets`; other origins are rejected.
+Mint callbacks, redemption managers, and the corporate-action stream each hold
+their own Alpaca client and bearer cache with the same auth mode, so a
+Retry-After hold on one does not delay or fail calls on another. Credential
+identifiers may appear in configuration diagnostics; key and secret values
+remain redacted.
+
+Deterministic JWT or authentication failures emit ERROR on `operational_alert`
+with the message `Alpaca credential rejected`. Mint callbacks retain their
+existing bounded retries and remain `CallbackPending` until recovery. Journal
+polling continues until its existing deadline. Redeem call failures remain
+terminal after the crate's retry budget is exhausted. See
+[the credential runbook](docs/runbooks/alpaca-kms-auth.md) for cutover,
+rotation, verification, and rollback.

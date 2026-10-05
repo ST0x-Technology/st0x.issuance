@@ -83,8 +83,10 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),
             account_id: "test-account".to_string(),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("test-secret".to_string()),
+            client_id: None,
+            kms_key_version: None,
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
             corporate_actions_read_timeout_secs: 90,

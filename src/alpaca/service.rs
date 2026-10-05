@@ -38,14 +38,20 @@ pub struct AlpacaConfig {
         env = "ALPACA_API_KEY",
         help = "Alpaca API key ID"
     )]
-    pub api_key: String,
+    pub api_key: Option<String>,
 
     #[arg(
         long = "alpaca-api-secret",
         env = "ALPACA_API_SECRET",
         help = "Alpaca API secret key"
     )]
-    pub api_secret: String,
+    pub api_secret: Option<String>,
+
+    #[arg(long = "alpaca-client-id", env = "ALPACA_CLIENT_ID")]
+    pub client_id: Option<String>,
+
+    #[arg(long = "alpaca-kms-key-version", env = "ALPACA_KMS_KEY_VERSION")]
+    pub kms_key_version: Option<String>,
 
     #[arg(
         long = "alpaca-connect-timeout-secs",
@@ -99,6 +105,8 @@ impl std::fmt::Debug for AlpacaConfig {
             .field("account_id", &self.account_id)
             .field("api_key", &"<redacted>")
             .field("api_secret", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("kms_key_version", &self.kms_key_version)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field(
@@ -117,15 +125,112 @@ impl std::fmt::Debug for AlpacaConfig {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AlpacaAuthConfigError {
+    #[error(
+        "configure exactly one complete Alpaca credential pair: API key/secret or client ID/KMS key version"
+    )]
+    CredentialPair,
+    #[error(
+        "Alpaca KMS key version must name projects/*/locations/*/keyRings/*/cryptoKeys/*/cryptoKeyVersions/<positive integer>"
+    )]
+    KmsKeyVersion,
+    #[error("Alpaca KMS auth requires the live or sandbox broker HTTPS origin")]
+    BrokerOrigin,
+}
+
 impl AlpacaConfig {
+    pub(crate) fn auth(
+        &self,
+    ) -> Result<st0x_alpaca::AlpacaAuth, AlpacaAuthConfigError> {
+        use st0x_alpaca::AlpacaAuth;
+        match (
+            &self.api_key,
+            &self.api_secret,
+            &self.client_id,
+            &self.kms_key_version,
+        ) {
+            (Some(key), Some(secret), None, None)
+                if !key.is_empty() && !secret.is_empty() =>
+            {
+                Ok(AlpacaAuth::Basic {
+                    api_key: key.clone(),
+                    api_secret: secret.clone(),
+                })
+            }
+            (None, None, Some(client_id), Some(version))
+                if !client_id.is_empty() && !version.is_empty() =>
+            {
+                let parts: Vec<_> = version.split('/').collect();
+                if parts.len() != 10
+                    || parts[0] != "projects"
+                    || parts[2] != "locations"
+                    || parts[4] != "keyRings"
+                    || parts[6] != "cryptoKeys"
+                    || parts[8] != "cryptoKeyVersions"
+                    || [parts[1], parts[3], parts[5], parts[7]]
+                        .iter()
+                        .any(|p| p.is_empty())
+                    || !parts[9].bytes().all(|c| c.is_ascii_digit())
+                    || parts[9].parse::<u64>().map_or(true, |v| v == 0)
+                {
+                    return Err(AlpacaAuthConfigError::KmsKeyVersion);
+                }
+                Ok(AlpacaAuth::KmsJwt {
+                    client_id: client_id.clone(),
+                    kms_key_version: version.clone(),
+                })
+            }
+            _ => Err(AlpacaAuthConfigError::CredentialPair),
+        }
+    }
+
+    pub(crate) fn token_url(
+        &self,
+    ) -> Result<&'static str, AlpacaAuthConfigError> {
+        if matches!(self.auth()?, st0x_alpaca::AlpacaAuth::Basic { .. }) {
+            return Ok(st0x_alpaca::ALPACA_TOKEN_URL);
+        }
+        let url = reqwest::Url::parse(&self.api_base_url)
+            .map_err(|_| AlpacaAuthConfigError::BrokerOrigin)?;
+        if url.scheme() != "https"
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AlpacaAuthConfigError::BrokerOrigin);
+        }
+        match url.host_str() {
+            Some("broker-api.alpaca.markets") => {
+                Ok(st0x_alpaca::ALPACA_TOKEN_URL)
+            }
+            Some("broker-api.sandbox.alpaca.markets") => {
+                Ok(st0x_alpaca::ALPACA_SANDBOX_TOKEN_URL)
+            }
+            _ => Err(AlpacaAuthConfigError::BrokerOrigin),
+        }
+    }
     pub(crate) fn service(
         &self,
     ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
-        let client = st0x_alpaca::AlpacaClient::new(
+        self.service_with_auth(
+            self.auth().map_err(|e| AlpacaError::Auth(e.to_string()))?,
+            self.token_url().map_err(|e| AlpacaError::Auth(e.to_string()))?,
+        )
+    }
+
+    pub(crate) fn service_with_auth(
+        &self,
+        auth: st0x_alpaca::AlpacaAuth,
+        token_url: &str,
+    ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
+        let client = st0x_alpaca::AlpacaClient::with_auth(
             &self.api_base_url,
             self.account_id.clone(),
-            self.api_key.clone(),
-            self.api_secret.clone(),
+            auth,
+            token_url,
             Duration::from_secs(self.connect_timeout_secs),
             Duration::from_secs(self.request_timeout_secs),
         )?;
@@ -136,8 +241,10 @@ impl AlpacaConfig {
         Self {
             api_base_url: "https://example.com".to_string(),
             account_id: "test-account-id".to_string(),
-            api_key: "test".to_string(),
-            api_secret: "test".to_string(),
+            api_key: Some("test".to_string()),
+            api_secret: Some("test".to_string()),
+            client_id: None,
+            kms_key_version: None,
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
             corporate_actions_read_timeout_secs: 90,
@@ -146,6 +253,18 @@ impl AlpacaConfig {
             corporate_actions_bootstrap_since: None,
         }
     }
+}
+
+pub(crate) fn alert_credential_rejection(error: &AlpacaError) -> bool {
+    let rejected = match error {
+        AlpacaError::Jwt(error) => error.is_deterministic(),
+        AlpacaError::Auth(_) => true,
+        _ => false,
+    };
+    if rejected {
+        error!(target: "operational_alert", error = %error, "Alpaca credential rejected");
+    }
+    rejected
 }
 
 struct InstrumentedAlpacaService {
@@ -302,6 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn debug_shows_kms_identifiers_and_redacts_basic_credentials() {
+        let mut config = AlpacaConfig::test_default();
+        config.client_id = Some("s01-client".into());
+        config.kms_key_version = Some("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".into());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("s01-client"));
+        assert!(debug.contains("cryptoKeyVersions/1"));
+        assert!(!debug.contains("Some(\"test\")"));
+    }
+
+    #[test]
+    fn basic_auth_preserves_loopback_and_custom_broker_endpoints() {
+        let mut config = AlpacaConfig::test_default();
+        config.api_base_url = "http://127.0.0.1:8000".into();
+        assert!(matches!(
+            config.auth().unwrap(),
+            st0x_alpaca::AlpacaAuth::Basic { .. }
+        ));
+        assert_eq!(config.token_url().unwrap(), st0x_alpaca::ALPACA_TOKEN_URL);
+    }
+
+    #[test]
     fn corporate_action_bootstrap_rejects_future_instants() {
         let result = CorporateActionBootstrapSince::try_from_instant(
             Utc::now() + Duration::minutes(1),
@@ -320,6 +461,52 @@ mod tests {
         config.api_base_url = server.base_url();
         config.account_id = "test-account".into();
         config.service().unwrap()
+    }
+
+    #[tokio::test]
+    async fn issuer_service_uses_cached_bearer_without_apca_headers() {
+        use p256::pkcs8::EncodePrivateKey;
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "s01-issuer-bearer",
+                "token_type": "Bearer", "expires_in": 900
+            }));
+        });
+        let poll = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests/tok-bearer")
+                .header("Authorization", "Bearer s01-issuer-bearer")
+                .header_missing("APCA-API-KEY-ID")
+                .header_missing("APCA-API-SECRET-KEY");
+            then.status(200).json_body(serde_json::json!({"type":"mint"}));
+        });
+        let key = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let mut config = AlpacaConfig::test_default();
+        config.api_base_url = server.base_url();
+        config.account_id = "test-account".into();
+        let service = config
+            .service_with_auth(
+                st0x_alpaca::AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-test-client".into(),
+                    private_key_pem: key
+                        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                        .unwrap()
+                        .to_string(),
+                },
+                &format!("{}/token", server.base_url()),
+            )
+            .unwrap();
+        let request_id = TokenizationRequestId::new("tok-bearer");
+        for _ in 0..2 {
+            assert!(matches!(
+                service.poll_request_status(&request_id).await.unwrap(),
+                TokenizationRequest::Mint {}
+            ));
+        }
+        token.assert_calls(1);
+        poll.assert_calls(2);
     }
 
     #[traced_test]

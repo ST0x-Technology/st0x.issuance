@@ -2635,7 +2635,10 @@ impl Job<SendCallbackContext> for SendCallbackJob {
                 tx_hash,
                 network,
             ))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                crate::alpaca::service::alert_credential_rejection(error);
+            })?;
 
         ctx.mint_store
             .send(
@@ -5073,6 +5076,108 @@ mod tests {
             Level::WARN,
             &[test, "TxIntended classification uncertain", "preserving"]
         ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejected_jwt_callback_exhausts_job_budget_and_stays_pending() {
+        use apalis::prelude::{Monitor, WorkerBuilder};
+        use p256::pkcs8::EncodePrivateKey;
+
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_tokens_minted(&issuer_request_id),
+        )
+        .await;
+        let server = httpmock::MockServer::start_async().await;
+        let rejected = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(401).body("invalid_client");
+        });
+        let key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let mut config = crate::alpaca::AlpacaConfig::test_default();
+        config.api_base_url = server.base_url();
+        let alpaca = config
+            .service_with_auth(
+                st0x_alpaca::AlpacaAuth::PrivateKeyJwt {
+                    client_id: "s01-rejected".into(),
+                    private_key_pem: key
+                        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                        .unwrap()
+                        .to_string(),
+                },
+                &server.url("/token"),
+            )
+            .unwrap();
+        let context = Arc::new(SendCallbackContext {
+            mint_store: harness.mint_store.clone(),
+            alpaca,
+        });
+        let mut queue =
+            JobQueue::<SendCallbackJob>::with_fast_poll(&harness.apalis_pool);
+        queue
+            .push_scheduled_batch([crate::jobs::ScheduledTask {
+                task: SendCallbackJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+                idempotency_key: issuer_request_id.to_string(),
+                run_after: std::time::Duration::ZERO,
+                max_attempts: Some(2),
+            }])
+            .await
+            .unwrap();
+        let pool = harness.apalis_pool.clone();
+        let monitor = Monitor::new().register(move |_| {
+            WorkerBuilder::new("s01-jwt-callback-test")
+                .backend(
+                    JobQueue::<SendCallbackJob>::with_fast_poll(&pool)
+                        .into_storage(),
+                )
+                .data(context.clone())
+                .build(
+                    crate::jobs::work::<SendCallbackContext, SendCallbackJob>,
+                )
+        });
+        let signal = async {
+            loop {
+                let exhausted: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Killed' AND attempts >= max_attempts"
+                ).bind(type_name::<SendCallbackJob>()).fetch_one(&harness.pool).await.unwrap();
+                if exhausted > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            monitor.run_with_signal(signal),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        rejected.assert_calls(2);
+        assert!(matches!(
+            harness.mint_store.load(&issuer_request_id).await.unwrap().unwrap(),
+            Mint::CallbackPending { .. }
+        ));
+        logs_assert(|lines| {
+            if lines.iter().any(|line| {
+                line.contains("ERROR")
+                    && line.contains("operational_alert")
+                    && line.contains("Alpaca credential rejected")
+                    && line.contains("401")
+            }) {
+                Ok(())
+            } else {
+                Err("missing Alpaca credential rejection alert".into())
+            }
+        });
     }
 
     /// The callback job only acts on `CallbackPending`; from any other state it

@@ -416,35 +416,32 @@ For detailed architectural patterns and design decisions, see
 ## GCP release path
 
 Alongside the DigitalOcean deploy-rs path, main builds an OCI image of the
-`st0x-issuance` binary (`nix build .#bot-oci`, contract in
-`nix/oci-image.nix`). This repo deploys itself:
+`st0x-issuance` binary (`nix build .#bot-oci`, contract in `nix/oci-image.nix`).
+This repo deploys itself:
 
-- **Staging**: a merge to main (`build-oci.yml`) pushes and attests the
-  image, publishes `config.staging.toml` as a runtime-config version, and
-  writes both into the staging VM's deploy state; the VM verifies the
-  attestation and rolls.
+- **Staging**: a merge to main (`build-oci.yml`) pushes and attests the image,
+  publishes `config.staging.toml` as a runtime-config version, and writes both
+  into the staging VM's deploy state; the VM verifies the attestation and rolls.
 - **Production**: a `vX.Y.Z` tag (`release-tag.yml`) labels that commit's
-  attested image and deploys it behind the production project's `app-deploy`
-  PAM grant (an approver activates it in the GCP console). A merge that
-  changes `config.prod.toml` is a config-only release on the live image
-  when nothing but configs and Markdown changed since the commit production
-  runs (the live digest's commit tag); otherwise the config ships with the
-  next tag. A slower run whose config is no longer main's fails instead of
-  publishing an older config.
-  `production-release.yml`'s dispatch with a version is a rollback. All of
-  these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
-- Tags on commits older than this release path run the old `release-tag.yml`
-  and only label; deploy them with the rollback dispatch. Every production
-  release leaves its PAM grant ACTIVE for up to an hour: the releaser has no
-  right to revoke it, so the revoke step only warns. The next release inside
-  that hour (a queued run included) fails at "Await PAM approval" until
-  someone revokes the grant in the GCP console; that is the normal case, not
-  an error, until devops grants the releaser `grants.revoke` on
-  `app-deploy`. After a PAM timeout, start a fresh run rather than
-  re-running the failed job: a re-run skips the preflight that checks the
-  config is still current. Setting `PRODUCTION_RELEASES_ENABLED` also
-  retires the droplet path: `deploy-prod.yaml` refuses to run while it is
-  `true`.
+  attested image and deploys it behind the production project's `app-deploy` PAM
+  grant (an approver activates it in the GCP console). A merge that changes
+  `config.prod.toml` is a config-only release on the live image when nothing but
+  configs and Markdown changed since the commit production runs (the live
+  digest's commit tag); otherwise the config ships with the next tag. A slower
+  run whose config is no longer main's fails instead of publishing an older
+  config. `production-release.yml`'s dispatch with a version is a rollback. All
+  of these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
+- Tags on commits older than this release path run the old `release-tag.yml` and
+  only label; deploy them with the rollback dispatch. Every production release
+  leaves its PAM grant ACTIVE for up to an hour: the releaser has no right to
+  revoke it, so the revoke step only warns. The next release inside that hour (a
+  queued run included) fails at "Await PAM approval" until someone revokes the
+  grant in the GCP console; that is the normal case, not an error, until devops
+  grants the releaser `grants.revoke` on `app-deploy`. After a PAM timeout,
+  start a fresh run rather than re-running the failed job: a re-run skips the
+  preflight that checks the config is still current. Setting
+  `PRODUCTION_RELEASES_ENABLED` also retires the droplet path:
+  `deploy-prod.yaml` refuses to run while it is `true`.
 
 The GCP deployments authenticate to Turnkey without a stored key:
 `TURNKEY_KMS_API_KEY` names a Cloud KMS P-256 key whose public half is the
@@ -455,3 +452,15 @@ remains for local and droplet use; set exactly one of the two.
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy
 unvalidated until it grows a config-only mode (boot is the gate).
+
+### Alpaca broker credentials
+
+S01 issuance supports one complete auth pair: `ALPACA_API_KEY` with
+`ALPACA_API_SECRET`, or `ALPACA_CLIENT_ID` with `ALPACA_KMS_KEY_VERSION`. Mixed
+and partial pairs fail `validate-config`. On GCP, KMS signs the JWT using the
+workload service account; no Alpaca secret is stored in the container. Live and
+sandbox token endpoints follow `ALPACA_API_BASE_URL`. Basic remains available
+for local tests, rollback, and the production droplet until its GCP migration.
+
+See [the Alpaca credential runbook](docs/runbooks/alpaca-kms-auth.md) before
+changing credentials or revoking an existing API key.

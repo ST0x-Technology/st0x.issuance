@@ -1137,6 +1137,8 @@ fn setup_redemption_managers(
         apalis_pool,
         bot_wallet,
     } = params;
+    // Own client: a Retry-After hold from mint callbacks must not fail a
+    // redemption whose call was never sent.
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
