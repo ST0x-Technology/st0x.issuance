@@ -22,89 +22,8 @@ pub(crate) use api::{
 };
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
+pub(crate) use st0x_issuance_dto::Email;
 pub(crate) use view::AccountView;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Email(String);
-
-impl Email {
-    pub(crate) fn new(email: &str) -> Result<Self, AccountError> {
-        let normalized = Self::checked_structure(email)?;
-
-        // Reject embedded whitespace/control characters — `trim()` only strips
-        // the ends, so "user @domain.com" or "user@do main.com" would otherwise
-        // pass. No valid address contains them. New input only: values already
-        // committed to the event log were accepted by the older, laxer
-        // validator and must keep deserializing (see `deserialize_stored`).
-        if normalized.contains(|character: char| {
-            character.is_whitespace() || character.is_control()
-        }) {
-            return Err(AccountError::InvalidEmail { email: normalized });
-        }
-
-        Ok(Self(normalized))
-    }
-
-    /// Deserializer for `Email` values already committed to the event log or
-    /// projected view rows, used via
-    /// `#[serde(deserialize_with = "Email::deserialize_stored")]`.
-    ///
-    /// Stored values were validated by the rules in force when they were
-    /// written, so only the structural checks the validator has always
-    /// enforced apply here. Checks added later — the embedded
-    /// whitespace/control rejection in [`Email::new`] — must not apply
-    /// retroactively: a historical event the old validator accepted would
-    /// otherwise fail deserialization and brick event replay, view reads, and
-    /// service startup. New input still validates strictly via [`Email::new`]
-    /// (the default `Deserialize` impl, which API request bodies use).
-    pub(crate) fn deserialize_stored<'de, D>(
-        deserializer: D,
-    ) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::checked_structure(&value)
-            .map(Self)
-            .map_err(serde::de::Error::custom)
-    }
-
-    /// Normalization plus the structural checks the validator has enforced
-    /// since account registration shipped: exactly one `@` separating a
-    /// non-empty local part from a non-empty domain.
-    fn checked_structure(email: &str) -> Result<String, AccountError> {
-        let normalized = email.trim().to_lowercase();
-
-        let structure_valid = match normalized.split_once('@') {
-            Some((local, domain)) => {
-                !local.is_empty() && !domain.is_empty() && !domain.contains('@')
-            }
-            None => false,
-        };
-
-        if !structure_valid {
-            return Err(AccountError::InvalidEmail { email: normalized });
-        }
-
-        Ok(normalized)
-    }
-}
-
-impl std::fmt::Display for Email {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Email {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(&value).map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
@@ -334,8 +253,6 @@ impl EventSourced for Account {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub(crate) enum AccountError {
-    #[error("Invalid email format: {email}")]
-    InvalidEmail { email: String },
     #[error("Account already registered for email: {email}")]
     AccountAlreadyRegistered { email: Email },
     #[error("Account is not registered")]
@@ -366,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_creates_new_account() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
 
         let events = TestHarness::<Account>::with(())
             .given_no_previous_events()
@@ -393,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_when_already_registered_returns_error() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
 
         let err = TestHarness::<Account>::with(())
             .given(vec![AccountEvent::Registered {
@@ -416,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn test_link_to_alpaca_on_registered_account() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
 
         let events = TestHarness::<Account>::with(())
@@ -464,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_link_to_alpaca_when_already_linked_returns_error() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
 
         let err = TestHarness::<Account>::with(())
             .given(vec![
@@ -495,7 +412,7 @@ mod tests {
     #[test]
     fn test_apply_registered_updates_state() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let registered_at = chrono::Utc::now();
 
         let account = replay::<Account>(vec![AccountEvent::Registered {
@@ -523,7 +440,7 @@ mod tests {
     #[test]
     fn test_apply_linked_to_alpaca_updates_state() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let registered_at = chrono::Utc::now();
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
         let linked_at = chrono::Utc::now();
@@ -563,56 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn test_email_smart_constructor_validates() {
-        assert!(matches!(
-            Email::new("not-an-email"),
-            Err(AccountError::InvalidEmail { email }) if email == "not-an-email"
-        ));
-
-        assert!(matches!(
-            Email::new("@"),
-            Err(AccountError::InvalidEmail { email }) if email == "@"
-        ));
-
-        assert!(matches!(
-            Email::new("user@"),
-            Err(AccountError::InvalidEmail { email }) if email == "user@"
-        ));
-
-        assert!(matches!(
-            Email::new("@domain"),
-            Err(AccountError::InvalidEmail { email }) if email == "@domain"
-        ));
-
-        assert!(matches!(
-            Email::new("user@@domain.com"),
-            Err(AccountError::InvalidEmail { email }) if email == "user@@domain.com"
-        ));
-
-        assert!(matches!(
-            Email::new("user@domain@com"),
-            Err(AccountError::InvalidEmail { email }) if email == "user@domain@com"
-        ));
-
-        // Embedded whitespace/control chars in either part are rejected — only
-        // leading/trailing whitespace is trimmed.
-        assert!(matches!(
-            Email::new("user @domain.com"),
-            Err(AccountError::InvalidEmail { email }) if email == "user @domain.com"
-        ));
-        assert!(matches!(
-            Email::new("user@do main.com"),
-            Err(AccountError::InvalidEmail { email }) if email == "user@do main.com"
-        ));
-        assert!(matches!(
-            Email::new("user\t@domain.com"),
-            Err(AccountError::InvalidEmail { email }) if email == "user\t@domain.com"
-        ));
-
-        assert!(Email::new("user@example.com").is_ok());
-    }
-
-    #[test]
     fn stored_event_with_embedded_whitespace_email_still_deserializes() {
         // The embedded-whitespace rejection in `Email::new` applies to new
         // input only. This payload shape was accepted by the validator before
@@ -628,28 +495,7 @@ mod tests {
         let AccountEvent::Registered { email, .. } = event else {
             panic!("Expected Registered event");
         };
-        assert_eq!(email.0, "user @domain.com");
-    }
-
-    #[test]
-    fn email_deserialize_stays_strict_for_new_input() {
-        // API request bodies deserialize `Email` through the default
-        // `Deserialize` impl, which must keep enforcing the full `Email::new`
-        // rules — the stored-value tolerance is opt-in per field.
-        let result: Result<Email, _> =
-            serde_json::from_str(r#""user @domain.com""#);
-
-        assert!(
-            result.is_err(),
-            "ingress deserialization must reject embedded whitespace"
-        );
-    }
-
-    #[test]
-    fn test_email_normalizes_trim_and_lowercase() {
-        let email = Email::new("  User@Example.COM  ").unwrap();
-
-        assert_eq!(email.0, "user@example.com");
+        assert_eq!(email.to_string(), "user @domain.com");
     }
 
     #[test]
@@ -661,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitelist_wallet_on_linked_to_alpaca_account() {
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let client_id = ClientId::new();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
@@ -715,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn test_whitelist_wallet_on_registered_but_not_linked_account() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
         let err = TestHarness::<Account>::with(())
@@ -736,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitelist_already_whitelisted_wallet_is_idempotent() {
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let client_id = ClientId::new();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
@@ -762,7 +608,7 @@ mod tests {
     #[test]
     fn test_apply_wallet_whitelisted_adds_wallet() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
         let wallet = address!("0x1111111111111111111111111111111111111111");
@@ -793,7 +639,7 @@ mod tests {
     #[test]
     fn test_apply_wallet_whitelisted_adds_multiple_wallets() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
         let wallet1 = address!("0x1111111111111111111111111111111111111111");
@@ -829,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unwhitelist_wallet_on_linked_account() {
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let client_id = ClientId::new();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
@@ -884,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn test_unwhitelist_not_linked() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
         let err = TestHarness::<Account>::with(())
@@ -905,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unwhitelist_already_absent_is_idempotent() {
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let client_id = ClientId::new();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
@@ -929,7 +775,7 @@ mod tests {
     #[test]
     fn test_apply_wallet_unwhitelisted_removes_wallet() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let registered_at = chrono::Utc::now();
         let linked_at = chrono::Utc::now();
         let wallet = address!("0x1111111111111111111111111111111111111111");
@@ -971,7 +817,7 @@ mod tests {
     #[test]
     fn test_apply_wallet_whitelisted_to_non_linked_account_returns_error() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
         let error = replay::<Account>(vec![
@@ -998,7 +844,7 @@ mod tests {
     #[test]
     fn test_apply_wallet_unwhitelisted_to_non_linked_account_returns_error() {
         let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
+        let email = Email::new("user@example.com").unwrap();
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
         let error = replay::<Account>(vec![

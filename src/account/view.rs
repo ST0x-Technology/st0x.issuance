@@ -79,8 +79,8 @@ pub(crate) async fn find_by_email(
         WHERE json_extract(payload, '$.Live.Registered.email') = ?
            OR json_extract(payload, '$.Live.LinkedToAlpaca.email') = ?
         "#,
-        email.0,
-        email.0
+        email.as_str(),
+        email.as_str()
     )
     .fetch_optional(pool)
     .await?;
@@ -215,7 +215,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
-        let email = Email("client@example.com".to_string());
+        let email = Email::new("client@example.com").unwrap();
         let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
 
         harness.register_account(client_id, email.clone()).await;
@@ -247,7 +247,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
-        let email = Email("registered-only@example.com".to_string());
+        let email = Email::new("registered-only@example.com").unwrap();
 
         harness.register_account(client_id, email.clone()).await;
 
@@ -288,7 +288,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
-        let email = Email("email@example.com".to_string());
+        let email = Email::new("email@example.com").unwrap();
         let alpaca_account = AlpacaAccountNumber("ALPACA999".to_string());
 
         harness.register_account(client_id, email.clone()).await;
@@ -320,7 +320,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
-        let email = Email("registered@example.com".to_string());
+        let email = Email::new("registered@example.com").unwrap();
 
         harness.register_account(client_id, email.clone()).await;
 
@@ -346,7 +346,7 @@ mod tests {
     async fn test_find_by_email_returns_none_when_not_found() {
         let pool = setup_test_db().await;
 
-        let email = Email("nonexistent@example.com".to_string());
+        let email = Email::new("nonexistent@example.com").unwrap();
 
         let result =
             find_by_email(&pool, &email).await.expect("Query should succeed");
@@ -360,7 +360,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
-        let email = Email("wallet@example.com".to_string());
+        let email = Email::new("wallet@example.com").unwrap();
         let alpaca_account = AlpacaAccountNumber("ALPACA-W".to_string());
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -406,7 +406,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let client_id = ClientId::new();
-        let email = Email("rebuild@example.com".to_string());
+        let email = Email::new("rebuild@example.com").unwrap();
         let alpaca_account = AlpacaAccountNumber("ALPACA-R".to_string());
         let wallet = address!("0x2222222222222222222222222222222222222222");
 

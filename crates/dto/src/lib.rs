@@ -10,6 +10,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, Bytes};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -313,6 +314,114 @@ impl<'de> Deserialize<'de> for AssetKey {
     }
 }
 
+/// Registered account email, normalized to trimmed lowercase.
+///
+/// Internal operator wire type deliberately not exported to the dashboard
+/// TypeScript bindings (no `TS` derive): the dashboard never registers
+/// accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Email(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EmailError {
+    #[error("Invalid email format: {email}")]
+    Invalid { email: String },
+}
+
+impl Email {
+    /// Constructs an email from new input, enforcing every current rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmailError::Invalid`] when the normalized value lacks exactly
+    /// one `@` between a non-empty local part and a non-empty domain, or
+    /// contains embedded whitespace or control characters.
+    pub fn new(email: &str) -> Result<Self, EmailError> {
+        let normalized = Self::checked_structure(email)?;
+
+        // Reject embedded whitespace/control characters — `trim()` only strips
+        // the ends, so "user @domain.com" or "user@do main.com" would otherwise
+        // pass. No valid address contains them. New input only: values already
+        // committed to the event log were accepted by the older, laxer
+        // validator and must keep deserializing (see `deserialize_stored`).
+        if normalized.contains(|character: char| {
+            character.is_whitespace() || character.is_control()
+        }) {
+            return Err(EmailError::Invalid { email: normalized });
+        }
+
+        Ok(Self(normalized))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Deserializer for `Email` values already committed to the event log or
+    /// projected view rows, used via
+    /// `#[serde(deserialize_with = "Email::deserialize_stored")]`.
+    ///
+    /// Stored values were validated by the rules in force when they were
+    /// written, so only the structural checks the validator has always
+    /// enforced apply here. Checks added later — the embedded
+    /// whitespace/control rejection in [`Email::new`] — must not apply
+    /// retroactively: a historical event the old validator accepted would
+    /// otherwise fail deserialization and brick event replay, view reads, and
+    /// service startup. New input still validates strictly via [`Email::new`]
+    /// (the default `Deserialize` impl, which API request bodies use).
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error when the value is not a string or
+    /// fails the structural checks.
+    pub fn deserialize_stored<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::checked_structure(&value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+
+    /// Normalization plus the structural checks the validator has enforced
+    /// since account registration shipped: exactly one `@` separating a
+    /// non-empty local part from a non-empty domain.
+    fn checked_structure(email: &str) -> Result<String, EmailError> {
+        let normalized = email.trim().to_lowercase();
+
+        let structure_valid = match normalized.split_once('@') {
+            Some((local, domain)) => {
+                !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+            }
+            None => false,
+        };
+
+        if !structure_valid {
+            return Err(EmailError::Invalid { email: normalized });
+        }
+
+        Ok(normalized)
+    }
+}
+
+impl std::fmt::Display for Email {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Email {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Single supported asset, as returned by `GET /tokenized-assets/<underlying>`.
 ///
 /// Carries the full [`TokenizedAssetStatus`] rather than an `enabled: bool`: a
@@ -459,6 +568,47 @@ pub struct AddTokenizedAssetRequest {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct AddTokenizedAssetResponse {
     pub underlying: UnderlyingSymbol,
+}
+
+/// Request body of `POST /accounts` and its `POST /ops/debug/accounts` twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings (see
+/// [`MintAuthorizationRequest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct RegisterAccountRequest {
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub email: Email,
+}
+
+/// Request body of `POST /accounts/<client_id>/wallets` and its
+/// `POST /ops/debug/accounts/<client_id>/wallets` twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct WhitelistWalletRequest {
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub wallet: Address,
+}
+
+/// Request body of `POST /admin/freeze-schedules` and its
+/// `POST /ops/capital/freeze-schedules` twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ScheduleFreezeWindowRequest {
+    /// Underlying symbol whose supply freezes for the corporate action.
+    pub underlying: UnderlyingSymbol,
+    /// Instant the `Freeze` fires. May already be in the past for an
+    /// in-progress window (the freeze then applies immediately).
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub freeze_at: DateTime<Utc>,
+    /// Instant the `Unfreeze` fires. Must be after `freeze_at` and in the
+    /// future.
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub unfreeze_at: DateTime<Utc>,
 }
 
 /// Exports every DTO's TypeScript binding into `out_dir` (one `.ts` file per
@@ -1075,5 +1225,76 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&out_dir).unwrap();
+    }
+
+    #[test]
+    fn test_email_smart_constructor_validates() {
+        assert!(matches!(
+            Email::new("not-an-email"),
+            Err(EmailError::Invalid { email }) if email == "not-an-email"
+        ));
+
+        assert!(matches!(
+            Email::new("@"),
+            Err(EmailError::Invalid { email }) if email == "@"
+        ));
+
+        assert!(matches!(
+            Email::new("user@"),
+            Err(EmailError::Invalid { email }) if email == "user@"
+        ));
+
+        assert!(matches!(
+            Email::new("@domain"),
+            Err(EmailError::Invalid { email }) if email == "@domain"
+        ));
+
+        assert!(matches!(
+            Email::new("user@@domain.com"),
+            Err(EmailError::Invalid { email }) if email == "user@@domain.com"
+        ));
+
+        assert!(matches!(
+            Email::new("user@domain@com"),
+            Err(EmailError::Invalid { email }) if email == "user@domain@com"
+        ));
+
+        // Embedded whitespace/control chars in either part are rejected — only
+        // leading/trailing whitespace is trimmed.
+        assert!(matches!(
+            Email::new("user @domain.com"),
+            Err(EmailError::Invalid { email }) if email == "user @domain.com"
+        ));
+        assert!(matches!(
+            Email::new("user@do main.com"),
+            Err(EmailError::Invalid { email }) if email == "user@do main.com"
+        ));
+        assert!(matches!(
+            Email::new("user\t@domain.com"),
+            Err(EmailError::Invalid { email }) if email == "user\t@domain.com"
+        ));
+
+        assert!(Email::new("user@example.com").is_ok());
+    }
+
+    #[test]
+    fn email_deserialize_stays_strict_for_new_input() {
+        // API request bodies deserialize `Email` through the default
+        // `Deserialize` impl, which must keep enforcing the full `Email::new`
+        // rules — the stored-value tolerance is opt-in per field.
+        let result: Result<Email, _> =
+            serde_json::from_str(r#""user @domain.com""#);
+
+        assert!(
+            result.is_err(),
+            "ingress deserialization must reject embedded whitespace"
+        );
+    }
+
+    #[test]
+    fn test_email_normalizes_trim_and_lowercase() {
+        let email = Email::new("  User@Example.COM  ").unwrap();
+
+        assert_eq!(email.0, "user@example.com");
     }
 }

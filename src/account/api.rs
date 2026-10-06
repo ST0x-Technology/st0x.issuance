@@ -7,6 +7,7 @@ use rocket::response::Responder;
 use rocket::serde::json::Json;
 use rocket::{delete, post};
 use serde::{Deserialize, Serialize};
+use st0x_issuance_dto::{RegisterAccountRequest, WhitelistWalletRequest};
 use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
@@ -67,12 +68,6 @@ impl<'r> Responder<'r, 'static> for ApiError {
     }
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct RegisterAccountRequest {
-    #[schema(value_type = String)]
-    pub(crate) email: Email,
-}
-
 /// Response from account registration containing the newly assigned client ID.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RegisterAccountResponse {
@@ -123,7 +118,7 @@ pub(crate) async fn register_account_ops(
     register_account_logic(store, pool, request).await
 }
 
-#[tracing::instrument(skip(store, pool), fields(email = %request.email.0))]
+#[tracing::instrument(skip(store, pool), fields(email = %request.email))]
 async fn register_account_logic(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
@@ -135,7 +130,7 @@ async fn register_account_logic(
     // after the event has already committed.
     let claimed = sqlx::query!(
         "INSERT OR IGNORE INTO account_emails (email) VALUES (?)",
-        request.email.0
+        request.email.as_str()
     )
     .execute(pool.inner())
     .await
@@ -154,12 +149,12 @@ async fn register_account_logic(
         // re-registration of this email.
         if let Err(rollback_err) = sqlx::query!(
             "DELETE FROM account_emails WHERE email = ?",
-            request.email.0
+            request.email.as_str()
         )
         .execute(pool.inner())
         .await
         {
-            error!(target: "account", email = %request.email.0,
+            error!(target: "account", email = %request.email,
                 error = %rollback_err,
                 "Failed to release the email claim after a failed \
                  registration; the email stays claimed (every retry gets 409) \
@@ -203,7 +198,7 @@ pub struct AccountLinkResponse {
 }
 
 #[tracing::instrument(skip(_auth, store, pool), fields(
-    email = %request.email.0,
+    email = %request.email,
     account = %request.account.0
 ))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
@@ -235,12 +230,6 @@ pub(crate) async fn connect_account(
         .map_err(|_| rocket::http::Status::InternalServerError)?;
 
     Ok(Json(AccountLinkResponse { client_id }))
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct WhitelistWalletRequest {
-    #[schema(value_type = String)]
-    pub(crate) wallet: Address,
 }
 
 /// Response from wallet whitelist/unwhitelist operations.
@@ -431,7 +420,7 @@ mod tests {
 
         sqlx::query!(
             "INSERT OR IGNORE INTO account_emails (email) VALUES (?)",
-            email.0
+            email.as_str()
         )
         .execute(pool)
         .await
