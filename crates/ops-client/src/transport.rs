@@ -23,9 +23,9 @@ use url::Url;
 /// bot caps the engine run at 120 s and answers 504. Cutting the request
 /// earlier would report a transport failure for a run whose outcome the bot is
 /// about to state. That holds only while the load balancer's backend timeout
-/// for the breakglass tier exceeds those 150 s. An orchestrator approval waits
-/// for its on-chain receipt and can still outlast it, which surfaces as
-/// `NoResponse`: the outcome is unknown and the logs say what happened.
+/// for the breakglass tier exceeds those 150 s. An orchestrator approval stops
+/// waiting for its receipt after 20 s and answers 202 with the transaction
+/// hash, well inside this bound.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -44,8 +44,8 @@ use crate::underlying::{
     load_freeze_status, with_freeze_admission,
 };
 use crate::vault::onboarding::{
-    ApprovalOutcome, check_orchestrator_readiness, ensure_unlimited_approval,
-    prove_signing_shapes,
+    APPROVAL_RECEIPT_DEADLINE, ApprovalOutcome, check_orchestrator_readiness,
+    ensure_unlimited_approval, prove_signing_shapes,
 };
 use crate::wallet::turnkey::resolve_turnkey_signer;
 use crate::wallet::{SignerConfig, SignerEnv};
@@ -873,7 +873,14 @@ async fn run_approve_orchestrator(
         );
     }
 
-    match ensure_unlimited_approval(&provider, vault, orchestrator, bot).await?
+    match ensure_unlimited_approval(
+        &provider,
+        vault,
+        orchestrator,
+        bot,
+        APPROVAL_RECEIPT_DEADLINE,
+    )
+    .await?
     {
         ApprovalOutcome::AlreadyUnlimited => println!(
             "Already unlimited: {} vault {vault} needs no approval \
@@ -884,6 +891,13 @@ async fn run_approve_orchestrator(
             "Approved: unlimited allowance for orchestrator {orchestrator} \
              on {} vault {vault} in {tx_hash}.",
             args.underlying
+        ),
+        ApprovalOutcome::SubmittedUnconfirmed { tx_hash } => println!(
+            "Submitted, unconfirmed: {tx_hash} was broadcast for {} vault \
+             {vault} but not confirmed within {}s. Check it on chain before \
+             re-running; once it lands a re-run sends nothing.",
+            args.underlying,
+            APPROVAL_RECEIPT_DEADLINE.as_secs()
         ),
     }
     println!("Run orchestrator-preflight to verify overall readiness.");

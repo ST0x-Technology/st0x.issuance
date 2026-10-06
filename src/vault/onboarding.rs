@@ -18,7 +18,8 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use std::fmt::{self, Display, Formatter};
-use tracing::{debug, info};
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 use crate::bindings::{
     IST0xOrchestratorV1, OffchainAssetReceiptVault,
@@ -156,7 +157,18 @@ pub(crate) enum ApprovalOutcome {
     /// An `approve(orchestrator, U256::MAX)` landed and the re-read
     /// allowance is unlimited.
     Approved { tx_hash: B256 },
+    /// The approval was broadcast but no receipt arrived within the deadline
+    /// (or the receipt poll failed), so it may still land. The hash is what
+    /// the operator reconciles on chain instead of sending a second approval.
+    SubmittedUnconfirmed { tx_hash: B256 },
 }
+
+/// How long [`ensure_unlimited_approval`] waits for the receipt once the
+/// approval is broadcast. Base and HyperEVM mine within seconds, so this is
+/// ample for a healthy transaction, and it keeps the whole `/ops` request under
+/// a load balancer's default 30-second backend timeout so the bot's verdict,
+/// not a gateway's 504, reaches the operator.
+pub(crate) const APPROVAL_RECEIPT_DEADLINE: Duration = Duration::from_secs(20);
 
 /// One transaction shape the Turnkey signing policy must allow. Target and
 /// calldata are fixed at build time, so tests can decode exactly what would
@@ -183,8 +195,6 @@ pub(crate) struct SigningShapeProof {
 pub(crate) enum OnboardingError {
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
-    #[error(transparent)]
-    PendingTransaction(#[from] alloy::providers::PendingTransactionError),
     #[error(transparent)]
     Transport(#[from] alloy::transports::TransportError),
     #[error("approve transaction {tx_hash} reverted on-chain")]
@@ -311,6 +321,7 @@ pub(crate) async fn ensure_unlimited_approval<P: Provider>(
     vault: Address,
     orchestrator: Address,
     bot: Address,
+    receipt_deadline: Duration,
 ) -> Result<ApprovalOutcome, OnboardingError> {
     let vault_contract =
         OffchainAssetReceiptVault::new(vault, signing_provider);
@@ -326,13 +337,35 @@ pub(crate) async fn ensure_unlimited_approval<P: Provider>(
         return Ok(ApprovalOutcome::AlreadyUnlimited);
     }
 
-    let receipt = vault_contract
-        .approve(orchestrator, U256::MAX)
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
-    let tx_hash = receipt.transaction_hash;
+    let pending =
+        vault_contract.approve(orchestrator, U256::MAX).send().await?;
+    let tx_hash = *pending.tx_hash();
+
+    // An outer timeout rather than the watcher's own: it also bounds a receipt
+    // poll whose RPC call hangs. Past broadcast every failure to confirm is
+    // the same outcome for the operator: the approval may still land.
+    let receipt =
+        match tokio::time::timeout(receipt_deadline, pending.get_receipt())
+            .await
+        {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(error)) => {
+                warn!(target: "vault", %vault, %orchestrator, %tx_hash,
+                    %error,
+                    "Approval broadcast but its receipt poll failed; \
+                     reporting it unconfirmed"
+                );
+                return Ok(ApprovalOutcome::SubmittedUnconfirmed { tx_hash });
+            }
+            Err(_) => {
+                warn!(target: "vault", %vault, %orchestrator, %tx_hash,
+                    deadline_secs = receipt_deadline.as_secs(),
+                    "Approval broadcast but no receipt within the deadline; \
+                     reporting it unconfirmed"
+                );
+                return Ok(ApprovalOutcome::SubmittedUnconfirmed { tx_hash });
+            }
+        };
     if !receipt.status() {
         return Err(OnboardingError::ApprovalReverted { tx_hash });
     }
@@ -531,6 +564,7 @@ const fn pass_fail(passed: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi;
     use alloy::signers::local::PrivateKeySigner;
     use httpmock::MockServer;
     use tracing::Level;
@@ -728,6 +762,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            APPROVAL_RECEIPT_DEADLINE,
         )
         .await
         .unwrap();
@@ -753,6 +788,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            APPROVAL_RECEIPT_DEADLINE,
         )
         .await
         .unwrap();
@@ -764,6 +800,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            APPROVAL_RECEIPT_DEADLINE,
         )
         .await
         .unwrap();
@@ -792,6 +829,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            APPROVAL_RECEIPT_DEADLINE,
         )
         .await
         .unwrap();
@@ -799,6 +837,44 @@ mod tests {
         assert!(matches!(outcome, ApprovalOutcome::Approved { .. }));
         let report = readiness(&evm, orchestrator, evm.wallet_address).await;
         assert!(report.assets[0].is_unlimited());
+    }
+
+    /// An approval whose receipt never arrives must come back within the
+    /// deadline as submitted-unconfirmed with the broadcast hash, rather than
+    /// hold the request until a gateway cuts it off with no hash at all.
+    #[traced_test]
+    #[tokio::test]
+    async fn unmined_approval_is_reported_unconfirmed_with_its_hash() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let provider = signing_provider(&evm).await;
+        provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_unlimited_approval(
+                &provider,
+                evm.vault_address,
+                orchestrator,
+                evm.wallet_address,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the approval must answer once its receipt deadline passes")
+        .unwrap();
+
+        let ApprovalOutcome::SubmittedUnconfirmed { tx_hash } = outcome else {
+            panic!("expected SubmittedUnconfirmed, got {outcome:?}");
+        };
+        assert!(
+            provider.get_transaction_by_hash(tx_hash).await.unwrap().is_some(),
+            "the reported hash must be the approval the node holds as pending"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["no receipt within the deadline", &tx_hash.to_string()]
+        ));
     }
 
     #[test]

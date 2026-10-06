@@ -1459,7 +1459,9 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   token) through the Turnkey signer, after verifying the configured address
   answers as an orchestrator. Idempotent — an already-unlimited allowance sends
   nothing — and success is re-verified by an on-chain allowance read, never
-  inferred from the receipt.
+  inferred from the receipt. Like the `/ops` route, it waits at most 20 seconds
+  for the receipt and otherwise reports the broadcast transaction hash as
+  submitted but unconfirmed, to reconcile on chain rather than re-run.
 - `issuer verify-orchestrator-signing <UNDERLYING>` — signs, WITHOUT
   broadcasting, one transaction per shape the Turnkey signing policy must allow
   before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
@@ -4960,6 +4962,22 @@ Tiers and routes:
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
+`orchestrator-approve` waits at most 20 seconds for the approval's receipt once
+it is broadcast, short enough that the whole request fits under a load
+balancer's default 30-second backend timeout and the client's request timeout,
+so the bot's own verdict reaches the operator. It responds with
+`{ outcome, tx_hash }`:
+
+- `already_unlimited` (200, `tx_hash` null): nothing was sent.
+- `approved` (200): the receipt succeeded and the re-read allowance is
+  unlimited.
+- `submitted_unconfirmed` (202): the approval was broadcast, but no receipt
+  arrived within the deadline (or the receipt poll failed), so it may still
+  land. The operator reconciles `tx_hash` on chain instead of retrying; a retry
+  after it lands sends nothing. The wallet lock is released at the deadline, as
+  a live mint's is after broadcast, with the approval already in the node's
+  pending pool.
+
 Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
 echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
 `terminal`, or `close` view. For a `Start` or `Resume` request with
@@ -5128,12 +5146,11 @@ outage during sign-in. Failures are explained:
   balancer had no healthy backend. A read can be retried; before retrying a
   write, the logs show whether it was applied.
 - **502 or 504:** a gateway gave up waiting, either the load balancer's backend
-  timeout (an `approve-orchestrator` waiting for its receipt, or a long
-  burn-excess run, can outlast it) or the bot's own bound (its wait on the
-  chain, or a burn-excess run's), so the outcome is unknown. A read can be
-  retried. A burn-excess dry-run changed nothing and an `--execute` is resumed
-  by re-running the same command, which reads the persisted burn stream; for any
-  other write, the logs show whether it was applied before a retry.
+  timeout (a long burn-excess run can outlast it) or the bot's own bound (its
+  wait on the chain, or a burn-excess run's), so the outcome is unknown. A read
+  can be retried. A burn-excess dry-run changed nothing and an `--execute` is
+  resumed by re-running the same command, which reads the persisted burn stream;
+  for any other write, the logs show whether it was applied before a retry.
 - **No response:** a connection that timed out or dropped after the request was
   sent leaves the outcome unknown, and the client says so.
 - **Unwritable output:** the bot answered with success but stdout could not take

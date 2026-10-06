@@ -24,9 +24,9 @@ use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::Config;
 use crate::mint::has_unresolved_signer_intent;
 use crate::vault::onboarding::{
-    ApprovalOutcome, OnboardingError, OrchestratorReadiness,
-    check_orchestrator_readiness, ensure_unlimited_approval,
-    prove_signing_shapes,
+    APPROVAL_RECEIPT_DEADLINE, ApprovalOutcome, OnboardingError,
+    OrchestratorReadiness, check_orchestrator_readiness,
+    ensure_unlimited_approval, prove_signing_shapes,
 };
 use crate::vault::{NetworkVaultServices, VaultService};
 use crate::wallet::SignerConfig;
@@ -166,7 +166,9 @@ pub(crate) async fn orchestrator_verify_signing_ops(
 /// Capital-tier one-time unlimited approval of an asset's vault shares to the
 /// orchestrator, signed and broadcast through Turnkey. Idempotent: an already
 /// unlimited allowance sends nothing. Refuses if the configured address does
-/// not verify as a healthy orchestrator.
+/// not verify as a healthy orchestrator. An approval broadcast but unconfirmed
+/// within [`APPROVAL_RECEIPT_DEADLINE`] answers 202 with its hash, so the
+/// operator reconciles it on chain rather than sending a second approval.
 #[post("/ops/capital/orchestrator-approve/<network>/<underlying>")]
 #[tracing::instrument(
     target = "auth",
@@ -181,7 +183,7 @@ pub(crate) async fn orchestrator_approve_ops(
     vault_services: &State<NetworkVaultServices>,
     network: &str,
     underlying: UnderlyingParam,
-) -> Result<Json<ApproveResponse>, Status> {
+) -> Result<(Status, Json<ApproveResponse>), Status> {
     let network = parse_network(network)?;
     let UnderlyingParam(symbol) = underlying;
     let OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey } =
@@ -243,19 +245,30 @@ pub(crate) async fn orchestrator_approve_ops(
     )
     .await?;
 
-    let response = match outcome {
-        ApprovalOutcome::AlreadyUnlimited => {
-            ApproveResponse { outcome: "already_unlimited", tx_hash: None }
-        }
-        ApprovalOutcome::Approved { tx_hash } => ApproveResponse {
-            outcome: "approved",
-            tx_hash: Some(tx_hash.to_string()),
-        },
+    let (status, response) = match outcome {
+        ApprovalOutcome::AlreadyUnlimited => (
+            Status::Ok,
+            ApproveResponse { outcome: "already_unlimited", tx_hash: None },
+        ),
+        ApprovalOutcome::Approved { tx_hash } => (
+            Status::Ok,
+            ApproveResponse {
+                outcome: "approved",
+                tx_hash: Some(tx_hash.to_string()),
+            },
+        ),
+        ApprovalOutcome::SubmittedUnconfirmed { tx_hash } => (
+            Status::Accepted,
+            ApproveResponse {
+                outcome: "submitted_unconfirmed",
+                tx_hash: Some(tx_hash.to_string()),
+            },
+        ),
     };
     info!(target: "asset", %orchestrator, %vault, outcome = response.outcome,
-        "Orchestrator approval settled"
+        tx_hash = ?response.tx_hash, "Orchestrator approval settled"
     );
-    Ok(Json(response))
+    Ok((status, Json(response)))
 }
 
 /// Broadcasts the approval from the production wallet under the network's
@@ -264,12 +277,14 @@ pub(crate) async fn orchestrator_approve_ops(
 /// check so no live flow can persist a signed nonce between the check and
 /// this broadcast; while it is held no live flow fills a nonce either, so the
 /// pending count this route's provider reads is the one to use. The lock is
-/// held until the receipt is in, since the service's nonce manager resyncs
-/// from the chain's pending count and must not observe this transaction only
-/// halfway through. Refuses with 409 while an unresolved mint or redemption
-/// signer intent already holds a signed nonce on this network: both would
-/// fill from the same pending nonce and one would fail nonce-too-low, leaving
-/// the bot's recovery to reconcile a submission it did not make.
+/// held until the receipt is in or [`APPROVAL_RECEIPT_DEADLINE`] passes. The
+/// service's nonce manager resyncs from the chain's pending count; past the
+/// deadline the approval is already in the node's pending pool, so a live flow
+/// filling next takes the nonce after it, as it does after its own broadcasts.
+/// Refuses with 409 while an unresolved mint or redemption signer intent
+/// already holds a signed nonce on this network: both would fill from the same
+/// pending nonce and one would fail nonce-too-low, leaving the bot's recovery
+/// to reconcile a submission it did not make.
 async fn approve_under_wallet_lock<P: Provider>(
     vault_service: &dyn VaultService,
     pool: &Pool<Sqlite>,
@@ -295,14 +310,20 @@ async fn approve_under_wallet_lock<P: Provider>(
         return Err(Status::Conflict);
     }
 
-    ensure_unlimited_approval(provider, vault, orchestrator, bot).await.map_err(
-        |error| {
-            error!(target: "asset", %orchestrator, %vault, %error,
-                "Orchestrator approval failed"
-            );
-            map_onboarding_error(&error)
-        },
+    ensure_unlimited_approval(
+        provider,
+        vault,
+        orchestrator,
+        bot,
+        APPROVAL_RECEIPT_DEADLINE,
     )
+    .await
+    .map_err(|error| {
+        error!(target: "asset", %orchestrator, %vault, %error,
+            "Orchestrator approval failed"
+        );
+        map_onboarding_error(&error)
+    })
 }
 
 #[derive(Serialize)]
@@ -455,14 +476,13 @@ fn parse_assets(assets: &[String]) -> Result<Vec<UnderlyingSymbol>, Status> {
 /// RPC fault (502).
 const fn map_onboarding_error(error: &OnboardingError) -> Status {
     use OnboardingError::{
-        ApprovalNotEffective, ApprovalReverted, Contract, PendingTransaction,
-        SigningRejected, Transport,
+        ApprovalNotEffective, ApprovalReverted, Contract, SigningRejected,
+        Transport,
     };
 
     match error {
         SigningRejected { .. } => Status::UnprocessableEntity,
         Contract(_)
-        | PendingTransaction(_)
         | Transport(_)
         | ApprovalReverted { .. }
         | ApprovalNotEffective { .. } => Status::BadGateway,
