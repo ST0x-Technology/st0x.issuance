@@ -59,12 +59,13 @@ underlying-scoped and has no network query parameter.
 
 ## 1. Configure and validate the Ethereum runtime
 
-A second runtime is supported by the merged environment parser. Configure all
-three fields as one complete group:
+A second runtime is supported by the merged environment parser. Configure the
+group:
 
-- `CHAIN_ETHEREUM_RPC_URL`
 - `CHAIN_ETHEREUM_CHAIN_ID=1`
 - `CHAIN_ETHEREUM_BACKFILL_START_BLOCK`
+- `CHAIN_ETHEREUM_RPC_URL`, optional when `ALCHEMY_API_KEY` is set (an explicit
+  URL wins over the derived Alchemy endpoint)
 
 Supplying only part of the group fails startup. The grouped Base form
 (`CHAIN_BASE_*`) overrides the legacy flat Base variables when both are present;

@@ -1,3 +1,6 @@
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![allow(clippy::disallowed_methods)]
 // Each integration test file (`tests/*.rs`) is compiled as a separate binary
 // crate. `mod harness;` includes the full harness in every binary, so functions
 // not used by a particular test trigger dead_code warnings. There is no way to
@@ -592,7 +595,6 @@ pub fn create_config_with_db(
     Ok(Config {
         database_url: db_path.to_string(),
         database_max_connections: 5,
-        rpc_url: rpc_url.clone(),
         chain_id: evm.chain_id,
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
@@ -635,7 +637,7 @@ pub fn create_config_with_db(
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: evm.chain_id,
-            rpc_url,
+            rpc: rpc_url.into(),
             backfill_start_block: 0,
             low_gas_threshold: None,
         }],
@@ -657,14 +659,14 @@ pub fn create_multichain_config_with_db(
         ChainConfig {
             network: Network::Base,
             chain_id: base_evm.chain_id,
-            rpc_url: Url::parse(&base_evm.endpoint)?,
+            rpc: Url::parse(&base_evm.endpoint)?.into(),
             backfill_start_block: 0,
             low_gas_threshold: None,
         },
         ChainConfig {
             network: Network::Ethereum,
             chain_id: eth_evm.chain_id,
-            rpc_url: Url::parse(&eth_evm.endpoint)?,
+            rpc: Url::parse(&eth_evm.endpoint)?.into(),
             backfill_start_block: 0,
             low_gas_threshold: None,
         },

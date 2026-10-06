@@ -1,2 +1,23 @@
 allow-unwrap-in-tests = true
 too-many-lines-threshold = 200
+
+# Production chain clients go through `chain::rpc_client`, which sends a
+# derived endpoint's key as a header and strips the URL from transport
+# errors. Building a provider straight from a URL bypasses both.
+disallowed-methods = [
+  { path = "alloy::providers::ProviderBuilder::connect", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_with", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_with_config", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_ws", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_http", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_reqwest", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::RootProvider::new_http", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::RpcClient::new_http", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::ClientBuilder::http", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::ProviderBuilder::connect_pubsub_with", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::providers::RootProvider::connect", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::RpcClient::new_http_with_client", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::ClientBuilder::connect", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::ClientBuilder::connect_with", reason = "build chain clients with chain::rpc_client and connect_client" },
+  { path = "alloy::rpc::client::ClientBuilder::connect_with_config", reason = "build chain clients with chain::rpc_client and connect_client" },
+]

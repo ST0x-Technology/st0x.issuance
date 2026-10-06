@@ -1,3 +1,6 @@
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used)]
 
 //! End-to-end orchestrator-mode redemption flows on Anvil.

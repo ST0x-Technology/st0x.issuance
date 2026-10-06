@@ -1,3 +1,6 @@
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used)]
 
 mod harness;
@@ -282,7 +285,6 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     let config = Config {
         database_url,
         database_max_connections: 5,
-        rpc_url: rpc_url.clone(),
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
@@ -326,7 +328,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
-            rpc_url,
+            rpc: rpc_url.into(),
             low_gas_threshold: None,
             backfill_start_block: 0,
         }],

@@ -14,13 +14,13 @@ use serde::Serialize;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
 use tracing::{error, info, warn};
-use url::Url;
 
 use super::api::UnderlyingParam;
 use super::cli::preflight_assets;
 use super::view::find_vault;
 use super::{Network, UnderlyingSymbol};
 use crate::auth::{CapitalOps, DebugOps, ReadOps};
+use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::Config;
 use crate::mint::has_unresolved_signer_intent;
 use crate::vault::onboarding::{
@@ -43,7 +43,7 @@ pub(crate) async fn orchestrator_preflight_ops(
     asset: Vec<String>,
 ) -> Result<Json<PreflightResponse>, Status> {
     let network = parse_network(network)?;
-    let OrchestratorContext { orchestrator, bot, rpc_url, .. } =
+    let OrchestratorContext { orchestrator, bot, rpc, .. } =
         resolve_orchestrator_context(config.inner(), network)?;
 
     let filter = parse_assets(&asset)?;
@@ -61,15 +61,14 @@ pub(crate) async fn orchestrator_preflight_ops(
         Status::UnprocessableEntity
     })?;
 
-    let provider = ProviderBuilder::new()
-        .connect(rpc_url.as_str())
-        .await
-        .map_err(|error| {
+    let provider = ProviderBuilder::new().connect_client(
+        rpc_client(&rpc).map_err(|error| {
             error!(target: "asset", %network, %error,
                 "Orchestrator preflight could not connect to RPC"
             );
             Status::BadGateway
-        })?;
+        })?,
+    );
 
     let report =
         check_orchestrator_readiness(&provider, orchestrator, bot, &assets)
@@ -106,7 +105,7 @@ pub(crate) async fn orchestrator_verify_signing_ops(
 ) -> Result<Json<VerifySigningResponse>, Status> {
     let network = parse_network(network)?;
     let UnderlyingParam(symbol) = underlying;
-    let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
+    let OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
@@ -123,15 +122,14 @@ pub(crate) async fn orchestrator_verify_signing_ops(
             Status::InternalServerError
         })?;
 
-    let provider = ProviderBuilder::new()
-        .connect(rpc_url.as_str())
-        .await
-        .map_err(|error| {
+    let provider = ProviderBuilder::new().connect_client(
+        rpc_client(&rpc).map_err(|error| {
             error!(target: "asset", %error,
                 "verify-signing could not connect to RPC"
             );
             Status::BadGateway
-        })?;
+        })?,
+    );
 
     let proofs = prove_signing_shapes(
         &provider,
@@ -186,7 +184,7 @@ pub(crate) async fn orchestrator_approve_ops(
 ) -> Result<Json<ApproveResponse>, Status> {
     let network = parse_network(network)?;
     let UnderlyingParam(symbol) = underlying;
-    let OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey } =
+    let OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
 
     let vault = find_vault(pool.inner(), &symbol, &network)
@@ -206,12 +204,10 @@ pub(crate) async fn orchestrator_approve_ops(
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect(rpc_url.as_str())
-        .await
-        .map_err(|error| {
+        .connect_client(rpc_client(&rpc).map_err(|error| {
             error!(target: "asset", %error, "approve could not connect to RPC");
             Status::BadGateway
-        })?;
+        })?);
 
     // The spender is about to receive an unlimited allowance from the
     // production wallet, so prove the address is a healthy orchestrator first:
@@ -389,7 +385,7 @@ pub(crate) struct ApproveResponse {
 struct OrchestratorContext<'a> {
     orchestrator: Address,
     bot: Address,
-    rpc_url: Url,
+    rpc: RpcEndpoint,
     chain_id: u64,
     turnkey: &'a TurnkeyConfig,
 }
@@ -428,10 +424,10 @@ fn resolve_orchestrator_context(
             );
             Status::InternalServerError
         })?;
-    let rpc_url = chain.rpc_url.clone();
+    let rpc = chain.rpc.clone();
     let chain_id = chain.chain_id;
 
-    Ok(OrchestratorContext { orchestrator, bot, rpc_url, chain_id, turnkey })
+    Ok(OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey })
 }
 
 fn parse_network(network: &str) -> Result<Network, Status> {

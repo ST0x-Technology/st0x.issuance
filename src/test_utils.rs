@@ -30,7 +30,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 use uuid::Uuid;
 
 use crate::account::Account;
@@ -160,7 +159,6 @@ pub(crate) fn test_config() -> Result<Config, anyhow::Error> {
     Ok(Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
-        rpc_url: Url::parse("wss://localhost:8545")?,
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
@@ -372,6 +370,10 @@ impl LocalEvm {
         Self::with_chain_id(ANVIL_CHAIN_ID).await
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Anvil test clients connect by URL"
+    )]
     async fn connect(&self) -> Result<impl Provider, LocalEvmError> {
         let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
         let wallet = EthereumWallet::from(signer);
@@ -388,6 +390,10 @@ impl LocalEvm {
     ///
     /// Returns an error if Anvil startup, provider connection, or contract
     /// deployment fails.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Anvil test clients connect by URL"
+    )]
     pub async fn with_chain_id(chain_id: u64) -> Result<Self, LocalEvmError> {
         let anvil = test_anvil().chain_id(chain_id).spawn();
         let endpoint = anvil.ws_endpoint();

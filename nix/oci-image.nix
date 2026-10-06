@@ -14,7 +14,8 @@
 #   so an omitted value makes a staging box present as prod; the compose
 #   must set it explicitly, never rely on the default), LOG_LEVEL and
 #   CONFIG=<path to a mounted TOML>; plus the secret variables
-#   (RPC_URL, signer, Alpaca, notifications: see src/config.rs `env =`)
+#   (ALCHEMY_API_KEY or per-chain RPC URLs, signer, Alpaca,
+#   notifications: see src/config.rs `env =`)
 #   through a compose env_file. There is no secrets-file loader in the
 #   app; a mounted secrets TOML is never read. Nothing is baked: no config
 #   file, no secrets.

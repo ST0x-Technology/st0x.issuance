@@ -14,9 +14,7 @@ use sqlx::{Pool, Sqlite};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use url::Url;
 
-use crate::config::{InvalidRpcScheme, wss_to_http};
 use crate::tokenized_asset::Network;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
@@ -29,6 +27,12 @@ use crate::wallet::{
     SignerConfig, SignerResolveError, local::resolve_local_signer,
     turnkey::resolve_turnkey_signer,
 };
+pub(crate) use rpc::rpc_client;
+pub use rpc::{
+    AlchemyApiKey, InvalidAlchemyApiKey, RpcClientError, RpcEndpoint,
+};
+
+mod rpc;
 
 const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
 
@@ -37,7 +41,7 @@ const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
 pub struct ChainConfig {
     pub network: Network,
     pub chain_id: u64,
-    pub rpc_url: Url,
+    pub rpc: RpcEndpoint,
     pub backfill_start_block: u64,
     /// Low gas alert threshold for the issuer wallet's native balance, in
     /// wei. `None` disables gas monitoring; mixing `Some` and `None` across
@@ -130,7 +134,7 @@ pub enum ChainRegistryError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
-    InvalidRpcScheme(#[from] InvalidRpcScheme),
+    RpcClient(#[from] RpcClientError),
     #[error("Failed to resolve signer: {0}")]
     SignerResolve(#[from] SignerResolveError),
     #[error(
@@ -279,13 +283,13 @@ async fn build_chain_runtime(
     let ChainConfig {
         network,
         chain_id,
-        rpc_url,
+        rpc,
         backfill_start_block,
         low_gas_threshold,
     } = config;
 
-    let http_url = wss_to_http(&rpc_url)?;
-    let http_provider = ProviderBuilder::new().connect_http(http_url);
+    let http_provider =
+        ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
 
     let rpc_chain_id = http_provider.get_chain_id().await?;
     if rpc_chain_id != chain_id {
@@ -316,21 +320,24 @@ async fn build_chain_runtime(
         .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_http(wss_to_http(&rpc_url)?);
+        .connect_client(rpc_client(&rpc)?);
 
     let vault_service: Arc<dyn VaultService> =
         Arc::new(RealBlockchainService::new(signing_provider, nonce_manager));
 
     // The signing provider built above is the single endpoint every on-chain
     // mint and redemption (burn) transaction for this network is signed and
-    // broadcast through. Log host and scheme only; the RPC URL carries the
-    // provider API key in its path, which must never reach the logs.
+    // broadcast through. Log host and scheme only; an explicit RPC URL may
+    // carry the provider API key in its path, which must never reach the
+    // logs.
+    let rpc_url = rpc.url();
     info!(
         target: "startup",
         %network,
         chain_id,
         rpc_scheme = rpc_url.scheme(),
         rpc_host = rpc_url.host_str().unwrap_or("(none)"),
+        rpc_bearer_auth = rpc.uses_bearer_auth(),
         "RPC endpoint for on-chain mint and redemption transactions"
     );
 
@@ -351,6 +358,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use tracing::Level;
     use tracing_test::traced_test;
+    use url::Url;
 
     use super::*;
     use crate::test_utils::logs_contain_at;
@@ -364,7 +372,7 @@ mod tests {
         ChainConfig {
             network: Network::Base,
             chain_id,
-            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
+            rpc: Url::parse("wss://localhost:8545").unwrap().into(),
             backfill_start_block: 1,
             low_gas_threshold: None,
         }
@@ -378,7 +386,7 @@ mod tests {
             ChainConfig {
                 network: Network::Ethereum,
                 chain_id: 8453,
-                rpc_url: Url::parse("wss://localhost:8546").unwrap(),
+                rpc: Url::parse("wss://localhost:8546").unwrap().into(),
                 backfill_start_block: 1,
                 low_gas_threshold: None,
             },
@@ -400,7 +408,7 @@ mod tests {
             ChainConfig {
                 network: Network::Ethereum,
                 chain_id: 1,
-                rpc_url: Url::parse("wss://localhost:8546").unwrap(),
+                rpc: Url::parse("wss://localhost:8546").unwrap().into(),
                 backfill_start_block: 1,
                 low_gas_threshold: None,
             },

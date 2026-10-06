@@ -16,7 +16,8 @@ use url::Url;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::chain::{
-    ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
+    AlchemyApiKey, ChainConfig, ChainRegistry, ChainRegistryError,
+    InvalidAlchemyApiKey, RpcEndpoint, build_chain_registry,
 };
 use crate::notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
@@ -219,7 +220,6 @@ pub(crate) const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 5;
 pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
-    pub rpc_url: Url,
     pub chain_id: u64,
     pub signer: SignerConfig,
     pub backfill_start_block: u64,
@@ -511,10 +511,22 @@ struct Env {
     #[arg(
         long,
         env = "RPC_URL",
-        required_unless_present = "chain_base_rpc_url",
-        help = "WebSocket RPC endpoint URL (wss://...)"
+        help = "Legacy flat Base RPC endpoint URL; required unless \
+                CHAIN_BASE_CHAIN_ID and CHAIN_BASE_BACKFILL_START_BLOCK \
+                configure Base, whose URL then comes from CHAIN_BASE_RPC_URL, \
+                this variable, or ALCHEMY_API_KEY"
     )]
-    rpc_url: Option<Url>,
+    rpc_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "ALCHEMY_API_KEY",
+        hide_env_values = true,
+        help = "Alchemy API key; gives every chain group without an explicit \
+                CHAIN_<NETWORK>_RPC_URL its Alchemy endpoint (not \
+                CHAIN_BINANCE_*), sent as an Authorization header"
+    )]
+    alchemy_api_key: Option<String>,
 
     #[arg(
         long,
@@ -602,14 +614,15 @@ struct Env {
             "chain_base_backfill_start_block"
         ],
         help = "Base RPC endpoint; setting it requires the full CHAIN_BASE_* \
-                group and overrides the legacy flat Base variables"
+                group. Optional: without it the group uses RPC_URL, then \
+                ALCHEMY_API_KEY"
     )]
     chain_base_rpc_url: Option<Url>,
 
     #[arg(
         long,
         env = "CHAIN_BASE_CHAIN_ID",
-        requires = "chain_base_rpc_url",
+        requires = "chain_base_backfill_start_block",
         help = "Chain ID for the Base group; must be Base's canonical 8453"
     )]
     chain_base_chain_id: Option<u64>,
@@ -617,7 +630,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_BASE_BACKFILL_START_BLOCK",
-        requires = "chain_base_rpc_url",
+        requires = "chain_base_chain_id",
         help = "Receipt-backfill start block for the Base group"
     )]
     chain_base_backfill_start_block: Option<u64>,
@@ -625,7 +638,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_BASE_LOW_GAS_THRESHOLD",
-        requires = "chain_base_rpc_url",
+        requires = "chain_base_chain_id",
         help = "Low gas alert threshold for the Base group, in ETH \
                 (e.g. \"0.05\")"
     )]
@@ -639,14 +652,14 @@ struct Env {
             "chain_ethereum_backfill_start_block"
         ],
         help = "Ethereum RPC endpoint; setting it requires the full \
-                CHAIN_ETHEREUM_* group and enables the Ethereum chain"
+                CHAIN_ETHEREUM_* group. Optional when ALCHEMY_API_KEY is set"
     )]
     chain_ethereum_rpc_url: Option<Url>,
 
     #[arg(
         long,
         env = "CHAIN_ETHEREUM_CHAIN_ID",
-        requires = "chain_ethereum_rpc_url",
+        requires = "chain_ethereum_backfill_start_block",
         help = "Chain ID for the Ethereum group; must be Ethereum's canonical 1"
     )]
     chain_ethereum_chain_id: Option<u64>,
@@ -654,7 +667,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_ETHEREUM_BACKFILL_START_BLOCK",
-        requires = "chain_ethereum_rpc_url",
+        requires = "chain_ethereum_chain_id",
         help = "Receipt-backfill start block for the Ethereum group"
     )]
     chain_ethereum_backfill_start_block: Option<u64>,
@@ -662,7 +675,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_ETHEREUM_LOW_GAS_THRESHOLD",
-        requires = "chain_ethereum_rpc_url",
+        requires = "chain_ethereum_chain_id",
         help = "Low gas alert threshold for the Ethereum group, in ETH \
                 (e.g. \"0.05\")"
     )]
@@ -676,14 +689,14 @@ struct Env {
             "chain_hyperevm_backfill_start_block"
         ],
         help = "HyperEVM RPC endpoint; setting it requires the full \
-                CHAIN_HYPEREVM_* group and enables the HyperEVM chain"
+                CHAIN_HYPEREVM_* group. Optional when ALCHEMY_API_KEY is set"
     )]
     chain_hyperevm_rpc_url: Option<Url>,
 
     #[arg(
         long,
         env = "CHAIN_HYPEREVM_CHAIN_ID",
-        requires = "chain_hyperevm_rpc_url",
+        requires = "chain_hyperevm_backfill_start_block",
         help = "Chain ID for the HyperEVM group; must be HyperEVM's \
                 canonical 999"
     )]
@@ -692,7 +705,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_HYPEREVM_BACKFILL_START_BLOCK",
-        requires = "chain_hyperevm_rpc_url",
+        requires = "chain_hyperevm_chain_id",
         help = "Receipt-backfill start block for the HyperEVM group"
     )]
     chain_hyperevm_backfill_start_block: Option<u64>,
@@ -700,7 +713,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_HYPEREVM_LOW_GAS_THRESHOLD",
-        requires = "chain_hyperevm_rpc_url",
+        requires = "chain_hyperevm_chain_id",
         help = "Low gas alert threshold for the HyperEVM group, in HYPE \
                 (e.g. \"1.0\")"
     )]
@@ -714,14 +727,14 @@ struct Env {
             "chain_robinhood_backfill_start_block"
         ],
         help = "Robinhood Chain RPC endpoint; setting it requires the full \
-                CHAIN_ROBINHOOD_* group and enables the Robinhood chain"
+                CHAIN_ROBINHOOD_* group. Optional when ALCHEMY_API_KEY is set"
     )]
     chain_robinhood_rpc_url: Option<Url>,
 
     #[arg(
         long,
         env = "CHAIN_ROBINHOOD_CHAIN_ID",
-        requires = "chain_robinhood_rpc_url",
+        requires = "chain_robinhood_backfill_start_block",
         help = "Chain ID for the Robinhood group; must be Robinhood Chain's \
                 canonical 4663"
     )]
@@ -730,7 +743,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_ROBINHOOD_BACKFILL_START_BLOCK",
-        requires = "chain_robinhood_rpc_url",
+        requires = "chain_robinhood_chain_id",
         help = "Receipt-backfill start block for the Robinhood group"
     )]
     chain_robinhood_backfill_start_block: Option<u64>,
@@ -738,7 +751,7 @@ struct Env {
     #[arg(
         long,
         env = "CHAIN_ROBINHOOD_LOW_GAS_THRESHOLD",
-        requires = "chain_robinhood_rpc_url",
+        requires = "chain_robinhood_chain_id",
         help = "Low gas alert threshold for the Robinhood group, in ETH \
                 (e.g. \"0.05\")"
     )]
@@ -808,7 +821,6 @@ impl Env {
             chat_id,
             message_thread_id,
         )?;
-        let rpc_url = base.rpc_url.clone();
         let chain_id = base.chain_id;
         let backfill_start_block = base.backfill_start_block;
         let signer = self.signer.into_config()?;
@@ -865,7 +877,6 @@ impl Env {
         Ok(Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
-            rpc_url,
             chain_id,
             signer,
             backfill_start_block,
@@ -898,26 +909,52 @@ impl Env {
     fn chain_configs(
         &self,
     ) -> Result<(ChainConfig, Vec<ChainConfig>), ConfigError> {
+        // Empty counts as unset: a templated `ALCHEMY_API_KEY=${...}` with
+        // nothing behind it must not fail a deployment whose URLs are all
+        // explicit.
+        let alchemy = self
+            .alchemy_api_key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .map(AlchemyApiKey::new)
+            .transpose()?;
+        let alchemy = alchemy.as_ref();
+        // Empty counts as unset here too: rollout removes RPC_URL, and a
+        // templated `RPC_URL=${...}` left behind must not stop the service.
+        let legacy_rpc_url = self
+            .rpc_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+            .map(Url::parse)
+            .transpose()
+            .map_err(|source| ConfigError::InvalidConfiguredRpcUrl {
+                network: Network::Base,
+                source,
+            })?;
+
         let base = if let Some(base) = Self::optional_chain_config(
             Network::Base,
             &ChainGroupEnv {
                 rpc_url: self.chain_base_rpc_url.as_ref(),
+                legacy_rpc_url: legacy_rpc_url.as_ref(),
+                alchemy,
                 chain_id: self.chain_base_chain_id,
                 backfill_start_block: self.chain_base_backfill_start_block,
                 low_gas_threshold: self.chain_base_low_gas_threshold.as_deref(),
             },
         )? {
-            // Both forms set is a legitimate state — the legacy flat vars
+            // Both URLs set is a legitimate state — the legacy flat vars
             // stay in the environment for operator tooling — but the service
             // itself must not silently split-brain between them, so the
             // precedence is stated once, loudly.
-            if self.rpc_url.is_some() {
+            if legacy_rpc_url.is_some() && self.chain_base_rpc_url.is_some() {
                 warn!(
                     target: "config",
-                    rpc_url = %base.rpc_url,
+                    rpc_scheme = base.rpc.url().scheme(),
+                    rpc_host = base.rpc.url().host_str().unwrap_or("(none)"),
                     chain_id = base.chain_id,
-                    "Both legacy (RPC_URL) and grouped (CHAIN_BASE_*) Base \
-                     configuration are set; the grouped form takes precedence \
+                    "Both legacy (RPC_URL) and grouped (CHAIN_BASE_RPC_URL) \
+                     Base RPC URLs are set; the grouped form takes precedence \
                      for the service"
                 );
             }
@@ -937,18 +974,15 @@ impl Env {
             }
             base
         } else {
-            // Clap's `required_unless_present = "chain_base_rpc_url"` on the
-            // legacy pair makes these `ok_or`s unreachable from a parsed
-            // `Env`; they stay as a defensive guard so a future edit to those
-            // clap attributes degrades to a startup error instead of a panic.
-            let rpc_url = self
-                .rpc_url
-                .clone()
+            // The flat form stays explicit: it is how local development
+            // points Base at Anvil, where a derived mainnet URL would be
+            // wrong. Without the grouped CHAIN_BASE_* ids it needs RPC_URL.
+            let rpc_url = legacy_rpc_url
                 .ok_or(ConfigError::MissingBaseChainConfiguration)?;
             ChainConfig {
                 network: Network::Base,
                 chain_id: self.chain_id,
-                rpc_url,
+                rpc: rpc_url.into(),
                 backfill_start_block: self.backfill_start_block,
                 low_gas_threshold: parse_low_gas_threshold(
                     Network::Base,
@@ -960,6 +994,8 @@ impl Env {
             Network::Ethereum,
             &ChainGroupEnv {
                 rpc_url: self.chain_ethereum_rpc_url.as_ref(),
+                legacy_rpc_url: None,
+                alchemy,
                 chain_id: self.chain_ethereum_chain_id,
                 backfill_start_block: self.chain_ethereum_backfill_start_block,
                 low_gas_threshold: self
@@ -971,6 +1007,8 @@ impl Env {
             Network::HyperEvm,
             &ChainGroupEnv {
                 rpc_url: self.chain_hyperevm_rpc_url.as_ref(),
+                legacy_rpc_url: None,
+                alchemy,
                 chain_id: self.chain_hyperevm_chain_id,
                 backfill_start_block: self.chain_hyperevm_backfill_start_block,
                 low_gas_threshold: self
@@ -982,6 +1020,8 @@ impl Env {
             Network::Robinhood,
             &ChainGroupEnv {
                 rpc_url: self.chain_robinhood_rpc_url.as_ref(),
+                legacy_rpc_url: None,
+                alchemy,
                 chain_id: self.chain_robinhood_chain_id,
                 backfill_start_block: self.chain_robinhood_backfill_start_block,
                 low_gas_threshold: self
@@ -993,6 +1033,8 @@ impl Env {
             Network::BnbSmartChain,
             &ChainGroupEnv {
                 rpc_url: self.chain_binance_rpc_url.as_ref(),
+                legacy_rpc_url: None,
+                alchemy,
                 chain_id: self.chain_binance_chain_id,
                 backfill_start_block: self.chain_binance_backfill_start_block,
                 low_gas_threshold: self
@@ -1015,25 +1057,27 @@ impl Env {
     ) -> Result<Option<ChainConfig>, ConfigError> {
         let &ChainGroupEnv {
             rpc_url,
+            legacy_rpc_url,
+            alchemy,
             chain_id,
             backfill_start_block,
             low_gas_threshold,
         } = group;
 
-        match (rpc_url, chain_id, backfill_start_block) {
-            (None, None, None) => {
-                // Clap's `requires` ties each threshold to its group's RPC
-                // URL, so this is a defensive guard like the legacy-Base
-                // `ok_or` above: a future clap edit degrades to a startup
-                // error instead of a silently dropped threshold.
-                if low_gas_threshold.is_some() {
+        match (chain_id, backfill_start_block) {
+            (None, None) => {
+                // Clap's `requires` ties the group's URL and threshold to its
+                // chain id, so this is a defensive guard like the legacy-Base
+                // `ok_or` in `chain_configs`: a future clap edit degrades to a
+                // startup error instead of a silently dropped setting.
+                if rpc_url.is_some() || low_gas_threshold.is_some() {
                     return Err(ConfigError::ParseError(clap::Error::new(
                         clap::error::ErrorKind::MissingRequiredArgument,
                     )));
                 }
                 Ok(None)
             }
-            (Some(rpc_url), Some(chain_id), Some(backfill_start_block)) => {
+            (Some(chain_id), Some(backfill_start_block)) => {
                 // A network label bound to a chain it does not name is not a
                 // recoverable misconfiguration: the receipt inventory is keyed
                 // `{chain_id}:{vault}`, so starting `Network::Base` on a
@@ -1057,7 +1101,12 @@ impl Env {
                 Ok(Some(ChainConfig {
                     network,
                     chain_id,
-                    rpc_url: rpc_url.clone(),
+                    rpc: resolve_rpc_endpoint(
+                        network,
+                        rpc_url.cloned(),
+                        legacy_rpc_url.cloned(),
+                        alchemy,
+                    )?,
                     backfill_start_block,
                     low_gas_threshold: parse_low_gas_threshold(
                         network,
@@ -1079,6 +1128,10 @@ impl Env {
 /// compile silently and produce a runtime with the wrong start block.
 struct ChainGroupEnv<'env> {
     rpc_url: Option<&'env Url>,
+    /// The legacy flat `RPC_URL`, ranked after the group's own URL. `None`
+    /// for every network but Base.
+    legacy_rpc_url: Option<&'env Url>,
+    alchemy: Option<&'env AlchemyApiKey>,
     chain_id: Option<u64>,
     backfill_start_block: Option<u64>,
     low_gas_threshold: Option<&'env str>,
@@ -1260,8 +1313,15 @@ pub enum ConfigError {
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
-    #[error("Base chain configuration is required")]
+    #[error(
+        "Base chain configuration is required: set CHAIN_BASE_CHAIN_ID and \
+         CHAIN_BASE_BACKFILL_START_BLOCK (the URL comes from \
+         CHAIN_BASE_RPC_URL, RPC_URL or ALCHEMY_API_KEY), or the legacy flat \
+         RPC_URL"
+    )]
     MissingBaseChainConfiguration,
+    #[error(transparent)]
+    InvalidAlchemyApiKey(#[from] InvalidAlchemyApiKey),
     #[error(
         "CHAIN_{}_CHAIN_ID is {configured} but {network} is chain {expected}; \
          a network bound to the wrong chain would re-key the receipt inventory",
@@ -1632,50 +1692,76 @@ pub(crate) fn wss_to_http(url: &Url) -> Result<Url, InvalidRpcScheme> {
     Ok(http_url)
 }
 
-/// Resolves the service RPC URL for `network` from process environment
+/// Picks one network's RPC endpoint, the same way for the service and the
+/// operator CLIs: the group's own `CHAIN_<NETWORK>_RPC_URL`, then (Base only)
+/// the legacy flat `RPC_URL`, then the endpoint `ALCHEMY_API_KEY` derives.
+fn resolve_rpc_endpoint(
+    network: Network,
+    explicit: Option<Url>,
+    legacy_base: Option<Url>,
+    alchemy: Option<&AlchemyApiKey>,
+) -> Result<RpcEndpoint, ConfigError> {
+    let legacy_base = legacy_base.filter(|_| network == Network::Base);
+
+    if let Some(url) = explicit.or(legacy_base) {
+        return Ok(url.into());
+    }
+
+    alchemy.and_then(|key| key.endpoint(network)).ok_or(
+        ConfigError::NetworkRpcNotConfigured {
+            network,
+            hint: rpc_settings_hint(network),
+        },
+    )
+}
+
+/// The variables that would give `network` an RPC endpoint.
+const fn rpc_settings_hint(network: Network) -> &'static str {
+    match network {
+        Network::Base => "CHAIN_BASE_RPC_URL, RPC_URL or ALCHEMY_API_KEY",
+        Network::Ethereum => "CHAIN_ETHEREUM_RPC_URL or ALCHEMY_API_KEY",
+        Network::HyperEvm => "CHAIN_HYPEREVM_RPC_URL or ALCHEMY_API_KEY",
+        Network::Robinhood => "CHAIN_ROBINHOOD_RPC_URL or ALCHEMY_API_KEY",
+        Network::BnbSmartChain => "CHAIN_BINANCE_RPC_URL",
+    }
+}
+
+/// Resolves the service RPC endpoint for `network` from process environment
 /// (deployment secrets / `.env` — the same variables the long-running bot
-/// loads). Operator CLIs call this instead of taking `--rpc-url`.
+/// loads). Operator CLIs call this instead of requiring `--rpc-url`.
 ///
-/// Precedence matches service config: for Base, `CHAIN_BASE_RPC_URL` wins over
-/// legacy `RPC_URL`; other networks use only their `CHAIN_<NETWORK>_RPC_URL`.
-pub(crate) fn configured_rpc_url(network: Network) -> Result<Url, ConfigError> {
-    resolve_configured_rpc_url(network, |name| {
+/// Precedence matches service config; see [`resolve_rpc_endpoint`].
+pub(crate) fn configured_rpc_endpoint(
+    network: Network,
+) -> Result<RpcEndpoint, ConfigError> {
+    resolve_configured_rpc_endpoint(network, |name| {
         std::env::var(name).ok().filter(|value| !value.is_empty())
     })
 }
 
-fn resolve_configured_rpc_url(
+fn resolve_configured_rpc_endpoint(
     network: Network,
     env_get: impl Fn(&str) -> Option<String>,
-) -> Result<Url, ConfigError> {
-    let (primary, fallback, hint) = match network {
-        Network::Base => (
-            "CHAIN_BASE_RPC_URL",
-            Some("RPC_URL"),
-            "CHAIN_BASE_RPC_URL or RPC_URL",
-        ),
-        Network::Ethereum => {
-            ("CHAIN_ETHEREUM_RPC_URL", None, "CHAIN_ETHEREUM_RPC_URL")
-        }
-        Network::HyperEvm => {
-            ("CHAIN_HYPEREVM_RPC_URL", None, "CHAIN_HYPEREVM_RPC_URL")
-        }
-        Network::Robinhood => {
-            ("CHAIN_ROBINHOOD_RPC_URL", None, "CHAIN_ROBINHOOD_RPC_URL")
-        }
-        Network::BnbSmartChain => {
-            ("CHAIN_BINANCE_RPC_URL", None, "CHAIN_BINANCE_RPC_URL")
-        }
+) -> Result<RpcEndpoint, ConfigError> {
+    let parse = |name: &str| {
+        env_get(name).map(|raw| Url::parse(&raw)).transpose().map_err(
+            |source| ConfigError::InvalidConfiguredRpcUrl { network, source },
+        )
     };
 
-    let raw = env_get(primary)
-        .or_else(|| fallback.and_then(&env_get))
-        .ok_or(ConfigError::NetworkRpcNotConfigured { network, hint })?;
+    let explicit =
+        parse(&format!("CHAIN_{}_RPC_URL", network.as_str().to_uppercase()))?;
+    let legacy_base = if explicit.is_none() && network == Network::Base {
+        parse("RPC_URL")?
+    } else {
+        None
+    };
+    let alchemy = env_get("ALCHEMY_API_KEY")
+        .filter(|key| !key.is_empty())
+        .map(AlchemyApiKey::new)
+        .transpose()?;
 
-    Url::parse(&raw).map_err(|source| ConfigError::InvalidConfiguredRpcUrl {
-        network,
-        source,
-    })
+    resolve_rpc_endpoint(network, explicit, legacy_base, alchemy.as_ref())
 }
 
 /// Domain target categories used in `target:` on all tracing macros.
@@ -1928,7 +2014,11 @@ mod tests {
         let chain = &config.chains[0];
         assert_eq!(chain.network, Network::Base);
         assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
-        assert_eq!(chain.rpc_url, config.rpc_url);
+        assert_eq!(
+            chain.rpc.url(),
+            &Url::parse("wss://localhost:8545").unwrap()
+        );
+        assert!(!chain.rpc.uses_bearer_auth());
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
     }
 
@@ -1986,7 +2076,7 @@ mod tests {
         let base = &config.chains[0];
         assert_eq!(base.network, Network::Base);
         assert_eq!(base.chain_id, 8453);
-        assert_eq!(base.rpc_url, Url::parse("wss://base.example").unwrap());
+        assert_eq!(base.rpc.url(), &Url::parse("wss://base.example").unwrap());
         assert_eq!(base.backfill_start_block, 42_000_000);
     }
 
@@ -2012,8 +2102,8 @@ mod tests {
         assert_eq!(config.chains.len(), 1);
         let base = &config.chains[0];
         assert_eq!(
-            base.rpc_url,
-            Url::parse("wss://base-grouped.example").unwrap(),
+            base.rpc.url(),
+            &Url::parse("wss://base-grouped.example").unwrap(),
             "the grouped RPC endpoint must win over the legacy RPC_URL"
         );
         assert_eq!(base.chain_id, 8453);
@@ -2033,6 +2123,8 @@ mod tests {
             Network::Ethereum,
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
+                legacy_rpc_url: None,
+                alchemy: None,
                 chain_id: Some(8453),
                 backfill_start_block: Some(22_000_000),
                 low_gas_threshold: None,
@@ -2073,8 +2165,8 @@ mod tests {
         assert_eq!(ethereum.network, Network::Ethereum);
         assert_eq!(ethereum.chain_id, 1);
         assert_eq!(
-            ethereum.rpc_url,
-            Url::parse("wss://ethereum.example").unwrap()
+            ethereum.rpc.url(),
+            &Url::parse("wss://ethereum.example").unwrap()
         );
         assert_eq!(ethereum.backfill_start_block, 22_000_000);
     }
@@ -2099,8 +2191,8 @@ mod tests {
         assert_eq!(hyperevm.network, Network::HyperEvm);
         assert_eq!(hyperevm.chain_id, 999);
         assert_eq!(
-            hyperevm.rpc_url,
-            Url::parse("wss://hyperevm.example").unwrap()
+            hyperevm.rpc.url(),
+            &Url::parse("wss://hyperevm.example").unwrap()
         );
         assert_eq!(hyperevm.backfill_start_block, 9_000_000);
     }
@@ -2177,6 +2269,8 @@ mod tests {
             Network::Ethereum,
             &ChainGroupEnv {
                 rpc_url: None,
+                legacy_rpc_url: None,
+                alchemy: None,
                 chain_id: None,
                 backfill_start_block: None,
                 low_gas_threshold: Some("0.05"),
@@ -2266,6 +2360,8 @@ mod tests {
             Network::HyperEvm,
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
+                legacy_rpc_url: None,
+                alchemy: None,
                 chain_id: Some(998),
                 backfill_start_block: Some(9_000_000),
                 low_gas_threshold: None,
@@ -2487,8 +2583,12 @@ mod tests {
             _ => None,
         };
 
-        let url = resolve_configured_rpc_url(Network::Base, lookup).unwrap();
-        assert_eq!(url, Url::parse("wss://base-grouped.example").unwrap());
+        let rpc =
+            resolve_configured_rpc_endpoint(Network::Base, lookup).unwrap();
+        assert_eq!(
+            rpc.url(),
+            &Url::parse("wss://base-grouped.example").unwrap()
+        );
     }
 
     #[test]
@@ -2498,8 +2598,9 @@ mod tests {
             _ => None,
         };
 
-        let url = resolve_configured_rpc_url(Network::Base, lookup).unwrap();
-        assert_eq!(url, Url::parse("wss://legacy.example").unwrap());
+        let rpc =
+            resolve_configured_rpc_endpoint(Network::Base, lookup).unwrap();
+        assert_eq!(rpc.url(), &Url::parse("wss://legacy.example").unwrap());
     }
 
     #[test]
@@ -2509,8 +2610,8 @@ mod tests {
             _ => None,
         };
 
-        let err =
-            resolve_configured_rpc_url(Network::Ethereum, lookup).unwrap_err();
+        let err = resolve_configured_rpc_endpoint(Network::Ethereum, lookup)
+            .unwrap_err();
         assert!(matches!(
             err,
             ConfigError::NetworkRpcNotConfigured {
@@ -2528,11 +2629,301 @@ mod tests {
         };
 
         let err =
-            resolve_configured_rpc_url(Network::Base, lookup).unwrap_err();
+            resolve_configured_rpc_endpoint(Network::Base, lookup).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::InvalidConfiguredRpcUrl { network: Network::Base, .. }
         ));
+    }
+
+    const ALCHEMY_KEY: &str = "alchemyTestKey_123";
+
+    fn alchemy_key() -> AlchemyApiKey {
+        AlchemyApiKey::new(ALCHEMY_KEY.to_string()).unwrap()
+    }
+
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn rpc_endpoint_derives_from_the_key_when_no_url_is_set() {
+        for (network, host) in [
+            (Network::Base, "base-mainnet.g.alchemy.com"),
+            (Network::Ethereum, "eth-mainnet.g.alchemy.com"),
+            (Network::HyperEvm, "hyperliquid-mainnet.g.alchemy.com"),
+            (Network::Robinhood, "robinhood-mainnet.g.alchemy.com"),
+        ] {
+            let rpc =
+                resolve_rpc_endpoint(network, None, None, Some(&alchemy_key()))
+                    .unwrap();
+
+            assert_eq!(rpc.url(), &url(&format!("https://{host}/v2")));
+            assert!(rpc.uses_bearer_auth(), "{network}");
+        }
+    }
+
+    #[test]
+    fn explicit_rpc_url_wins_over_the_key() {
+        for network in [
+            Network::Base,
+            Network::Ethereum,
+            Network::HyperEvm,
+            Network::Robinhood,
+        ] {
+            let rpc = resolve_rpc_endpoint(
+                network,
+                Some(url("wss://explicit.example")),
+                None,
+                Some(&alchemy_key()),
+            )
+            .unwrap();
+
+            assert_eq!(rpc.url(), &url("wss://explicit.example"));
+            assert!(!rpc.uses_bearer_auth(), "{network}");
+        }
+    }
+
+    #[test]
+    fn base_rpc_precedence_is_grouped_then_legacy_then_key() {
+        let key = alchemy_key();
+        let resolve = |explicit: Option<&str>, legacy: Option<&str>| {
+            resolve_rpc_endpoint(
+                Network::Base,
+                explicit.map(url),
+                legacy.map(url),
+                Some(&key),
+            )
+            .unwrap()
+        };
+
+        let grouped = resolve(
+            Some("wss://grouped.example"),
+            Some("wss://legacy.example"),
+        );
+        assert_eq!(grouped.url(), &url("wss://grouped.example"));
+
+        let legacy = resolve(None, Some("wss://legacy.example"));
+        assert_eq!(legacy.url(), &url("wss://legacy.example"));
+        assert!(!legacy.uses_bearer_auth());
+
+        let derived = resolve(None, None);
+        assert_eq!(
+            derived.url(),
+            &url("https://base-mainnet.g.alchemy.com/v2")
+        );
+    }
+
+    #[test]
+    fn legacy_rpc_url_never_reaches_another_network() {
+        let rpc = resolve_rpc_endpoint(
+            Network::Ethereum,
+            None,
+            Some(url("wss://legacy.example")),
+            Some(&alchemy_key()),
+        )
+        .unwrap();
+
+        assert_eq!(rpc.url(), &url("https://eth-mainnet.g.alchemy.com/v2"));
+    }
+
+    #[test]
+    fn bnb_smart_chain_needs_an_explicit_url_even_with_the_key() {
+        let error = resolve_rpc_endpoint(
+            Network::BnbSmartChain,
+            None,
+            None,
+            Some(&alchemy_key()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::NetworkRpcNotConfigured {
+                network: Network::BnbSmartChain,
+                hint: "CHAIN_BINANCE_RPC_URL",
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_url_and_key_names_every_way_to_configure_the_rpc() {
+        let error = resolve_rpc_endpoint(Network::Robinhood, None, None, None)
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("CHAIN_ROBINHOOD_RPC_URL"), "{message}");
+        assert!(message.contains("ALCHEMY_API_KEY"), "{message}");
+    }
+
+    #[test]
+    fn configured_rpc_endpoint_derives_from_the_key() {
+        let lookup = |name: &str| match name {
+            "ALCHEMY_API_KEY" => Some(ALCHEMY_KEY.into()),
+            _ => None,
+        };
+
+        let rpc = resolve_configured_rpc_endpoint(Network::Robinhood, lookup)
+            .unwrap();
+        assert_eq!(
+            rpc.url(),
+            &url("https://robinhood-mainnet.g.alchemy.com/v2")
+        );
+        assert!(rpc.uses_bearer_auth());
+    }
+
+    #[test]
+    fn configured_rpc_endpoint_treats_an_empty_key_as_unset() {
+        let lookup = |name: &str| match name {
+            "CHAIN_ETHEREUM_RPC_URL" => Some("wss://ethereum.example".into()),
+            "ALCHEMY_API_KEY" => Some(String::new()),
+            _ => None,
+        };
+
+        let rpc =
+            resolve_configured_rpc_endpoint(Network::Ethereum, lookup).unwrap();
+        assert_eq!(rpc.url(), &url("wss://ethereum.example"));
+    }
+
+    #[test]
+    fn configured_rpc_endpoint_rejects_a_malformed_key_without_echoing_it() {
+        let lookup = |name: &str| match name {
+            "ALCHEMY_API_KEY" => Some("leaked/key".into()),
+            _ => None,
+        };
+
+        let error = resolve_configured_rpc_endpoint(Network::Ethereum, lookup)
+            .unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidAlchemyApiKey(_)));
+        assert!(!error.to_string().contains("leaked"));
+    }
+
+    #[test]
+    fn grouped_ids_and_the_key_enable_a_chain_without_any_url() {
+        let mut args = minimal_args();
+        remove_argument(&mut args, "--rpc-url");
+        args.extend_from_slice(&[
+            "--alchemy-api-key",
+            ALCHEMY_KEY,
+            "--chain-base-chain-id",
+            "8453",
+            "--chain-base-backfill-start-block",
+            "42000000",
+            "--chain-ethereum-chain-id",
+            "1",
+            "--chain-ethereum-backfill-start-block",
+            "22000000",
+        ]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert_eq!(config.chains.len(), 2);
+        let base = &config.chains[0];
+        assert_eq!(base.network, Network::Base);
+        assert_eq!(
+            base.rpc.url(),
+            &url("https://base-mainnet.g.alchemy.com/v2")
+        );
+        assert!(base.rpc.uses_bearer_auth());
+        let ethereum = &config.chains[1];
+        assert_eq!(ethereum.network, Network::Ethereum);
+        assert_eq!(
+            ethereum.rpc.url(),
+            &url("https://eth-mainnet.g.alchemy.com/v2")
+        );
+        assert!(!format!("{:?}", config.chains).contains(ALCHEMY_KEY));
+    }
+
+    #[test]
+    fn an_empty_key_counts_as_unset() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--alchemy-api-key", ""]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert_eq!(config.chains.len(), 1);
+        assert!(!config.chains[0].rpc.uses_bearer_auth());
+    }
+
+    #[test]
+    fn a_malformed_key_fails_startup_without_echoing_it() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--alchemy-api-key", "leaked key"]);
+
+        let Err(error) = Env::try_parse_from(args).unwrap().into_config()
+        else {
+            panic!("a malformed ALCHEMY_API_KEY must fail startup");
+        };
+
+        assert!(matches!(error, ConfigError::InvalidAlchemyApiKey(_)));
+        assert!(!error.to_string().contains("leaked"));
+    }
+
+    #[test]
+    fn the_key_alone_does_not_configure_base() {
+        let mut args = minimal_args();
+        remove_argument(&mut args, "--rpc-url");
+        args.extend_from_slice(&["--alchemy-api-key", ALCHEMY_KEY]);
+
+        let Err(error) = Env::try_parse_from(args).unwrap().into_config()
+        else {
+            panic!("Base needs its CHAIN_BASE_* ids or the legacy RPC_URL");
+        };
+
+        assert!(matches!(error, ConfigError::MissingBaseChainConfiguration));
+        let message = error.to_string();
+        assert!(message.contains("CHAIN_BASE_CHAIN_ID"), "{message}");
+        assert!(message.contains("RPC_URL"), "{message}");
+    }
+
+    #[test]
+    fn chain_id_is_checked_before_the_rpc_is_resolved() {
+        let result = Env::optional_chain_config(
+            Network::Robinhood,
+            &ChainGroupEnv {
+                rpc_url: None,
+                legacy_rpc_url: None,
+                alchemy: None,
+                chain_id: Some(46630),
+                backfill_start_block: Some(1),
+                low_gas_threshold: None,
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::ChainIdNotForNetwork {
+                    network: Network::Robinhood,
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn both_base_urls_warning_logs_the_host_only() {
+        let mut args = minimal_args();
+        remove_argument(&mut args, "--rpc-url");
+        args.extend_from_slice(&[
+            "--rpc-url",
+            "wss://legacy.example/v2/SECRETLEGACY",
+            "--chain-base-rpc-url",
+            "wss://grouped.example/v2/SECRETGROUPED",
+            "--chain-base-chain-id",
+            "8453",
+            "--chain-base-backfill-start-block",
+            "42000000",
+        ]);
+
+        Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert!(logs_contain("Both legacy (RPC_URL) and grouped"));
+        assert!(logs_contain("grouped.example"));
+        assert!(!logs_contain("SECRET"));
     }
 
     #[tokio::test]

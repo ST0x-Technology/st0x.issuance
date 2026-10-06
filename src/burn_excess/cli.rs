@@ -8,14 +8,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 use std::io;
 use std::str::FromStr;
-use url::Url;
 
 use super::engine::{BurnExcessOutcome, BurnExcessRequest, run_burn_excess};
 use super::proof::BurnExcessMode;
 use crate::Quantity;
+use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, configured_rpc_url,
-    wss_to_http,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
+    configured_rpc_endpoint,
 };
 use crate::mint::IssuerMintRequestId;
 use crate::tokenized_asset::Network;
@@ -63,9 +63,10 @@ pub(crate) struct BurnExcessSharedArgs {
     incident_id: Option<String>,
 
     /// Network of the vault listing (cross-checked with mint + chain-id).
-    /// RPC is taken from the service environment for this network
-    /// (`CHAIN_<NETWORK>_RPC_URL`, or legacy `RPC_URL` for Base) — same
-    /// secrets as the long-running bot; not a CLI flag.
+    /// RPC is taken from the service environment for this network, in the
+    /// service's order: `CHAIN_<NETWORK>_RPC_URL`, then legacy `RPC_URL` for
+    /// Base, then the endpoint derived from `ALCHEMY_API_KEY` — same secrets
+    /// as the long-running bot; not a CLI flag.
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
@@ -161,13 +162,13 @@ pub(crate) async fn run_burn_excess_cli(
     // The offline CLI has no service config to consult: it resolves the RPC
     // from the environment and proves the chain id against it, since nothing
     // verified that endpoint at startup.
-    let rpc_url = configured_rpc_url(shared.network)?;
-    let chain_id = verified_chain_id(&rpc_url, shared.chain_id).await?;
+    let rpc = configured_rpc_endpoint(shared.network)?;
+    let chain_id = verified_chain_id(&rpc, shared.chain_id).await?;
 
     let outcome = run_burn_excess_request(
         &pool,
         &signer_config,
-        rpc_url,
+        &rpc,
         chain_id,
         request,
         confirm,
@@ -177,15 +178,15 @@ pub(crate) async fn run_burn_excess_cli(
     Ok(())
 }
 
-/// Builds the signing and read providers for `rpc_url` from the signer, then
+/// Builds the signing and read providers for `rpc` from the signer, then
 /// runs the dual-path orchestration. The offline CLI has no running service to
-/// borrow a vault service from, so it builds its own here, with `rpc_url` and
+/// borrow a vault service from, so it builds its own here, with `rpc` and
 /// the verified `chain_id` resolved by the caller; the breakglass HTTP routes
 /// sign through the service's shared vault service instead.
 async fn run_burn_excess_request(
     pool: &Pool<Sqlite>,
     signer_config: &SignerConfig,
-    rpc_url: Url,
+    rpc: &RpcEndpoint,
     chain_id: u64,
     request: BurnExcessRequest,
     confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
@@ -199,7 +200,6 @@ async fn run_burn_excess_request(
         }
     };
 
-    let http_url = wss_to_http(&rpc_url)?;
     let nonce_manager = ResyncNonceManager::default();
     let signing_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
@@ -208,12 +208,12 @@ async fn run_burn_excess_request(
         .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_http(http_url.clone());
+        .connect_client(rpc_client(rpc)?);
 
     let vault_service =
         RealBlockchainService::new(signing_provider, nonce_manager);
 
-    let read_provider = ProviderBuilder::new().connect_http(http_url);
+    let read_provider = ProviderBuilder::new().connect_client(rpc_client(rpc)?);
 
     run_burn_excess(
         pool,
@@ -265,12 +265,11 @@ async fn connect_pool(
 }
 
 async fn verified_chain_id(
-    rpc_url: &Url,
+    rpc: &RpcEndpoint,
     expected_chain_id: u64,
 ) -> anyhow::Result<u64> {
     let chain_id = ProviderBuilder::new()
-        .connect(rpc_url.as_str())
-        .await?
+        .connect_client(rpc_client(rpc)?)
         .get_chain_id()
         .await?;
 

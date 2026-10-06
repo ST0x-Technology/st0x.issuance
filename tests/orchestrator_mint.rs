@@ -8,6 +8,10 @@
 //! drive the full HTTP service through the public API, with the orchestrator
 //! deployed on Anvil and only Alpaca mocked.
 
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![allow(clippy::disallowed_methods)]
+
 mod harness;
 
 use alloy::network::EthereumWallet;
