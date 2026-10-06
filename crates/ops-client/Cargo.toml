@@ -1,0 +1,33 @@
+[package]
+name = "st0x-issuance-ops"
+version = "0.1.0"
+edition = "2024"
+
+# The binary shares its name with the unrelated `st0x-issuance-client` library
+# (the liquidity bot's X-API-KEY client), so its docs are disabled: both crates
+# would otherwise render into the same `target/doc/st0x_issuance_client`.
+[[bin]]
+name = "st0x-issuance-client"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+alloy-primitives.workspace = true
+base64 = "0.23.1"
+chrono = "0.4.45"
+clap.workspace = true
+rand = "0.10.3"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.0"
+st0x-issuance-dto = { version = "0.1.0", path = "../dto" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

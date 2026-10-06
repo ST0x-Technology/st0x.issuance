@@ -174,7 +174,9 @@ st0x.issuance/
 │   └── auth/                # API key auth and IP whitelisting
 ├── tests/                   # End-to-end tests (Anvil + mocks)
 ├── crates/
-│   └── sqlite-es/           # SQLite event store implementation
+│   ├── dto/                 # Shared HTTP wire types (server, clients, dashboard)
+│   ├── client/              # Liquidity bot's X-API-KEY client for the service API
+│   └── ops-client/          # S01 operator client for the IAP-gated /ops API
 ├── migrations/              # Database migrations
 └── docs/                    # Developer documentation
 ```
@@ -202,6 +204,24 @@ endpoints.
   redemption
 - `GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}` -
   Poll request status
+
+## Operator Client
+
+`st0x-issuance-client` (`crates/ops-client`) is the S01 operator's typed client
+for the IAP-gated `/ops/{read,debug,capital}` routes. It replaces the offline
+`issuer` CLI and the shared-key `/admin` calls for those tiers, prints each
+response as one JSON line, and exits 0, 2 (setup), 77 (auth/access), or 1.
+
+```bash
+cargo run -p st0x-issuance-ops -- --env staging read stuck
+cargo run -p st0x-issuance-ops -- --env staging capital freeze AAPL
+cargo run -p st0x-issuance-ops -- --env staging debug --help
+```
+
+It reads `S01_ISSUANCE_{STAGING,PROD}_URL` plus either the S01 Desktop OAuth
+client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call opens a browser sign-in
+with your S01 Google account) or, in CI, a workload-identity ID token
+(`_ID_TOKEN`). See SPEC.md "Operator client" for the full contract.
 
 ## Mint Flow
 

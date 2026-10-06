@@ -121,7 +121,7 @@ tokio = { workspace = true, features = ["macros", "test-util"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 
 [workspace]
-members = ["crates/dto", "crates/client"]
+members = ["crates/dto", "crates/client", "crates/ops-client"]
 
 [workspace.dependencies]
 alloy-primitives = { version = "1.6.0", features = ["serde"] }
