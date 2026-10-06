@@ -77,6 +77,13 @@ enum MockBehavior {
         started: Arc<Notify>,
         release: Arc<Notify>,
     },
+    /// The orchestrator readiness gate waits for an explicit test release,
+    /// so a test can advance the redemption while that read is in flight.
+    #[cfg(test)]
+    ReadinessBlocked {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Burn confirmation waits for an explicit test release, then reports an
     /// uncertain pending result.
     #[cfg(test)]
@@ -512,6 +519,34 @@ impl MockVaultService {
         let MockBehavior::WalletLockBlocked { release, .. } = &self.behavior
         else {
             panic!("mock does not block wallet lock acquisition");
+        };
+        release.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_readiness_blocked() -> Self {
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::ReadinessBlocked {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_readiness_read(&self) {
+        let MockBehavior::ReadinessBlocked { started, .. } = &self.behavior
+        else {
+            panic!("mock does not block the readiness read");
+        };
+        started.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_readiness_read(&self) {
+        let MockBehavior::ReadinessBlocked { release, .. } = &self.behavior
+        else {
+            panic!("mock does not block the readiness read");
         };
         release.notify_one();
     }
@@ -1398,6 +1433,7 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::PrepareBurnBlocked { .. }
+            | MockBehavior::ReadinessBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
@@ -1585,6 +1621,7 @@ impl VaultService for MockVaultService {
             }
             #[cfg(test)]
             MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::ReadinessBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
@@ -1788,6 +1825,12 @@ impl VaultService for MockVaultService {
             self.orchestrator
                 .readiness_call_count
                 .fetch_add(1, Ordering::Relaxed);
+            if let MockBehavior::ReadinessBlocked { started, release } =
+                &self.behavior
+            {
+                started.notify_one();
+                release.notified().await;
+            }
             let readiness_opt = *self.orchestrator.readiness.lock().unwrap();
             if let Some(readiness) = readiness_opt {
                 return Ok(readiness);
@@ -1954,6 +1997,7 @@ impl VaultService for MockVaultService {
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::PrepareBurnBlocked { .. }
+            | MockBehavior::ReadinessBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
@@ -2147,6 +2191,7 @@ impl VaultService for MockVaultService {
             MockBehavior::SubmitFailure
             | MockBehavior::WalletLockBlocked { .. }
             | MockBehavior::PrepareBurnBlocked { .. }
+            | MockBehavior::ReadinessBlocked { .. }
             | MockBehavior::SubmitRevert
             | MockBehavior::PrepareTxFails
             | MockBehavior::InvalidPreparedMint => {
