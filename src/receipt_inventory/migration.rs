@@ -27,7 +27,7 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{PendingTransactionError, Provider};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
-use event_sorcery::StoreBuilder;
+use event_sorcery::{Store, StoreBuilder};
 use itertools::izip;
 use sqlx::{Pool, Sqlite};
 use std::fmt;
@@ -393,6 +393,28 @@ enum MigrationRefusal {
     RecipientChainMismatch { corroborated: u64, migration: u64 },
 
     #[error(
+        "{recipient} was corroborated as an {kind}, which this move does not \
+         go to: a wallet rotation (--to) moves receipts to the incoming \
+         signing wallet, an externally owned account, and the orchestrator \
+         cutover (--to-configured-orchestrator) moves them to the configured \
+         orchestrator contract"
+    )]
+    RecipientKindMismatch {
+        recipient: Address,
+        kind: RecipientKind,
+        custody_after_move: CustodyAfterMove,
+    },
+
+    #[error(
+        "custody of vault {vault} is recorded at the cutover destination \
+         {recipient}, which only a cutover by an earlier release records; the \
+         no-custody cutover and its rollback do not apply to this store. \
+         Escalate to engineering: after a rollback, confirm-custody must \
+         re-record the bot wallet before the service starts"
+    )]
+    CutoverCustodyAtDestination { vault: Address, recipient: Address },
+
+    #[error(
         "vault {vault} custody has never been confirmed; confirm the outgoing \
          holder before migrating"
     )]
@@ -746,6 +768,26 @@ pub enum MigrationOutcome {
     },
 }
 
+/// What a completed move does to the vault's recorded custody holder.
+///
+/// The two kinds of move differ in who owns the receipts afterwards, so they
+/// differ in whether the bot should keep tracking them (SPEC "Receipt
+/// custody").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyAfterMove {
+    /// A signing-wallet rotation: the receipts still belong to the bot, at a
+    /// new address. Custody follows them, so balances are read at the new
+    /// wallet and a zero at the outgoing one is not mistaken for a spent
+    /// receipt.
+    FollowsReceipts,
+    /// The orchestrator cutover: the receipts now belong to a contract the bot
+    /// cannot move them out of, and the contract picks which ones each burn
+    /// consumes. Custody stays at the bot wallet, which now holds nothing, so
+    /// the next reconciliation reads zero there and removes the moved receipts
+    /// from inventory — the truth, since the bot owns none of them.
+    StaysWithHolder,
+}
+
 /// Which kind of address a destination was proven to be.
 ///
 /// Deciding which corroboration it had to clear. Recorded on the witness so
@@ -869,6 +911,23 @@ impl CorroboratedRecipient {
     pub const fn kind(self) -> RecipientKind {
         self.kind
     }
+
+    /// Refuses a destination whose proven kind contradicts the move, so a
+    /// driver refuses before its confirmation prompt and the operator never
+    /// approves a move to a destination of the wrong kind.
+    /// [`migrate_vault_receipts`] checks again before anything moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a rotation targets a contract or the cutover
+    /// targets an externally owned account.
+    pub(crate) fn corroborate_move(
+        self,
+        custody_after_move: CustodyAfterMove,
+    ) -> anyhow::Result<()> {
+        corroborate_recipient_kind(self, custody_after_move)?;
+        Ok(())
+    }
 }
 
 /// The EOA corroboration: refused unless the chain has independent evidence
@@ -983,6 +1042,10 @@ impl std::fmt::Display for CorroboratedRecipient {
 /// reports [`MigrationOutcome::AlreadyMigrated`] rather than submitting a
 /// second transfer.
 ///
+/// `custody_after_move` states whether the recorded custody holder follows
+/// the receipts (a wallet rotation) or stays at the outgoing holder (the
+/// orchestrator cutover); see [`CustodyAfterMove`].
+///
 /// The error type is erased to `anyhow` at this boundary, matching the other
 /// public orchestration boundary; the typed [`MigrationRefusal`] hierarchy is
 /// preserved for every caller inside the crate.
@@ -998,24 +1061,61 @@ pub async fn migrate_vault_receipts<P: Provider + Clone + Send + Sync>(
     provider: P,
     identity: VaultIdentity<'_>,
     recipient: CorroboratedRecipient,
+    custody_after_move: CustodyAfterMove,
 ) -> anyhow::Result<MigrationOutcome> {
     prepare_custody_engine_state(pool).await?;
     identity.corroborate_provider(&provider).await?;
     identity.corroborate_listing(pool).await?;
     corroborate_recipient_chain(identity.chain_id, recipient.chain_id())?;
+    corroborate_recipient_kind(recipient, custody_after_move)?;
 
     let custody =
         OnchainReceiptCustody::resolve(provider, identity.vault).await?;
 
-    execute_migration(pool, &custody, identity, recipient).await
+    execute_migration(pool, &custody, identity, recipient, custody_after_move)
+        .await
 }
 
-/// Tracked receipts with balance for this vault, for the driver's
-/// confirmation prompt.
+/// Runs the engine's recorded-custody route checks before the driver's
+/// confirmation prompt, so the operator is not asked to approve a move the
+/// engine refuses for the vault's recorded custody (for example
+/// `CustodyUnobserved` or `CutoverCustodyAtDestination`).
+/// [`migrate_vault_receipts`] checks again before anything moves.
 ///
-/// Informational only: [`migrate_vault_receipts`]
-/// re-derives its own holdings under the quiescence gates before anything
-/// moves, so this count gates nothing.
+/// # Errors
+///
+/// Returns an error if the store cannot be opened, the inventory fails to
+/// load, or the recorded custody refuses the route.
+pub(crate) async fn corroborate_custody_route(
+    pool: &Pool<Sqlite>,
+    chain_id: u64,
+    vault: Address,
+    recipient: CorroboratedRecipient,
+    custody_after_move: CustodyAfterMove,
+) -> anyhow::Result<()> {
+    let store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+    let inventory = load_inventory(&store, chain_id, &vault).await?;
+
+    recorded_route_for_move(
+        &inventory,
+        vault,
+        recipient.holder(),
+        recipient.address(),
+        custody_after_move,
+    )?;
+
+    Ok(())
+}
+
+/// Every receipt inventory tracks for this vault, for the driver's
+/// confirmation prompt and its refusal of an empty inventory.
+///
+/// The count includes a receipt whose available balance a reservation holds
+/// at zero, so such a vault reaches the engine and gets its
+/// in-flight-burn refusal rather than "nothing to move".
+/// [`migrate_vault_receipts`] re-derives its own holdings under the
+/// quiescence gates before anything moves.
 ///
 /// # Errors
 ///
@@ -1196,6 +1296,29 @@ const fn corroborate_recipient_chain(
     Ok(())
 }
 
+/// A wallet rotation moves receipts to the incoming signing wallet, an
+/// externally owned account, and custody follows them there. The orchestrator
+/// cutover moves them to the orchestrator contract, and custody stays with the
+/// bot wallet. A destination of the other kind would record custody at an
+/// address the bot never signs from, or empty the inventory of receipts the
+/// bot still owns.
+const fn corroborate_recipient_kind(
+    recipient: CorroboratedRecipient,
+    custody_after_move: CustodyAfterMove,
+) -> Result<(), MigrationRefusal> {
+    match (custody_after_move, recipient.kind()) {
+        (CustodyAfterMove::FollowsReceipts, RecipientKind::ExternallyOwned)
+        | (CustodyAfterMove::StaysWithHolder, RecipientKind::Erc1155Receiver) => {
+            Ok(())
+        }
+        (_, kind) => Err(MigrationRefusal::RecipientKindMismatch {
+            recipient: recipient.address(),
+            kind,
+            custody_after_move,
+        }),
+    }
+}
+
 fn corroborate_recorded_custody_route(
     vault: Address,
     recorded: Option<Address>,
@@ -1226,6 +1349,54 @@ fn corroborate_recorded_custody_route(
             holder,
             recipient,
         }),
+    }
+}
+
+/// The recorded-custody route checks the engine and the driver's pre-prompt
+/// check share, so the two cannot drift apart.
+fn recorded_route_for_move(
+    inventory: &ReceiptInventory,
+    vault: Address,
+    holder: Address,
+    recipient: Address,
+    custody_after_move: CustodyAfterMove,
+) -> Result<RecordedCustodyRoute, MigrationRefusal> {
+    let route = corroborate_recorded_custody_route(
+        vault,
+        inventory.custody().holder(),
+        inventory.custody().moved_from(),
+        holder,
+        recipient,
+    )?;
+    corroborate_route_for_move(route, custody_after_move, vault, recipient)?;
+
+    Ok(route)
+}
+
+/// Only a cutover by an earlier release recorded custody at the orchestrator.
+/// A cutover that finds custody already recorded at its destination is
+/// looking at such a store, where the no-custody cutover and its rollback do
+/// not apply (SPEC "Receipt custody"), so it refuses instead of reporting the
+/// move as already done.
+const fn corroborate_route_for_move(
+    route: RecordedCustodyRoute,
+    custody_after_move: CustodyAfterMove,
+    vault: Address,
+    recipient: Address,
+) -> Result<(), MigrationRefusal> {
+    match (route, custody_after_move) {
+        (
+            RecordedCustodyRoute::AtRecipient,
+            CustodyAfterMove::StaysWithHolder,
+        ) => Err(MigrationRefusal::CutoverCustodyAtDestination {
+            vault,
+            recipient,
+        }),
+        (RecordedCustodyRoute::AtHolder, _)
+        | (
+            RecordedCustodyRoute::AtRecipient,
+            CustodyAfterMove::FollowsReceipts,
+        ) => Ok(()),
     }
 }
 
@@ -1260,6 +1431,7 @@ async fn execute_migration(
     custody: &(impl ReceiptCustody + Sync),
     identity: VaultIdentity<'_>,
     recipient: CorroboratedRecipient,
+    custody_after_move: CustodyAfterMove,
 ) -> anyhow::Result<MigrationOutcome> {
     let VaultIdentity { network: _, chain_id, vault, underlying } = identity;
     let holder = recipient.holder();
@@ -1269,12 +1441,12 @@ async fn execute_migration(
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
     let inventory = load_inventory(&store, chain_id, &vault).await?;
-    let route = corroborate_recorded_custody_route(
+    let route = recorded_route_for_move(
+        &inventory,
         vault,
-        inventory.custody().holder(),
-        inventory.custody().moved_from(),
         holder,
         recipient,
+        custody_after_move,
     )?;
     let tracked = quiescent_tracked_holdings(
         pool, &inventory, chain_id, vault, underlying,
@@ -1301,17 +1473,17 @@ async fn execute_migration(
                 "Receipt custody already migrated"
             );
 
-            // An already-completed move is still recorded idempotently so the
-            // custody history reflects the on-chain state observed here.
-            send_receipt_inventory_command(
+            // For a rotation, an already-completed move is still recorded
+            // idempotently so the custody history reflects the on-chain state
+            // observed here. The cutover records nothing either way.
+            record_custody_after_move(
                 &store,
                 chain_id,
-                &vault,
-                ReceiptInventoryCommand::RecordCustodyMigration {
-                    from: holder,
-                    to: recipient,
-                    tx_hash: None,
-                },
+                vault,
+                holder,
+                recipient,
+                None,
+                custody_after_move,
             )
             .await?;
 
@@ -1321,20 +1493,20 @@ async fn execute_migration(
             let outcome =
                 migrate_vault_custody(custody, &holdings, recipient).await?;
 
-            // Recorded only after the move is verified, so the inventory's
-            // custody history never claims a transfer that did not land. This
-            // is what a later reverse migration reads its destination from,
-            // instead of being handed an address.
+            // For a rotation, recorded only after the move is verified, so the
+            // inventory's custody history never claims a transfer that did not
+            // land. This is what a later reverse migration reads its
+            // destination from, instead of being handed an address. The
+            // cutover records nothing.
             if let MigrationOutcome::Migrated { transaction, .. } = &outcome {
-                send_receipt_inventory_command(
+                record_custody_after_move(
                     &store,
                     chain_id,
-                    &vault,
-                    ReceiptInventoryCommand::RecordCustodyMigration {
-                        from: holder,
-                        to: recipient,
-                        tx_hash: Some(*transaction),
-                    },
+                    vault,
+                    holder,
+                    recipient,
+                    Some(*transaction),
+                    custody_after_move,
                 )
                 .await?;
             }
@@ -1342,6 +1514,54 @@ async fn execute_migration(
             Ok(outcome)
         }
     }
+}
+
+/// Records what a verified move did to the vault's custody holder.
+///
+/// A wallet rotation records the migration: the receipts still belong to the
+/// bot, so balances must be read at the new wallet from now on. The
+/// orchestrator cutover records nothing: the receipts now belong to the
+/// orchestrator, so custody stays at the holder, which holds nothing, and the
+/// next reconciliation removes the moved receipts from inventory by reading
+/// zero there (SPEC "Receipt custody").
+async fn record_custody_after_move(
+    store: &Store<ReceiptInventory>,
+    chain_id: u64,
+    vault: Address,
+    holder: Address,
+    recipient: Address,
+    tx_hash: Option<B256>,
+    custody_after_move: CustodyAfterMove,
+) -> anyhow::Result<()> {
+    match custody_after_move {
+        CustodyAfterMove::FollowsReceipts => {
+            send_receipt_inventory_command(
+                store,
+                chain_id,
+                &vault,
+                ReceiptInventoryCommand::RecordCustodyMigration {
+                    from: holder,
+                    to: recipient,
+                    tx_hash,
+                },
+            )
+            .await?;
+        }
+        CustodyAfterMove::StaysWithHolder => {
+            info!(
+                target: "receipt_inventory",
+                chain_id,
+                %vault,
+                %holder,
+                %recipient,
+                "Receipts moved to a contract that now owns them; custody \
+                 stays recorded at the holder, and the next reconciliation \
+                 removes the moved receipts from inventory"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Confirms on-chain that `holder` holds exactly every tracked balance for
@@ -3718,6 +3938,92 @@ mod tests {
                 }
             ));
         }
+
+        #[test]
+        fn each_move_accepts_only_its_own_destination_kind() {
+            let destination = Address::repeat_byte(0x22);
+            let recipient_of_kind = |kind| CorroboratedRecipient {
+                chain_id: 8453,
+                holder: Address::repeat_byte(0x11),
+                recipient: destination,
+                kind,
+            };
+
+            for (custody_after_move, kind) in [
+                (
+                    CustodyAfterMove::FollowsReceipts,
+                    RecipientKind::Erc1155Receiver,
+                ),
+                (
+                    CustodyAfterMove::StaysWithHolder,
+                    RecipientKind::ExternallyOwned,
+                ),
+            ] {
+                let error = corroborate_recipient_kind(
+                    recipient_of_kind(kind),
+                    custody_after_move,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MigrationRefusal::RecipientKindMismatch {
+                            recipient,
+                            kind: refused_kind,
+                            custody_after_move: refused_move,
+                        } if recipient == destination
+                            && refused_kind == kind
+                            && refused_move == custody_after_move
+                    ),
+                    "{custody_after_move:?} must refuse an {kind}, got: \
+                     {error:?}"
+                );
+            }
+
+            for (custody_after_move, kind) in [
+                (
+                    CustodyAfterMove::FollowsReceipts,
+                    RecipientKind::ExternallyOwned,
+                ),
+                (
+                    CustodyAfterMove::StaysWithHolder,
+                    RecipientKind::Erc1155Receiver,
+                ),
+            ] {
+                corroborate_recipient_kind(
+                    recipient_of_kind(kind),
+                    custody_after_move,
+                )
+                .unwrap();
+            }
+        }
+
+        /// The driver's pre-prompt check refuses exactly what the engine
+        /// refuses, with the engine's own refusal.
+        #[test]
+        fn the_pre_prompt_check_refuses_what_the_engine_refuses() {
+            let recipient = CorroboratedRecipient {
+                chain_id: 8453,
+                holder: Address::repeat_byte(0x11),
+                recipient: Address::repeat_byte(0x22),
+                kind: RecipientKind::Erc1155Receiver,
+            };
+
+            let error = recipient
+                .corroborate_move(CustodyAfterMove::FollowsReceipts)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::RecipientKindMismatch { .. })
+                ),
+                "a rotation to a contract must be refused, got: {error:?}"
+            );
+
+            recipient
+                .corroborate_move(CustodyAfterMove::StaysWithHolder)
+                .unwrap();
+        }
     }
 
     mod vault_identity_corroboration {
@@ -4001,6 +4307,48 @@ mod tests {
         }
 
         #[test]
+        fn a_cutover_refuses_custody_recorded_at_its_destination() {
+            let route = corroborate_recorded_custody_route(
+                VAULT,
+                Some(INCOMING),
+                Some(OUTGOING),
+                OUTGOING,
+                INCOMING,
+            )
+            .unwrap();
+
+            let error = corroborate_route_for_move(
+                route,
+                CustodyAfterMove::StaysWithHolder,
+                VAULT,
+                INCOMING,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                MigrationRefusal::CutoverCustodyAtDestination {
+                    vault: VAULT,
+                    recipient: INCOMING,
+                }
+            ));
+
+            corroborate_route_for_move(
+                route,
+                CustodyAfterMove::FollowsReceipts,
+                VAULT,
+                INCOMING,
+            )
+            .unwrap();
+            corroborate_route_for_move(
+                RecordedCustodyRoute::AtHolder,
+                CustodyAfterMove::StaysWithHolder,
+                VAULT,
+                INCOMING,
+            )
+            .unwrap();
+        }
+
+        #[test]
         fn a_recorded_destination_allows_an_idempotent_rerun() {
             let route = corroborate_recorded_custody_route(
                 VAULT,
@@ -4183,6 +4531,93 @@ mod tests {
                 .holder()
         }
 
+        /// The driver's pre-prompt route check refuses exactly what the
+        /// engine refuses for the recorded custody, with the engine's own
+        /// refusal.
+        #[tokio::test]
+        async fn the_pre_prompt_route_check_refuses_what_the_engine_refuses() {
+            let pool = pool_with_migrations().await;
+            let store = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let chain_id = Network::Base.chain_id();
+            let vault = Address::repeat_byte(0x11);
+            let holder = Address::repeat_byte(0x22);
+            let orchestrator = Address::repeat_byte(0x33);
+            let cutover = CorroboratedRecipient {
+                chain_id,
+                holder,
+                recipient: orchestrator,
+                kind: RecipientKind::Erc1155Receiver,
+            };
+
+            let unobserved = corroborate_custody_route(
+                &pool,
+                chain_id,
+                vault,
+                cutover,
+                CustodyAfterMove::StaysWithHolder,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    unobserved.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::CustodyUnobserved { .. })
+                ),
+                "unobserved custody must be refused, got: {unobserved:?}"
+            );
+
+            send_receipt_inventory_command(
+                &store,
+                chain_id,
+                &vault,
+                ReceiptInventoryCommand::ConfirmCustody { holder },
+            )
+            .await
+            .unwrap();
+            corroborate_custody_route(
+                &pool,
+                chain_id,
+                vault,
+                cutover,
+                CustodyAfterMove::StaysWithHolder,
+            )
+            .await
+            .unwrap();
+
+            // The custody an earlier release's cutover recorded.
+            record_custody_after_move(
+                &store,
+                chain_id,
+                vault,
+                holder,
+                orchestrator,
+                None,
+                CustodyAfterMove::FollowsReceipts,
+            )
+            .await
+            .unwrap();
+            let earlier_cutover = corroborate_custody_route(
+                &pool,
+                chain_id,
+                vault,
+                cutover,
+                CustodyAfterMove::StaysWithHolder,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    earlier_cutover.downcast_ref::<MigrationRefusal>(),
+                    Some(MigrationRefusal::CutoverCustodyAtDestination { .. })
+                ),
+                "custody recorded at the cutover destination must be refused, \
+                 got: {earlier_cutover:?}"
+            );
+        }
+
         fn corroborated_identity<'a>(
             evm: &LocalEvm,
             underlying: &'a UnderlyingSymbol,
@@ -4198,6 +4633,69 @@ mod tests {
                 underlying,
             )
             .unwrap()
+        }
+
+        /// Only a wallet rotation records custody after a verified move. The
+        /// orchestrator cutover leaves custody where it was, because the
+        /// orchestrator owns the moved receipts, and says so at INFO. The
+        /// Anvil scenarios in `tests/receipt_custody.rs` prove the same end to
+        /// end, including the inventory drain and the rollback rediscovery.
+        #[traced_test]
+        #[tokio::test]
+        async fn only_a_rotation_records_custody_after_a_move() {
+            let pool = pool_with_migrations().await;
+            let store = StoreBuilder::<ReceiptInventory>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let chain_id = Network::Base.chain_id();
+            let vault = Address::repeat_byte(0x11);
+            let holder = Address::repeat_byte(0x22);
+            let recipient = Address::repeat_byte(0x33);
+
+            record_custody_after_move(
+                &store,
+                chain_id,
+                vault,
+                holder,
+                recipient,
+                None,
+                CustodyAfterMove::StaysWithHolder,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                recorded_holder(&pool, vault).await,
+                None,
+                "the cutover must not record the orchestrator as holder"
+            );
+            assert!(logs_contain_at!(
+                tracing::Level::INFO,
+                &[
+                    "custody stays recorded at the holder",
+                    &vault.to_string(),
+                    &recipient.to_string(),
+                ]
+            ));
+
+            record_custody_after_move(
+                &store,
+                chain_id,
+                vault,
+                holder,
+                recipient,
+                None,
+                CustodyAfterMove::FollowsReceipts,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                recorded_holder(&pool, vault).await,
+                Some(recipient),
+                "a rotation must record the new wallet as holder"
+            );
         }
 
         /// The bootstrap only records a holder whose on-chain balances match

@@ -688,9 +688,10 @@ impl Custody {
     /// True when a recorded migration moved custody away from `wallet`:
     /// another holder is on record, and the recorded origin is `wallet`.
     ///
-    /// This is the expected state after a deliberate custody move (receipts
-    /// sitting in the orchestrator during the cutover, until RAI-1223
-    /// retires the subsystem), not displacement — balance readers skip such
+    /// This is the expected state after a deliberate custody move (a wallet
+    /// rotation whose receipts sit at the new wallet while the service still
+    /// signs with `wallet`; the orchestrator cutover records no migration),
+    /// not displacement — balance readers skip such
     /// a vault instead of taking readings against `wallet` that can only be
     /// refused as `CustodyDisplaced`. A holder mismatch with no recorded
     /// migration from `wallet` stays displacement and fails loudly.

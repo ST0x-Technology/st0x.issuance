@@ -30,8 +30,9 @@ use crate::config::{
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
-    CorroboratedRecipient, MigrationOutcome, VaultIdentity,
-    confirm_custody_holder, migrate_vault_receipts, tracked_receipt_count,
+    CorroboratedRecipient, CustodyAfterMove, MigrationOutcome, VaultIdentity,
+    confirm_custody_holder, corroborate_custody_route, migrate_vault_receipts,
+    tracked_receipt_count,
 };
 use crate::redemption::IssuerRedemptionRequestId;
 use crate::redemption::force_complete::{
@@ -150,16 +151,17 @@ enum IssuerCommand {
     MoveReceipts(Box<MoveReceiptsArgs>),
     /// Verifies on-chain that the Turnkey bot wallet holds exactly every
     /// tracked receipt balance for the asset's vault, then records it as
-    /// the inventory's custody holder. The rollback counterpart of
-    /// move-receipts: after an EMERGENCY_ROLE withdrawReceipt returns a
-    /// token's receipts to the bot wallet, recorded custody still names the
-    /// old destination and reconciliation stays skipped until this
-    /// re-confirmation. The holder is always the Turnkey wallet — never
-    /// typed — and cannot be recorded wrongly: a wallet that does not hold
-    /// every tracked balance is refused with the first mismatch. Requires
-    /// the deployment hold armed and the service stopped
-    /// (docs/runbooks/deploy-hold.md); signs nothing and submits nothing
-    /// on-chain.
+    /// the inventory's custody holder. The wallet-rotation counterpart of
+    /// move-receipts: after receipts return to the bot wallet from a rotated
+    /// wallet, recorded custody still names that wallet and reconciliation
+    /// stays skipped until this re-confirmation. It also records a holder
+    /// for a vault whose custody was never observed. An orchestrator cutover
+    /// records no custody, so its rollback does not need this command. The
+    /// holder is always the Turnkey wallet — never typed — and cannot be
+    /// recorded wrongly: a wallet that does not hold every tracked balance
+    /// is refused with the first mismatch. Requires the deployment hold
+    /// armed and the service stopped (docs/runbooks/deploy-hold.md); signs
+    /// nothing and submits nothing on-chain.
     ConfirmCustody(Box<ConfirmCustodyArgs>),
 }
 
@@ -994,42 +996,7 @@ async fn run_move_receipts(
     }
     let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
-    let configured_orchestrator = load_config_file(&args.config)?
-        .vault_modes
-        .orchestrator_address_for(args.network);
-    let destination = match (
-        args.destination.to,
-        args.destination.to_configured_orchestrator,
-    ) {
-        (None, true) => configured_orchestrator.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} has no [orchestrator.addresses] entry for '{}' to move \
-                 receipts to; add it, or state a wallet destination with \
-                 --to",
-                args.config.display(),
-                args.network
-            )
-        })?,
-        (Some(stated), false) => {
-            if configured_orchestrator == Some(stated) {
-                anyhow::bail!(
-                    "--to {stated} is the configured orchestrator address \
-                     for '{}'; use --to-configured-orchestrator so the \
-                     cutover destination is read from {}, never typed",
-                    args.network,
-                    args.config.display()
-                );
-            }
-            stated
-        }
-        // Unreachable through clap (the destination group is required and
-        // mutually exclusive), but a refusal keeps this total without a
-        // panic path.
-        _ => anyhow::bail!(
-            "state exactly one destination: --to <ADDRESS> or \
-             --to-configured-orchestrator"
-        ),
-    };
+    let (destination, custody_after_move) = resolve_move_destination(&args)?;
 
     let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
     else {
@@ -1062,6 +1029,7 @@ async fn run_move_receipts(
 
     let recipient =
         CorroboratedRecipient::verify(&provider, bot, destination).await?;
+    recipient.corroborate_move(custody_after_move)?;
     let identity = VaultIdentity::verify(
         &admin.pool,
         &provider,
@@ -1072,6 +1040,15 @@ async fn run_move_receipts(
     )
     .await?;
     let receipts = tracked_receipt_count(&admin.pool, chain_id, vault).await?;
+    refuse_empty_inventory(receipts, vault, chain_id, custody_after_move)?;
+    corroborate_custody_route(
+        &admin.pool,
+        chain_id,
+        vault,
+        recipient,
+        custody_after_move,
+    )
+    .await?;
 
     if !confirm(&format!(
         "Move {receipts} tracked receipt(s) of {} vault {vault} from Turnkey \
@@ -1082,8 +1059,14 @@ async fn run_move_receipts(
         anyhow::bail!("aborted by operator");
     }
 
-    match migrate_vault_receipts(&admin.pool, provider, identity, recipient)
-        .await?
+    match migrate_vault_receipts(
+        &admin.pool,
+        provider,
+        identity,
+        recipient,
+        custody_after_move,
+    )
+    .await?
     {
         MigrationOutcome::Migrated { transaction, receipts } => println!(
             "Moved {receipts} receipt(s) of {} vault {vault} to \
@@ -1097,7 +1080,93 @@ async fn run_move_receipts(
         ),
     }
 
+    if custody_after_move == CustodyAfterMove::StaysWithHolder {
+        println!(
+            "Custody stays recorded at Turnkey wallet {bot}. The moved \
+             receipts leave inventory on the next service start, when \
+             reconciliation reads zero for them at {bot}."
+        );
+    }
+
     Ok(())
+}
+
+/// Resolves where `move-receipts` sends the receipts, and what the move does
+/// to recorded custody.
+///
+/// The cutover moves receipts to a contract that then owns them, so custody
+/// stays with the bot wallet; a rotation moves them to another bot wallet, so
+/// custody follows (SPEC "Receipt custody").
+fn resolve_move_destination(
+    args: &MoveReceiptsArgs,
+) -> anyhow::Result<(Address, CustodyAfterMove)> {
+    let configured_orchestrator = load_config_file(&args.config)?
+        .vault_modes
+        .orchestrator_address_for(args.network);
+
+    match (args.destination.to, args.destination.to_configured_orchestrator) {
+        (None, true) => {
+            let orchestrator = configured_orchestrator.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no [orchestrator.addresses] entry for '{}' to \
+                     move receipts to; add it to the config first",
+                    args.config.display(),
+                    args.network
+                )
+            })?;
+            Ok((orchestrator, CustodyAfterMove::StaysWithHolder))
+        }
+        (Some(stated), false) => {
+            if configured_orchestrator == Some(stated) {
+                anyhow::bail!(
+                    "--to {stated} is the configured orchestrator address \
+                     for '{}'; use --to-configured-orchestrator so the \
+                     cutover destination is read from {}, never typed",
+                    args.network,
+                    args.config.display()
+                );
+            }
+            Ok((stated, CustodyAfterMove::FollowsReceipts))
+        }
+        // Unreachable through clap (the destination group is required and
+        // mutually exclusive), but a refusal keeps this total without a
+        // panic path.
+        _ => anyhow::bail!(
+            "state exactly one destination: --to <ADDRESS> or \
+             --to-configured-orchestrator"
+        ),
+    }
+}
+
+/// Refuses before the confirmation prompt when the vault tracks no receipts
+/// at all, so the operator is never asked to approve moving nothing; the
+/// engine refuses a vault with no movable balance (`InventoryEmpty`). After a
+/// cutover and a service start an empty inventory is the expected state,
+/// because the moved receipts left inventory, so the cutover message says so.
+fn refuse_empty_inventory(
+    receipts: usize,
+    vault: Address,
+    chain_id: u64,
+    custody_after_move: CustodyAfterMove,
+) -> anyhow::Result<()> {
+    if receipts > 0 {
+        return Ok(());
+    }
+
+    match custody_after_move {
+        CustodyAfterMove::StaysWithHolder => anyhow::bail!(
+            "vault {vault} tracks no receipts on chain {chain_id}, so there \
+             is nothing to move. After a cutover and a service start this is \
+             expected: the moved receipts left inventory. Otherwise the \
+             inventory may be behind the chain; check the vault on-chain \
+             before you continue"
+        ),
+        CustodyAfterMove::FollowsReceipts => anyhow::bail!(
+            "vault {vault} tracks no receipts on chain {chain_id}, so there \
+             is nothing to move. An inventory that was never backfilled looks \
+             the same; check the vault on-chain before you continue"
+        ),
+    }
 }
 
 /// Verifies the deploy hold is armed: hold file present, readiness marker
@@ -2941,6 +3010,91 @@ mod tests {
             "--to-configured-orchestrator alone must parse: {:?}",
             configured.err()
         );
+    }
+
+    /// Each destination flag selects what the move does to recorded custody.
+    /// The cutover leaves custody with the bot wallet, because the
+    /// orchestrator owns the receipts afterwards; a rotation records the new
+    /// wallet, because the receipts still belong to the bot. Swapping these
+    /// would either re-create the orchestrator custody record the cutover
+    /// must avoid, or leave a rotated wallet's receipts unguarded.
+    #[test]
+    fn each_destination_flag_selects_its_custody_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = write_orchestrator_config(directory.path());
+        let config = config_path.to_str().unwrap();
+
+        let cutover = move_receipts_args(
+            config,
+            &["--to-configured-orchestrator"],
+            &TURNKEY_FLAGS,
+        );
+        assert_eq!(
+            resolve_move_destination(&cutover).unwrap(),
+            (
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                CustodyAfterMove::StaysWithHolder,
+            ),
+        );
+
+        let rotation = move_receipts_args(
+            config,
+            &["--to", "0x00000000000000000000000000000000000000aa"],
+            &TURNKEY_FLAGS,
+        );
+        assert_eq!(
+            resolve_move_destination(&rotation).unwrap(),
+            (
+                address!("0x00000000000000000000000000000000000000aa"),
+                CustodyAfterMove::FollowsReceipts,
+            ),
+        );
+    }
+
+    /// An empty inventory is refused before the prompt, and the cutover
+    /// message says that after a cutover and a service start it is expected.
+    #[test]
+    fn an_empty_inventory_is_refused_before_the_prompt() {
+        let vault = address!("0x00000000000000000000000000000000000000bb");
+
+        let cutover = refuse_empty_inventory(
+            0,
+            vault,
+            8453,
+            CustodyAfterMove::StaysWithHolder,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            cutover.contains("nothing to move")
+                && cutover.contains(
+                    "After a cutover and a service start this is expected"
+                ),
+            "the cutover refusal must say an empty inventory is expected \
+             after a cutover, got: {cutover}"
+        );
+
+        let rotation = refuse_empty_inventory(
+            0,
+            vault,
+            8453,
+            CustodyAfterMove::FollowsReceipts,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            rotation.contains("nothing to move")
+                && !rotation.contains("cutover"),
+            "the rotation refusal must not mention the cutover, got: \
+             {rotation}"
+        );
+
+        for custody_after_move in [
+            CustodyAfterMove::StaysWithHolder,
+            CustodyAfterMove::FollowsReceipts,
+        ] {
+            refuse_empty_inventory(1, vault, 8453, custody_after_move).unwrap();
+        }
     }
 
     /// A typed orchestrator address must be refused with the config-flag
