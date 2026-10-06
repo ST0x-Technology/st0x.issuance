@@ -371,7 +371,10 @@ authoritative statement of what each observation records.
   vault-direct recovery's proactive receipt-inventory check
   (`RecordExistingMint`, see "Recovery orchestration" above). A `NonceReplayed`
   revert is only the fallback signal for a submit/query race, not the primary
-  discovery path. Carries
+  discovery path. Recovery also records it when the mint's own persisted tx is
+  found mined under `MintingFailed`: the event data is read from that tx's
+  receipt, as in the normal confirm, never through the vault-direct confirm.
+  Carries
   `{issuer_request_id, tx_hash, nonce, shares_minted, block_number,
   recovered_at}`
 
@@ -525,7 +528,7 @@ protection.
 | `TxSubmitted` + StillMineable                                         | Rebroadcast same bytes and/or re-enqueue confirm; stay `TxSubmitted`                                                                                                                                                                                                                                                                             |
 | `TxSubmitted` + Uncertain                                             | No event; retry observe later (scheduled recovery re-polls ~60s)                                                                                                                                                                                                                                                                                 |
 | `TxSubmitted` / failed-from-submitted + MinedReverted or ProvablyDead | `MintingFailed` (if not already), then budgeted retry may prepare **new** `MintTxIntended` **only after wallet-guard recheck**. Only the job whose `tx_id` is the mint's current submission may record it — a stale confirm job for a superseded submission re-drives recovery instead, the same identity gate the reverted-confirm path applies |
-| `MintingFailed` + MinedSuccess                                        | `ConfirmMintJob` for the prepared hash, **not** `RetryMint`, so `RecordExistingMint` can run. A mined deposit under a failed aggregate resolves forward and does not consume a retry                                                                                                                                                             |
+| `MintingFailed` + MinedSuccess                                        | Vault-direct: `ConfirmMintJob` for the prepared hash, **not** `RetryMint`, so `RecordExistingMint` can run. Orchestrator: `OrchestratorMintRecovered` from the prepared hash's own `Minted` event, never the vault-direct confirm. A mined mint under a failed aggregate resolves forward and does not consume a retry                           |
 | Pre-intent prep failure (`Minting` never intended)                    | Existing `MintingFailed` + retry schedule (unchanged; no on-chain identity)                                                                                                                                                                                                                                                                      |
 
 Recovery (`drive_one_step` + durable jobs) checks the receipt inventory for a
