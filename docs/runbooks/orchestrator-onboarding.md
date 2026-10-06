@@ -21,10 +21,22 @@ There is no testnet or staging chain for this: every step below runs against
 prod (Base mainnet) and is verified by on-chain reads. The first live end-to-end
 orchestrator mint/burn is the RKLB pilot's manual exercise (step 13), which
 everything before it must fully precede. The full cutover cycle — migrate,
-operate, roll back, resume — is rehearsed by the Anvil end-to-end suite
-(`tests/receipt_custody.rs`,
-`test_receipt_custody_migrates_into_the_orchestrator`), the only pre-prod
-environment.
+operate, roll back, resume — is rehearsed twice before prod. The Anvil
+end-to-end suite (`tests/receipt_custody.rs`,
+`test_receipt_custody_migrates_into_the_orchestrator`) runs it on contracts it
+deploys itself. The fork rehearsal (`tests/fork_rehearsal.rs`) runs it on a
+local Anvil fork of Base, against the real RKLB vault, receipts and
+orchestrator. It is ignored by default; run it, as a gate before the pilot, with
+a Base RPC that can serve state at the fork block:
+
+```
+FORK_RPC_URL=<Base RPC> FORK_BLOCK=<recent block> \
+  cargo test --test fork_rehearsal -- --ignored --nocapture
+```
+
+The fork signs nothing with a real key and changes nothing on Base. It does not
+exercise Turnkey signing or the `issuer` commands below, which accept only the
+Turnkey signer.
 
 ## Prerequisites
 
@@ -383,11 +395,11 @@ window. Every check is a command with an expected exit status, except two manual
 reviews: the domain and implementation-hash comparison, and the deny-side
 Turnkey policy review. Record each command's output, and the result of each
 review, with the cutover. Repeat the per-chain checks for each chain in the
-derived set; only the `PRODUCTION_RELEASES_ENABLED` check and the liquidity
-bot's deployed-revision, tag/pin and config-address checks are deployment-wide
-and run once. The Turnkey MintAuth policy checks are NOT deployment-wide: the
-orchestrator's EIP-712 domain carries the id of the chain it runs on, so they
-run per chain too (see the policy bullet):
+derived set; only the `PRODUCTION_RELEASES_ENABLED` check, the fork rehearsal
+and the liquidity bot's deployed-revision, tag/pin and config-address checks are
+deployment-wide and run once. The Turnkey MintAuth policy checks are NOT
+deployment-wide: the orchestrator's EIP-712 domain carries the id of the chain
+it runs on, so they run per chain too (see the policy bullet):
 
 - The configured orchestrator on this chain is the deployment
   `config.prod.toml`'s comment claims. Preflight and `approve-orchestrator` pass
@@ -450,6 +462,24 @@ run per chain too (see the policy bullet):
   ```
 
   → exit 0.
+- For the RKLB pilot, the fork rehearsal passes on the code that production
+  runs. It covers RKLB on Base only, so it runs once, not per chain. On your
+  workstation, use a checkout of the commit that
+  `/run/st0x/st0x-issuance.git-rev` names, with no local changes. Set
+  `FORK_EMERGENCY_HOLDER` to the `EMERGENCY_ROLE` holder recorded for Base, so
+  the rollback runs as that holder. Set `FORK_BLOCK` to a Base block from the
+  day of the window:
+
+  ```sh
+  FORK_RPC_URL=<Base RPC> FORK_BLOCK=<Base block from today> \
+    FORK_EMERGENCY_HOLDER=<EMERGENCY_ROLE holder> \
+    cargo test --test fork_rehearsal -- --ignored --nocapture
+  ```
+
+  → exit 0, and the `rollback holder` line of the record names that holder. A
+  record that names the stand-in wallet fails this check. Record the commit and
+  the printed `--- fork rehearsal record ---` lines (they include the fork block
+  and the holder) with the cutover.
 - No stuck mints or redemptions for this asset:
 
   ```sh
@@ -1156,16 +1186,15 @@ Escalation:
    for that `issuer_request_id`, repeated on every recovery pass, is this case.
    That WARN repeats only while the mint's recovery job is live. The job gives
    up after `MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS` polls with no progress
-   (360 polls at one minute each, so about 6 hours), logs the ERROR
-   "Scheduled mint recovery abandoned the mint while still incomplete", and
-   is marked `Killed`.
-   After that, the reconcile pass does not start a new job for the mint, so the
-   per-mint WARN stops, while the summary `ERROR` above keeps firing. The WARN
-   comes back when something drives the mint again: a restart (the startup
-   re-scan), or `POST /admin/reprocess/mint/<issuer_request_id>`, which accepts
-   a `Minting` mint and replaces its `Killed` recovery job. So for a long wait,
-   such as one overnight, do not expect a recent WARN: search the log back to
-   when the mint started.
+   (360 polls at one minute each, so about 6 hours), logs the ERROR "Scheduled
+   mint recovery abandoned the mint while still incomplete", and is marked
+   `Killed`. After that, the reconcile pass does not start a new job for the
+   mint, so the per-mint WARN stops, while the summary `ERROR` above keeps
+   firing. The WARN comes back when something drives the mint again: a restart
+   (the startup re-scan), or `POST /admin/reprocess/mint/<issuer_request_id>`,
+   which accepts a `Minting` mint and replaces its `Killed` recovery job. So for
+   a long wait, such as one overnight, do not expect a recent WARN: search the
+   log back to when the mint started.
 
    The alert names only the oldest waiter. With `waiting_mints` above one, find
    the others by the age of their wait. For the first hour, `/admin/stuck` does
