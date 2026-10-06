@@ -4770,7 +4770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6818,11 +6818,13 @@ dependencies = [
  "alloy-primitives",
  "chrono",
  "proptest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "thiserror",
  "ts-rs",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -6844,6 +6846,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -7794,9 +7797,9 @@ checksum = "e2eebbbfe4093922c2b6734d7c679ebfebd704a0d7e56dfcb0d05818ce28977d"
 
 [[package]]
 name = "uuid"
-version = "1.26.1"
+version = "1.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+checksum = "97277d36b9c3ace13e58fa6e753f8b0bbbf302a18dd193240d70f9e29681059a"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

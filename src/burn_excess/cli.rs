@@ -6,12 +6,12 @@ use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Subcommand};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::DecimalShares;
 use std::io;
 use std::str::FromStr;
 
 use super::engine::{BurnExcessOutcome, BurnExcessRequest, run_burn_excess};
 use super::proof::BurnExcessMode;
-use crate::Quantity;
 use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
@@ -51,8 +51,8 @@ pub(crate) struct BurnExcessSharedArgs {
 
     /// Excess share amount as a decimal (18-decimal fixed point on chain),
     /// e.g. `0.750`.
-    #[arg(long, value_parser = parse_shares)]
-    shares: U256,
+    #[arg(long)]
+    shares: DecimalShares,
 
     /// Why this recovery is being run; recorded on events.
     #[arg(long)]
@@ -113,14 +113,6 @@ pub(crate) struct BurnExcessExternalArgs {
     funding_tx_hash: B256,
 }
 
-pub(crate) fn parse_shares(value: &str) -> Result<U256, String> {
-    let decimal = rust_decimal::Decimal::from_str(value)
-        .map_err(|error| format!("invalid shares decimal: {error}"))?;
-    Quantity::new(decimal)
-        .to_u256_with_18_decimals()
-        .map_err(|error| error.to_string())
-}
-
 /// Dispatches `issuer burn-excess …` after clap has selected the mode keyword.
 pub(crate) async fn run_burn_excess_cli(
     command: BurnExcessCommand,
@@ -150,7 +142,7 @@ pub(crate) async fn run_burn_excess_cli(
         deposit_tx_hash: shared.deposit_tx_hash,
         funding_tx_hash,
         receipt_id: shared.receipt_id,
-        shares: shared.shares,
+        shares: shared.shares.to_u256(),
         reason: shared.reason,
         incident_id: shared.incident_id,
         network: shared.network,

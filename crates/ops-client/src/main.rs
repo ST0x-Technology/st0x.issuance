@@ -11,7 +11,9 @@ mod transport;
 use clap::Parser;
 use reqwest::Method;
 use st0x_issuance_dto::{
-    AddTokenizedAssetRequest, RegisterAccountRequest,
+    AddTokenizedAssetRequest, BurnExcessCommon, BurnExcessExternalRequest,
+    BurnExcessInternalRequest, CloseMintRequest, CloseRedemptionRequest,
+    ForceCompleteRedemptionRequest, RegisterAccountRequest,
     ScheduleFreezeWindowRequest, TokenSymbol, WhitelistWalletRequest,
 };
 use std::io::Write;
@@ -19,8 +21,8 @@ use std::process::ExitCode;
 
 use crate::auth::AuthError;
 use crate::cli::{
-    CapitalCommand, Cli, Command, DebugCommand, ReadCommand,
-    WrappedTransfersArgs,
+    BreakglassCommand, BurnExcessArgs, BurnExcessCommand, CapitalCommand, Cli,
+    Command, DebugCommand, ReadCommand, WrappedTransfersArgs,
 };
 use crate::target::{Env, TargetError};
 use crate::transport::{
@@ -46,7 +48,7 @@ async fn main() -> ExitCode {
             if failure.reached_server() {
                 eprintln!(
                     "\nS01 Cloud Logging: {}",
-                    cloud_logging_url(env, log_search(&command))
+                    cloud_logging_url(env, log_search(&command).as_deref())
                 );
             }
             ExitCode::from(failure.exit_code())
@@ -121,6 +123,7 @@ fn route(command: &Command) -> Route {
         Command::Read(read) => read_route(read),
         Command::Debug(debug) => debug_route(debug),
         Command::Capital(capital) => capital_route(capital),
+        Command::Breakglass(breakglass) => breakglass_route(breakglass),
     }
 }
 
@@ -308,6 +311,129 @@ fn capital_route(command: &CapitalCommand) -> Route {
     }
 }
 
+fn breakglass_route(command: &BreakglassCommand) -> Route {
+    use BreakglassCommand::{
+        BurnExcess, CloseMint, CloseRedemption, ForceCompleteRedemption,
+    };
+
+    match command {
+        ForceCompleteRedemption {
+            issuer_request_id,
+            burn_tx_hash,
+            reason,
+            acknowledged_unresolved_burn_tx_hash,
+        } => Route {
+            body: Some(RouteBody::ForceCompleteRedemption(
+                ForceCompleteRedemptionRequest {
+                    burn_tx_hash: *burn_tx_hash,
+                    reason: reason.clone(),
+                    acknowledged_unresolved_burn_tx_hash:
+                        *acknowledged_unresolved_burn_tx_hash,
+                },
+            )),
+            ..bare(
+                Method::POST,
+                Tier::Breakglass,
+                format!(
+                    "/force-complete/redemption/{}",
+                    encode_segment(issuer_request_id)
+                ),
+            )
+        },
+        CloseRedemption {
+            issuer_request_id,
+            reason,
+            acknowledged_unresolved_burn_tx_hash,
+        } => Route {
+            body: Some(RouteBody::CloseRedemption(CloseRedemptionRequest {
+                reason: reason.clone(),
+                acknowledged_unresolved_burn_tx_hash:
+                    *acknowledged_unresolved_burn_tx_hash,
+            })),
+            ..bare(
+                Method::POST,
+                Tier::Breakglass,
+                format!(
+                    "/close/redemption/{}",
+                    encode_segment(issuer_request_id)
+                ),
+            )
+        },
+        CloseMint {
+            issuer_request_id,
+            reason,
+            acknowledged_unresolved_mint_tx_hash,
+            acknowledged_unresolved_mint_nonce,
+        } => Route {
+            body: Some(RouteBody::CloseMint(CloseMintRequest {
+                reason: reason.clone(),
+                acknowledged_unresolved_mint_tx_hash:
+                    *acknowledged_unresolved_mint_tx_hash,
+                acknowledged_unresolved_mint_nonce:
+                    *acknowledged_unresolved_mint_nonce,
+            })),
+            ..bare(
+                Method::POST,
+                Tier::Breakglass,
+                format!("/close/mint/{}", encode_segment(issuer_request_id)),
+            )
+        },
+        BurnExcess(BurnExcessCommand::Internal(args)) => Route {
+            body: Some(RouteBody::BurnExcessInternal(
+                BurnExcessInternalRequest { common: burn_excess_common(args) },
+            )),
+            ..bare(
+                Method::POST,
+                Tier::Breakglass,
+                "/burn-excess/internal".to_owned(),
+            )
+        },
+        BurnExcess(BurnExcessCommand::External { funding_tx_hash, args }) => {
+            Route {
+                body: Some(RouteBody::BurnExcessExternal(
+                    BurnExcessExternalRequest {
+                        funding_tx_hash: *funding_tx_hash,
+                        common: burn_excess_common(args),
+                    },
+                )),
+                ..bare(
+                    Method::POST,
+                    Tier::Breakglass,
+                    "/burn-excess/external".to_owned(),
+                )
+            }
+        }
+    }
+}
+
+fn burn_excess_common(args: &BurnExcessArgs) -> BurnExcessCommon {
+    let BurnExcessArgs {
+        issuer_request_id,
+        deposit_tx_hash,
+        receipt_id,
+        shares,
+        reason,
+        incident_id,
+        network,
+        chain_id,
+        execute,
+        close,
+    } = args;
+
+    BurnExcessCommon {
+        issuer_request_id: *issuer_request_id,
+        deposit_tx_hash: *deposit_tx_hash,
+        receipt_id: *receipt_id,
+        shares: shares.clone(),
+        reason: reason.clone(),
+        incident_id: incident_id.clone(),
+        network: *network,
+        chain_id: *chain_id,
+        execute: *execute,
+        close: *close,
+    }
+}
+
 /// A route with no query and no body.
 const fn bare(method: Method, tier: Tier, path: String) -> Route {
     Route { method, tier, path, query: Vec::new(), body: None }
@@ -315,23 +441,35 @@ const fn bare(method: Method, tier: Tier, path: String) -> Route {
 
 /// The identifier a failed command's logs would mention: its aggregate or
 /// client id, or its underlying. `None` for commands that name neither.
-fn log_search(command: &Command) -> Option<&str> {
+fn log_search(command: &Command) -> Option<String> {
     match command {
         Command::Read(ReadCommand::Status { underlying }) => {
-            Some(underlying.as_str())
+            Some(underlying.as_str().to_owned())
         }
         Command::Read(_)
         | Command::Debug(DebugCommand::RegisterAccount { .. }) => None,
         Command::Debug(
             DebugCommand::RecoverRedemption { issuer_request_id }
             | DebugCommand::ReprocessMint { issuer_request_id },
-        ) => Some(issuer_request_id),
+        )
+        | Command::Breakglass(
+            BreakglassCommand::ForceCompleteRedemption {
+                issuer_request_id,
+                ..
+            }
+            | BreakglassCommand::CloseRedemption { issuer_request_id, .. }
+            | BreakglassCommand::CloseMint { issuer_request_id, .. },
+        ) => Some(issuer_request_id.clone()),
+        Command::Breakglass(BreakglassCommand::BurnExcess(
+            BurnExcessCommand::Internal(args)
+            | BurnExcessCommand::External { args, .. },
+        )) => Some(args.issuer_request_id.to_string()),
         Command::Debug(
             DebugCommand::WhitelistWallet { client_id, .. }
             | DebugCommand::UnwhitelistWallet { client_id, .. },
-        ) => Some(client_id),
+        ) => Some(client_id.clone()),
         Command::Debug(DebugCommand::Snapshot { aggregate_id, .. }) => {
-            Some(aggregate_id)
+            Some(aggregate_id.clone())
         }
         Command::Debug(
             DebugCommand::VerifyOrchestratorSigning { underlying, .. }
@@ -343,7 +481,7 @@ fn log_search(command: &Command) -> Option<&str> {
             | CapitalCommand::Unfreeze { underlying }
             | CapitalCommand::ScheduleFreeze { underlying, .. }
             | CapitalCommand::ApproveOrchestrator { underlying, .. },
-        ) => Some(underlying.as_str()),
+        ) => Some(underlying.as_str().to_owned()),
     }
 }
 
@@ -628,21 +766,151 @@ mod tests {
         );
     }
 
+    const MINT: &str = "5f0c6c0e-8a4b-4c9e-9f3a-2b7d1e6a4c10";
+    const HASH_A: &str =
+        "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const HASH_B: &str =
+        "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn burn_excess_flags<'flag>(extra: &[&'flag str]) -> Vec<&'flag str> {
+        let mut flags = vec![
+            "breakglass",
+            "burn-excess",
+            "--issuer-request-id",
+            MINT,
+            "--deposit-tx-hash",
+            HASH_A,
+            "--receipt-id",
+            "0x1",
+            "--shares",
+            "0.750",
+            "--reason",
+            "duplicate deposit",
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+        ];
+        flags.splice(2..2, extra.iter().copied());
+        flags
+    }
+
+    #[test]
+    fn every_breakglass_verb_maps_to_its_route() {
+        assert_eq!(
+            wire(&[
+                "breakglass",
+                "force-complete-redemption",
+                HASH_A,
+                "--burn-tx-hash",
+                HASH_B,
+                "--reason",
+                "burn landed",
+                "--acknowledged-unresolved-burn-tx-hash",
+                HASH_A,
+            ]),
+            (
+                format!(
+                    "POST /ops/breakglass/force-complete/redemption/{HASH_A}"
+                ),
+                Some(json!({
+                    "burn_tx_hash": HASH_B,
+                    "reason": "burn landed",
+                    "acknowledged_unresolved_burn_tx_hash": HASH_A
+                }))
+            )
+        );
+        assert_eq!(
+            wire(&[
+                "breakglass",
+                "close-redemption",
+                HASH_A,
+                "--reason",
+                "dead"
+            ]),
+            (
+                format!("POST /ops/breakglass/close/redemption/{HASH_A}"),
+                Some(json!({ "reason": "dead" }))
+            )
+        );
+        assert_eq!(
+            wire(&[
+                "breakglass",
+                "close-mint",
+                MINT,
+                "--reason",
+                "nonce replayed",
+                "--acknowledged-unresolved-mint-nonce",
+                HASH_B,
+            ]),
+            (
+                format!("POST /ops/breakglass/close/mint/{MINT}"),
+                Some(json!({
+                    "reason": "nonce replayed",
+                    "acknowledged_unresolved_mint_nonce": HASH_B
+                }))
+            )
+        );
+        assert_eq!(
+            wire(&burn_excess_flags(&["internal"])),
+            (
+                "POST /ops/breakglass/burn-excess/internal".to_owned(),
+                Some(json!({
+                    "issuer_request_id": MINT,
+                    "deposit_tx_hash": HASH_A,
+                    "receipt_id": "0x1",
+                    "shares": "0.750",
+                    "reason": "duplicate deposit",
+                    "network": "base",
+                    "chain_id": 8453,
+                    "execute": false,
+                    "close": false
+                }))
+            )
+        );
+
+        let mut external =
+            burn_excess_flags(&["external", "--funding-tx-hash", HASH_B]);
+        external.extend(["--incident-id", "INC-7", "--execute"]);
+        assert_eq!(
+            wire(&external),
+            (
+                "POST /ops/breakglass/burn-excess/external".to_owned(),
+                Some(json!({
+                    "funding_tx_hash": HASH_B,
+                    "issuer_request_id": MINT,
+                    "deposit_tx_hash": HASH_A,
+                    "receipt_id": "0x1",
+                    "shares": "0.750",
+                    "reason": "duplicate deposit",
+                    "incident_id": "INC-7",
+                    "network": "base",
+                    "chain_id": 8453,
+                    "execute": true,
+                    "close": false
+                }))
+            )
+        );
+    }
+
     #[test]
     fn the_logging_link_searches_the_named_identifier_in_the_right_project() {
         let freeze = command(&["capital", "freeze", "AAPL"]);
         assert_eq!(
-            cloud_logging_url(Env::Staging, log_search(&freeze)),
+            cloud_logging_url(Env::Staging, log_search(&freeze).as_deref()),
             "https://console.cloud.google.com/logs/query;query=%22AAPL%22\
              ?project=s01-issuance-staging"
         );
 
         let stuck = command(&["read", "stuck"]);
         assert_eq!(
-            cloud_logging_url(Env::Production, log_search(&stuck)),
+            cloud_logging_url(Env::Production, log_search(&stuck).as_deref()),
             "https://console.cloud.google.com/logs/query;\
              query=severity%3E%3DWARNING?project=s01-issuance"
         );
+
+        let burn = command(&burn_excess_flags(&["internal"]));
+        assert_eq!(log_search(&burn).as_deref(), Some(MINT));
     }
 
     #[test]

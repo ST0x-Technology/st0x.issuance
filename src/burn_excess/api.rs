@@ -10,18 +10,19 @@
 //! lock (an unresolved mint/redemption burn intent on the network refuses with
 //! `Conflict`).
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::B256;
 use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, post};
-use serde::de::{self, Deserializer};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::{
+    BurnExcessCommon, BurnExcessExternalRequest, BurnExcessInternalRequest,
+};
 use std::time::Duration;
 use tracing::{error, warn};
 
-use super::cli::parse_shares;
 use super::engine::{
     BurnExcessEngineError, BurnExcessOutcome, BurnExcessRequest,
     run_burn_excess,
@@ -32,7 +33,6 @@ use crate::chain::{ChainConfig, rpc_client};
 use crate::config::Config;
 use crate::mint::IssuerMintRequestId;
 use crate::redemption::poller_pause::PollerPauses;
-use crate::tokenized_asset::Network;
 use crate::vault::NetworkVaultServices;
 
 /// Caps how long either burn-excess route runs the engine. Both hold the
@@ -44,88 +44,29 @@ use crate::vault::NetworkVaultServices;
 /// route returns 504. Chosen above the expected broadcast-and-confirm window.
 const BURN_EXCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// An 18-decimal fixed-point share amount parsed from its decimal-string wire
-/// form at deserialize time, so an invalid or over-precise quantity is refused
-/// before the handler runs. Private inner; the [`Deserialize`] impl (via
-/// [`parse_shares`]) is the only constructor, so a `Shares` that exists is a
-/// valid on-chain amount.
-pub(crate) struct Shares(U256);
-
-impl Shares {
-    /// Returns the validated fixed-point amount for the burn engine.
-    const fn into_u256(self) -> U256 {
-        self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for Shares {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        parse_shares(&raw).map(Self).map_err(de::Error::custom)
-    }
-}
-
-/// Fields shared by both burn-excess routes. `#[serde(flatten)]` folds these
-/// into each request struct, so a field added here changes both routes'
-/// contract at once, never just one.
-#[derive(Deserialize)]
-pub(crate) struct BurnExcessCommon {
-    issuer_request_id: IssuerMintRequestId,
-    deposit_tx_hash: B256,
-    receipt_id: U256,
-    shares: Shares,
-    reason: String,
-    #[serde(default)]
-    incident_id: Option<String>,
-    network: Network,
-    chain_id: u64,
-    /// Perform the mutation (sign and broadcast the burn; the external path
-    /// also writes the funding exclusion). Default is a dry-run that proves the
-    /// plan and logs it without touching chain or state.
-    #[serde(default)]
-    execute: bool,
-    /// Close a dead intended/submitted stream instead of burning.
-    #[serde(default)]
-    close: bool,
-}
-
-impl BurnExcessCommon {
-    /// Builds the engine request. The operator-supplied chain id is validated
-    /// against the network's configured chain entry in `run_burn_excess_ops`,
-    /// where that entry is resolved; this method cannot see the config, so it
-    /// is infallible.
-    fn into_request(
-        self,
-        mode: BurnExcessMode,
-        funding_tx_hash: Option<B256>,
-    ) -> BurnExcessRequest {
-        BurnExcessRequest {
-            mode,
-            issuer_request_id: self.issuer_request_id,
-            deposit_tx_hash: self.deposit_tx_hash,
-            funding_tx_hash,
-            receipt_id: self.receipt_id,
-            shares: self.shares.into_u256(),
-            reason: self.reason,
-            incident_id: self.incident_id,
-            network: self.network,
-            chain_id: self.chain_id,
-            execute: self.execute,
-            close: self.close,
-        }
-    }
-}
-
-/// Operator inputs for an internal-path excess burn, mirroring the
-/// `burn-excess internal` CLI flags. `shares` is an 18-decimal fixed-point
-/// amount as a decimal string (e.g. `"0.750"`).
-#[derive(Deserialize)]
-pub(crate) struct BurnExcessInternalRequest {
-    #[serde(flatten)]
+/// Builds the engine request from a route body. The operator-supplied chain
+/// id is validated against the network's configured chain entry by
+/// `resolve_chain`, which can see the config; this function cannot, so it is
+/// infallible.
+fn into_request(
     common: BurnExcessCommon,
+    mode: BurnExcessMode,
+    funding_tx_hash: Option<B256>,
+) -> BurnExcessRequest {
+    BurnExcessRequest {
+        mode,
+        issuer_request_id: IssuerMintRequestId::new(common.issuer_request_id),
+        deposit_tx_hash: common.deposit_tx_hash,
+        funding_tx_hash,
+        receipt_id: common.receipt_id,
+        shares: common.shares.to_u256(),
+        reason: common.reason,
+        incident_id: common.incident_id,
+        network: common.network,
+        chain_id: common.chain_id,
+        execute: common.execute,
+        close: common.close,
+    }
 }
 
 #[derive(Serialize)]
@@ -150,6 +91,7 @@ fn resolve_chain<'config>(
         .find(|candidate| candidate.network == request.network)
         .ok_or_else(|| {
             error!(target: "admin", network = %request.network, path,
+                issuer_request_id = %request.issuer_request_id,
                 "No chain configuration for network"
             );
             Status::InternalServerError
@@ -157,6 +99,7 @@ fn resolve_chain<'config>(
 
     if request.chain_id != chain.chain_id {
         warn!(target: "admin", network = %request.network, path,
+            issuer_request_id = %request.issuer_request_id,
             chain_id = request.chain_id, configured = chain.chain_id,
             "burn-excess chain_id does not match the configured chain"
         );
@@ -184,17 +127,29 @@ async fn run_burn_excess_ops(
     request: BurnExcessRequest,
     path: &'static str,
 ) -> Result<Json<BurnExcessResponse>, Status> {
+    // On every line below, so the client's Cloud Logging link (which searches
+    // for the command's issuer request id) finds the run's setup failure,
+    // plan, and outcome.
+    let issuer_request_id = request.issuer_request_id.clone();
     let vault_service =
         vault_services.service(request.network).map_err(|error| {
-            warn!(target: "admin", %error, path, "burn-excess refused");
+            warn!(target: "admin", %error, path,
+                issuer_request_id = %issuer_request_id, "burn-excess refused"
+            );
             Status::UnprocessableEntity
         })?;
     let issuer_wallet = config.signer.address().map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess signer address unavailable");
+        error!(target: "admin", %error, path,
+            issuer_request_id = %issuer_request_id,
+            "burn-excess signer address unavailable"
+        );
         Status::InternalServerError
     })?;
     let rpc = rpc_client(&chain.rpc).map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess RPC unavailable");
+        error!(target: "admin", %error, path,
+            issuer_request_id = %issuer_request_id,
+            "burn-excess RPC unavailable"
+        );
         Status::InternalServerError
     })?;
     let read_provider = ProviderBuilder::new().connect_client(rpc);
@@ -217,6 +172,7 @@ async fn run_burn_excess_ops(
                 // burn; here the request's `execute` stood in for that answer,
                 // so the plan is recorded instead, next to reason and incident.
                 warn!(target: "admin", plan, path,
+                    issuer_request_id = %issuer_request_id,
                     "burn-excess auto-approving operator-confirmed plan"
                 );
                 Ok::<bool, std::io::Error>(true)
@@ -225,11 +181,15 @@ async fn run_burn_excess_ops(
     )
     .await
     .map_err(|_| {
-        error!(target: "admin", path, "burn-excess timed out");
+        error!(target: "admin", path, issuer_request_id = %issuer_request_id,
+            "burn-excess timed out"
+        );
         Status::GatewayTimeout
     })?
     .map_err(|error| {
-        error!(target: "admin", %error, path, "burn-excess failed");
+        error!(target: "admin", %error, path,
+            issuer_request_id = %issuer_request_id, "burn-excess failed"
+        );
         map_burn_excess_error(&error)
     })?;
 
@@ -258,7 +218,7 @@ pub(crate) async fn burn_excess_internal_ops(
     body: Json<BurnExcessInternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
     let request =
-        body.into_inner().common.into_request(BurnExcessMode::Internal, None);
+        into_request(body.into_inner().common, BurnExcessMode::Internal, None);
     let chain = resolve_chain(config.inner(), &request, "internal")?;
     run_burn_excess_ops(
         pool.inner(),
@@ -269,16 +229,6 @@ pub(crate) async fn burn_excess_internal_ops(
         "internal",
     )
     .await
-}
-
-/// Operator inputs for an external-path excess burn, mirroring the
-/// `burn-excess external` CLI flags. `funding_tx_hash` is the on-chain Transfer
-/// that moved the excess shares into the issuer wallet.
-#[derive(Deserialize)]
-pub(crate) struct BurnExcessExternalRequest {
-    funding_tx_hash: B256,
-    #[serde(flatten)]
-    common: BurnExcessCommon,
 }
 
 /// Breakglass-tier external-path excess-share burn. Unlike `internal`, the
@@ -309,14 +259,18 @@ pub(crate) async fn burn_excess_external_ops(
 ) -> Result<Json<BurnExcessResponse>, Status> {
     let body = body.into_inner();
     let network = body.common.network;
+    let issuer_request_id = body.common.issuer_request_id;
     let funding_tx_hash = body.funding_tx_hash;
-    let request = body
-        .common
-        .into_request(BurnExcessMode::External, Some(funding_tx_hash));
+    let request = into_request(
+        body.common,
+        BurnExcessMode::External,
+        Some(funding_tx_hash),
+    );
     let chain = resolve_chain(config.inner(), &request, "external")?;
 
     let Some(control) = poller_pauses.control(network) else {
         warn!(target: "admin", network = %network,
+            issuer_request_id = %issuer_request_id,
             "burn-excess external has no transfer poller to quiesce for network"
         );
         return Err(Status::UnprocessableEntity);
@@ -325,9 +279,11 @@ pub(crate) async fn burn_excess_external_ops(
     // Quiesce the poller before the exclusion write so it cannot open a
     // spurious Redemption for the funding Transfer. The guard resumes the
     // poller on success, error, timeout, and panic paths alike; a poller that
-    // will not confirm parked is a 503 rather than an unprotected burn.
+    // cannot be paused in time (it does not park, or another breakglass run
+    // still holds it) is a 503 rather than an unprotected or queued burn.
     let _guard = control.pause().await.map_err(|error| {
-        warn!(target: "admin", network = %network, %error,
+        warn!(target: "admin", network = %network,
+            issuer_request_id = %issuer_request_id, %error,
             "burn-excess external: poller not quiesced; refusing to run"
         );
         Status::ServiceUnavailable

@@ -9,10 +9,13 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+use uuid::Uuid;
 
 /// Underlying equity symbol, e.g. `SGOV`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, TS)]
@@ -609,6 +612,209 @@ pub struct ScheduleFreezeWindowRequest {
     /// future.
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub unfreeze_at: DateTime<Utc>,
+}
+
+/// Request body of `POST /admin/close/redemption/<issuer_request_id>` and its
+/// `POST /ops/breakglass/close/redemption/<issuer_request_id>` twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CloseRedemptionRequest {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub acknowledged_unresolved_burn_tx_hash: Option<B256>,
+}
+
+/// Request body of `POST /admin/force-complete/redemption/<issuer_request_id>`
+/// and its `POST /ops/breakglass/force-complete/redemption/<issuer_request_id>`
+/// twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ForceCompleteRedemptionRequest {
+    /// On-chain transaction hash that burned the redemption's shares. Verified
+    /// against the chain before the redemption is terminalized.
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub burn_tx_hash: B256,
+    /// Operator-supplied audit reason recorded with the terminal event.
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub acknowledged_unresolved_burn_tx_hash: Option<B256>,
+}
+
+/// Request body of `POST /admin/close/mint/<aggregate_id>` and its
+/// `POST /ops/breakglass/close/mint/<aggregate_id>` twin.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct CloseMintRequest {
+    pub reason: String,
+    /// Required when the mint still holds a prepared deposit identity: must
+    /// equal the exact `MintTxIntended` / prepared hash. Omit only when the
+    /// mint has no prepared identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub acknowledged_unresolved_mint_tx_hash: Option<B256>,
+    /// Required only to close a `NonceReplayUnresolved` mint, and must
+    /// exactly echo that mint's persisted authorization nonce; rejected on
+    /// any other mint. Records that an operator verified the nonce's
+    /// absence against a chain view outside this bot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
+    pub acknowledged_unresolved_mint_nonce: Option<B256>,
+}
+
+/// An 18-decimal fixed-point share amount in its decimal-string wire form,
+/// e.g. `"0.750"`.
+///
+/// Parsed at construction, so an invalid or over-precise quantity is refused
+/// before any handler runs. Private fields; [`FromStr`] (and the
+/// [`Deserialize`] impl over it) is the only constructor, so a `DecimalShares`
+/// that exists is a valid on-chain amount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecimalShares {
+    decimal: Decimal,
+    fixed_point: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DecimalSharesError {
+    #[error("invalid shares decimal: {0}")]
+    Decimal(#[from] rust_decimal::Error),
+    #[error("shares must be greater than zero")]
+    Zero,
+    #[error("shares must not be negative: {value}")]
+    Negative { value: Decimal },
+    #[error("shares {value} overflow when scaled to 18 decimals")]
+    Overflow { value: Decimal },
+    #[error("shares {value} have more than 18 decimal places")]
+    TooPrecise { value: Decimal },
+    #[error("shares {value} exceed the representable on-chain amount")]
+    OutOfRange { value: Decimal },
+}
+
+impl DecimalShares {
+    /// The on-chain amount: the decimal scaled by 10^18.
+    #[must_use]
+    pub const fn to_u256(&self) -> U256 {
+        self.fixed_point
+    }
+}
+
+impl FromStr for DecimalShares {
+    type Err = DecimalSharesError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // `from_str_exact`, not `from_str`: the latter rounds past 28
+        // significant digits and falls back to a lossy scientific parser, so
+        // an over-precise or exponent amount would be checked only after it
+        // had already been rounded.
+        let decimal = Decimal::from_str_exact(value)?;
+
+        // Checked before the sign so `-0` reads as a zero burn, not a negative
+        // one. A zero excess is never a burn to run: refusing it here keeps a
+        // malformed request from pausing the redemption poller and fetching
+        // the deposit proof before the engine's share-mismatch refusal.
+        if decimal.is_zero() {
+            return Err(DecimalSharesError::Zero);
+        }
+
+        if decimal.is_sign_negative() {
+            return Err(DecimalSharesError::Negative { value: decimal });
+        }
+
+        let scaled = decimal
+            .checked_mul(Decimal::from(10_u128.pow(18)))
+            .ok_or(DecimalSharesError::Overflow { value: decimal })?;
+
+        if scaled.fract() != Decimal::ZERO {
+            return Err(DecimalSharesError::TooPrecise { value: decimal });
+        }
+
+        let units = scaled
+            .to_u128()
+            .ok_or(DecimalSharesError::OutOfRange { value: decimal })?;
+
+        Ok(Self { decimal, fixed_point: U256::from(units) })
+    }
+}
+
+impl std::fmt::Display for DecimalShares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.decimal)
+    }
+}
+
+impl Serialize for DecimalShares {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for DecimalShares {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Fields shared by both burn-excess request bodies. `#[serde(flatten)]` folds
+/// these into each, so a field added here changes both routes' contract at
+/// once, never just one.
+///
+/// Internal operator wire type; not exported to the dashboard bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnExcessCommon {
+    /// The mint whose deposit produced the excess.
+    pub issuer_request_id: Uuid,
+    /// Deposit transaction that created the excess receipt and shares.
+    pub deposit_tx_hash: B256,
+    /// Excess receipt id from the deposit.
+    pub receipt_id: U256,
+    pub shares: DecimalShares,
+    /// Why this recovery is being run; recorded on events.
+    pub reason: String,
+    /// Optional incident or ticket id for the audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<String>,
+    pub network: Network,
+    /// Validated against the network's configured chain entry.
+    pub chain_id: u64,
+    /// Perform the mutation (sign and broadcast the burn; the external path
+    /// also writes the funding exclusion). Default is a dry-run that proves the
+    /// plan without touching chain or state.
+    #[serde(default)]
+    pub execute: bool,
+    /// Close a dead intended/submitted stream instead of burning.
+    #[serde(default)]
+    pub close: bool,
+}
+
+/// Request body of `POST /ops/breakglass/burn-excess/internal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnExcessInternalRequest {
+    #[serde(flatten)]
+    pub common: BurnExcessCommon,
+}
+
+/// Request body of `POST /ops/breakglass/burn-excess/external`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnExcessExternalRequest {
+    /// Funding Transfer that moved the excess shares into the issuer wallet.
+    pub funding_tx_hash: B256,
+    #[serde(flatten)]
+    pub common: BurnExcessCommon,
 }
 
 /// Exports every DTO's TypeScript binding into `out_dir` (one `.ts` file per
@@ -1296,5 +1502,69 @@ mod tests {
         let email = Email::new("  User@Example.COM  ").unwrap();
 
         assert_eq!(email.0, "user@example.com");
+    }
+
+    #[test]
+    fn decimal_shares_scale_a_decimal_to_18_fixed_point_places() {
+        let shares: DecimalShares = "0.750".parse().unwrap();
+
+        assert_eq!(shares.to_u256(), U256::from(750_000_000_000_000_000_u128));
+        assert_eq!(
+            serde_json::to_value(&shares).unwrap(),
+            json!("0.750"),
+            "the wire form round-trips the operator's decimal as written"
+        );
+        assert_eq!(
+            "0.000000000000000001".parse::<DecimalShares>().unwrap().to_u256(),
+            U256::from(1_u8)
+        );
+    }
+
+    #[test]
+    fn decimal_shares_refuse_amounts_the_chain_cannot_represent() {
+        for zero in ["0", "0.000", "-0"] {
+            assert!(
+                matches!(
+                    zero.parse::<DecimalShares>(),
+                    Err(DecimalSharesError::Zero)
+                ),
+                "{zero} must be refused as a zero burn"
+            );
+        }
+        assert!(matches!(
+            "-1".parse::<DecimalShares>(),
+            Err(DecimalSharesError::Negative { .. })
+        ));
+        assert!(matches!(
+            "0.0000000000000000001".parse::<DecimalShares>(),
+            Err(DecimalSharesError::TooPrecise { .. })
+        ));
+        assert!(matches!(
+            "79228162514264337593543950335".parse::<DecimalShares>(),
+            Err(DecimalSharesError::Overflow { .. })
+        ));
+        assert!(matches!(
+            "one".parse::<DecimalShares>(),
+            Err(DecimalSharesError::Decimal(_))
+        ));
+        assert!(
+            "0.74999999999999999999999999999".parse::<DecimalShares>().is_err(),
+            "29 fractional digits must be refused, not rounded to 0.75"
+        );
+        assert!(
+            "0.00000000000000000000000000001".parse::<DecimalShares>().is_err(),
+            "a nonzero amount must not round to zero"
+        );
+        assert!(
+            "1e1".parse::<DecimalShares>().is_err(),
+            "exponent notation goes through a lossy parser and is refused"
+        );
+        assert!(
+            serde_json::from_value::<DecimalShares>(json!(
+                "0.0000000000000000001"
+            ))
+            .is_err(),
+            "a request body cannot carry an over-precise amount"
+        );
     }
 }

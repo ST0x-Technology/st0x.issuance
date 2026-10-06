@@ -105,8 +105,14 @@ a mint receipt.
 
 If logs show `Duplicate Deposit/receipt for already-tracked issuer_request_id`,
 a second on-chain deposit already landed for that mint. Do **not** mint again —
-the excess shares must be burned, and `issuer burn-excess` is the only supported
-way to do it.
+the excess shares must be burned with `burn-excess`. The `internal` mode runs
+through the operator client
+(`st0x-issuance-client breakglass burn-excess
+internal`), with the offline
+`issuer burn-excess` CLI as the fallback when the client cannot reach the bot.
+The `external` mode stays on the offline CLI with the issuer service stopped
+until [RAI-2958](https://linear.app/makeitrain/issue/RAI-2958) lands (see
+below).
 
 The observation is also recorded durably as a
 `ReceiptInventoryEvent::ConflictingItnDepositObserved` event on the vault's
@@ -125,21 +131,36 @@ Collect these before running anything:
 | Network / chain id | The vault's listing (`--network`, cross-checked `--chain-id`)       |
 | Vault              | The vault the duplicate deposit hit                                 |
 
-Then pick the mode by where the excess shares sit **now** — the CLI never infers
-it:
+Then pick the mode by where the excess shares sit **now** — burn-excess never
+infers it:
 
 - Shares still in the issuer wallet (the deposit's original recipient is the
   issuer):
-  `issuer burn-excess internal --issuer-request-id <id> --deposit-tx-hash
-  <discovered_tx_hash> --receipt-id <discovered_receipt_id> --shares <raw>
-  --network <net> --chain-id <id> --reason "<why>" --incident-id <id> --execute`
-- Shares were minted to someone else and must be moved back first: transfer them
-  to the issuer wallet, then run the same command as `external` with
-  `--funding-tx-hash <that transfer's tx>` added. Stop the issuer service first
-  — a running transfer poller can open a `Redemption` for that funding transfer.
+  `st0x-issuance-client --env <env> breakglass burn-excess internal
+  --issuer-request-id <id> --deposit-tx-hash <discovered_tx_hash> --receipt-id
+  <discovered_receipt_id> --shares <decimal, e.g. 0.750> --network <net>
+  --chain-id <id> --reason "<why>" --incident-id <id> --execute`
+- Shares were minted to someone else and must be moved back first: use the
+  offline `issuer burn-excess external` CLI over SSH, not the client. Stop the
+  issuer service **before** transferring the shares to the issuer wallet, keep
+  it stopped until the run finishes, then run it with the same flags as above
+  plus `--funding-tx-hash <that transfer's tx>`. The live
+  `breakglass burn-excess external` route pauses the redemption transfer poller
+  only once the request arrives, after the funding transfer is mined, and a dry
+  run resumes it before `--execute`. In either gap a running poller can read a
+  transfer from the AP's linked wallet as a redemption and call Alpaca, and
+  burn-excess then refuses that funding tx (`FundingAlreadyRedeemedTx`).
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
-plan without signing or writing an exclusion.
+plan without signing or writing an exclusion. A 504 leaves an `--execute` run's
+outcome unknown; re-running the same command reads the persisted burn and
+resumes it.
+
+The offline CLI takes the same flags
+(`issuer burn-excess internal|external
+...`) and needs SSH to the bot host. For
+`external` it is the required path, with the service stopped from before the
+funding transfer until the run finishes: offline, nothing pauses the poller.
 
 ## Step 2: Diagnose the failure
 
