@@ -2371,8 +2371,8 @@ st0x.deploy audit report covering the orchestrator.
   **pre-burn pointer value** (0 on a fresh orchestrator, where receipt ids start
   at 1), consistent with the pointer-movement reading above.
 - Roles: `MINT_ROLE` and `BURN_ROLE` (held by the bot wallet, gating the two
-  entry points above), `EMERGENCY_ROLE` (manual recovery: moving receipts
-  between wallets, adjusting the burn pointer).
+  entry points above), `EMERGENCY_ROLE` (manual recovery: moving receipts or
+  shares out of the orchestrator, adjusting the burn pointer).
 - Decodable revert reasons: `NonceReplayed`, `BadRecipientSignature`,
   `RecipientCallbackRejected`, `InsufficientReceipts`, `VaultLogicMismatch`,
   `ReceiptLogicMismatch`, `VaultAmountMismatch`. See "Failure States" below for
@@ -2689,12 +2689,12 @@ runbook is authored and executed for the pilot in RAI-1222). Subsequent assets
 follow the same per-asset procedure (RAI-1246); the end state flips
 `[orchestrator].default_vault_mode` to `"orchestrator"` and drops the per-asset
 overrides. Rollback is the same procedure in reverse for just the affected
-asset: freeze, flip its `vault_mode` back to `"vault_direct"`, return that
-token's receipts to the bot wallet via `EMERGENCY_ROLE`, check on-chain that the
-orchestrator holds none of the vault's receipt ids, redeploy (startup
-rediscovers the returned receipts — see "Receipt custody"), unfreeze — no other
-asset is touched. Vault-direct mode's flows, aggregate states, and events are
-completely unchanged by this migration.
+asset: freeze, return that token's receipts to the bot wallet via
+`EMERGENCY_ROLE`, check on-chain that the orchestrator holds none of the vault's
+receipt ids, flip its `vault_mode` back to `"vault_direct"` and redeploy
+(startup rediscovers the returned receipts — see "Receipt custody"), unfreeze —
+no other asset is touched. Vault-direct mode's flows, aggregate states, and
+events are completely unchanged by this migration.
 
 **Both modes run side by side for the whole rollout.** While any asset remains
 vault-direct, `ReceiptInventory` and the receipt-monitoring/backfill machinery
@@ -2860,10 +2860,12 @@ the pool is drained between the simulation and the mined transaction.
   startup, and via the manual admin recovery endpoint) does not resubmit a
   deterministically-reverting burn — only the manual re-drive below does, once
   the underlying shortfall is fixed.
-- Recovery is a manual `EMERGENCY_ROLE` action (moving receipts back in, or
-  adjusting the burn pointer). Once the operator fixes the shortfall on-chain,
-  the existing admin path — `POST /admin/recover/redemption/<id>` ->
-  `ResumeBurn` — resumes the redemption. No new recovery machinery.
+- Recovery is manual. The holder of the missing receipts transfers them back to
+  the orchestrator with a plain ERC-1155 transfer, or the `EMERGENCY_ROLE`
+  holder lowers the burn pointer (`setBurnIndex`); no `EMERGENCY_ROLE` action
+  moves receipts in. Once the operator fixes the shortfall on-chain, the
+  existing admin path — `POST /admin/recover/redemption/<id>` -> `ResumeBurn` —
+  resumes the redemption. No new recovery machinery.
 - Affected redemptions are individually visible today via the existing
   `GET /admin/stuck` (`Failed` state) and are identifiable by their
   `classification: BurnFailureClassification::InsufficientReceipts` field. A
