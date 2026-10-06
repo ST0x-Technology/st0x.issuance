@@ -1,0 +1,113 @@
+# Alert rules for issuance, file-provisioned into the T0 Grafana
+# (grafana.t0trade.com). Pushed to the observability config bucket by
+# .github/workflows/observability.yml on merge; the box picks them up within
+# a minute and restarts Grafana.
+#
+# Provisioned rules are read-only in the UI; change them here, via PR.
+# Datasource uids are fixed by the box: victoriametrics (PromQL over the
+# probes' gauges), cloudmon (Cloud Monitoring, the service's own metrics
+# and log-based metrics). Routing is by the `service` label; `severity:
+# critical` also pages PagerDuty in US extended hours.
+#
+# Removing a rule from this file does NOT remove it from Grafana: add its
+# uid to deleteRules below as well, or it keeps firing.
+apiVersion: 1
+
+deleteRules: []
+
+groups:
+  # The two figures the flow page's header turns red on, as alerts, so nobody
+  # has to be looking at the page. Kais, 2026-09-19: "when backup is 100%
+  # should be green, 101% should probably also be green. 99% should be orange
+  # below 99% red. and make an alert for T0 ... same in unhedged make colors
+  # choose the thresholds." Both read the capital and issuance probes'
+  # gauges in VictoriaMetrics; the thresholds are the page's.
+  - orgId: 1
+    name: issuance-backing
+    folder: Alerts
+    interval: 1m
+    rules:
+      # S01's shares over the tokens it has issued, both at Alpaca's price.
+      # Under 99% for ten minutes: tokens exist that no share backs, beyond
+      # what a price tick between the two reads explains. Critical: it is the
+      # one figure on the issuance side that must never be wrong.
+      - uid: t0backshort001
+        title: s01-backing-under-99pct-production
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: 100 * sum(t0_issuance_backing_usd{env="production",account="omni"}) / sum(t0_issuance_tokens_usd{env="production"})
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [99], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          summary: "S01 backing is {{ printf \"%.1f\" $values.A.Value }}% of tokens issued"
+          description: >-
+            The shares in S01's Alpaca account are worth less than 99% of the
+            tokens outstanding on every chain, at Alpaca's price, for ten
+            minutes. Tokens exist that no share backs. Open the flow page,
+            hover the backed figure for the symbols short, then the issuance
+            board for the per-symbol gap (t0_issuance_backing_gap_usd).
+        labels: {service: issuance, severity: critical}
+
+      # Between 99% and 100% for half an hour: thin, worth a look, not a page.
+      - uid: t0backthin001
+        title: s01-backing-under-100pct-production
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: 100 * sum(t0_issuance_backing_usd{env="production",account="omni"}) / sum(t0_issuance_tokens_usd{env="production"})
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [100], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: OK
+        for: 30m
+        annotations:
+          summary: "S01 backing is {{ printf \"%.2f\" $values.A.Value }}% of tokens issued"
+          description: >-
+            Under 100% but above 99% for half an hour. Usually a price tick
+            between the two reads or a mint mid-flight; if it stays, look at
+            the per-symbol gap on the issuance board.
+        labels: {service: issuance, severity: warning}

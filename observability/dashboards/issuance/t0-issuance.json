@@ -1,0 +1,2635 @@
+{
+  "uid": "t0-issuance",
+  "title": "Issuance",
+  "description": "Production only. The Omni account at Alpaca holds the real shares that back every tokenised equity T0 has issued, and until 2026-09-18 00:19 UTC nothing watched it: issuance-probe now reads it every 3 minutes with the read-only transparency credential and this board is where it lands. BACKING is those positions summed. The second account, Deposit, is $30,000 of idle cash, published so that an idle account going non-idle is visible rather than because anything happens there; its trading_blocked flag has always been 1. Every journal figure is a gauge of TODAY in UTC that resets at midnight, so nothing here wraps one in rate() or increase(), and the drop to zero at 00:00 UTC is the reset rather than an outage. Mints and redeems arrive with the US open at 13:30 UTC, so a zero before then is a quiet morning: the flow tiles say \"none yet today\" for that and \"-\" for a stage that has stopped publishing, and the lanes at the bottom say whether any of it can be trusted. The mints and redeems on this board are the OTHER END of the inferred itn_on_wire row on the Health board: the same events as Alpaca journal records, with a quantity, a price, a timestamp and the ITN request id, so the two can be compared. The general Health board stays a ten-second glance and deliberately carries none of this.",
+  "tags": [
+    "issuance",
+    "t0"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "1m",
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "Related",
+      "tags": [
+        "t0"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Other T0 dashboards"
+    },
+    {
+      "type": "link",
+      "title": "The money corridor, live",
+      "icon": "external link",
+      "tags": [],
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": true,
+      "url": "/flow/",
+      "tooltip": "Every mint and redeem here also lands there as a tokenisation move"
+    }
+  ],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "BACKING, USD",
+      "description": "The shares in the Omni account at Alpaca, summed at Alpaca's own marks (t0_issuance_backing_usd{account=\"omni\"}). This is what backs every tokenised equity T0 has issued: one token's backing is one row of the table below. It equals Alpaca's own long_market_value while nothing is short, checked on 2026-09-17 and agreeing to the cent. Read from Alpaca every 3 minutes with the read-only transparency credential; measured $1,958,829.49 across 50 positions at 2026-09-18 03:52 UTC. Nothing watched this account at all before 2026-09-18 00:19 UTC.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_backing_usd{env=\"production\",account=\"omni\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "locale",
+          "displayName": "BACKING",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#73bf69"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "SYMBOLS BACKED",
+      "description": "How many symbols the Omni account holds (t0_issuance_backing_positions{account=\"omni\"}). 50 on 2026-09-18, and bounded by what T0 lists. A fall means a symbol went to zero shares rather than a price moving, and the table below says which. This counts symbols, not shares: shares leaving a symbol that still holds some show as a smaller Shares column there, never here.",
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_backing_positions{env=\"production\",account=\"omni\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "none",
+          "displayName": "SYMBOLS",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8b93a1"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "UNEXPLAINED, USD",
+      "description": "Alpaca's own equity for the Omni account, less its cash, less the positions summed, as an absolute value. All three are read in one cycle from the same account view, so the residual is Alpaca disagreeing with itself and belongs at zero: it measured $0.004 at 2026-09-18 03:52 UTC. Amber above $1 and red above $1,000 say the backing figure beside it no longer accounts for the whole account, most likely a short position or a holding that is not an equity, and should be read before that number is trusted. This is Alpaca against Alpaca; whether the SHARES match the TOKENS is the row further down.",
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 10,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "abs(last_over_time(t0_issuance_account_equity_usd{env=\"production\",account=\"omni\"}[10m]) - last_over_time(t0_issuance_account_cash_usd{env=\"production\",account=\"omni\"}[10m]) - last_over_time(t0_issuance_backing_usd{env=\"production\",account=\"omni\"}[10m]))",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "locale",
+          "displayName": "UNEXPLAINED",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              },
+              {
+                "color": "#f2cc0c",
+                "value": 1
+              },
+              {
+                "color": "#f0553d",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "CHANGE IN THE BACKING",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 0
+      },
+      "description": "How far the backing has moved over each window, as a plain difference between two readings and never a rate. bps is that change against the level at the start of the window. symbols is the change in how many symbols are held, so a move with symbols at 0 is the market repricing what was already there, and a move with symbols non-zero is a symbol arriving or leaving entirely. Shares moving inside a symbol show in neither column; the table below carries the quantities. A window longer than the probe's own history has no row at all, so the 24 hours and 7 days rows appear as the board ages past 2026-09-18 00:19 UTC.",
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (window, sort) (label_replace(label_replace((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 15m)), \"window\", \"15 minutes\", \"\", \"\"), \"sort\", \"1\", \"\", \"\"))\nor\nsum by (window, sort) (label_replace(label_replace((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 1h)), \"window\", \"1 hour\", \"\", \"\"), \"sort\", \"2\", \"\", \"\"))\nor\nsum by (window, sort) (label_replace(label_replace((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 6h)), \"window\", \"6 hours\", \"\", \"\"), \"sort\", \"3\", \"\", \"\"))\nor\nsum by (window, sort) (label_replace(label_replace((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 24h)), \"window\", \"24 hours\", \"\", \"\"), \"sort\", \"4\", \"\", \"\"))\nor\nsum by (window, sort) (label_replace(label_replace((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 7d)), \"window\", \"7 days\", \"\", \"\"), \"sort\", \"5\", \"\", \"\"))",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (window) (label_replace((10000 * (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 15m)) / ((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 15m) > 0)), \"window\", \"15 minutes\", \"\", \"\"))\nor\nsum by (window) (label_replace((10000 * (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 1h)) / ((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 1h) > 0)), \"window\", \"1 hour\", \"\", \"\"))\nor\nsum by (window) (label_replace((10000 * (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 6h)) / ((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 6h) > 0)), \"window\", \"6 hours\", \"\", \"\"))\nor\nsum by (window) (label_replace((10000 * (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 24h)) / ((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 24h) > 0)), \"window\", \"24 hours\", \"\", \"\"))\nor\nsum by (window) (label_replace((10000 * (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} - (t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 7d)) / ((t0_issuance_backing_usd{env=\"production\",account=\"omni\"} offset 7d) > 0)), \"window\", \"7 days\", \"\", \"\"))",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (window) (label_replace((t0_issuance_backing_positions{env=\"production\",account=\"omni\"} - (t0_issuance_backing_positions{env=\"production\",account=\"omni\"} offset 15m)), \"window\", \"15 minutes\", \"\", \"\"))\nor\nsum by (window) (label_replace((t0_issuance_backing_positions{env=\"production\",account=\"omni\"} - (t0_issuance_backing_positions{env=\"production\",account=\"omni\"} offset 1h)), \"window\", \"1 hour\", \"\", \"\"))\nor\nsum by (window) (label_replace((t0_issuance_backing_positions{env=\"production\",account=\"omni\"} - (t0_issuance_backing_positions{env=\"production\",account=\"omni\"} offset 6h)), \"window\", \"6 hours\", \"\", \"\"))\nor\nsum by (window) (label_replace((t0_issuance_backing_positions{env=\"production\",account=\"omni\"} - (t0_issuance_backing_positions{env=\"production\",account=\"omni\"} offset 24h)), \"window\", \"24 hours\", \"\", \"\"))\nor\nsum by (window) (label_replace((t0_issuance_backing_positions{env=\"production\",account=\"omni\"} - (t0_issuance_backing_positions{env=\"production\",account=\"omni\"} offset 7d)), \"window\", \"7 days\", \"\", \"\"))",
+          "instant": true,
+          "format": "table",
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "window",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "sort",
+                "desc": false
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "sort": true
+            },
+            "indexByName": {
+              "window": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3
+            },
+            "renameByName": {
+              "window": "Window",
+              "Value #A": "Change (USD)",
+              "Value #B": "bps",
+              "Value #C": "symbols",
+              "Value 1": "Change (USD)",
+              "Value 2": "bps",
+              "Value 3": "symbols"
+            }
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*A$",
+            "renamePattern": "Change (USD)"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*B$",
+            "renamePattern": "bps"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*C$",
+            "renamePattern": "symbols"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 2,
+          "custom": {
+            "align": "right",
+            "cellOptions": {
+              "type": "color-text"
+            },
+            "filterable": false,
+            "minWidth": 60
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Window"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "unit",
+                "value": "string"
+              },
+              {
+                "id": "custom.width",
+                "value": 96
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(Change \\(USD\\)|Value.*A)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 132
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(bps|Value.*B)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 74
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(symbols|Value.*C)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "THE BACKING, OVER TIME",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "description": "The backing on a real dollar axis, with the symbol count on the right. The line is flat while US markets are shut because Alpaca's marks do not move, so a flat overnight stretch is correct rather than a stalled probe: the probe's own freshness is the last row of this board, not this line. A step while markets are shut is shares moving, which is a mint or a redeem.",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_backing_usd{env=\"production\",account=\"omni\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "backing, USD"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_backing_positions{env=\"production\",account=\"omni\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "symbols held"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#73bf69"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "lineInterpolation": "stepAfter",
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisPlacement": "left",
+            "axisGridShow": true,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "symbols held"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8b93a1"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "symbols"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WHAT THE BACKING EARNS",
+      "description": "What the shares held to back the tokens have paid and been charged, cumulative since the first record on 2026-03-17. This is the one set of figures on this board that does NOT reset at midnight: income is read in FULL every cycle rather than for the day, so these are running totals since March. That is deliberate and the opposite of how the journals are read: 75 records in six months means a daily figure would read zero on all but a handful of days a year and say nothing on the rest. Dividends are what the positions paid, withholding is the 15 percent non-resident-alien tax taken off them (tax DEU), fees are the regulatory charges (CAT, ADR, REG, TAF) and interest is Alpaca's own. Net is the four summed, three of them already signed negative. Measured on 2026-09-18: $2,492.52 of dividends over 27 records against $373.30 withheld over 24, $4.30 of fees over 23 and $0.33 of interest over 1, net $2,114.59. SGOV ($1,413.90) and SPYM ($1,028.21) are almost all of the dividend line between them, both being funds, so that part is really interest. The per-symbol split is deliberately not drawn: 16 symbols paid something and 14 of them paid under $11. If the \"Income read in full\" lane below is red, one of the four types was refused or cut short and every figure here reads LOW.",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_income_usd{env=\"production\",account=\"omni\",kind=\"dividend\"}[10m]) or vector(NaN), \"k\", \"dividends\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_income_usd{env=\"production\",account=\"omni\",kind=\"withholding\"}[10m]) or vector(NaN), \"k\", \"withholding tax\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_income_usd{env=\"production\",account=\"omni\",kind=\"fee\"}[10m]) or vector(NaN), \"k\", \"fees\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_income_usd{env=\"production\",account=\"omni\",kind=\"interest\"}[10m]) or vector(NaN), \"k\", \"interest\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_income_net_usd{env=\"production\",account=\"omni\"}[10m]) or vector(NaN), \"k\", \"net since 2026-03-17\", \"\", \"\")",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 2,
+          "displayName": "${__field.labels.k}",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8b93a1"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Do the tokens match the shares (the chain side, one block)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "panels": [],
+      "id": 9104
+    },
+    {
+      "type": "stat",
+      "title": "TOKENS OUT, USD",
+      "description": "Every tASSET in the world, at Alpaca's current price: unwrapped supply plus legacy supply, less the tokens sitting in S01's issuer wallet waiting to be burned. A redeem is a transfer to that wallet and Alpaca journals the shares out before the burn lands, so without that subtraction COIN read 77 shares short on 2026-09-18 when it was in fact 0.01 out. This is what S01 has issued; the BACKING above is what it holds against it. $1,778,727 at 2026-09-18 block 51463658.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_tokens_usd{env=\"production\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "locale",
+          "displayName": "TOKENS OUT, USD",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "id": 9105
+    },
+    {
+      "type": "stat",
+      "title": "OVER-BACKED, USD",
+      "description": "Shares S01 holds beyond what it has issued, summed over the symbols where that is the case. Not dangerous, but not nothing: stock sitting in the custodian account that no token claims. $180k on 2026-09-18, almost all of it FGI (12,053 shares, $119k) and DNUT (18,618 shares, $57k); 38 of 54 symbols were within a hundredth of a share.",
+      "gridPos": {
+        "h": 8,
+        "w": 5,
+        "x": 6,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_backing_over_usd{env=\"production\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "locale",
+          "displayName": "OVER-BACKED, USD",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              },
+              {
+                "color": "#f2cc0c",
+                "value": 10000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "id": 9106
+    },
+    {
+      "type": "stat",
+      "title": "SHORT, USD",
+      "description": "Tokens that exist with no share behind them, summed over the symbols where that is the case, as a positive number. THIS is the one that has to be zero. A mint or redeem in flight shows here for one cycle, since the chain is read seconds after Alpaca; anything that stays is S01's problem, and T0 is trading a token worth less than its price. $0.00 on 2026-09-18 once the burn queue was subtracted.",
+      "gridPos": {
+        "h": 8,
+        "w": 5,
+        "x": 11,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_backing_short_usd{env=\"production\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "locale",
+          "displayName": "SHORT, USD",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              },
+              {
+                "color": "#f2cc0c",
+                "value": 1
+              },
+              {
+                "color": "#f0553d",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "id": 9107
+    },
+    {
+      "type": "stat",
+      "title": "WRAPPED, USD",
+      "description": "tASSET locked inside the wtASSET wrappers, at Alpaca's price. The wt token is the one that trades in T0's inventory and against takers, so this is the part of the issuance that is actually in circulation as tradeable stock; the difference from TOKENS OUT is unwrapped tASSET held raw. $1,774,148 on 2026-09-18.",
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 16,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_tokens_wrapped_usd{env=\"production\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "locale",
+          "displayName": "WRAPPED, USD",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "id": 9108
+    },
+    {
+      "type": "stat",
+      "title": "CHAIN READ",
+      "description": "1 when the token list was read, the RPC key fetched, the one Multicall3 call answered and no element in it failed. 0 means every figure in this row is stale or partial and should be read as such.",
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(t0_issuance_chain_read_complete{env=\"production\"}[10m])",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "none",
+          "displayName": "COMPLETE",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#f0553d",
+                "value": null
+              },
+              {
+                "color": "#73bf69",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "id": 9109
+    },
+    {
+      "type": "table",
+      "title": "SHARES AGAINST TOKENS, BY SYMBOL",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "description": "One row per symbol in either the Omni account or st0x.registry, sorted by the gap in dollars. At Alpaca is the shares held. Tokens out is tASSET plus legacy tASSET, less what sits in S01's issuer wallet awaiting burn; Wrapped is the tASSET locked in the wtASSET wrapper; Burn queue is that issuer-wallet balance. Gap is At Alpaca minus Tokens out, in shares and in dollars: positive is stock no token claims, negative is a token no share backs. A symbol with tokens and no Alpaca position (the four European ones, 1.0 token each on 2026-09-18) has no price and shows no dollar figure. RKLB and IBHG are the other way round: held at Alpaca, not in the registry, so the whole position is a gap and the registry needs the row.",
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": true,
+          "reducer": [
+            "sum"
+          ],
+          "fields": [
+            "Gap (USD)"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "ALP",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_position_qty{env=\"production\",account=\"omni\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "OUT",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_token_outstanding_qty{env=\"production\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "WRAP",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_token_wrapped_qty{env=\"production\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "QUEUE",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_token_burn_queue_qty{env=\"production\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "GAPQ",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_backing_gap_qty{env=\"production\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "GAP",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_backing_gap_usd{env=\"production\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "symbol",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true
+            },
+            "indexByName": {
+              "symbol": 0,
+              "Value #ALP": 1,
+              "Value #OUT": 2,
+              "Value #WRAP": 3,
+              "Value #QUEUE": 4,
+              "Value #GAPQ": 5,
+              "Value #GAP": 6
+            },
+            "renameByName": {
+              "symbol": "Symbol",
+              "Value #ALP": "At Alpaca (shares)",
+              "Value #OUT": "Tokens out",
+              "Value #WRAP": "Wrapped",
+              "Value #QUEUE": "Burn queue",
+              "Value #GAPQ": "Gap (shares)",
+              "Value #GAP": "Gap (USD)"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Gap (USD)",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "right",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          },
+          "mappings": [],
+          "unit": "locale",
+          "decimals": 4
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Symbol"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Gap (USD)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 150
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#f0553d",
+                      "value": null
+                    },
+                    {
+                      "color": "#73bf69",
+                      "value": -1
+                    },
+                    {
+                      "color": "#f2cc0c",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Gap (shares)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 4
+              },
+              {
+                "id": "custom.width",
+                "value": 150
+              }
+            ]
+          }
+        ]
+      },
+      "id": 9110
+    },
+    {
+      "type": "row",
+      "title": "Which symbols hold the backing",
+      "id": 9101,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      }
+    },
+    {
+      "type": "table",
+      "title": "EVERY SYMBOL, BY VALUE",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "description": "One row per symbol the Omni account holds, sorted by what it is worth. Value is Alpaca's market value for that position, Shares is the quantity and Price is Alpaca's current mark. Quantity and price are published apart as well as multiplied on purpose, so a change can be split into the market repricing what was already held against shares arriving or leaving. Share of backing is the position against the total, so the column sums to 100 percent and the bar is drawn against the largest holding rather than against 100. Fifty rows on 2026-09-18, heavily skewed: SPYM 30.8 percent, FGI 27.0 percent and COIN 14.7 percent held just under three quarters of it.",
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": true,
+          "reducer": [
+            "sum"
+          ],
+          "fields": [
+            "Value (USD)"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "USD",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_position_usd{env=\"production\",account=\"omni\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "QTY",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_position_qty{env=\"production\",account=\"omni\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "PRICE",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_position_price_usd{env=\"production\",account=\"omni\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "PCT",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (100 * t0_issuance_position_usd{env=\"production\",account=\"omni\"} / on(env,account) group_left() t0_issuance_backing_usd{env=\"production\",account=\"omni\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "symbol",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true
+            },
+            "indexByName": {
+              "symbol": 0,
+              "Value #USD": 1,
+              "Value #PCT": 2,
+              "Value #QTY": 3,
+              "Value #PRICE": 4
+            },
+            "renameByName": {
+              "symbol": "Symbol",
+              "Value #USD": "Value (USD)",
+              "Value #QTY": "Shares",
+              "Value #PRICE": "Price (USD)",
+              "Value #PCT": "Share of backing"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Value (USD)",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "right",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Symbol"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value (USD)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Shares"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Price (USD)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of backing"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8b93a1"
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "title": "The mint and redeem pipeline, today so far (UTC)",
+      "id": 9102,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      }
+    },
+    {
+      "type": "stat",
+      "title": "TODAY'S ITN FLOW, USD",
+      "description": "Every mint and redeem the Instant Tokenization Network booked against the Omni account so far today, read as Alpaca's own journal records rather than inferred: dollars are quantity times price, because net_amount was \"0\" on every one of the 992 journals measured (a mint moves shares, not dollars). Net is minted less redeemed, so a positive net is a day that put more shares into the Omni account than it took out. Measured on 2026-09-17: $206,361.83 minted over 140 journals against $200,868.32 redeemed over 150, net $5,493.51. These are gauges of TODAY in UTC that reset to zero at midnight, so they are never wrapped in rate() or increase(): a reset reads as a counter restart there and inflates the answer. \"none yet today\" is a real zero that the probe read in full. A \"-\" means the journals stage published nothing for two cycles, which is the other kind of zero. Mints and redeems arrive with the US open at 13:30 UTC, so a quiet zero before then is expected rather than broken. If the \"Journal day read in full\" lane at the bottom of this board is red, the probe hit its page budget and every figure here reads LOW.",
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_total_usd{env=\"production\",account=\"omni\",direction=\"mint\"}[10m]) or vector(NaN), \"k\", \"minted\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_total_usd{env=\"production\",account=\"omni\",direction=\"redeem\"}[10m]) or vector(NaN), \"k\", \"redeemed\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_net_usd{env=\"production\",account=\"omni\"}[10m]) or vector(NaN), \"k\", \"net (mint less redeem)\", \"\", \"\")",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 2,
+          "displayName": "${__field.labels.k}",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8b93a1"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 0,
+                "to": 0,
+                "result": {
+                  "text": "none yet today",
+                  "color": "#8b93a1",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "TODAY'S ITN JOURNALS",
+      "description": "The same day counted as records rather than dollars: how many journals of each direction Alpaca booked against the Omni account today. Direction comes from the first word of the journal description, and across 1,185 journals measured to 2026-09-17 the verb set was exactly mint and redeem. Anything else is counted under unknown rather than dropped or guessed at, so a non-zero unknown is news, and the verb itself goes to the VictoriaLogs record. These are gauges of TODAY in UTC that reset to zero at midnight, so they are never wrapped in rate() or increase(): a reset reads as a counter restart there and inflates the answer. \"none yet today\" is a real zero that the probe read in full. A \"-\" means the journals stage published nothing for two cycles, which is the other kind of zero. Mints and redeems arrive with the US open at 13:30 UTC, so a quiet zero before then is expected rather than broken. If the \"Journal day read in full\" lane at the bottom of this board is red, the probe hit its page budget and every figure here reads LOW.",
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_total_count{env=\"production\",account=\"omni\",direction=\"mint\"}[10m]) or vector(NaN), \"k\", \"mints\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_total_count{env=\"production\",account=\"omni\",direction=\"redeem\"}[10m]) or vector(NaN), \"k\", \"redeems\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_total_count{env=\"production\",account=\"omni\",direction=\"unknown\"}[10m]) or vector(NaN), \"k\", \"unknown verb\", \"\", \"\")",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "displayName": "${__field.labels.k}",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8b93a1"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 0,
+                "to": 0,
+                "result": {
+                  "text": "none yet today",
+                  "color": "#8b93a1",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "TODAY'S ITN FLOW, OVER TIME",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      },
+      "description": "Today's flow through the day, with the unknown-verb line drawn as well so a third verb cannot appear unseen. Each line only ever climbs, because each is a total accumulating since midnight, and the drop to zero at 00:00 UTC is the gauge resetting rather than an outage or a reversal. A line sitting flat on zero before 13:30 UTC is a trading day that has not opened yet; a line sitting flat on zero well after it is worth taking to the lanes below. Never read a rate off this panel: the midnight reset would inflate it. If the \"Journal day read in full\" lane at the bottom of this board is red, the probe hit its page budget and every figure here reads LOW.",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_journal_total_usd{env=\"production\",account=\"omni\",direction=\"mint\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "minted today"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_journal_total_usd{env=\"production\",account=\"omni\",direction=\"redeem\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "redeemed today"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_journal_net_usd{env=\"production\",account=\"omni\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "net (mint less redeem)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "t0_issuance_journal_total_usd{env=\"production\",account=\"omni\",direction=\"unknown\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "unknown verb"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "locale",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "lineInterpolation": "stepAfter",
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "axisGridShow": true,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "minted today"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#73bf69"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "redeemed today"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#ff9830"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "net (mint less redeem)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#ffffff"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    6,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unknown verb"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f0553d"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "title": "MINTS AND REDEEMS TODAY, BY SYMBOL (no rows until the first one)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 82
+      },
+      "description": "Which tokenised equities moved today, split by direction. There are no rows at all until the first journal of the day, which normally arrives after the US open at 13:30 UTC, so an empty table in the morning is the honest reading and not a broken query: the totals above publish their zeros deliberately, while this per-symbol view publishes no series for a symbol that has not moved. Dollars are quantity times price. These are gauges of TODAY in UTC that reset to zero at midnight, so they are never wrapped in rate() or increase(): a reset reads as a counter restart there and inflates the answer. If the \"Journal day read in full\" lane at the bottom of this board is red, the probe hit its page budget and every figure here reads LOW.",
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": true,
+          "reducer": [
+            "sum"
+          ],
+          "fields": [
+            "Minted (USD)",
+            "Redeemed (USD)"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "MUSD",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_usd{env=\"production\",account=\"omni\",direction=\"mint\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "MN",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_count{env=\"production\",account=\"omni\",direction=\"mint\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "RUSD",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_usd{env=\"production\",account=\"omni\",direction=\"redeem\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "RN",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_count{env=\"production\",account=\"omni\",direction=\"redeem\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "MQTY",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_qty{env=\"production\",account=\"omni\",direction=\"mint\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        },
+        {
+          "refId": "RQTY",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (symbol) (t0_issuance_journal_qty{env=\"production\",account=\"omni\",direction=\"redeem\"})",
+          "instant": true,
+          "format": "table",
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "symbol",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true
+            },
+            "indexByName": {
+              "symbol": 0,
+              "Value #MUSD": 1,
+              "Value #MN": 2,
+              "Value #MQTY": 3,
+              "Value #RUSD": 4,
+              "Value #RN": 5,
+              "Value #RQTY": 6
+            },
+            "renameByName": {
+              "symbol": "Symbol",
+              "Value #MUSD": "Minted (USD)",
+              "Value #MN": "mints",
+              "Value #MQTY": "Shares minted",
+              "Value #RUSD": "Redeemed (USD)",
+              "Value #RN": "redeems",
+              "Value #RQTY": "Shares redeemed"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Minted (USD)",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "right",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          },
+          "mappings": [],
+          "noValue": "No mint or redeem yet today. The day resets at 00:00 UTC and journals start with the US open, 13:30 UTC."
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Symbol"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(Minted|Redeemed) \\(USD\\)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^Shares (minted|redeemed)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(mints|redeems)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "title": "Is the probe telling the truth",
+      "id": 9103,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 94
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 95
+      },
+      "description": "One lane per thing that can make this board lie, over the selected range. Green and quiet means nothing to say; a lane turns red the moment its condition holds and stays red until it clears, so you can see when it started and how long it lasted. Journal day read in full: the page budget is 8 pages per account per cycle, over twice the heaviest day measured, and when it is hit the read stops early and every journal figure above reads LOW, which otherwise looks exactly like a quiet session. Income read in full: one of the four income types was refused by Alpaca or did not read to the end, which makes every figure in WHAT THE BACKING EARNS read LOW; the filter vocabulary there is not the response vocabulary, so a type can be rejected as invalid, and DIVTAX and SSO were measured as rejected. Journal verb against Alpaca's sign: Alpaca also signs the quantity, negative on a redeem, and the two agreed on 992 of 992 measured, so a mismatch means the data model changed and the directions above are no longer safe. Unknown journal verbs: a third verb appeared, and its rows are published under direction \"unknown\" rather than dropped. Journal page budget: 7 or more pages read, so the budget can be raised before it is hit rather than after. Probe stages: any of the eleven stages failed this cycle. Probe pushing: nothing pushed in the last 10 minutes, against a 3 minute timer. Omni account: not ACTIVE, or trading or transfers blocked. Deposit account moved: the idle $30,000 changed in the last hour, which has not happened since its one ACH deposit on 2026-02-03. The Deposit account's trading_blocked flag is 1 by design and is deliberately not a lane.",
+      "options": {
+        "mergeValues": true,
+        "showValue": "always",
+        "alignValue": "center",
+        "rowHeight": 0.75,
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "READ",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(1 - last_over_time(t0_issuance_journal_read_complete{env=\"production\",account=\"omni\"}[5m]), \"lane\", \"Journal day read in full\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "INCOME",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(1 - last_over_time(t0_issuance_income_read_complete{env=\"production\",account=\"omni\"}[5m]), \"lane\", \"Income read in full\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "SIGN",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_sign_mismatch{env=\"production\",account=\"omni\"}[5m]), \"lane\", \"Journal verb against Alpaca's sign\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "VERB",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_unknown_verbs{env=\"production\",account=\"omni\"}[5m]), \"lane\", \"Unknown journal verbs\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "PAGES",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_pages{env=\"production\",account=\"omni\"}[5m]) >= bool 7, \"lane\", \"Journal page budget (8 a cycle)\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "STAGES",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(sum(last_over_time(t0_issuance_probe_failures{env=\"production\"}[5m])), \"lane\", \"Probe stages failing\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "FRESH",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace((time() - timestamp(t0_issuance_probe_success{env=\"production\"})) > bool 600, \"lane\", \"Probe pushing (3 min timer)\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "OMNI",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace((1 - last_over_time(t0_issuance_account_status{env=\"production\",account=\"omni\"}[5m])) + last_over_time(t0_issuance_account_trading_blocked{env=\"production\",account=\"omni\"}[5m]) + last_over_time(t0_issuance_account_transfers_blocked{env=\"production\",account=\"omni\"}[5m]), \"lane\", \"Omni account active and unblocked\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        },
+        {
+          "refId": "DEPOSIT",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(abs(last_over_time(t0_issuance_account_equity_usd{env=\"production\",account=\"deposit\"}[5m]) - last_over_time(t0_issuance_account_equity_usd{env=\"production\",account=\"deposit\"}[5m] offset 1h)) > bool 0.01, \"lane\", \"Deposit account moved\", \"\", \"\")",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{lane}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 75,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "range",
+              "options": {
+                "from": -0.5,
+                "to": 0.5,
+                "result": {
+                  "text": "ok",
+                  "color": "#2f6f3e",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 0.5,
+                "to": 1000000000,
+                "result": {
+                  "text": "ISSUE",
+                  "color": "#f0553d",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "no data",
+                  "color": "#3d4249",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2f6f3e",
+                "value": null
+              },
+              {
+                "color": "#f0553d",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "LAST CYCLE",
+      "description": "How long ago the probe last pushed, from the timestamp on t0_issuance_probe_success. The timer runs every 3 minutes, so amber at 7 minutes is two missed cycles and red at 15 minutes means the exporter is down and every number on this board is stale rather than flat. This is the panel that tells an overnight flat line from a dead probe.",
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 0,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "(time() - timestamp(t0_issuance_probe_success{env=\"production\"}))",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "displayName": "LAST CYCLE",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#73bf69",
+                "value": null
+              },
+              {
+                "color": "#f2cc0c",
+                "value": 420
+              },
+              {
+                "color": "#f0553d",
+                "value": 900
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "THE PROBE ITSELF",
+      "description": "Pages read: how many pages of Alpaca activity the last cycle fetched for the Omni account, against a budget of 8. Journals logged: records written to VictoriaLogs in the last cycle, which on a steady state is the mints and redeems of the last 3 minutes and nothing else. Activity ids held: how many journal ids the state file keeps against a repeat write, capped at 4,000. Sign mismatches and unknown verbs: the two cross-checks, both 0 on everything measured. Journals logged and activity ids held carry no account label, because the log push and the state file are one per cycle across both accounts rather than one per account. The day itself is re-read from Alpaca in full every cycle rather than accumulated, so a missed cycle, a restart or a failed push leaves no gap and no double count.",
+      "gridPos": {
+        "h": 5,
+        "w": 19,
+        "x": 5,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_pages{env=\"production\",account=\"omni\"}[10m]) or vector(NaN), \"k\", \"pages read (of 8)\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_logged{env=\"production\"}[10m]) or vector(NaN), \"k\", \"journals logged\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_known_ids{env=\"production\"}[10m]) or vector(NaN), \"k\", \"activity ids held\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_sign_mismatch{env=\"production\",account=\"omni\"}[10m]) or vector(NaN), \"k\", \"sign mismatches\", \"\", \"\")",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(last_over_time(t0_issuance_journal_unknown_verbs{env=\"production\",account=\"omni\"}[10m]) or vector(NaN), \"k\", \"unknown verbs\", \"\", \"\")",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "displayName": "${__field.labels.k}",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8b93a1"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "-",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
