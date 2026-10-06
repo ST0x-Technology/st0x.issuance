@@ -124,6 +124,16 @@ pub(crate) enum TransportError {
         server_said(.body)
     )]
     Unavailable { body: String },
+    /// 502 or 504: something between the operator and the bot gave up waiting,
+    /// either the load balancer's backend timeout or the bot's own wait on the
+    /// chain, so a write may still have been applied.
+    #[error(
+        "HTTP {status}: a gateway gave up waiting for the bot, so the outcome \
+         is unknown. A read can be retried; before retrying a write, check the \
+         logs for whether it was applied.{}",
+        server_said(.body)
+    )]
+    OutcomeUnknown { status: StatusCode, body: String },
     #[error("HTTP {status}: the request failed.{}", server_said(.body))]
     Http { status: StatusCode, body: String },
     #[error(
@@ -299,6 +309,9 @@ async fn classify(
         StatusCode::FORBIDDEN => TransportError::Forbidden { body },
         StatusCode::NOT_FOUND => TransportError::NotFound { body },
         StatusCode::SERVICE_UNAVAILABLE => TransportError::Unavailable { body },
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => {
+            TransportError::OutcomeUnknown { status, body }
+        }
         status => TransportError::Http { status, body },
     })
 }
@@ -549,6 +562,23 @@ mod tests {
         )
         .await;
         assert!(matches!(unavailable, TransportError::Unavailable { .. }));
+
+        // A gateway that gave up waiting (the load balancer's backend timeout,
+        // or the bot's own RPC wait) may still see the write land, so these
+        // must not read as a plain failure an operator would retry.
+        for response in [
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+            "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+        ] {
+            let gateway = failure(response).await;
+            let message = gateway.to_string();
+            assert!(message.contains("outcome is unknown"), "{message}");
+            assert!(message.contains("check the logs"), "{message}");
+            assert!(gateway.reached_server());
+            assert!(!gateway.is_access_denied());
+        }
 
         let conflict = failure(
             "HTTP/1.1 409 Conflict\r\nContent-Length: 4\r\n\

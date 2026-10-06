@@ -581,6 +581,53 @@ mod tests {
         );
     }
 
+    /// `add-tokenized-asset` and `schedule-freeze` carry the symbol in a JSON
+    /// body, which the bot keys exactly as sent, so the client upper-cases
+    /// every symbol at parse time as the offline `issuer` CLI does.
+    #[test]
+    fn lowercase_symbols_are_sent_upper_cased() {
+        let (_, add) = wire(&[
+            "debug",
+            "add-tokenized-asset",
+            "--underlying",
+            "aapl",
+            "--token",
+            "tAAPL",
+            "--network",
+            "base",
+            "--vault",
+            "0x2222222222222222222222222222222222222222",
+        ]);
+        assert_eq!(add.unwrap()["underlying"], "AAPL");
+
+        let (_, schedule) = wire(&[
+            "capital",
+            "schedule-freeze",
+            "--underlying",
+            "aapl",
+            "--freeze-at",
+            "2026-10-01T13:30:00Z",
+            "--unfreeze-at",
+            "2026-10-02T13:30:00Z",
+        ]);
+        assert_eq!(schedule.unwrap()["underlying"], "AAPL");
+
+        assert_eq!(
+            wire(&["capital", "freeze", "aapl"]),
+            bodiless("POST /ops/capital/freeze/AAPL")
+        );
+        assert_eq!(
+            wire(&[
+                "read",
+                "orchestrator-preflight",
+                "base",
+                "--asset",
+                "aapl"
+            ]),
+            bodiless("GET /ops/read/orchestrator-preflight/base?asset=AAPL")
+        );
+    }
+
     #[test]
     fn the_logging_link_searches_the_named_identifier_in_the_right_project() {
         let freeze = command(&["capital", "freeze", "AAPL"]);

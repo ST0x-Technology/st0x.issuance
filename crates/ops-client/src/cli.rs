@@ -5,7 +5,9 @@
 use alloy_primitives::Address;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use st0x_issuance_dto::{Email, Network, UnderlyingSymbol};
+use st0x_issuance_dto::{
+    Email, Network, UnderlyingSymbol, UnderlyingSymbolError,
+};
 
 use crate::target::Env;
 
@@ -45,12 +47,15 @@ pub(crate) enum ReadCommand {
     /// Detected wrapped-token transfers.
     WrappedTransfers(WrappedTransfersArgs),
     /// An underlying's freeze status.
-    Status { underlying: UnderlyingSymbol },
+    Status {
+        #[arg(value_parser = uppercase_symbol)]
+        underlying: UnderlyingSymbol,
+    },
     /// Read-only on-chain readiness of a network's orchestrator.
     OrchestratorPreflight {
         network: Network,
         /// Asset to check; repeat for several.
-        #[arg(long = "asset")]
+        #[arg(long = "asset", value_parser = uppercase_symbol)]
         assets: Vec<UnderlyingSymbol>,
     },
 }
@@ -76,7 +81,11 @@ pub(crate) enum DebugCommand {
     /// Reprocess a stuck or failed mint.
     ReprocessMint { issuer_request_id: String },
     /// Run the orchestrator signing verification for an asset.
-    VerifyOrchestratorSigning { network: Network, underlying: UnderlyingSymbol },
+    VerifyOrchestratorSigning {
+        network: Network,
+        #[arg(value_parser = uppercase_symbol)]
+        underlying: UnderlyingSymbol,
+    },
     /// Register an account for an email address.
     RegisterAccount {
         #[arg(long, value_parser = Email::new)]
@@ -88,13 +97,14 @@ pub(crate) enum DebugCommand {
     UnwhitelistWallet { client_id: String, wallet: Address },
     /// Show an asset's listing on one network.
     TokenizedAsset {
+        #[arg(value_parser = uppercase_symbol)]
         underlying: UnderlyingSymbol,
         #[arg(long)]
         network: Network,
     },
     /// List an asset on a network.
     AddTokenizedAsset {
-        #[arg(long)]
+        #[arg(long, value_parser = uppercase_symbol)]
         underlying: UnderlyingSymbol,
         #[arg(long)]
         token: String,
@@ -110,12 +120,18 @@ pub(crate) enum DebugCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum CapitalCommand {
     /// Freeze an underlying on every network.
-    Freeze { underlying: UnderlyingSymbol },
+    Freeze {
+        #[arg(value_parser = uppercase_symbol)]
+        underlying: UnderlyingSymbol,
+    },
     /// Unfreeze an underlying.
-    Unfreeze { underlying: UnderlyingSymbol },
+    Unfreeze {
+        #[arg(value_parser = uppercase_symbol)]
+        underlying: UnderlyingSymbol,
+    },
     /// Schedule a freeze window for a corporate action (RFC 3339 instants).
     ScheduleFreeze {
-        #[arg(long)]
+        #[arg(long, value_parser = uppercase_symbol)]
         underlying: UnderlyingSymbol,
         #[arg(long)]
         freeze_at: DateTime<Utc>,
@@ -123,7 +139,21 @@ pub(crate) enum CapitalCommand {
         unfreeze_at: DateTime<Utc>,
     },
     /// Grant the orchestrator its one-time allowance for an asset.
-    ApproveOrchestrator { network: Network, underlying: UnderlyingSymbol },
+    ApproveOrchestrator {
+        network: Network,
+        #[arg(value_parser = uppercase_symbol)]
+        underlying: UnderlyingSymbol,
+    },
+}
+
+/// Parses an underlying symbol upper-cased, as the offline `issuer` CLI does.
+/// The bot keys a listing or freeze window by the symbol exactly as a request
+/// body carries it, so `aapl` would otherwise address a different asset than
+/// the `AAPL` every other path uses.
+fn uppercase_symbol(
+    value: &str,
+) -> Result<UnderlyingSymbol, UnderlyingSymbolError> {
+    UnderlyingSymbol::new(value.to_ascii_uppercase())
 }
 
 #[cfg(test)]

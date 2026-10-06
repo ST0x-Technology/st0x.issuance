@@ -5077,7 +5077,10 @@ key or secret-file option.
 Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
 (`RegisterAccountRequest`, `WhitelistWalletRequest`, `AddTokenizedAssetRequest`,
 `ScheduleFreezeWindowRequest`), so client and bot cannot drift on a body shape.
-Path segments are percent-encoded and redirects are never followed.
+Every underlying symbol argument is upper-cased at parse time, as the offline
+`issuer` CLI does, because the bot keys a listing or freeze window by the symbol
+exactly as a body carries it. Path segments are percent-encoded and redirects
+are never followed.
 
 On success, stdout carries exactly the response body as one compact JSON line
 (the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
@@ -5101,6 +5104,10 @@ outage during sign-in. Failures are explained:
   not fetch Google's IAP keys or the load balancer had no healthy backend. A
   read can be retried; before retrying a write, the logs show whether it was
   applied.
+- **502 or 504:** a gateway gave up waiting, either the load balancer's backend
+  timeout (an `approve-orchestrator` waiting for its receipt can outlast it) or
+  the bot's own wait on the chain, so the outcome is unknown. A read can be
+  retried; before retrying a write, the logs show whether it was applied.
 - **No response:** a connection that timed out or dropped after the request was
   sent leaves the outcome unknown, and the client says so.
 - **Unwritable output:** the bot answered with success but stdout could not take
