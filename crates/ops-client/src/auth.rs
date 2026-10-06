@@ -42,6 +42,17 @@ pub(crate) enum AuthError {
     Authorization { code: String },
     #[error("the sign-in redirect carried no authorization code")]
     MissingCode,
+    /// Google does not redirect back for a broken client configuration (RFC
+    /// 6749 section 4.1.2.1: an invalid client id or redirect URI); it shows
+    /// the error in the browser instead, so the wait for the redirect is bounded.
+    #[error(
+        "the browser sign-in did not finish within {} minutes. If the browser \
+         showed a Google error (for example deleted_client or \
+         redirect_uri_mismatch), check S01_ISSUANCE_*_CLIENT_ID and the \
+         Desktop OAuth client; otherwise re-run and complete the sign-in.",
+        SIGN_IN_TIMEOUT.as_secs() / 60
+    )]
+    SignInTimedOut,
 }
 
 impl AuthError {
@@ -68,14 +79,18 @@ impl AuthError {
             | Self::Json(_)
             | Self::Url(_)
             | Self::MissingIdToken
-            | Self::MissingCode => false,
+            | Self::MissingCode
+            | Self::SignInTimedOut => false,
         }
     }
 
     /// Google rejected the Desktop OAuth client or the request it made (RFC
-    /// 6749 sections 4.1.2.1 and 5.2): a setup error no sign-in can repair.
+    /// 6749 sections 4.1.2.1 and 5.2), or never redirected back, which is how
+    /// it reports a client id or redirect URI it cannot accept: a setup error
+    /// no sign-in can repair.
     pub(crate) fn is_client_misconfigured(&self) -> bool {
         let code = match self {
+            Self::SignInTimedOut => return true,
             Self::Authorization { code } => Some(code.as_str()),
             Self::TokenEndpoint { code, .. } => code.as_deref(),
             _ => None,
@@ -100,18 +115,26 @@ const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// Bounds each exchange with Google so a stalled endpoint cannot hang the
-/// sign-in; the operator's browser step itself is not bounded.
+/// sign-in.
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds the operator's browser step: long enough to sign in, short enough
+/// that a client configuration Google refuses to redirect for fails rather
+/// than hangs.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How often the loopback listener checks for a connection and the deadline.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Bounds how long one loopback connection may take to send its whole request
-/// line, so a connection that never sends one (a browser preconnect) or drips
+/// head, so a connection that never sends one (a browser preconnect) or drips
 /// it cannot stall the sign-in.
 const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The longest loopback request line accepted; Google's redirect is far
-/// shorter, so a longer one is not the redirect.
-const MAX_REQUEST_LINE: usize = 8 * 1024;
+/// The longest loopback request head accepted; a browser's redirect, headers
+/// included, is far shorter, so a longer one is not the redirect.
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
 
 /// Returns the ID token for `identity`. Workload identity already holds one;
 /// the Desktop client silently refreshes a cached sign-in, or signs the
@@ -152,8 +175,8 @@ async fn desktop_id_token(
             // Only a rejected grant (`invalid_grant`: the refresh token was
             // revoked or expired) needs a new browser sign-in. Anything else
             // (a network failure, a rate limit, a 5xx, a bad client secret) is
-            // reported instead, since the browser wait is unbounded and a
-            // sign-in would not fix it.
+            // reported instead: a sign-in would not fix it, so the operator is
+            // not sent to the browser for it.
             Err(error) if error.is_rejected_grant() => {
                 eprintln!(
                     "The cached S01 sign-in was rejected ({error}); signing in \
@@ -200,9 +223,10 @@ async fn interactive_id_token(
          account:\n\n{auth_url}\n"
     );
 
-    let code =
-        tokio::task::spawn_blocking(move || capture_code(&listener, &state))
-            .await??;
+    let code = tokio::task::spawn_blocking(move || {
+        capture_code(&listener, &state, SIGN_IN_TIMEOUT)
+    })
+    .await??;
 
     let token = post_token(
         http,
@@ -289,34 +313,64 @@ fn extract_id_token(token: &serde_json::Value) -> Result<String, AuthError> {
         .ok_or(AuthError::MissingIdToken)
 }
 
-/// Waits for the loopback redirect, returns the authorization code, and serves
-/// a small page telling the operator the sign-in is done. Only a request
-/// carrying this sign-in's own `state` counts (RFC 6749 section 10.12): any
-/// other connection (a browser preconnect or favicon fetch, another local
-/// process) is dropped and the wait continues. Blocking, so it runs on a
+/// Waits up to `timeout` for the loopback redirect, returns the authorization
+/// code, and serves a small page telling the operator how the sign-in ended.
+/// Only a request carrying this sign-in's own `state` counts (RFC 6749 section
+/// 10.12): any other connection (a browser preconnect or favicon fetch, another
+/// local process) is dropped and the wait continues. Blocking, so it runs on a
 /// blocking task off the async runtime.
 fn capture_code(
     listener: &std::net::TcpListener,
     expected_state: &str,
+    timeout: Duration,
 ) -> Result<String, AuthError> {
-    let (mut stream, params) = loop {
-        let (stream, _) = listener.accept()?;
+    let deadline =
+        Instant::now().checked_add(timeout).ok_or(AuthError::SignInTimedOut)?;
+    listener.set_nonblocking(true)?;
 
-        if let Some(params) = redirect_params(&stream)
+    let (mut stream, params) = loop {
+        if Instant::now() >= deadline {
+            return Err(AuthError::SignInTimedOut);
+        }
+
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        // An accepted socket inherits the listener's non-blocking mode on some
+        // platforms (BSD, macOS), and the request read relies on blocking
+        // reads with a timeout.
+        stream.set_nonblocking(false)?;
+
+        if let Some(params) = redirect_params(&stream, deadline)
             && params.get("state").map(String::as_str) == Some(expected_state)
         {
             break (stream, params);
         }
     };
 
-    let page = "<html><body>Sign-in complete. You can close this tab and \
-                return to the terminal.</body></html>";
+    let completed =
+        !params.contains_key("error") && params.contains_key("code");
+    let page = if completed {
+        "<html><body>Sign-in complete. You can close this tab and return to \
+         the terminal.</body></html>"
+    } else {
+        "<html><body>Sign-in did not complete. Return to the terminal for the \
+         reason.</body></html>"
+    };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: \
          {}\r\nConnection: close\r\n\r\n{page}",
         page.len()
     );
-    std::io::Write::write_all(&mut stream, response.as_bytes())?;
+    // The page is a courtesy: `params` already decides the outcome, so a tab
+    // the operator closed early must not discard a captured code.
+    let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
 
     if let Some(code) = params.get("error") {
         return Err(AuthError::Authorization { code: code.clone() });
@@ -326,11 +380,12 @@ fn capture_code(
 }
 
 /// The query parameters of the request on `stream`, or `None` when no request
-/// line arrived in time.
+/// line arrived before the connection's read deadline.
 fn redirect_params(
     stream: &std::net::TcpStream,
+    sign_in_deadline: Instant,
 ) -> Option<HashMap<String, String>> {
-    let request_line = request_line(stream)?;
+    let request_line = request_line(stream, sign_in_deadline)?;
     let query = request_line
         .split_whitespace()
         .nth(1)
@@ -340,32 +395,56 @@ fn redirect_params(
     Some(url::form_urlencoded::parse(query.as_bytes()).into_owned().collect())
 }
 
-/// Reads the request line within `REDIRECT_READ_TIMEOUT` overall and
-/// `MAX_REQUEST_LINE` bytes, so a connection that stalls, drips, or floods
-/// cannot hold up the sign-in. `None` on any shortfall: the failure belongs to
-/// that connection, never the sign-in.
-fn request_line(mut stream: &std::net::TcpStream) -> Option<String> {
-    let deadline = Instant::now().checked_add(REDIRECT_READ_TIMEOUT)?;
-    let mut line = Vec::new();
+/// Reads the request head and returns its first line. The read stops at the
+/// blank line ending the headers, at `MAX_REQUEST_HEAD` bytes, or at the
+/// earlier of `REDIRECT_READ_TIMEOUT` and `sign_in_deadline`, so a connection
+/// that stalls, drips, or floods cannot hold up the sign-in. Draining the head
+/// lets the socket close with a FIN after the response rather than a reset for
+/// unread data, so the browser shows the page; it is best effort, so a first
+/// line already read is still returned when a bound stops the drain. `None`
+/// when no complete first line arrived: the failure belongs to that
+/// connection, never the sign-in.
+fn request_line(
+    mut stream: &std::net::TcpStream,
+    sign_in_deadline: Instant,
+) -> Option<String> {
+    let deadline = Instant::now()
+        .checked_add(REDIRECT_READ_TIMEOUT)?
+        .min(sign_in_deadline);
+    let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
 
     loop {
-        let remaining = deadline
+        let Some(remaining) = deadline
             .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())?;
-        stream.set_read_timeout(Some(remaining)).ok()?;
-        let count = stream.read(&mut chunk).ok().filter(|count| *count > 0)?;
-        line.extend_from_slice(chunk.get(..count)?);
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return first_line(&head);
+        };
 
-        if let Some(end) = line.iter().position(|byte| *byte == b'\n') {
-            line.truncate(end);
-            return String::from_utf8(line).ok();
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return first_line(&head);
         }
 
-        if line.len() > MAX_REQUEST_LINE {
-            return None;
+        let count = match stream.read(&mut chunk) {
+            Ok(count) if count > 0 => count,
+            _ => return first_line(&head),
+        };
+        head.extend_from_slice(chunk.get(..count)?);
+
+        if head.windows(4).any(|window| window == b"\r\n\r\n")
+            || head.len() > MAX_REQUEST_HEAD
+        {
+            return first_line(&head);
         }
     }
+}
+
+/// The bytes before the first `\n`, when one has arrived.
+fn first_line(head: &[u8]) -> Option<String> {
+    let end = head.iter().position(|byte| *byte == b'\n')?;
+
+    String::from_utf8(head.get(..end)?.to_vec()).ok()
 }
 
 /// A URL-safe, unpadded base64 string of `bytes` random bytes, for the PKCE
@@ -518,11 +597,11 @@ mod tests {
     use reqwest::StatusCode;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        AuthError, capture_code, extract_id_token, load_refresh_token_at,
-        refresh_id_token, store_refresh_token_at,
+        AuthError, REDIRECT_READ_TIMEOUT, capture_code, extract_id_token,
+        load_refresh_token_at, refresh_id_token, store_refresh_token_at,
     };
 
     #[test]
@@ -588,69 +667,154 @@ mod tests {
         assert_eq!(load_refresh_token_at(&path, "cid-1").unwrap(), "rtok-2");
     }
 
+    /// One loopback connection that is not this sign-in's redirect.
+    enum Stray {
+        Send(Vec<u8>),
+        /// A request line that never ends, sent until the listener drops it.
+        Flood,
+    }
+
     /// Drives `capture_code` (expecting state `xyz`) through `strays`, each its
-    /// own loopback connection, then the redirect carrying `query`.
+    /// own loopback connection, then the redirect carrying `query`. Returns the
+    /// result and the raw response served to the redirect.
     fn capture_after(
-        strays: Vec<Vec<u8>>,
+        strays: Vec<Stray>,
         query: &'static str,
-    ) -> Result<String, AuthError> {
+    ) -> (Result<String, AuthError>, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let sender = std::thread::spawn(move || {
             for stray in strays {
                 let mut stream =
                     TcpStream::connect(("127.0.0.1", port)).unwrap();
-                stream.write_all(&stray).unwrap();
+                match stray {
+                    Stray::Send(bytes) => stream.write_all(&bytes).unwrap(),
+                    Stray::Flood => {
+                        let chunk = [b'a'; 1024];
+                        while stream.write_all(&chunk).is_ok() {}
+                    }
+                }
             }
 
+            // Browser-sized: a real redirect carries ~1-3 KiB of headers, and
+            // closing on unread bytes would reset the page read below.
             let mut redirect = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let request =
-                format!("GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            let request = format!(
+                "GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: \
+                 {}\r\n\r\n",
+                "a".repeat(3 * 1024)
+            );
             redirect.write_all(request.as_bytes()).unwrap();
-            let mut sink = Vec::new();
-            redirect.read_to_end(&mut sink).unwrap();
+            let mut page = String::new();
+            redirect.read_to_string(&mut page).unwrap();
+            page
         });
 
-        let result = capture_code(&listener, "xyz");
-        sender.join().unwrap();
-        result
+        let result = capture_code(&listener, "xyz", Duration::from_secs(60));
+        (result, sender.join().unwrap())
     }
 
-    fn capture(query: &'static str) -> Result<String, AuthError> {
+    fn capture(query: &'static str) -> (Result<String, AuthError>, String) {
         capture_after(Vec::new(), query)
     }
 
     #[test]
     fn capture_code_returns_the_authorization_code() {
-        assert_eq!(capture("code=abc&state=xyz").unwrap(), "abc");
+        let (result, page) = capture("code=abc&state=xyz");
+
+        assert_eq!(result.unwrap(), "abc");
+        assert!(page.contains("Sign-in complete"), "{page}");
     }
 
     #[test]
     fn capture_code_rejects_a_missing_code() {
-        assert!(matches!(capture("state=xyz"), Err(AuthError::MissingCode)));
+        let (result, page) = capture("state=xyz");
+
+        assert!(matches!(result, Err(AuthError::MissingCode)));
+        assert!(page.contains("did not complete"), "{page}");
     }
 
     #[test]
     fn capture_code_surfaces_the_redirect_error() {
+        let (result, page) = capture("error=access_denied&state=xyz");
+
         assert!(matches!(
-            capture("error=access_denied&state=xyz"),
+            result,
             Err(AuthError::Authorization { code }) if code == "access_denied"
         ));
+        assert!(page.contains("did not complete"), "{page}");
     }
 
     #[test]
     fn capture_code_waits_past_everything_but_its_own_redirect() {
-        let mut oversized = b"GET /?".to_vec();
-        oversized.resize(10 * 1024, b'a');
         let strays = vec![
-            b"GET /favicon.ico HTTP/1.1\r\n\r\n".to_vec(),
-            Vec::new(),
-            oversized,
-            b"GET /?error=access_denied HTTP/1.1\r\n\r\n".to_vec(),
-            b"GET /?code=forged&state=wrong HTTP/1.1\r\n\r\n".to_vec(),
+            Stray::Send(b"GET /favicon.ico HTTP/1.1\r\n\r\n".to_vec()),
+            Stray::Send(Vec::new()),
+            Stray::Flood,
+            Stray::Send(b"GET /?error=access_denied HTTP/1.1\r\n\r\n".to_vec()),
+            Stray::Send(
+                b"GET /?code=forged&state=wrong HTTP/1.1\r\n\r\n".to_vec(),
+            ),
         ];
+        let started = Instant::now();
 
-        assert_eq!(capture_after(strays, "code=abc&state=xyz").unwrap(), "abc");
+        let (result, _) = capture_after(strays, "code=abc&state=xyz");
+
+        assert_eq!(result.unwrap(), "abc");
+        assert!(
+            started.elapsed() < REDIRECT_READ_TIMEOUT / 2,
+            "the flood is cut off by size, not by the read deadline"
+        );
+    }
+
+    #[test]
+    fn capture_code_gives_up_when_no_redirect_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+
+        let result = capture_code(&listener, "xyz", Duration::from_millis(300));
+
+        assert!(matches!(result, Err(AuthError::SignInTimedOut)));
+        assert!(result.unwrap_err().is_client_misconfigured());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn capture_code_keeps_its_deadline_while_a_connection_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _silent =
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+
+        let result = capture_code(&listener, "xyz", Duration::from_millis(300));
+
+        assert!(matches!(result, Err(AuthError::SignInTimedOut)));
+        assert!(
+            started.elapsed() < REDIRECT_READ_TIMEOUT / 2,
+            "the stalled read is cut off by the sign-in deadline"
+        );
+    }
+
+    #[test]
+    fn capture_code_keeps_a_redirect_whose_head_exceeds_the_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut redirect = TcpStream::connect(address).unwrap();
+            let request = format!(
+                "GET /?code=abc&state=xyz HTTP/1.1\r\nCookie: {}\r\n\r\n",
+                "a".repeat(20 * 1024)
+            );
+            // The head is cut off at the cap, so the write and the page read
+            // may meet a reset; only the captured code matters here.
+            let _ = redirect.write_all(request.as_bytes());
+            let _ = redirect.read_to_end(&mut Vec::new());
+        });
+
+        let result = capture_code(&listener, "xyz", Duration::from_secs(3));
+        sender.join().unwrap();
+
+        assert_eq!(result.unwrap(), "abc");
     }
 
     /// Serves one token-endpoint response over loopback and returns its URL.

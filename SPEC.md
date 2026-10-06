@@ -5039,8 +5039,9 @@ liquidity bot's `X-API-KEY` client for the service API.
 
 Invocation is `st0x-issuance-client --env <staging|production> <group> <verb>`,
 and `--env` has no default. Per environment the client reads
-`S01_ISSUANCE_{STAGING,PROD}_URL`, the https base URL of the S01 ops load
-balancer, and obtains a Google ID token one of two ways. Both share one
+`S01_ISSUANCE_{STAGING,PROD}_URL`, the bare https origin of the S01 ops load
+balancer (a path, query, or fragment is refused, since every route sets the
+whole path), and obtains a Google ID token one of two ways. Both share one
 transport: the token travels as `Authorization: Bearer`, and IAP (not the
 client) stamps the `x-goog-iap-jwt-assertion` the bot verifies. There is no API
 key or secret-file option.
@@ -5059,10 +5060,14 @@ key or secret-file option.
   sign-in Google rejects as `invalid_grant` (revoked or expired) reopens the
   browser; any other failure (network, rate limit, Google 5xx, a rejected
   client) is reported instead, so a command never waits on the browser for
-  something a sign-in cannot fix. The loopback listener accepts only the
-  redirect carrying the sign-in's own `state`, reading each connection's request
-  line within a size and time bound. The cache and client ids are separate from
-  the T0 client's, so S01 sign-in never needs the T0 Google account.
+  something a sign-in cannot fix. The browser step is bounded at 5 minutes:
+  Google shows a client id or redirect URI it cannot accept in the browser
+  instead of redirecting back, so that case fails as a setup error rather than
+  hanging. The loopback listener accepts only the redirect carrying the
+  sign-in's own `state`, reading each connection's whole request head within a
+  size and time bound, and its page says whether the sign-in completed. The
+  cache and client ids are separate from the T0 client's, so S01 sign-in never
+  needs the T0 Google account.
 - **CI:** when `S01_ISSUANCE_*_ID_TOKEN` is set, the client sends that token and
   skips the OAuth flow. The CI job mints it through S01 workload identity by
   impersonating an S01 service account for an ID token. The minting stays in CI
@@ -5078,10 +5083,11 @@ On success, stdout carries exactly the response body as one compact JSON line
 (the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
 exit code is 0 on success, 2 for a setup or argument error (including an OAuth
 client or request Google rejects, such as `invalid_client` or
-`unauthorized_client`), 77 for an authentication or authorization refusal (by
-IAP, by Google rejecting the grant as `invalid_grant`, or by the operator
-declining at the consent screen), and 1 otherwise, including a network failure
-or Google outage during sign-in. Failures are explained:
+`unauthorized_client`, and a browser sign-in that never redirects back within
+the time limit), 77 for an authentication or authorization refusal (by IAP, by
+Google rejecting the grant as `invalid_grant`, or by the operator declining at
+the consent screen), and 1 otherwise, including a network failure or Google
+outage during sign-in. Failures are explained:
 
 - **401, or an IAP redirect to sign-in:** the S01 Google identity was missing,
   expired, or rejected, including a token minted for another tier's audience.

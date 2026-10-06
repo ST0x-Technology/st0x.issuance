@@ -74,6 +74,11 @@ pub(crate) enum TargetError {
     },
     #[error("{variable} must use https, got {url}")]
     NotHttps { variable: String, url: Url },
+    #[error(
+        "{variable} must be the bare https origin of the S01 ops load balancer \
+         (no path, query, or fragment), got {url}"
+    )]
+    NotOrigin { variable: String, url: Url },
 }
 
 const URL_HINT: &str = "the https base URL of the S01 ops load balancer";
@@ -98,6 +103,18 @@ pub(crate) fn resolve(
 
     if base_url.scheme() != "https" {
         return Err(TargetError::NotHttps {
+            variable: url_variable,
+            url: base_url,
+        });
+    }
+
+    // Every route sets the whole path, so a path on the base URL would be
+    // dropped silently and the request would land somewhere else.
+    if base_url.path() != "/"
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+    {
+        return Err(TargetError::NotOrigin {
             variable: url_variable,
             url: base_url,
         });
@@ -275,6 +292,20 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, TargetError::NotHttps { .. }));
+    }
+
+    #[test]
+    fn a_base_url_with_a_path_is_refused() {
+        let error = resolve(
+            Env::Staging,
+            lookup(&[
+                ("S01_ISSUANCE_STAGING_URL", "https://lb.example/issuance"),
+                ("S01_ISSUANCE_STAGING_ID_TOKEN", "ci-token"),
+            ]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TargetError::NotOrigin { .. }));
     }
 
     #[test]
