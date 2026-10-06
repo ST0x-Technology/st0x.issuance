@@ -1540,7 +1540,10 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::PendingTransaction(_)
         | VaultError::Rpc(_)
         | VaultError::ContradictoryDeathSignals { .. }
-        | VaultError::BroadcastHashMismatch { .. } => true,
+        | VaultError::BroadcastHashMismatch { .. }
+        // Burn-rebroadcast-only, unreachable here; a timeout proves nothing
+        // about what the node holds.
+        | VaultError::BurnRebroadcastTimedOut { .. } => true,
         VaultError::InvalidReceipt
         // Prepare-time refusals (the burn cannot fit a block; a padded
         // estimate cannot be represented); nothing was broadcast, so
@@ -1592,7 +1595,10 @@ pub(super) const fn is_uncertain_confirm_observation(
         | VaultError::Rpc(_)
         | VaultError::ContradictoryDeathSignals { .. }
         | VaultError::InvalidReceipt
-        | VaultError::MissingBlockNumber { .. } => true,
+        | VaultError::MissingBlockNumber { .. }
+        // Burn-rebroadcast-only, unreachable here; a timeout proves nothing,
+        // so it fails closed.
+        | VaultError::BurnRebroadcastTimedOut { .. } => true,
         VaultError::EventNotFound { .. }
         // Burn-prepare-only variants, unreachable on the mint confirm
         // paths; definitive by construction.
