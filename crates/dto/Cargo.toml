@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 alloy-primitives = { workspace = true }
-chrono = { version = "0.4.45", features = ["serde"] }
+chrono = { workspace = true }
 serde = { workspace = true }
 thiserror.workspace = true
 ts-rs = { workspace = true }

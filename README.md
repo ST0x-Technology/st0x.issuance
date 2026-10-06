@@ -219,8 +219,8 @@ cargo run -p st0x-issuance-ops -- --env staging debug --help
 ```
 
 It reads `S01_ISSUANCE_{STAGING,PROD}_URL` plus either the S01 Desktop OAuth
-client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call opens a browser sign-in
-with your S01 Google account) or, in CI, a workload-identity ID token
+client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call prints a browser sign-in
+URL for your S01 Google account) or, in CI, a workload-identity ID token
 (`_ID_TOKEN`). See SPEC.md "Operator client" for the full contract.
 
 ## Mint Flow

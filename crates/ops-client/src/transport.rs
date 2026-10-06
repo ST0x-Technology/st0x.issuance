@@ -2,10 +2,12 @@
 //! route with the bearer ID token and maps the response to `TransportError`.
 //! Holds no domain logic; the bot validates and decides everything.
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
+use serde::de::IgnoredAny;
 use st0x_issuance_dto::{
     AddTokenizedAssetRequest, RegisterAccountRequest,
     ScheduleFreezeWindowRequest, WhitelistWalletRequest,
@@ -13,8 +15,9 @@ use st0x_issuance_dto::{
 use std::time::Duration;
 use url::Url;
 
-/// Overall per-request bound, long enough for an orchestrator approval, which
-/// waits for its on-chain receipt before answering.
+/// Overall per-request bound. An orchestrator approval waits for its on-chain
+/// receipt before answering and can outlast it, which surfaces as
+/// `NoResponse`: the outcome is unknown and the logs say what happened.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -60,17 +63,28 @@ pub(crate) struct Route {
     pub(crate) body: Option<RouteBody>,
 }
 
-const SIGN_IN_AGAIN: &str = "Re-run the command to sign in again, or delete \
-     st0x-issuance-client/oauth-<env>.json under your XDG config directory to \
-     force it; in CI, mint a fresh ID token for this environment.";
+const SIGN_IN_AGAIN: &str = "Re-running alone reuses the cached S01 sign-in. \
+     To sign in again (for example as another S01 account), delete \
+     st0x-issuance-client/oauth-<env>.json under your XDG config directory \
+     and re-run; in CI, mint a fresh ID token for this environment.";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
     #[error(
-        "the request to the S01 ops API at {url} failed: {}",
+        "the request to the S01 ops API at {url} was not sent: {}",
         error_chain(.source)
     )]
-    Request {
+    NotSent {
+        url: Url,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error(
+        "the S01 ops API at {url} did not answer: {}\nThe request may have \
+         been applied; check the logs before retrying a write.",
+        error_chain(.source)
+    )]
+    NoResponse {
         url: Url,
         #[source]
         source: reqwest::Error,
@@ -102,9 +116,11 @@ pub(crate) enum TransportError {
     )]
     NotFound { body: String },
     #[error(
-        "HTTP 503 Service Unavailable: the request never reached a handler \
-         (for example the bot could not fetch Google's IAP keys); retrying is \
-         safe.{}",
+        "HTTP 503 Service Unavailable: the deployment could not serve the \
+         request (for example the bot could not fetch Google's IAP keys, or \
+         the load balancer had no healthy backend). A read can be retried; \
+         before retrying a write, check the logs for whether it was \
+         applied.{}",
         server_said(.body)
     )]
     Unavailable { body: String },
@@ -135,10 +151,10 @@ impl TransportError {
         )
     }
 
-    /// Whether the S01 deployment answered, so its logs may explain the
-    /// failure; a request that never connected left nothing there.
+    /// Whether the request may have reached the S01 deployment, so its logs
+    /// may explain the failure; only a request never sent left nothing there.
     pub(crate) const fn reached_server(&self) -> bool {
-        !matches!(self, Self::Request { .. })
+        !matches!(self, Self::NotSent { .. })
     }
 }
 
@@ -158,13 +174,17 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     rendered
 }
 
-fn server_said(body: &str) -> String {
+/// The server's own words for an error: a JSON body in full, anything else (an
+/// IAP or load balancer HTML page) as a one-line preview.
+pub(crate) fn server_said(body: &str) -> String {
     let trimmed = body.trim();
 
     if trimmed.is_empty() {
         String::new()
-    } else {
+    } else if serde_json::from_str::<IgnoredAny>(trimmed).is_ok() {
         format!("\nServer said: {trimmed}")
+    } else {
+        format!("\nServer said: {}", body_prefix(trimmed))
     }
 }
 
@@ -192,7 +212,7 @@ impl Client {
     pub(crate) async fn send(
         &self,
         route: &Route,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<String, TransportError> {
         let url = self.url(route);
         let request = self
             .http
@@ -207,8 +227,14 @@ impl Client {
             None => request.header(CONTENT_LENGTH, "0"),
         };
 
+        // Only a failure to build the request or to connect proves it never
+        // left; a timeout or reset after that leaves the outcome unknown.
         let response = request.send().await.map_err(|source| {
-            TransportError::Request { url: url.clone(), source }
+            if source.is_connect() || source.is_builder() {
+                TransportError::NotSent { url: url.clone(), source }
+            } else {
+                TransportError::NoResponse { url: url.clone(), source }
+            }
         })?;
 
         classify(response, url).await
@@ -230,10 +256,13 @@ impl Client {
     }
 }
 
+/// Maps a response to its body, which must be JSON, or to the failure its
+/// status means. The body is returned verbatim so the output is exactly what
+/// the bot sent.
 async fn classify(
     response: reqwest::Response,
     url: Url,
-) -> Result<serde_json::Value, TransportError> {
+) -> Result<String, TransportError> {
     let status = response.status();
 
     // Redirects are never followed: IAP answers a missing or rejected
@@ -245,24 +274,24 @@ async fn classify(
         });
     }
 
-    if status == StatusCode::NO_CONTENT {
-        return Ok(serde_json::Value::Null);
-    }
-
     let content_type = header_text(&response, CONTENT_TYPE);
-    let body = response
-        .text()
-        .await
-        .map_err(|source| TransportError::Request { url, source })?;
+    // An error status already says what happened, so its body is only
+    // diagnostic; a success whose body was cut off leaves the outcome unknown.
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) if !status.is_success() => String::new(),
+        Err(source) => return Err(TransportError::NoResponse { url, source }),
+    };
 
     if status.is_success() {
-        return serde_json::from_str(&body).map_err(|source| {
-            TransportError::Decode {
+        return match serde_json::from_str::<IgnoredAny>(&body) {
+            Ok(IgnoredAny) => Ok(body),
+            Err(source) => Err(TransportError::Decode {
                 content_type,
                 body_prefix: body_prefix(&body),
                 source,
-            }
-        });
+            }),
+        };
     }
 
     Err(match status {
@@ -296,33 +325,15 @@ fn body_prefix(body: &str) -> String {
         .collect()
 }
 
+/// Everything outside the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`).
+const SEGMENT_RESERVED: &AsciiSet =
+    &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+
 /// Percent-encodes one path segment so an interpolated value (an id, symbol,
 /// or address) cannot inject extra `/` segments or a `?`/`#` that would change
-/// routing. Keeps the RFC 3986 unreserved set; encodes everything else.
+/// routing.
 pub(crate) fn encode_segment(segment: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-    let mut encoded = String::with_capacity(segment.len());
-    for &byte in segment.as_bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~' => {
-                encoded.push(char::from(byte));
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-            }
-        }
-    }
-
-    encoded
+    utf8_percent_encode(segment, SEGMENT_RESERVED).to_string()
 }
 
 #[cfg(test)]
@@ -402,9 +413,10 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
+    /// Keys out of alphabetical order, so a re-serialized body would differ.
     const OK_JSON: &str = "HTTP/1.1 200 OK\r\nContent-Type: \
-        application/json\r\nContent-Length: 11\r\nConnection: \
-        close\r\n\r\n{\"ok\":true}";
+        application/json\r\nContent-Length: 13\r\nConnection: \
+        close\r\n\r\n{\"b\":1,\"a\":2}";
 
     fn route(method: Method, tier: Tier, path: &str) -> Route {
         Route {
@@ -429,7 +441,7 @@ mod tests {
         let value = client.send(&read).await.unwrap();
         let request = requests.recv().unwrap();
 
-        assert_eq!(value, json!({ "ok": true }));
+        assert_eq!(value, r#"{"b":1,"a":2}"#, "the body is passed through");
         assert!(
             request.starts_with(
                 "GET /ops/read/wrapped-transfers?limit=5&before_network=a+b "
@@ -566,17 +578,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_content_renders_as_null() {
-        let (base, _requests) =
-            serve("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
-        let client = Client::new(base, "id-token".to_owned()).unwrap();
+    async fn a_body_cut_off_after_the_status_may_have_been_applied() {
+        let error = failure(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: 50\r\nConnection: close\r\n\r\n{\"ok\":",
+        )
+        .await;
 
-        let value = client
-            .send(&route(Method::POST, Tier::Capital, "/freeze/AAPL"))
-            .await
-            .unwrap();
+        assert!(matches!(error, TransportError::NoResponse { .. }));
+        assert!(error.reached_server(), "its logs may say what happened");
+    }
 
-        assert_eq!(value, serde_json::Value::Null);
+    #[tokio::test]
+    async fn a_connection_dropped_after_the_request_may_have_been_applied() {
+        let error = failure("").await;
+
+        assert!(matches!(error, TransportError::NoResponse { .. }));
+        assert!(error.reached_server(), "its logs may say what happened");
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_error_body_keeps_the_known_denial() {
+        let error = failure(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 50\r\n\
+             Connection: close\r\n\r\npartial",
+        )
+        .await;
+
+        assert!(matches!(error, TransportError::Forbidden { .. }));
+        assert!(error.is_access_denied());
+    }
+
+    #[tokio::test]
+    async fn an_html_error_page_is_previewed_on_one_line() {
+        let page = format!(
+            "<html>\n<body>\n{}\n</body>\n</html>",
+            "no healthy upstream ".repeat(20)
+        );
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+
+        let message = failure(response.leak()).await.to_string();
+        let said = message.split_once("Server said: ").unwrap().1;
+
+        assert!(!said.contains('\n'), "{said}");
+        assert!(said.len() <= 120, "{said}");
     }
 
     #[tokio::test]
@@ -595,7 +644,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, TransportError::Request { .. }));
+        assert!(matches!(error, TransportError::NotSent { .. }));
         assert!(!error.reached_server());
     }
 

@@ -3,14 +3,16 @@
 //! OAuth flow (loopback + PKCE) whose refresh token is cached for silent reuse.
 
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::target::{Env, Identity};
-use crate::transport::error_chain;
+use crate::transport::{error_chain, server_said};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthError {
@@ -24,18 +26,73 @@ pub(crate) enum AuthError {
     Json(#[from] serde_json::Error),
     #[error("invalid Google authorization endpoint: {0}")]
     Url(#[from] url::ParseError),
-    #[error("Google's token endpoint returned {status}: {body}")]
-    TokenEndpoint { status: reqwest::StatusCode, body: String },
+    #[error("Google's token endpoint returned {status}.{}", server_said(.body))]
+    TokenEndpoint {
+        status: reqwest::StatusCode,
+        /// The response's OAuth 2.0 `error` code (RFC 6749 section 5.2), when
+        /// it carried one.
+        code: Option<String>,
+        body: String,
+    },
     #[error("Google's token response carried no id_token")]
     MissingIdToken,
-    #[error("the sign-in was denied: {reason}")]
-    Denied { reason: String },
-    #[error(
-        "the sign-in redirect state did not match; ignoring a possible forgery"
-    )]
-    StateMismatch,
+    /// The sign-in redirect's OAuth 2.0 `error` code (RFC 6749 section
+    /// 4.1.2.1).
+    #[error("the sign-in did not complete: Google reported {code}")]
+    Authorization { code: String },
     #[error("the sign-in redirect carried no authorization code")]
     MissingCode,
+}
+
+impl AuthError {
+    /// Google rejected the grant itself (`invalid_grant`: a revoked or expired
+    /// refresh token, or a bad authorization code). Only this calls for a new
+    /// browser sign-in; a rate limit, an outage, or a misconfigured client
+    /// does not.
+    pub(crate) fn is_rejected_grant(&self) -> bool {
+        matches!(
+            self,
+            Self::TokenEndpoint { code: Some(code), .. } if code == "invalid_grant"
+        )
+    }
+
+    /// A refusal of the operator's identity: the operator declined at the
+    /// consent screen (`access_denied`), or Google rejected the grant.
+    pub(crate) fn is_access_denied(&self) -> bool {
+        match self {
+            Self::Authorization { code } => code == "access_denied",
+            Self::TokenEndpoint { .. } => self.is_rejected_grant(),
+            Self::Io(_)
+            | Self::Join(_)
+            | Self::Http(_)
+            | Self::Json(_)
+            | Self::Url(_)
+            | Self::MissingIdToken
+            | Self::MissingCode => false,
+        }
+    }
+
+    /// Google rejected the Desktop OAuth client or the request it made (RFC
+    /// 6749 sections 4.1.2.1 and 5.2): a setup error no sign-in can repair.
+    pub(crate) fn is_client_misconfigured(&self) -> bool {
+        let code = match self {
+            Self::Authorization { code } => Some(code.as_str()),
+            Self::TokenEndpoint { code, .. } => code.as_deref(),
+            _ => None,
+        };
+
+        matches!(
+            code,
+            Some(
+                "invalid_request"
+                    | "invalid_client"
+                    | "unauthorized_client"
+                    | "unsupported_response_type"
+                    | "unsupported_grant_type"
+                    | "invalid_scope"
+            )
+        )
+    }
 }
 
 /// Google OAuth 2.0 endpoints for the installed-application (Desktop) flow.
@@ -47,10 +104,14 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bounds how long one loopback connection may take to send its request line,
-/// so a connection that never sends one (a browser preconnect) cannot stall
-/// the sign-in.
+/// Bounds how long one loopback connection may take to send its whole request
+/// line, so a connection that never sends one (a browser preconnect) or drips
+/// it cannot stall the sign-in.
 const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest loopback request line accepted; Google's redirect is far
+/// shorter, so a longer one is not the redirect.
+const MAX_REQUEST_LINE: usize = 8 * 1024;
 
 /// Returns the ID token for `identity`. Workload identity already holds one;
 /// the Desktop client silently refreshes a cached sign-in, or signs the
@@ -77,7 +138,7 @@ async fn desktop_id_token(
         .connect_timeout(TOKEN_CONNECT_TIMEOUT)
         .build()?;
 
-    if let Some(refresh_token) = load_refresh_token(env) {
+    if let Some(refresh_token) = load_refresh_token(env, client_id) {
         match refresh_id_token(
             &http,
             TOKEN_ENDPOINT,
@@ -88,12 +149,18 @@ async fn desktop_id_token(
         .await
         {
             Ok(id_token) => return Ok(id_token),
-            Err(error) => {
+            // Only a rejected grant (`invalid_grant`: the refresh token was
+            // revoked or expired) needs a new browser sign-in. Anything else
+            // (a network failure, a rate limit, a 5xx, a bad client secret) is
+            // reported instead, since the browser wait is unbounded and a
+            // sign-in would not fix it.
+            Err(error) if error.is_rejected_grant() => {
                 eprintln!(
-                    "The cached S01 sign-in could not be refreshed ({error}); \
-                     signing in again."
+                    "The cached S01 sign-in was rejected ({error}); signing in \
+                     again."
                 );
             }
+            Err(error) => return Err(error),
         }
     }
 
@@ -154,7 +221,7 @@ async fn interactive_id_token(
     if let Some(refresh_token) =
         token.get("refresh_token").and_then(serde_json::Value::as_str)
     {
-        store_refresh_token(env, refresh_token);
+        store_refresh_token(env, client_id, refresh_token);
     }
 
     extract_id_token(&token)
@@ -193,13 +260,27 @@ async fn post_token(
     let body = response.text().await?;
 
     if !status.is_success() {
-        return Err(AuthError::TokenEndpoint { status, body });
+        let code = serde_json::from_str::<TokenErrorBody>(&body)
+            .ok()
+            .map(|parsed| parsed.error);
+        return Err(AuthError::TokenEndpoint { status, code, body });
     }
 
     Ok(serde_json::from_str(&body)?)
 }
 
+/// An OAuth 2.0 token error response (RFC 6749 section 5.2); only its `error`
+/// code decides how a failure is handled.
+#[derive(Deserialize)]
+struct TokenErrorBody {
+    error: String,
+}
+
 /// Pulls the `id_token` out of a token response; this JWT is what IAP checks.
+/// Google returns it from both the authorization-code exchange and a
+/// refresh-token exchange made with the Desktop client id and secret
+/// (<https://cloud.google.com/iap/docs/authentication-howto>, "Authenticate a
+/// user account" for a desktop app, "Refresh token").
 fn extract_id_token(token: &serde_json::Value) -> Result<String, AuthError> {
     token
         .get("id_token")
@@ -209,9 +290,10 @@ fn extract_id_token(token: &serde_json::Value) -> Result<String, AuthError> {
 }
 
 /// Waits for the loopback redirect, returns the authorization code, and serves
-/// a small page telling the operator the sign-in is done. Connections carrying
-/// no OAuth redirect parameters (a browser preconnect or favicon fetch, another
-/// local process) are dropped and the wait continues. Blocking, so it runs on a
+/// a small page telling the operator the sign-in is done. Only a request
+/// carrying this sign-in's own `state` counts (RFC 6749 section 10.12): any
+/// other connection (a browser preconnect or favicon fetch, another local
+/// process) is dropped and the wait continues. Blocking, so it runs on a
 /// blocking task off the async runtime.
 fn capture_code(
     listener: &std::net::TcpListener,
@@ -220,7 +302,9 @@ fn capture_code(
     let (mut stream, params) = loop {
         let (stream, _) = listener.accept()?;
 
-        if let Some(params) = redirect_params(&stream)? {
+        if let Some(params) = redirect_params(&stream)
+            && params.get("state").map(String::as_str) == Some(expected_state)
+        {
             break (stream, params);
         }
     };
@@ -234,44 +318,54 @@ fn capture_code(
     );
     std::io::Write::write_all(&mut stream, response.as_bytes())?;
 
-    if let Some(reason) = params.get("error") {
-        return Err(AuthError::Denied { reason: reason.clone() });
-    }
-
-    if params.get("state").map(String::as_str) != Some(expected_state) {
-        return Err(AuthError::StateMismatch);
+    if let Some(code) = params.get("error") {
+        return Err(AuthError::Authorization { code: code.clone() });
     }
 
     params.get("code").cloned().ok_or(AuthError::MissingCode)
 }
 
-/// The query parameters of the request on `stream`, or `None` when it is not
-/// the OAuth redirect: no request line arrived in time, or it carried none of
-/// `code`, `state`, or `error`.
+/// The query parameters of the request on `stream`, or `None` when no request
+/// line arrived in time.
 fn redirect_params(
     stream: &std::net::TcpStream,
-) -> Result<Option<HashMap<String, String>>, AuthError> {
-    stream.set_read_timeout(Some(REDIRECT_READ_TIMEOUT))?;
-    let mut reader = std::io::BufReader::new(stream);
-    let mut request_line = String::new();
-
-    // A timeout or reset belongs to this connection only, never the sign-in.
-    if std::io::BufRead::read_line(&mut reader, &mut request_line).is_err() {
-        return Ok(None);
-    }
-
+) -> Option<HashMap<String, String>> {
+    let request_line = request_line(stream)?;
     let query = request_line
         .split_whitespace()
         .nth(1)
         .and_then(|target| target.split_once('?'))
         .map_or("", |(_, query)| query);
-    let params: HashMap<String, String> =
-        url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
 
-    let is_redirect =
-        ["code", "state", "error"].iter().any(|key| params.contains_key(*key));
+    Some(url::form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+}
 
-    Ok(is_redirect.then_some(params))
+/// Reads the request line within `REDIRECT_READ_TIMEOUT` overall and
+/// `MAX_REQUEST_LINE` bytes, so a connection that stalls, drips, or floods
+/// cannot hold up the sign-in. `None` on any shortfall: the failure belongs to
+/// that connection, never the sign-in.
+fn request_line(mut stream: &std::net::TcpStream) -> Option<String> {
+    let deadline = Instant::now().checked_add(REDIRECT_READ_TIMEOUT)?;
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())?;
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let count = stream.read(&mut chunk).ok().filter(|count| *count > 0)?;
+        line.extend_from_slice(chunk.get(..count)?);
+
+        if let Some(end) = line.iter().position(|byte| *byte == b'\n') {
+            line.truncate(end);
+            return String::from_utf8(line).ok();
+        }
+
+        if line.len() > MAX_REQUEST_LINE {
+            return None;
+        }
+    }
 }
 
 /// A URL-safe, unpadded base64 string of `bytes` random bytes, for the PKCE
@@ -290,14 +384,12 @@ fn code_challenge(verifier: &str) -> String {
 
 /// Path of the cached refresh token for one environment: under
 /// `$XDG_CONFIG_HOME` (or `~/.config`) in this client's own directory, which
-/// is separate from the T0 client's, keyed by environment.
+/// is separate from the T0 client's, keyed by environment. Per the XDG Base
+/// Directory spec an empty or relative `$XDG_CONFIG_HOME` is ignored, so the
+/// token never lands relative to the working directory.
 fn refresh_token_path(env: Env) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(
-        || {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".config"))
-        },
-    )?;
+    let base = absolute_dir("XDG_CONFIG_HOME")
+        .or_else(|| absolute_dir("HOME").map(|home| home.join(".config")))?;
 
     Some(
         base.join("st0x-issuance-client")
@@ -305,25 +397,41 @@ fn refresh_token_path(env: Env) -> Option<PathBuf> {
     )
 }
 
-fn load_refresh_token(env: Env) -> Option<String> {
-    load_refresh_token_at(&refresh_token_path(env)?)
+fn absolute_dir(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
-fn load_refresh_token_at(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+/// The cached sign-in: the refresh token and the Desktop client id it was
+/// issued to, since Google refuses a refresh token from any other client.
+#[derive(Serialize, Deserialize)]
+struct CachedSignIn {
+    client_id: String,
+    refresh_token: String,
+}
 
-    parsed
-        .get("refresh_token")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+fn load_refresh_token(env: Env, client_id: &str) -> Option<String> {
+    load_refresh_token_at(&refresh_token_path(env)?, client_id)
+}
+
+/// The cached refresh token, if one was issued to `client_id`; a cache from a
+/// replaced client is ignored, so the operator signs in again. The cache is
+/// locked down before it is read.
+fn load_refresh_token_at(path: &Path, client_id: &str) -> Option<String> {
+    lock_down(path).ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let cached: CachedSignIn = serde_json::from_str(&contents).ok()?;
+
+    (cached.client_id == client_id).then_some(cached.refresh_token)
 }
 
 /// Best effort: a cache write failure must not fail the command, only cost the
 /// next run a sign-in, so it is reported rather than propagated.
-fn store_refresh_token(env: Env, refresh_token: &str) {
+fn store_refresh_token(env: Env, client_id: &str, refresh_token: &str) {
     if let Some(path) = refresh_token_path(env)
-        && let Err(error) = store_refresh_token_at(&path, refresh_token)
+        && let Err(error) =
+            store_refresh_token_at(&path, client_id, refresh_token)
     {
         eprintln!(
             "Could not cache the S01 sign-in at {} ({error}); the next run \
@@ -333,45 +441,81 @@ fn store_refresh_token(env: Env, refresh_token: &str) {
     }
 }
 
-/// Writes the refresh token to `path`, creating parent directories and
-/// pinning owner-only (0600) permissions on both new and existing files.
+/// Writes the cached sign-in to `path` in an owner-only (0700) directory and
+/// an owner-only (0600) file, both pinned before the token is written.
+#[cfg(unix)]
 fn store_refresh_token_at(
     path: &Path,
+    client_id: &str,
     refresh_token: &str,
 ) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     if let Some(directory) = path.parent() {
-        std::fs::create_dir_all(directory)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)?;
     }
 
-    let body =
-        serde_json::json!({ "refresh_token": refresh_token }).to_string();
+    let body = serde_json::to_string(&CachedSignIn {
+        client_id: client_id.to_owned(),
+        refresh_token: refresh_token.to_owned(),
+    })?;
 
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Created owner-only from the outset so the token is never briefly
+    // world-readable.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    lock_down(path)?;
+    file.write_all(body.as_bytes())
+}
 
-        // Created owner-only from the outset so the token is never briefly
-        // world-readable; the explicit chmod also covers a pre-existing file,
-        // whose mode `open` keeps.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(body.as_bytes())
+/// Without unix permission modes the cache cannot be made owner-only, so the
+/// long-lived refresh token is never written and each run signs in.
+#[cfg(not(unix))]
+fn store_refresh_token_at(
+    path: &Path,
+    _client_id: &str,
+    _refresh_token: &str,
+) -> std::io::Result<()> {
+    lock_down(path)
+}
+
+/// Pins this client's cache directory to 0700 and the cache file to 0600:
+/// `mode` covers only what a call creates, so a directory or file left looser
+/// (by hand, or by an older build) is tightened before a token is read from or
+/// written to it.
+#[cfg(unix)]
+fn lock_down(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(directory) = path.parent() {
+        std::fs::set_permissions(
+            directory,
+            std::fs::Permissions::from_mode(0o700),
+        )?;
     }
 
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, body)
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn lock_down(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "owner-only file permissions are only enforced on unix",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use reqwest::StatusCode;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
@@ -400,96 +544,113 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_refresh_token_cache_is_owner_only_and_roundtrips() {
+    fn the_sign_in_cache_is_owner_only_and_keyed_to_its_client() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("oauth.json");
+        let cache_dir = path.parent().unwrap().to_owned();
         let mode = |path: &std::path::Path| {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777
         };
-
-        store_refresh_token_at(&path, "rtok-1").unwrap();
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(load_refresh_token_at(&path).unwrap(), "rtok-1");
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        let loosen = || {
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(0o644),
+            )
             .unwrap();
-        store_refresh_token_at(&path, "rtok-2").unwrap();
-        assert_eq!(mode(&path), 0o600, "a loose existing file is locked down");
-        assert_eq!(load_refresh_token_at(&path).unwrap(), "rtok-2");
+            std::fs::set_permissions(
+                &cache_dir,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        };
+
+        store_refresh_token_at(&path, "cid-1", "rtok-1").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&cache_dir), 0o700);
+        assert_eq!(load_refresh_token_at(&path, "cid-1").unwrap(), "rtok-1");
+        assert_eq!(
+            load_refresh_token_at(&path, "cid-2"),
+            None,
+            "a replaced client signs in again"
+        );
+
+        loosen();
+        assert_eq!(load_refresh_token_at(&path, "cid-1").unwrap(), "rtok-1");
+        assert_eq!(mode(&path), 0o600, "locked down before it is read");
+        assert_eq!(mode(&cache_dir), 0o700, "locked down before it is read");
+
+        loosen();
+        store_refresh_token_at(&path, "cid-1", "rtok-2").unwrap();
+        assert_eq!(mode(&path), 0o600, "locked down before it is written");
+        assert_eq!(mode(&cache_dir), 0o700, "locked down before it is written");
+        assert_eq!(load_refresh_token_at(&path, "cid-1").unwrap(), "rtok-2");
     }
 
-    /// Drives `capture_code` against one loopback redirect carrying `query`.
-    fn capture(
+    /// Drives `capture_code` (expecting state `xyz`) through `strays`, each its
+    /// own loopback connection, then the redirect carrying `query`.
+    fn capture_after(
+        strays: Vec<Vec<u8>>,
         query: &'static str,
-        expected_state: &str,
     ) -> Result<String, AuthError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let sender = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let request =
-                format!("GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-            stream.write_all(request.as_bytes()).unwrap();
-            let mut sink = Vec::new();
-            stream.read_to_end(&mut sink).unwrap();
-        });
-
-        let result = capture_code(&listener, expected_state);
-        sender.join().unwrap();
-        result
-    }
-
-    #[test]
-    fn capture_code_returns_the_authorization_code() {
-        assert_eq!(capture("code=abc&state=xyz", "xyz").unwrap(), "abc");
-    }
-
-    #[test]
-    fn capture_code_rejects_a_mismatched_state() {
-        assert!(matches!(
-            capture("code=abc&state=wrong", "xyz"),
-            Err(AuthError::StateMismatch)
-        ));
-    }
-
-    #[test]
-    fn capture_code_rejects_a_missing_code() {
-        assert!(matches!(
-            capture("state=xyz", "xyz"),
-            Err(AuthError::MissingCode)
-        ));
-    }
-
-    #[test]
-    fn capture_code_surfaces_a_denial() {
-        assert!(matches!(
-            capture("error=access_denied&state=xyz", "xyz"),
-            Err(AuthError::Denied { reason }) if reason == "access_denied"
-        ));
-    }
-
-    #[test]
-    fn capture_code_skips_connections_that_are_not_the_redirect() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let sender = std::thread::spawn(move || {
-            let mut favicon = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            favicon.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").unwrap();
-            drop(favicon);
-            drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+            for stray in strays {
+                let mut stream =
+                    TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream.write_all(&stray).unwrap();
+            }
 
             let mut redirect = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            redirect
-                .write_all(b"GET /?code=abc&state=xyz HTTP/1.1\r\n\r\n")
-                .unwrap();
+            let request =
+                format!("GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            redirect.write_all(request.as_bytes()).unwrap();
             let mut sink = Vec::new();
             redirect.read_to_end(&mut sink).unwrap();
         });
 
-        assert_eq!(capture_code(&listener, "xyz").unwrap(), "abc");
+        let result = capture_code(&listener, "xyz");
         sender.join().unwrap();
+        result
+    }
+
+    fn capture(query: &'static str) -> Result<String, AuthError> {
+        capture_after(Vec::new(), query)
+    }
+
+    #[test]
+    fn capture_code_returns_the_authorization_code() {
+        assert_eq!(capture("code=abc&state=xyz").unwrap(), "abc");
+    }
+
+    #[test]
+    fn capture_code_rejects_a_missing_code() {
+        assert!(matches!(capture("state=xyz"), Err(AuthError::MissingCode)));
+    }
+
+    #[test]
+    fn capture_code_surfaces_the_redirect_error() {
+        assert!(matches!(
+            capture("error=access_denied&state=xyz"),
+            Err(AuthError::Authorization { code }) if code == "access_denied"
+        ));
+    }
+
+    #[test]
+    fn capture_code_waits_past_everything_but_its_own_redirect() {
+        let mut oversized = b"GET /?".to_vec();
+        oversized.resize(10 * 1024, b'a');
+        let strays = vec![
+            b"GET /favicon.ico HTTP/1.1\r\n\r\n".to_vec(),
+            Vec::new(),
+            oversized,
+            b"GET /?error=access_denied HTTP/1.1\r\n\r\n".to_vec(),
+            b"GET /?code=forged&state=wrong HTTP/1.1\r\n\r\n".to_vec(),
+        ];
+
+        assert_eq!(capture_after(strays, "code=abc&state=xyz").unwrap(), "abc");
     }
 
     /// Serves one token-endpoint response over loopback and returns its URL.
@@ -529,27 +690,48 @@ mod tests {
         assert_eq!(token, "fresh");
     }
 
-    #[tokio::test]
-    async fn refresh_fails_on_a_rejected_token_request() {
-        let endpoint = token_server(
-            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\ninvalid_grant",
-        );
-
-        let result = refresh_id_token(
+    async fn refresh_failure(response: &'static str) -> AuthError {
+        refresh_id_token(
             &http(Duration::from_secs(5)),
-            &endpoint,
+            &token_server(response),
             "cid",
             "secret",
             "rtok",
         )
-        .await;
+        .await
+        .unwrap_err()
+    }
 
+    #[tokio::test]
+    async fn only_an_invalid_grant_calls_for_a_new_sign_in() {
+        let revoked = refresh_failure(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+             Connection: close\r\n\r\n{\"error\":\"invalid_grant\",\
+             \"error_description\":\"Token has been expired or revoked.\"}",
+        )
+        .await;
         assert!(matches!(
-            result,
-            Err(AuthError::TokenEndpoint { status, body })
-                if status == reqwest::StatusCode::BAD_REQUEST
-                    && body == "invalid_grant"
+            &revoked,
+            AuthError::TokenEndpoint { status, .. } if *status == StatusCode::BAD_REQUEST
         ));
+        assert!(revoked.is_rejected_grant());
+        assert!(revoked.is_access_denied());
+
+        let throttled = refresh_failure(
+            "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n\
+             Rate Limit Exceeded",
+        )
+        .await;
+        assert!(!throttled.is_rejected_grant(), "a rate limit is transient");
+        assert!(!throttled.is_access_denied());
+
+        let bad_secret = refresh_failure(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+             Connection: close\r\n\r\n{\"error\":\"invalid_client\"}",
+        )
+        .await;
+        assert!(!bad_secret.is_rejected_grant(), "a sign-in cannot fix it");
+        assert!(bad_secret.is_client_misconfigured());
     }
 
     #[tokio::test]

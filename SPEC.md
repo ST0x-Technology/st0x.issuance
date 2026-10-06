@@ -5051,10 +5051,18 @@ key or secret-file option.
   non-confidential for a Desktop client) and sends the resulting ID token, whose
   audience is that client id. This requires the client id on the S01 ops
   backends' IAP programmatic-client allowlist. The refresh token is cached per
-  environment (`st0x-issuance-client/oauth-<env>.json` under the XDG config
-  directory, mode 0600), so later calls do not reopen the browser. The cache and
-  client ids are separate from the T0 client's, so S01 sign-in never needs the
-  T0 Google account.
+  environment together with the client id it was issued to
+  (`st0x-issuance-client/oauth-<env>.json` under the XDG config directory, mode
+  0600 in a 0700 directory, locked down before every read and write, and never
+  written where unix permissions are unavailable), so later calls do not reopen
+  the browser; a cache from a replaced client id is ignored. Only a cached
+  sign-in Google rejects as `invalid_grant` (revoked or expired) reopens the
+  browser; any other failure (network, rate limit, Google 5xx, a rejected
+  client) is reported instead, so a command never waits on the browser for
+  something a sign-in cannot fix. The loopback listener accepts only the
+  redirect carrying the sign-in's own `state`, reading each connection's request
+  line within a size and time bound. The cache and client ids are separate from
+  the T0 client's, so S01 sign-in never needs the T0 Google account.
 - **CI:** when `S01_ISSUANCE_*_ID_TOKEN` is set, the client sends that token and
   skips the OAuth flow. The CI job mints it through S01 workload identity by
   impersonating an S01 service account for an ID token. The minting stays in CI
@@ -5067,23 +5075,36 @@ Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
 Path segments are percent-encoded and redirects are never followed.
 
 On success, stdout carries exactly the response body as one compact JSON line
-(the bot's JSON, not re-modelled) and all diagnostics go to stderr. The exit
-code is 0 on success, 2 for a setup or argument error, 77 for an authentication
-or authorization failure, and 1 otherwise. Failures are explained:
+(the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
+exit code is 0 on success, 2 for a setup or argument error (including an OAuth
+client or request Google rejects, such as `invalid_client` or
+`unauthorized_client`), 77 for an authentication or authorization refusal (by
+IAP, by Google rejecting the grant as `invalid_grant`, or by the operator
+declining at the consent screen), and 1 otherwise, including a network failure
+or Google outage during sign-in. Failures are explained:
 
 - **401, or an IAP redirect to sign-in:** the S01 Google identity was missing,
   expired, or rejected, including a token minted for another tier's audience.
-  Re-running signs in again; deleting the cached refresh token forces it.
+  Re-running reuses the cached sign-in; deleting the cached refresh token signs
+  in again, for example as another S01 account.
 - **403:** authenticated, but the S01 account is not in the Workspace group IAP
   requires for this tier. The bot itself never answers 403 on `/ops`.
 - **404:** an unknown id or asset, or `/ops` is not mounted on that deployment
   (no `OPS_API_*_AUDIENCE` configured).
-- **503:** the bot could not fetch Google's IAP keys; retrying is safe.
+- **503:** the deployment could not serve the request, for example the bot could
+  not fetch Google's IAP keys or the load balancer had no healthy backend. A
+  read can be retried; before retrying a write, the logs show whether it was
+  applied.
+- **No response:** a connection that timed out or dropped after the request was
+  sent leaves the outcome unknown, and the client says so.
+- **Unwritable output:** the bot answered with success but stdout could not take
+  the body; the request was completed, so a read can be re-run but a write must
+  not be blindly retried.
 
-After any failure that reached the server, stderr also carries an S01 Cloud
-Logging link for the environment's project (`s01-issuance-staging` or
-`s01-issuance`), searching for the command's id or symbol when it has one and
-for warnings otherwise.
+After any failure where the request may have reached the server, stderr also
+carries an S01 Cloud Logging link for the environment's project
+(`s01-issuance-staging` or `s01-issuance`), searching for the command's id or
+symbol when it has one and for warnings otherwise.
 
 | Command                                                            | Route                                                                |
 | ------------------------------------------------------------------ | -------------------------------------------------------------------- |

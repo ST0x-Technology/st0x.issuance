@@ -6830,14 +6830,15 @@ name = "st0x-issuance-ops"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "base64 0.23.1",
+ "base64 0.22.1",
  "chrono",
  "clap",
+ "percent-encoding",
  "rand 0.10.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.10.9",
  "st0x-issuance-dto",
  "tempfile",
  "thiserror",

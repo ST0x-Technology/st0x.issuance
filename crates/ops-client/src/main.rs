@@ -5,7 +5,6 @@
 
 mod auth;
 mod cli;
-mod output;
 mod target;
 mod transport;
 
@@ -15,6 +14,7 @@ use st0x_issuance_dto::{
     AddTokenizedAssetRequest, RegisterAccountRequest,
     ScheduleFreezeWindowRequest, TokenSymbol, WhitelistWalletRequest,
 };
+use std::io::Write;
 use std::process::ExitCode;
 
 use crate::auth::AuthError;
@@ -22,7 +22,6 @@ use crate::cli::{
     CapitalCommand, Cli, Command, DebugCommand, ReadCommand,
     WrappedTransfersArgs,
 };
-use crate::output::OutputError;
 use crate::target::{Env, TargetError};
 use crate::transport::{
     Client, Route, RouteBody, Tier, TransportError, encode_segment,
@@ -61,31 +60,37 @@ enum Failure {
     Target(#[from] TargetError),
     #[error("could not build the HTTP client: {0}")]
     Http(#[from] reqwest::Error),
-    #[error(
-        "could not obtain an S01 Google identity: {0}\nComplete the browser \
-         sign-in when prompted."
-    )]
+    #[error("could not obtain an S01 Google identity: {0}")]
     Auth(#[from] AuthError),
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error(transparent)]
-    Output(#[from] OutputError),
+    #[error(
+        "the S01 ops API answered with success, but the response could not be \
+         written to stdout: {0}\nThe request was completed: a read can simply \
+         be re-run, but do not blindly retry a write."
+    )]
+    Output(#[source] std::io::Error),
 }
 
 impl Failure {
-    const fn exit_code(&self) -> u8 {
+    fn exit_code(&self) -> u8 {
         match self {
             Self::Target(_) | Self::Http(_) => EXIT_SETUP,
-            Self::Auth(_) => EXIT_ACCESS_DENIED,
+            Self::Auth(error) if error.is_access_denied() => EXIT_ACCESS_DENIED,
+            Self::Auth(error) if error.is_client_misconfigured() => EXIT_SETUP,
             Self::Transport(error) if error.is_access_denied() => {
                 EXIT_ACCESS_DENIED
             }
-            Self::Transport(_) | Self::Output(_) => EXIT_FAILED,
+            Self::Auth(_) | Self::Transport(_) | Self::Output(_) => EXIT_FAILED,
         }
     }
 
     const fn reached_server(&self) -> bool {
-        matches!(self, Self::Transport(error) if error.reached_server())
+        match self {
+            Self::Transport(error) => error.reached_server(),
+            Self::Output(_) => true,
+            Self::Target(_) | Self::Http(_) | Self::Auth(_) => false,
+        }
     }
 }
 
@@ -97,9 +102,18 @@ async fn run(
     let target = target::resolve(env, lookup)?;
     let token = auth::id_token(env, target.identity).await?;
     let client = Client::new(target.base_url, token)?;
-    let value = client.send(route).await?;
-    output::print(&value)?;
-    Ok(())
+    let body = client.send(route).await?;
+
+    // A write failure here follows a success the bot already acted on, which
+    // is what `Failure::Output` tells the operator.
+    print_body(&body).map_err(Failure::Output)
+}
+
+/// Writes the bot's response body to stdout as one line.
+fn print_body(body: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", body.trim_end())?;
+    stdout.flush()
 }
 
 fn route(command: &Command) -> Route {
@@ -342,7 +356,7 @@ fn cloud_logging_url(env: Env, search: Option<&str>) -> String {
     );
 
     format!(
-        "https://console.cloud.google.com/logs/query;query={};project={}",
+        "https://console.cloud.google.com/logs/query;query={}?project={}",
         encode_segment(&query),
         env.logging_project()
     )
@@ -351,10 +365,12 @@ fn cloud_logging_url(env: Env, search: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use reqwest::StatusCode;
     use serde_json::{Value, json};
     use url::Url;
 
     use super::{Failure, cloud_logging_url, log_search, route};
+    use crate::auth::AuthError;
     use crate::cli::Cli;
     use crate::target::{Env, TargetError};
     use crate::transport::{Client, TransportError};
@@ -570,15 +586,15 @@ mod tests {
         let freeze = command(&["capital", "freeze", "AAPL"]);
         assert_eq!(
             cloud_logging_url(Env::Staging, log_search(&freeze)),
-            "https://console.cloud.google.com/logs/query;query=%22AAPL%22;\
-             project=s01-issuance-staging"
+            "https://console.cloud.google.com/logs/query;query=%22AAPL%22\
+             ?project=s01-issuance-staging"
         );
 
         let stuck = command(&["read", "stuck"]);
         assert_eq!(
             cloud_logging_url(Env::Production, log_search(&stuck)),
             "https://console.cloud.google.com/logs/query;\
-             query=severity%3E%3DWARNING;project=s01-issuance"
+             query=severity%3E%3DWARNING?project=s01-issuance"
         );
     }
 
@@ -602,5 +618,61 @@ mod tests {
         });
         assert_eq!(failed.exit_code(), 1);
         assert!(failed.reached_server());
+
+        let declined = Failure::Auth(AuthError::Authorization {
+            code: "access_denied".to_owned(),
+        });
+        assert_eq!(declined.exit_code(), 77);
+
+        let bad_scope = Failure::Auth(AuthError::Authorization {
+            code: "invalid_scope".to_owned(),
+        });
+        assert_eq!(bad_scope.exit_code(), 2, "a client misconfiguration");
+
+        let revoked = Failure::Auth(AuthError::TokenEndpoint {
+            status: StatusCode::BAD_REQUEST,
+            code: Some("invalid_grant".to_owned()),
+            body: String::new(),
+        });
+        assert_eq!(revoked.exit_code(), 77);
+
+        let bad_secret = Failure::Auth(AuthError::TokenEndpoint {
+            status: StatusCode::UNAUTHORIZED,
+            code: Some("invalid_client".to_owned()),
+            body: String::new(),
+        });
+        assert_eq!(
+            bad_secret.exit_code(),
+            2,
+            "a misconfigured client is setup"
+        );
+
+        let wrong_grant_type = Failure::Auth(AuthError::TokenEndpoint {
+            status: StatusCode::BAD_REQUEST,
+            code: Some("unauthorized_client".to_owned()),
+            body: String::new(),
+        });
+        assert_eq!(
+            wrong_grant_type.exit_code(),
+            2,
+            "a client misconfiguration"
+        );
+
+        let throttled = Failure::Auth(AuthError::TokenEndpoint {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: None,
+            body: String::new(),
+        });
+        assert_eq!(throttled.exit_code(), 1, "a rate limit is not a denial");
+
+        let google_down = Failure::Auth(AuthError::Authorization {
+            code: "temporarily_unavailable".to_owned(),
+        });
+        assert_eq!(google_down.exit_code(), 1, "an outage is not a denial");
+        assert!(!google_down.reached_server());
+
+        let unwritten = Failure::Output(std::io::Error::other("broken pipe"));
+        assert_eq!(unwritten.exit_code(), 1);
+        assert!(unwritten.reached_server(), "the request was completed");
     }
 }

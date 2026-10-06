@@ -13,14 +13,15 @@ doc = false
 
 [dependencies]
 alloy-primitives.workspace = true
-base64 = "0.23.1"
-chrono = "0.4.45"
+base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
+percent-encoding = "2.3.2"
 rand = "0.10.3"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.0"
+sha2.workspace = true
 st0x-issuance-dto = { version = "0.1.0", path = "../dto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -30,4 +31,4 @@ url.workspace = true
 workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true
