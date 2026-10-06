@@ -5025,6 +5025,88 @@ become a wrong-audience or forged-token acceptance. Every `InternalAuth`
 operator route now has an `/ops` twin; `move-receipts` and `confirm-custody`
 stay offline `issuer` CLI verbs.
 
+#### Operator client (`st0x-issuance-client`)
+
+S01 operators reach the `read`, `debug`, and `capital` tiers through the
+`st0x-issuance-client` binary (workspace package `st0x-issuance-ops`,
+`crates/ops-client`), the S01 counterpart of the T0 liquidity client. It is a
+thin typed transport: every verb maps to exactly one `/ops/<tier>/...` route,
+and it holds no production secret and no domain logic, since the bot validates
+and decides everything. Breakglass routes, direct Alpaca account operations, and
+T0 liquidity are out of its scope. The library of the same name
+(`crates/client`, package `st0x-issuance-client`) is unrelated: it is the
+liquidity bot's `X-API-KEY` client for the service API.
+
+Invocation is `st0x-issuance-client --env <staging|production> <group> <verb>`,
+and `--env` has no default. Per environment the client reads
+`S01_ISSUANCE_{STAGING,PROD}_URL`, the https base URL of the S01 ops load
+balancer, and obtains a Google ID token one of two ways. Both share one
+transport: the token travels as `Authorization: Bearer`, and IAP (not the
+client) stamps the `x-goog-iap-jwt-assertion` the bot verifies. There is no API
+key or secret-file option.
+
+- **Operator:** the client signs the operator in to the current S01 Google
+  account in the browser through a Desktop OAuth client (loopback redirect with
+  PKCE; `S01_ISSUANCE_*_CLIENT_ID` and `_CLIENT_SECRET`, which Google treats as
+  non-confidential for a Desktop client) and sends the resulting ID token, whose
+  audience is that client id. This requires the client id on the S01 ops
+  backends' IAP programmatic-client allowlist. The refresh token is cached per
+  environment (`st0x-issuance-client/oauth-<env>.json` under the XDG config
+  directory, mode 0600), so later calls do not reopen the browser. The cache and
+  client ids are separate from the T0 client's, so S01 sign-in never needs the
+  T0 Google account.
+- **CI:** when `S01_ISSUANCE_*_ID_TOKEN` is set, the client sends that token and
+  skips the OAuth flow. The CI job mints it through S01 workload identity by
+  impersonating an S01 service account for an ID token. The minting stays in CI
+  because Google's Rust auth library does not issue ID tokens from
+  external-account (workload identity) credentials.
+
+Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
+(`RegisterAccountRequest`, `WhitelistWalletRequest`, `AddTokenizedAssetRequest`,
+`ScheduleFreezeWindowRequest`), so client and bot cannot drift on a body shape.
+Path segments are percent-encoded and redirects are never followed.
+
+On success, stdout carries exactly the response body as one compact JSON line
+(the bot's JSON, not re-modelled) and all diagnostics go to stderr. The exit
+code is 0 on success, 2 for a setup or argument error, 77 for an authentication
+or authorization failure, and 1 otherwise. Failures are explained:
+
+- **401, or an IAP redirect to sign-in:** the S01 Google identity was missing,
+  expired, or rejected, including a token minted for another tier's audience.
+  Re-running signs in again; deleting the cached refresh token forces it.
+- **403:** authenticated, but the S01 account is not in the Workspace group IAP
+  requires for this tier. The bot itself never answers 403 on `/ops`.
+- **404:** an unknown id or asset, or `/ops` is not mounted on that deployment
+  (no `OPS_API_*_AUDIENCE` configured).
+- **503:** the bot could not fetch Google's IAP keys; retrying is safe.
+
+After any failure that reached the server, stderr also carries an S01 Cloud
+Logging link for the environment's project (`s01-issuance-staging` or
+`s01-issuance`), searching for the command's id or symbol when it has one and
+for warnings otherwise.
+
+| Command                                                            | Route                                                                |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `read stuck`                                                       | `GET /ops/read/stuck`                                                |
+| `read orchestrator-health`                                         | `GET /ops/read/orchestrator-health`                                  |
+| `read network-telemetry`                                           | `GET /ops/read/network-telemetry`                                    |
+| `read wrapped-transfers [--limit] [--before-*]`                    | `GET /ops/read/wrapped-transfers`                                    |
+| `read status <underlying>`                                         | `GET /ops/read/status/<underlying>`                                  |
+| `read orchestrator-preflight <network> [--asset]...`               | `GET /ops/read/orchestrator-preflight/<network>`                     |
+| `debug recover-redemption <id>`                                    | `POST /ops/debug/recover/redemption/<id>`                            |
+| `debug reprocess-mint <id>`                                        | `POST /ops/debug/reprocess/mint/<id>`                                |
+| `debug verify-orchestrator-signing <network> <underlying>`         | `POST /ops/debug/orchestrator-verify-signing/<network>/<underlying>` |
+| `debug register-account --email`                                   | `POST /ops/debug/accounts`                                           |
+| `debug whitelist-wallet <client_id> <wallet>`                      | `POST /ops/debug/accounts/<client_id>/wallets`                       |
+| `debug unwhitelist-wallet <client_id> <wallet>`                    | `DELETE /ops/debug/accounts/<client_id>/wallets/<wallet>`            |
+| `debug tokenized-asset <underlying> --network`                     | `GET /ops/debug/tokenized-assets/<underlying>?network=`              |
+| `debug add-tokenized-asset --underlying --token --network --vault` | `POST /ops/debug/tokenized-assets`                                   |
+| `debug snapshot <aggregate_type> <aggregate_id>`                   | `GET /ops/debug/snapshots/<aggregate_type>/<aggregate_id>`           |
+| `capital freeze <underlying>`                                      | `POST /ops/capital/freeze/<underlying>`                              |
+| `capital unfreeze <underlying>`                                    | `POST /ops/capital/unfreeze/<underlying>`                            |
+| `capital schedule-freeze --underlying --freeze-at --unfreeze-at`   | `POST /ops/capital/freeze-schedules`                                 |
+| `capital approve-orchestrator <network> <underlying>`              | `POST /ops/capital/orchestrator-approve/<network>/<underlying>`      |
+
 ### Recover Stuck Aggregates
 
 Recovers a stuck or failed aggregate so existing recovery logic picks it up.
