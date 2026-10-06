@@ -106,7 +106,7 @@ Record the policy name(s) in the table below.
 ```
 issuer verify-orchestrator-signing RKLB \
   --config "$CONFIG" \
-  --network base --chain-id 8453 --rpc-url "$RPC_URL"
+  --network base --chain-id 8453
 ```
 
 Signs one transaction per shape in the table above — never broadcasting — and
@@ -120,7 +120,7 @@ live mint.
 ```
 issuer approve-orchestrator RKLB \
   --config "$CONFIG" \
-  --network base --chain-id 8453 --rpc-url "$RPC_URL"
+  --network base --chain-id 8453
 ```
 
 One-time unlimited ERC-20 approval, bot wallet → orchestrator, on the asset's
@@ -142,7 +142,7 @@ Record each executed approval in the table below.
 ```
 issuer orchestrator-preflight \
   --config "$CONFIG" \
-  --network base --chain-id 8453 --rpc-url "$RPC_URL" \
+  --network base --chain-id 8453 \
   --asset RKLB
 ```
 
@@ -292,7 +292,7 @@ discrepancy before proceeding.
 issuer move-receipts <SYM> \
   --to-configured-orchestrator \
   --config "$CONFIG" \
-  --network base --chain-id 8453 --rpc-url "$RPC_URL"
+  --network base --chain-id 8453
 ```
 
 The destination is read from the `--network`'s `[orchestrator.addresses]` entry
@@ -359,9 +359,8 @@ Touches only this asset:
    returns them on-chain. Verify bot-wallet `balanceOf` matches the step-9
    snapshot.
 5. With the hold still armed, re-record custody:
-   `issuer confirm-custody <SYM> --network base --chain-id 8453
-   --rpc-url "$RPC_URL"`.
-   **Before** this command runs, recorded custody is EXPECTED to still name the
+   `issuer confirm-custody <SYM> --network base --chain-id 8453`. **Before**
+   this command runs, recorded custody is EXPECTED to still name the
    orchestrator — the on-chain withdrawal (step 4) does not touch the persisted
    record, so that is not stale data to investigate. **After** it succeeds,
    recorded custody must name the bot wallet: the command verifies on-chain that

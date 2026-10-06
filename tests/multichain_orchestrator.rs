@@ -7,6 +7,10 @@
 //! redemption per chain — every operation must land on its own network's
 //! orchestrator and leave the other chain untouched.
 
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![allow(clippy::disallowed_methods)]
+
 mod harness;
 
 use alloy::network::EthereumWallet;

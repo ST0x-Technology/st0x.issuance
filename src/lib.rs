@@ -1,3 +1,7 @@
+// Tests connect to Anvil by URL; the clippy.toml ban on URL-built providers
+// guards production chain clients only.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use apalis::prelude::{Monitor, WorkerBuilder};
@@ -111,7 +115,7 @@ pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
-pub use chain::ChainConfig;
+pub use chain::{ChainConfig, RpcEndpoint};
 pub use config::{
     Config, Environment, LogFormat, LogLevel, VaultMode, VaultModeConfig,
     VaultModeKind, setup_tracing,

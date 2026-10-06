@@ -678,7 +678,7 @@ async fn external_burn_without_a_pause_control_is_refused() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: Network::Base.chain_id(),
-        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];
@@ -745,7 +745,7 @@ async fn external_burn_validates_chain_id_before_pausing_the_poller() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: 31337,
-        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];
@@ -803,7 +803,7 @@ async fn external_burn_resumes_the_poller_after_an_error() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: Network::Base.chain_id(),
-        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];
@@ -885,7 +885,7 @@ async fn internal_burn_validates_chain_id_against_the_configured_chain() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: anvil_chain_id,
-        rpc_url: Url::parse("wss://localhost:8545").expect("valid url"),
+        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];

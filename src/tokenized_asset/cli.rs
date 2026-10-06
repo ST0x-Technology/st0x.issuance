@@ -22,9 +22,11 @@ use crate::Network;
 use crate::burn_excess::cli::{
     BurnExcessCommand as BurnExcessCliCommand, run_burn_excess_cli,
 };
+use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::{
-    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogFormat,
-    LogLevel, VaultModeConfig, VaultModeKind, load_config_file, setup_tracing,
+    ConfigError, DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
+    LogFormat, LogLevel, VaultModeConfig, VaultModeKind,
+    configured_rpc_endpoint, load_config_file, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
 use crate::receipt_inventory::migration::{
@@ -177,9 +179,13 @@ struct ForceCompleteRedemptionArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against. Deliberately redundant with `--network`:
     /// the command refuses unless both name the same chain and the RPC
@@ -245,9 +251,13 @@ struct OrchestratorPreflightArgs {
     #[arg(long = "asset", value_parser = |value: &str| UnderlyingSymbol::new(value.to_ascii_uppercase()))]
     assets: Vec<UnderlyingSymbol>,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against, cross-checked against the chain the RPC
     /// reports.
@@ -290,9 +300,13 @@ struct ApproveOrchestratorArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against, cross-checked against the chain the RPC
     /// reports.
@@ -337,9 +351,13 @@ struct VerifyOrchestratorSigningArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against, cross-checked against the chain the RPC
     /// reports.
@@ -403,9 +421,13 @@ struct MoveReceiptsArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against, cross-checked against the chain the RPC
     /// reports.
@@ -442,9 +464,13 @@ struct ConfirmCustodyArgs {
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
-    /// RPC endpoint for the network — the service's own `RPC_URL`.
-    #[arg(long, env = "RPC_URL")]
-    rpc_url: Url,
+    /// RPC endpoint for the network. Defaults to the service's own endpoint
+    /// for `--network`, resolved from the environment the way the service
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
+    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
+    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    #[arg(long)]
+    rpc_url: Option<Url>,
 
     /// Chain this must run against, cross-checked against the chain the RPC
     /// reports.
@@ -624,6 +650,7 @@ async fn run_force_complete_redemption(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     println!("Using database: {}", args.database_url);
     let admin =
@@ -647,9 +674,8 @@ async fn run_force_complete_redemption(
                 underlying: evidence.underlying.clone(),
             })?;
 
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
-    let provider =
-        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
 
     let landed = verify_landed_burn(
         &provider,
@@ -726,6 +752,7 @@ async fn run_orchestrator_preflight(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     let vault_modes = load_config_file(&args.config)?.vault_modes;
     let orchestrator =
@@ -751,9 +778,8 @@ async fn run_orchestrator_preflight(
         preflight_assets(&admin.pool, args.network, &args.assets, &vault_modes)
             .await?;
 
-    verified_chain_id(&args.rpc_url, args.chain_id).await?;
-    let provider =
-        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+    verified_chain_id(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
     let report =
         check_orchestrator_readiness(&provider, orchestrator, bot, &assets)
             .await?;
@@ -784,6 +810,7 @@ async fn run_approve_orchestrator(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     let orchestrator =
         required_orchestrator_address(&args.config, args.network)?;
@@ -814,13 +841,12 @@ async fn run_approve_orchestrator(
         anyhow::bail!("aborted by operator");
     }
 
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect(args.rpc_url.as_str())
-        .await?;
+        .connect_client(rpc_client(&rpc)?);
 
     // The spender is about to receive an UNLIMITED allowance from the
     // production bot wallet, so prove the configured address actually IS an
@@ -879,6 +905,7 @@ async fn run_verify_orchestrator_signing(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     let orchestrator =
         required_orchestrator_address(&args.config, args.network)?;
@@ -903,10 +930,9 @@ async fn run_verify_orchestrator_signing(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
-    let provider =
-        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
 
     let proofs = prove_signing_shapes(
         &provider,
@@ -966,6 +992,7 @@ async fn run_move_receipts(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     let configured_orchestrator = load_config_file(&args.config)?
         .vault_modes
@@ -1024,13 +1051,12 @@ async fn run_move_receipts(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
+    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect(args.rpc_url.as_str())
-        .await?;
+        .connect_client(rpc_client(&rpc)?);
 
     verify_gas_readiness(&provider, bot).await?;
 
@@ -1124,6 +1150,7 @@ async fn run_confirm_custody(
             args.chain_id
         );
     }
+    let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network)?;
 
     let SignerConfig::Turnkey(turnkey_config) = args.signer.into_config()?
     else {
@@ -1145,9 +1172,8 @@ async fn run_confirm_custody(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&args.rpc_url, args.chain_id).await?;
-    let provider =
-        ProviderBuilder::new().connect(args.rpc_url.as_str()).await?;
+    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
 
     let identity = VaultIdentity::verify(
         &admin.pool,
@@ -1299,6 +1325,19 @@ pub(crate) async fn preflight_assets(
         .collect())
 }
 
+/// `--rpc-url` when the operator gave one, otherwise the service's own
+/// endpoint for `network`. A pure environment lookup, so a missing endpoint
+/// fails before any prompt.
+fn rpc_endpoint(
+    rpc_url: Option<&Url>,
+    network: Network,
+) -> Result<RpcEndpoint, ConfigError> {
+    rpc_url.map_or_else(
+        || configured_rpc_endpoint(network),
+        |url| Ok(url.clone().into()),
+    )
+}
+
 /// Connects to the RPC and cross-checks the chain it reports against
 /// `--chain-id`.
 ///
@@ -1309,19 +1348,20 @@ pub(crate) async fn preflight_assets(
 /// endpoint is wrong — and a deterministic deployment can put the same vault
 /// address on both chains, so reaching the contract proves nothing.
 async fn verified_chain_id(
-    rpc_url: &Url,
+    rpc: &RpcEndpoint,
     expected_chain_id: u64,
 ) -> anyhow::Result<u64> {
     let chain_id = ProviderBuilder::new()
-        .connect(rpc_url.as_str())
-        .await?
+        .connect_client(rpc_client(rpc)?)
         .get_chain_id()
         .await?;
 
     if chain_id != expected_chain_id {
+        // Host only: an explicit URL may carry a provider key in its path.
         anyhow::bail!(
-            "--chain-id is {expected_chain_id} but {rpc_url} reports chain \
-             {chain_id}"
+            "--chain-id is {expected_chain_id} but the RPC at {} reports \
+             chain {chain_id}",
+            rpc.url().host_str().unwrap_or("(none)")
         );
     }
 
@@ -2489,6 +2529,41 @@ mod tests {
                 UnderlyingSymbol::new("SGOV").unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn rpc_url_is_optional_and_an_explicit_one_wins() {
+        let parse = |rpc_url: &[&str]| {
+            let mut args = vec![
+                "issuer",
+                "orchestrator-preflight",
+                "--config",
+                "issuance-config.toml",
+                "--network",
+                "robinhood",
+                "--chain-id",
+                "4663",
+                "--turnkey-org-id",
+                "org-id",
+                "--turnkey-api-private-key",
+                "api-key",
+                "--turnkey-address",
+                "0x00000000000000000000000000000000000000cc",
+            ];
+            args.extend_from_slice(rpc_url);
+            let cli = IssuerCli::try_parse_from(args).expect("arguments parse");
+            let IssuerCommand::OrchestratorPreflight(args) = cli.command else {
+                panic!("expected the orchestrator-preflight subcommand")
+            };
+            args
+        };
+
+        assert_eq!(parse(&[]).rpc_url, None);
+
+        let args = parse(&["--rpc-url", "http://127.0.0.1:1"]);
+        let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network).unwrap();
+        assert_eq!(rpc.url(), &Url::parse("http://127.0.0.1:1").unwrap());
+        assert!(!rpc.uses_bearer_auth());
     }
 
     #[test]

@@ -62,6 +62,21 @@ runtime** when the value is known at compile time.
 deterministic fixture values. Use `::random()` when you just need a unique value
 and don't care about the specific bytes.
 
+## Production Chain Clients
+
+Build every production provider from an `RpcEndpoint` through
+`chain::rpc_client`, then `ProviderBuilder::connect_client`:
+
+```rust
+let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+```
+
+`rpc_client` maps `ws`/`wss` to HTTP, sends a derived Alchemy endpoint's key as
+an `Authorization: Bearer` header, and strips the URL from transport errors (an
+explicit URL may embed a provider key). `clippy.toml` bans building a provider
+straight from a URL (`connect`, `connect_http`, ...); tests that talk to Anvil
+allow it at the crate or module root.
+
 ## Mock Providers for Testing
 
 Use `Asserter` with `ProviderBuilder` for mocking RPC responses:

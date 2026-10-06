@@ -19,9 +19,10 @@ and step 3 fails closed without both.
 1. **`CHAIN_ROBINHOOD_*` in the deployment secrets**
    (`secret/st0x-issuance-prod.env.age` and
    `secret/st0x-issuance-staging.env.age` in this repository).
-   `CHAIN_ROBINHOOD_RPC_URL`, `CHAIN_ROBINHOOD_CHAIN_ID` and
-   `CHAIN_ROBINHOOD_BACKFILL_START_BLOCK` are an all-or-nothing group, and the
-   chain id is checked against Robinhood Chain's canonical 4663.
+   `CHAIN_ROBINHOOD_CHAIN_ID` and `CHAIN_ROBINHOOD_BACKFILL_START_BLOCK` are an
+   all-or-nothing group, and the chain id is checked against Robinhood Chain's
+   canonical 4663. `CHAIN_ROBINHOOD_RPC_URL` is optional when `ALCHEMY_API_KEY`
+   is set, and wins over the derived Alchemy endpoint when present.
    `CHAIN_ROBINHOOD_LOW_GAS_THRESHOLD` is optional and may be set alongside
    them.
 2. **The Robinhood deploy config** (this repo, `config.prod.toml` /

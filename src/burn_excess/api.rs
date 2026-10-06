@@ -28,8 +28,8 @@ use super::engine::{
 };
 use super::proof::BurnExcessMode;
 use crate::auth::BreakglassOps;
-use crate::chain::ChainConfig;
-use crate::config::{Config, wss_to_http};
+use crate::chain::{ChainConfig, rpc_client};
+use crate::config::Config;
 use crate::mint::IssuerMintRequestId;
 use crate::redemption::poller_pause::PollerPauses;
 use crate::tokenized_asset::Network;
@@ -193,11 +193,11 @@ async fn run_burn_excess_ops(
         error!(target: "admin", %error, path, "burn-excess signer address unavailable");
         Status::InternalServerError
     })?;
-    let http_url = wss_to_http(&chain.rpc_url).map_err(|error| {
+    let rpc = rpc_client(&chain.rpc).map_err(|error| {
         error!(target: "admin", %error, path, "burn-excess RPC unavailable");
         Status::InternalServerError
     })?;
-    let read_provider = ProviderBuilder::new().connect_http(http_url);
+    let read_provider = ProviderBuilder::new().connect_client(rpc);
     let executed = request.execute;
 
     // Bound the run so a hung provider or vault call cannot hold the wallet
