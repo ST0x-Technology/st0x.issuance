@@ -47,6 +47,11 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds how long one loopback connection may take to send its request line,
+/// so a connection that never sends one (a browser preconnect) cannot stall
+/// the sign-in.
+const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Returns the ID token for `identity`. Workload identity already holds one;
 /// the Desktop client silently refreshes a cached sign-in, or signs the
 /// operator in through the browser once and caches the result.
@@ -203,25 +208,22 @@ fn extract_id_token(token: &serde_json::Value) -> Result<String, AuthError> {
         .ok_or(AuthError::MissingIdToken)
 }
 
-/// Accepts the single loopback redirect, returns the authorization code, and
-/// serves a small page telling the operator the sign-in is done. Blocking, so
-/// it runs on a blocking task off the async runtime.
+/// Waits for the loopback redirect, returns the authorization code, and serves
+/// a small page telling the operator the sign-in is done. Connections carrying
+/// no OAuth redirect parameters (a browser preconnect or favicon fetch, another
+/// local process) are dropped and the wait continues. Blocking, so it runs on a
+/// blocking task off the async runtime.
 fn capture_code(
     listener: &std::net::TcpListener,
     expected_state: &str,
 ) -> Result<String, AuthError> {
-    let (mut stream, _) = listener.accept()?;
-    let mut reader = std::io::BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut request_line)?;
+    let (mut stream, params) = loop {
+        let (stream, _) = listener.accept()?;
 
-    let query = request_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|target| target.split_once('?'))
-        .map_or("", |(_, query)| query);
-    let params: HashMap<String, String> =
-        url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        if let Some(params) = redirect_params(&stream)? {
+            break (stream, params);
+        }
+    };
 
     let page = "<html><body>Sign-in complete. You can close this tab and \
                 return to the terminal.</body></html>";
@@ -241,6 +243,35 @@ fn capture_code(
     }
 
     params.get("code").cloned().ok_or(AuthError::MissingCode)
+}
+
+/// The query parameters of the request on `stream`, or `None` when it is not
+/// the OAuth redirect: no request line arrived in time, or it carried none of
+/// `code`, `state`, or `error`.
+fn redirect_params(
+    stream: &std::net::TcpStream,
+) -> Result<Option<HashMap<String, String>>, AuthError> {
+    stream.set_read_timeout(Some(REDIRECT_READ_TIMEOUT))?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut request_line = String::new();
+
+    // A timeout or reset belongs to this connection only, never the sign-in.
+    if std::io::BufRead::read_line(&mut reader, &mut request_line).is_err() {
+        return Ok(None);
+    }
+
+    let query = request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|target| target.split_once('?'))
+        .map_or("", |(_, query)| query);
+    let params: HashMap<String, String> =
+        url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+
+    let is_redirect =
+        ["code", "state", "error"].iter().any(|key| params.contains_key(*key));
+
+    Ok(is_redirect.then_some(params))
 }
 
 /// A URL-safe, unpadded base64 string of `bytes` random bytes, for the PKCE
@@ -437,6 +468,28 @@ mod tests {
             capture("error=access_denied&state=xyz", "xyz"),
             Err(AuthError::Denied { reason }) if reason == "access_denied"
         ));
+    }
+
+    #[test]
+    fn capture_code_skips_connections_that_are_not_the_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut favicon = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            favicon.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").unwrap();
+            drop(favicon);
+            drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+
+            let mut redirect = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            redirect
+                .write_all(b"GET /?code=abc&state=xyz HTTP/1.1\r\n\r\n")
+                .unwrap();
+            let mut sink = Vec::new();
+            redirect.read_to_end(&mut sink).unwrap();
+        });
+
+        assert_eq!(capture_code(&listener, "xyz").unwrap(), "abc");
+        sender.join().unwrap();
     }
 
     /// Serves one token-endpoint response over loopback and returns its URL.
