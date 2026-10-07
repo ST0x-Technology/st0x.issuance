@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 use url::Url;
 
 use super::view::{
@@ -44,8 +45,8 @@ use crate::underlying::{
     load_freeze_status, with_freeze_admission,
 };
 use crate::vault::onboarding::{
-    APPROVAL_RECEIPT_DEADLINE, ApprovalOutcome, check_orchestrator_readiness,
-    ensure_unlimited_approval, prove_signing_shapes,
+    ApprovalOutcome, check_orchestrator_readiness, ensure_unlimited_approval,
+    prove_signing_shapes,
 };
 use crate::wallet::turnkey::resolve_turnkey_signer;
 use crate::wallet::{SignerConfig, SignerEnv};
@@ -795,11 +796,20 @@ async fn run_orchestrator_preflight(
     Ok(())
 }
 
+/// The offline approval's budget, from its allowance read through the fill,
+/// the Turnkey signature, the broadcast, the receipt, and the allowance
+/// re-read; running out before the broadcast fails with nothing sent. No
+/// gateway sits in front of the CLI, so it outwaits a congested block rather
+/// than matching the `/ops` route's request budget.
+const OFFLINE_APPROVAL_DEADLINE: Duration = Duration::from_secs(300);
+
 /// Executes one asset's one-time unlimited approval through the Turnkey
 /// signer, after an explicit confirmation naming the asset, vault,
 /// orchestrator, and wallet. The mutation itself is idempotent
 /// ([`ensure_unlimited_approval`]), so a re-run after a completed approval
-/// reports "already unlimited" instead of sending again.
+/// reports "already unlimited" instead of sending again. An approval still
+/// unconfirmed at [`OFFLINE_APPROVAL_DEADLINE`] fails with its hash, so a
+/// script never proceeds as if the allowance were in place.
 async fn run_approve_orchestrator(
     args: ApproveOrchestratorArgs,
     confirm: impl Fn(&str) -> io::Result<bool>,
@@ -873,12 +883,15 @@ async fn run_approve_orchestrator(
         );
     }
 
+    let deadline = Instant::now()
+        .checked_add(OFFLINE_APPROVAL_DEADLINE)
+        .ok_or_else(|| anyhow::anyhow!("approval deadline overflows"))?;
     match ensure_unlimited_approval(
         &provider,
         vault,
         orchestrator,
         bot,
-        APPROVAL_RECEIPT_DEADLINE,
+        deadline,
     )
     .await?
     {
@@ -892,12 +905,16 @@ async fn run_approve_orchestrator(
              on {} vault {vault} in {tx_hash}.",
             args.underlying
         ),
-        ApprovalOutcome::SubmittedUnconfirmed { tx_hash } => println!(
-            "Submitted, unconfirmed: {tx_hash} was broadcast for {} vault \
-             {vault} but not confirmed within {}s. Check it on chain before \
-             re-running; once it lands a re-run sends nothing.",
+        ApprovalOutcome::SubmittedUnconfirmed { tx_hash } => anyhow::bail!(
+            "submitted, unconfirmed: {tx_hash} was signed for {} vault \
+             {vault} but not confirmed within {}s. Look it up on chain before \
+             re-running: once it lands a re-run sends nothing; if the chain \
+             does not know it, nothing was sent and a re-run is safe; if it \
+             stays pending, later mints and burns on this network queue \
+             behind its nonce until it is replaced through Turnkey, and a \
+             re-run only adds another transaction behind it.",
             args.underlying,
-            APPROVAL_RECEIPT_DEADLINE.as_secs()
+            OFFLINE_APPROVAL_DEADLINE.as_secs()
         ),
     }
     println!("Run orchestrator-preflight to verify overall readiness.");

@@ -5,7 +5,7 @@
 //! wallet from the Turnkey signer, the RPC from the per-network environment.
 
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
 use rocket::request::FromParam;
 use rocket::serde::json::Json;
@@ -13,6 +13,7 @@ use rocket::{State, get, post};
 use serde::Serialize;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use super::api::UnderlyingParam;
@@ -24,7 +25,7 @@ use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::Config;
 use crate::mint::has_unresolved_signer_intent;
 use crate::vault::onboarding::{
-    APPROVAL_RECEIPT_DEADLINE, ApprovalOutcome, OnboardingError,
+    APPROVAL_DEADLINE, APPROVAL_RECEIPT_POLL, ApprovalOutcome, OnboardingError,
     OrchestratorReadiness, check_orchestrator_readiness,
     ensure_unlimited_approval, prove_signing_shapes,
 };
@@ -166,9 +167,11 @@ pub(crate) async fn orchestrator_verify_signing_ops(
 /// Capital-tier one-time unlimited approval of an asset's vault shares to the
 /// orchestrator, signed and broadcast through Turnkey. Idempotent: an already
 /// unlimited allowance sends nothing. Refuses if the configured address does
-/// not verify as a healthy orchestrator. An approval broadcast but unconfirmed
-/// within [`APPROVAL_RECEIPT_DEADLINE`] answers 202 with its hash, so the
-/// operator reconciles it on chain rather than sending a second approval.
+/// not verify as a healthy orchestrator. The whole request runs against one
+/// [`APPROVAL_DEADLINE`] from its start: running out before the broadcast
+/// answers 503 with nothing sent, and an approval signed but not confirmed in
+/// time answers 202 with its hash, so the operator reconciles it on chain
+/// rather than sending a second approval.
 #[post("/ops/capital/orchestrator-approve/<network>/<underlying>")]
 #[tracing::instrument(
     target = "auth",
@@ -184,45 +187,64 @@ pub(crate) async fn orchestrator_approve_ops(
     network: &str,
     underlying: UnderlyingParam,
 ) -> Result<(Status, Json<ApproveResponse>), Status> {
+    let deadline = Instant::now()
+        .checked_add(APPROVAL_DEADLINE)
+        .ok_or(Status::InternalServerError)?;
     let network = parse_network(network)?;
     let UnderlyingParam(symbol) = underlying;
     let OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
 
-    let vault = find_vault(pool.inner(), &symbol, &network)
-        .await
-        .map_err(|error| {
-            error!(target: "asset", %error, "Failed to look up vault");
-            Status::InternalServerError
-        })?
-        .ok_or(Status::NotFound)?;
+    let vault = before_deadline(
+        deadline,
+        "vault lookup",
+        find_vault(pool.inner(), &symbol, &network),
+    )
+    .await?
+    .map_err(|error| {
+        error!(target: "asset", %error, "Failed to look up vault");
+        Status::InternalServerError
+    })?
+    .ok_or(Status::NotFound)?;
 
-    let resolved =
-        resolve_turnkey_signer(turnkey, chain_id).await.map_err(|error| {
-            error!(target: "asset", %error, "Failed to resolve Turnkey signer");
-            Status::InternalServerError
-        })?;
+    let resolved = before_deadline(
+        deadline,
+        "turnkey signer",
+        resolve_turnkey_signer(turnkey, chain_id),
+    )
+    .await?
+    .map_err(|error| {
+        error!(target: "asset", %error, "Failed to resolve Turnkey signer");
+        Status::InternalServerError
+    })?;
 
+    // A remote RPC client polls receipts every 7 s by default, which would
+    // spend most of the approval's deadline between two looks at a receipt
+    // that landed in the first block or two.
+    let rpc_client = rpc_client(&rpc).map_err(|error| {
+        error!(target: "asset", %error, "approve could not connect to RPC");
+        Status::BadGateway
+    })?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_client(rpc_client(&rpc).map_err(|error| {
-            error!(target: "asset", %error, "approve could not connect to RPC");
-            Status::BadGateway
-        })?);
+        .connect_client(rpc_client.with_poll_interval(APPROVAL_RECEIPT_POLL));
 
     // The spender is about to receive an unlimited allowance from the
     // production wallet, so prove the address is a healthy orchestrator first:
     // a stale or typo'd entry fails these reads or reports vault logic false.
-    let readiness =
-        check_orchestrator_readiness(&provider, orchestrator, bot, &[])
-            .await
-            .map_err(|error| {
-            error!(target: "asset", %orchestrator, %error,
-                "Refusing approve: orchestrator could not be verified"
-            );
-            map_onboarding_error(&error)
-        })?;
+    let readiness = before_deadline(
+        deadline,
+        "orchestrator readiness",
+        check_orchestrator_readiness(&provider, orchestrator, bot, &[]),
+    )
+    .await?
+    .map_err(|error| {
+        error!(target: "asset", %orchestrator, %error,
+            "Refusing approve: orchestrator could not be verified"
+        );
+        map_onboarding_error(&error)
+    })?;
     if !readiness.vault_logic_expected {
         warn!(target: "asset", %orchestrator,
             "Refusing approve: vaultLogicIsExpected() is false"
@@ -238,14 +260,55 @@ pub(crate) async fn orchestrator_approve_ops(
         vault_service.as_ref(),
         pool.inner(),
         network,
-        &provider,
-        vault,
-        orchestrator,
-        bot,
+        deadline,
+        async {
+            Box::pin(ensure_unlimited_approval(
+                &provider,
+                vault,
+                orchestrator,
+                bot,
+                deadline,
+            ))
+            .await
+            .map_err(|error| {
+                log_approval_failure(&error, orchestrator, vault);
+                map_onboarding_error(&error)
+            })
+        },
     )
     .await?;
 
-    let (status, response) = match outcome {
+    let (status, response) = approve_reply(outcome);
+    info!(target: "asset", %orchestrator, %vault, outcome = response.outcome,
+        tx_hash = ?response.tx_hash, "Orchestrator approval settled"
+    );
+    Ok((status, Json(response)))
+}
+
+/// Logs why the approval did not settle: running out of time before the
+/// broadcast is the same refusal the pre-broadcast steps log (WARN, nothing
+/// sent); anything else is a failed approval (ERROR, with the node's or
+/// chain's reason).
+fn log_approval_failure(
+    error: &OnboardingError,
+    orchestrator: Address,
+    vault: Address,
+) {
+    if matches!(error, OnboardingError::DeadlineBeforeBroadcast) {
+        warn!(target: "asset", step = "approval signing", %orchestrator, %vault,
+            "Refusing approve: deadline passed before broadcast; nothing sent"
+        );
+    } else {
+        error!(target: "asset", %orchestrator, %vault, %error,
+            "Orchestrator approval failed"
+        );
+    }
+}
+
+/// The approval's HTTP answer: 200 for a verified or already-unlimited
+/// allowance, 202 for one signed but not confirmed, which may still land.
+fn approve_reply(outcome: ApprovalOutcome) -> (Status, ApproveResponse) {
+    match outcome {
         ApprovalOutcome::AlreadyUnlimited => (
             Status::Ok,
             ApproveResponse { outcome: "already_unlimited", tx_hash: None },
@@ -264,66 +327,71 @@ pub(crate) async fn orchestrator_approve_ops(
                 tx_hash: Some(tx_hash.to_string()),
             },
         ),
-    };
-    info!(target: "asset", %orchestrator, %vault, outcome = response.outcome,
-        tx_hash = ?response.tx_hash, "Orchestrator approval settled"
-    );
-    Ok((status, Json(response)))
+    }
 }
 
-/// Broadcasts the approval from the production wallet under the network's
-/// service wallet lock, the one every live mint and redemption burn holds
-/// while it checks intents and signs. The lock is taken before the intent
-/// check so no live flow can persist a signed nonce between the check and
-/// this broadcast; while it is held no live flow fills a nonce either, so the
-/// pending count this route's provider reads is the one to use. The lock is
-/// held until the receipt is in or [`APPROVAL_RECEIPT_DEADLINE`] passes. The
-/// service's nonce manager resyncs from the chain's pending count; past the
-/// deadline the approval is already in the node's pending pool, so a live flow
-/// filling next takes the nonce after it, as it does after its own broadcasts.
-/// Refuses with 409 while an unresolved mint or redemption signer intent
-/// already holds a signed nonce on this network: both would fill from the same
-/// pending nonce and one would fail nonce-too-low, leaving the bot's recovery
-/// to reconcile a submission it did not make.
-async fn approve_under_wallet_lock<P: Provider>(
+/// Runs a pre-broadcast `step` of the approval against its deadline: one that
+/// would overrun it answers 503, since nothing has been sent yet and a retry
+/// is safe. `step` names it in the log.
+async fn before_deadline<T>(
+    deadline: Instant,
+    step: &'static str,
+    work: impl Future<Output = T>,
+) -> Result<T, Status> {
+    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
+        warn!(target: "asset", step,
+            "Refusing approve: deadline passed before broadcast; nothing sent"
+        );
+        Status::ServiceUnavailable
+    })
+}
+
+/// Runs `approval` under the network's service wallet lock, the lock every
+/// live mint and redemption burn holds while it checks intents and signs. The
+/// lock is taken before the intent check so no live flow can persist a signed
+/// nonce between the check and the broadcast; while it is held no live flow
+/// fills a nonce either, so the pending count the route's provider reads is
+/// the one to use. Waiting for the lock and the intent check count against
+/// the approval's deadline (503 on elapse, nothing sent). The lock is released
+/// when `approval` returns, at the latest at the deadline. An approval still
+/// pending then keeps its nonce: the service's nonce manager fills the next
+/// live flow after it from the node's pending count, so until it mines (or the
+/// operator replaces it) later mints and burns queue behind it. Refuses with
+/// 409 while an unresolved mint or redemption signer intent already holds a
+/// signed nonce on this network: both would fill from the same pending nonce
+/// and one would fail nonce-too-low, leaving the bot's recovery to reconcile a
+/// submission it did not make.
+async fn approve_under_wallet_lock(
     vault_service: &dyn VaultService,
     pool: &Pool<Sqlite>,
     network: Network,
-    provider: &P,
-    vault: Address,
-    orchestrator: Address,
-    bot: Address,
+    deadline: Instant,
+    approval: impl Future<Output = Result<ApprovalOutcome, Status>>,
 ) -> Result<ApprovalOutcome, Status> {
-    let _wallet_guard = vault_service.lock_wallet().await;
+    let _wallet_guard =
+        before_deadline(deadline, "wallet lock", vault_service.lock_wallet())
+            .await?;
 
-    if has_unresolved_signer_intent(pool, network, None).await.map_err(
-        |error| {
-            error!(target: "asset", %network, %error,
-                "Failed to check signer intents before approve"
-            );
-            Status::InternalServerError
-        },
-    )? {
+    let intent_held = before_deadline(
+        deadline,
+        "signer intent check",
+        has_unresolved_signer_intent(pool, network, None),
+    )
+    .await?
+    .map_err(|error| {
+        error!(target: "asset", %network, %error,
+            "Failed to check signer intents before approve"
+        );
+        Status::InternalServerError
+    })?;
+    if intent_held {
         warn!(target: "asset", %network,
             "Refusing approve: an unresolved signer intent holds the wallet nonce"
         );
         return Err(Status::Conflict);
     }
 
-    ensure_unlimited_approval(
-        provider,
-        vault,
-        orchestrator,
-        bot,
-        APPROVAL_RECEIPT_DEADLINE,
-    )
-    .await
-    .map_err(|error| {
-        error!(target: "asset", %orchestrator, %vault, %error,
-            "Orchestrator approval failed"
-        );
-        map_onboarding_error(&error)
-    })
+    approval.await
 }
 
 #[derive(Serialize)]
@@ -471,18 +539,28 @@ fn parse_assets(assets: &[String]) -> Result<Vec<UnderlyingSymbol>, Status> {
         .collect()
 }
 
-/// Maps an onboarding failure to an HTTP status. A Turnkey policy denial is a
-/// 422 the operator fixes in the policy; every other failure is an on-chain or
-/// RPC fault (502).
+/// Maps an onboarding failure to an HTTP status. A Turnkey policy denial found
+/// by the sign-only proof and a broadcast the node refused (nothing pending;
+/// its reason is in the log) are 422s the operator fixes before retrying; a
+/// deadline that passed before the broadcast is a 503 with nothing sent; a
+/// filled but unsigned transaction is the bot's own fault (500); every other
+/// failure, including the approval's own signing failing inside the fill, is
+/// an on-chain, RPC, or signer fault (502).
 const fn map_onboarding_error(error: &OnboardingError) -> Status {
     use OnboardingError::{
-        ApprovalNotEffective, ApprovalReverted, Contract, SigningRejected,
-        Transport,
+        ApprovalNotEffective, ApprovalReverted, BroadcastRejected, Contract,
+        DeadlineBeforeBroadcast, PendingTransaction, SigningRejected,
+        Transport, Unsigned,
     };
 
     match error {
-        SigningRejected { .. } => Status::UnprocessableEntity,
+        SigningRejected { .. } | BroadcastRejected { .. } => {
+            Status::UnprocessableEntity
+        }
+        DeadlineBeforeBroadcast => Status::ServiceUnavailable,
+        Unsigned => Status::InternalServerError,
         Contract(_)
+        | PendingTransaction(_)
         | Transport(_)
         | ApprovalReverted { .. }
         | ApprovalNotEffective { .. } => Status::BadGateway,
@@ -491,10 +569,9 @@ const fn map_onboarding_error(error: &OnboardingError) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::EthereumWallet;
-    use alloy::primitives::{Address, U256, address};
-    use alloy::providers::ProviderBuilder;
-    use alloy::signers::local::PrivateKeySigner;
+    use alloy::primitives::{Address, B256, address};
+    use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::transports::RpcError;
     use chrono::Utc;
     use cqrs_es::DomainEvent;
     use rocket::http::Status;
@@ -502,16 +579,24 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::{Pool, Sqlite};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::time::Instant;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
-    use super::approve_under_wallet_lock;
+    use super::{
+        approve_reply, approve_under_wallet_lock, log_approval_failure,
+        map_onboarding_error,
+    };
     use crate::account::ClientId;
-    use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::{IssuerMintRequestId, MintEvent, TokenizationRequestId};
-    use crate::test_utils::LocalEvm;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::PreparedMintTx;
+    use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
+    use crate::vault::onboarding::{ApprovalOutcome, OnboardingError};
     use crate::{Quantity, VaultMode};
 
     async fn migrated_pool() -> Pool<Sqlite> {
@@ -591,6 +676,10 @@ mod tests {
         .await;
     }
 
+    fn deadline_after(budget: Duration) -> Instant {
+        Instant::now().checked_add(budget).unwrap()
+    }
+
     /// The approval must take the service wallet lock before it checks for
     /// signer intents: a mint that signs while the approval is queued on the
     /// lock persists its intent under that lock, and the approval, once it
@@ -598,33 +687,25 @@ mod tests {
     /// nonce the mint just took.
     #[tokio::test]
     async fn approve_checks_intents_only_once_it_holds_the_wallet_lock() {
-        let evm = LocalEvm::new().await.unwrap();
-        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
-            .connect(&evm.endpoint)
-            .await
-            .unwrap();
         let pool = migrated_pool().await;
         let vault_service =
             Arc::new(MockVaultService::new_wallet_lock_blocked());
-        let orchestrator = Address::repeat_byte(0x42);
+        let broadcast = Arc::new(AtomicBool::new(false));
 
         let approval = tokio::spawn({
             let vault_service = Arc::clone(&vault_service);
             let pool = pool.clone();
-            let provider = provider.clone();
-            let vault = evm.vault_address;
-            let bot = evm.wallet_address;
+            let broadcast = Arc::clone(&broadcast);
             async move {
                 approve_under_wallet_lock(
                     vault_service.as_ref(),
                     &pool,
                     Network::Base,
-                    &provider,
-                    vault,
-                    orchestrator,
-                    bot,
+                    deadline_after(Duration::from_secs(25)),
+                    async {
+                        broadcast.store(true, Ordering::SeqCst);
+                        Ok(ApprovalOutcome::AlreadyUnlimited)
+                    },
                 )
                 .await
             }
@@ -646,58 +727,178 @@ mod tests {
         seed_mint_holding_the_signer(&pool).await;
         vault_service.release_wallet_lock();
 
-        let error = approval.await.unwrap().unwrap_err();
         assert_eq!(
-            error,
-            Status::Conflict,
+            approval.await.unwrap(),
+            Err(Status::Conflict),
             "the intent check must see the mint that signed while the approval waited"
         );
-        let allowance =
-            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
-                .allowance(evm.wallet_address, orchestrator)
-                .call()
-                .await
-                .unwrap();
-        assert_eq!(
-            allowance,
-            U256::ZERO,
-            "a refused approval must not have broadcast"
+        assert!(
+            !broadcast.load(Ordering::SeqCst),
+            "a refused approval must not have run"
         );
     }
 
-    /// With the wallet free and no intent outstanding the approval lands.
+    /// The approval runs while the wallet lock is held, so no live mint or
+    /// burn can fill a nonce between its intent check and its broadcast.
     #[tokio::test]
-    async fn approve_broadcasts_under_a_free_wallet() {
-        let evm = LocalEvm::new().await.unwrap();
-        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
-            .connect(&evm.endpoint)
-            .await
-            .unwrap();
+    async fn approval_runs_while_the_wallet_lock_is_held() {
         let pool = migrated_pool().await;
         let vault_service = MockVaultService::new_success();
-        let orchestrator = Address::repeat_byte(0x42);
 
-        approve_under_wallet_lock(
+        let outcome = approve_under_wallet_lock(
             &vault_service,
             &pool,
             Network::Base,
-            &provider,
-            evm.vault_address,
-            orchestrator,
-            evm.wallet_address,
+            deadline_after(Duration::from_secs(25)),
+            async {
+                let competing_got_the_wallet = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    vault_service.lock_wallet(),
+                )
+                .await
+                .is_ok();
+                assert!(
+                    !competing_got_the_wallet,
+                    "a live flow must not get the wallet while the approval runs"
+                );
+                Ok(ApprovalOutcome::AlreadyUnlimited)
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(ApprovalOutcome::AlreadyUnlimited));
+    }
+
+    /// Waiting for the wallet counts against the approval's deadline: a lock
+    /// held past it answers 503, before anything was signed or sent.
+    #[traced_test]
+    #[tokio::test]
+    async fn approve_queued_on_the_wallet_past_its_deadline_is_refused() {
+        let pool = migrated_pool().await;
+        let vault_service = MockVaultService::new_wallet_lock_blocked();
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            approve_under_wallet_lock(
+                &vault_service,
+                &pool,
+                Network::Base,
+                deadline_after(Duration::from_millis(100)),
+                async { Ok(ApprovalOutcome::AlreadyUnlimited) },
+            ),
         )
         .await
-        .unwrap();
+        .expect("the lock wait must end at the approval's deadline");
 
-        assert_eq!(vault_service.get_wallet_lock_call_count(), 1);
-        let allowance =
-            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
-                .allowance(evm.wallet_address, orchestrator)
-                .call()
-                .await
-                .unwrap();
-        assert_eq!(allowance, U256::MAX);
+        assert_eq!(refused, Err(Status::ServiceUnavailable));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Refusing approve: deadline passed before broadcast",
+                "nothing sent",
+                "wallet lock"
+            ]
+        ));
+    }
+
+    /// The intent check's database wait counts against the deadline too: a
+    /// pool with no free connection answers 503 rather than holding the wallet
+    /// lock, and the request, past it.
+    #[traced_test]
+    #[tokio::test]
+    async fn approve_with_the_database_stalled_past_its_deadline_is_refused() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let _held = pool.acquire().await.unwrap();
+        let vault_service = MockVaultService::new_success();
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            approve_under_wallet_lock(
+                &vault_service,
+                &pool,
+                Network::Base,
+                deadline_after(Duration::from_millis(100)),
+                async { Ok(ApprovalOutcome::AlreadyUnlimited) },
+            ),
+        )
+        .await
+        .expect("the intent check must end at the approval's deadline");
+
+        assert_eq!(refused, Err(Status::ServiceUnavailable));
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Refusing approve: deadline passed before broadcast",
+                "nothing sent",
+                "signer intent check"
+            ]
+        ));
+    }
+
+    /// The status is the script-visible half of the answer: only a verified
+    /// or already-unlimited allowance is 200; one signed but unconfirmed is
+    /// 202 with the hash to reconcile.
+    #[test]
+    fn approval_outcomes_map_to_their_status_and_body() {
+        let tx_hash = B256::repeat_byte(0xab);
+
+        let (status, body) =
+            approve_reply(ApprovalOutcome::SubmittedUnconfirmed { tx_hash });
+        assert_eq!(status, Status::Accepted);
+        assert_eq!(body.outcome, "submitted_unconfirmed");
+        assert_eq!(body.tx_hash, Some(tx_hash.to_string()));
+
+        let (status, body) =
+            approve_reply(ApprovalOutcome::Approved { tx_hash });
+        assert_eq!(status, Status::Ok);
+        assert_eq!(body.outcome, "approved");
+        assert_eq!(body.tx_hash, Some(tx_hash.to_string()));
+
+        let (status, body) = approve_reply(ApprovalOutcome::AlreadyUnlimited);
+        assert_eq!(status, Status::Ok);
+        assert_eq!(body.outcome, "already_unlimited");
+        assert_eq!(body.tx_hash, None);
+    }
+
+    /// A broadcast the node refused is definitive, nothing is pending, so it
+    /// is a 422 the client reports as a failure, not a 502 it reads as an
+    /// unknown outcome. Running out of time while signing is the same 503 the
+    /// pre-broadcast steps answer, logged as a WARN refusal, not an ERROR.
+    #[traced_test]
+    #[test]
+    fn refusals_map_to_definitive_statuses_and_logs() {
+        let refused = OnboardingError::BroadcastRejected {
+            tx_hash: B256::repeat_byte(0xcd),
+            source: RpcError::ErrorResp(ErrorPayload {
+                code: -32003,
+                message: "insufficient funds for gas * price + value".into(),
+                data: None,
+            }),
+        };
+        assert_eq!(map_onboarding_error(&refused), Status::UnprocessableEntity);
+
+        let late = OnboardingError::DeadlineBeforeBroadcast;
+        assert_eq!(map_onboarding_error(&late), Status::ServiceUnavailable);
+        log_approval_failure(
+            &late,
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Refusing approve: deadline passed before broadcast",
+                "approval signing"
+            ]
+        ));
+        assert!(!logs_contain_at!(
+            Level::ERROR,
+            &["Orchestrator approval failed"]
+        ));
     }
 }

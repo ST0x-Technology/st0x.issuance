@@ -1459,9 +1459,10 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   token) through the Turnkey signer, after verifying the configured address
   answers as an orchestrator. Idempotent — an already-unlimited allowance sends
   nothing — and success is re-verified by an on-chain allowance read, never
-  inferred from the receipt. Like the `/ops` route, it waits at most 20 seconds
-  for the receipt and otherwise reports the broadcast transaction hash as
-  submitted but unconfirmed, to reconcile on chain rather than re-run.
+  inferred from the receipt. It signs the approval before broadcasting it and
+  waits up to 5 minutes for a verified result (no gateway sits in front of it);
+  an approval still unconfirmed then fails with its hash and a non-zero exit, so
+  a script does not proceed as if the allowance were in place.
 - `issuer verify-orchestrator-signing <UNDERLYING>` — signs, WITHOUT
   broadcasting, one transaction per shape the Turnkey signing policy must allow
   before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
@@ -4962,21 +4963,47 @@ Tiers and routes:
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 
-`orchestrator-approve` waits at most 20 seconds for the approval's receipt once
-it is broadcast, short enough that the whole request fits under a load
-balancer's default 30-second backend timeout and the client's request timeout,
-so the bot's own verdict reaches the operator. It responds with
-`{ outcome, tx_hash }`:
+`orchestrator-approve` runs against one 18-second deadline from when the route
+starts, after IAP verification (which may take up to 10 seconds fetching
+Google's keys). It covers the vault lookup, the signer, the orchestrator checks,
+the wait for the service wallet lock, the broadcast, the receipt, and the
+allowance re-read, so the bot's own verdict arrives before a load balancer's
+default 30-second backend timeout and the client's request timeout. The approval
+is signed before it is broadcast, so its hash is known from then on. It responds
+with `{ outcome, tx_hash }`:
 
 - `already_unlimited` (200, `tx_hash` null): nothing was sent.
 - `approved` (200): the receipt succeeded and the re-read allowance is
   unlimited.
-- `submitted_unconfirmed` (202): the approval was broadcast, but no receipt
-  arrived within the deadline (or the receipt poll failed), so it may still
-  land. The operator reconciles `tx_hash` on chain instead of retrying; a retry
-  after it lands sends nothing. The wallet lock is released at the deadline, as
-  a live mint's is after broadcast, with the approval already in the node's
-  pending pool.
+- `submitted_unconfirmed` (202): the approval was signed and broadcast (or its
+  broadcast's answer was lost or cut off), but the receipt and the allowance
+  re-read did not both come back within the deadline, so it may still land. The
+  operator looks `tx_hash` up on chain instead of retrying: once it lands a
+  retry sends nothing; if the chain does not know it, nothing was sent and a
+  retry is safe. The wallet lock is released at the deadline, as a live mint's
+  is after broadcast. If the approval then stays pending without mining, it
+  keeps its nonce and later mints and burns on that network queue behind it
+  until it mines or the operator replaces that nonce through Turnkey; re-running
+  the approve only adds another transaction behind it.
+- 404: no vault is listed for that symbol on that network.
+- 422, nothing signed or sent: the network is unknown or the symbol empty, the
+  network has no `[orchestrator.addresses]` entry or no vault service, the
+  signer is not Turnkey, or the configured orchestrator did not verify
+  (`vaultLogicIsExpected()` false). The bot's warning for the request says
+  which; the operator fixes it before retrying.
+- 422, refused: the node answered the broadcast with an error (insufficient
+  funds, underpriced, nonce too low) and a lookup did not find the transaction
+  there. The bot logs the node's reason. If it also logs that the lookup failed
+  or ran out of time, the operator checks `tx_hash` on chain before retrying;
+  otherwise nothing is pending and retrying after fixing the cause is safe.
+- 409: an unresolved mint or redemption signer intent holds the network's wallet
+  nonce; nothing was signed or sent, and the approve is re-run once that flow
+  resolves.
+- 503: the deadline passed before the broadcast (for example the wallet lock
+  stayed held by a live mint or burn); nothing was sent and a retry is safe.
+
+The client prints the 202 body and exits 0 like any success, so a script must
+branch on `outcome`, not the exit code.
 
 Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
 echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
@@ -5142,15 +5169,20 @@ outage during sign-in. Failures are explained:
   (no `OPS_API_*_AUDIENCE` configured).
 - **503:** the deployment could not serve the request, for example the bot could
   not fetch Google's IAP keys, a burn-excess transfer poller could not be paused
-  in time (it did not park, or another breakglass run held it), or the load
-  balancer had no healthy backend. A read can be retried; before retrying a
-  write, the logs show whether it was applied.
+  in time (it did not park, or another breakglass run held it), an
+  `approve-orchestrator` ran out of time before broadcasting anything (nothing
+  sent), or the load balancer had no healthy backend. A read can be retried;
+  before retrying a write, the logs show whether it was applied.
 - **502 or 504:** a gateway gave up waiting, either the load balancer's backend
   timeout (a long burn-excess run can outlast it) or the bot's own bound (its
-  wait on the chain, or a burn-excess run's), so the outcome is unknown. A read
-  can be retried. A burn-excess dry-run changed nothing and an `--execute` is
-  resumed by re-running the same command, which reads the persisted burn stream;
-  for any other write, the logs show whether it was applied before a retry.
+  wait on the chain, or a burn-excess run's), so the outcome is unknown. An
+  `approve-orchestrator` also answers 502 when an RPC call failed, Turnkey
+  failed to sign it (nothing sent), its approval reverted, or it landed but the
+  re-read allowance is not unlimited; the bot's log for the request says which.
+  A read can be retried. A burn-excess dry-run changed nothing and an
+  `--execute` is resumed by re-running the same command, which reads the
+  persisted burn stream; for any other write, the logs show whether it was
+  applied before a retry.
 - **No response:** a connection that timed out or dropped after the request was
   sent leaves the outcome unknown, and the client says so.
 - **Unwritable output:** the bot answered with success but stdout could not take
