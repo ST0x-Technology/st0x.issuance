@@ -105,14 +105,10 @@ a mint receipt.
 
 If logs show `Duplicate Deposit/receipt for already-tracked issuer_request_id`,
 a second on-chain deposit already landed for that mint. Do **not** mint again —
-the excess shares must be burned with `burn-excess`. The `internal` mode runs
-through the operator client
-(`st0x-issuance-client breakglass burn-excess
-internal`), with the offline
-`issuer burn-excess` CLI as the fallback when the client cannot reach the bot.
-The `external` mode stays on the offline CLI with the issuer service stopped
-until [RAI-2958](https://linear.app/makeitrain/issue/RAI-2958) lands (see
-below).
+the excess shares must be burned with `burn-excess`. Both modes run through the
+operator client (`st0x-issuance-client breakglass burn-excess ...`), with the
+offline `issuer burn-excess` CLI as the fallback when the client cannot reach
+the bot.
 
 The observation is also recorded durably as a
 `ReceiptInventoryEvent::ConflictingItnDepositObserved` event on the vault's
@@ -140,16 +136,20 @@ infers it:
   --issuer-request-id <id> --deposit-tx-hash <discovered_tx_hash> --receipt-id
   <discovered_receipt_id> --shares <decimal, e.g. 0.750> --network <net>
   --chain-id <id> --reason "<why>" --incident-id <id> --execute`
-- Shares were minted to someone else and must be moved back first: use the
-  offline `issuer burn-excess external` CLI over SSH, not the client. Stop the
-  issuer service **before** transferring the shares to the issuer wallet, keep
-  it stopped until the run finishes, then run it with the same flags as above
-  plus `--funding-tx-hash <that transfer's tx>`. The live
-  `breakglass burn-excess external` route pauses the redemption transfer poller
-  only once the request arrives, after the funding transfer is mined, and a dry
-  run resumes it before `--execute`. In either gap a running poller can read a
-  transfer from the AP's linked wallet as a redemption and call Alpaca, and
-  burn-excess then refuses that funding tx (`FundingAlreadyRedeemedTx`).
+- Shares were minted to someone else and must be moved back first. **Before
+  anything is transferred**, record the funding expectation with the same flags
+  as above:
+  `st0x-issuance-client --env <env> breakglass burn-excess
+  expect-funding ... --execute`.
+  Its `precondition` names the exact Transfer to send: the excess shares, from
+  the deposit's original recipient to the issuer wallet. Only then have the
+  shares sent back; the bot's redemption poller holds that Transfer instead of
+  redeeming it. Then run `breakglass burn-excess external` with the same flags
+  plus `--funding-tx-hash <that transfer's tx>`; the bot refuses (409) a stream
+  with no expectation. While the expectation is open, later transfers into the
+  issuer wallet on that vault wait behind the held one, so finish the run
+  promptly. If the shares will not be sent, `expect-funding --close --execute`
+  releases the hold; a transfer that did arrive is then redeemed as usual.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's
@@ -158,9 +158,9 @@ resumes it.
 
 The offline CLI takes the same flags
 (`issuer burn-excess internal|external
-...`) and needs SSH to the bot host. For
-`external` it is the required path, with the service stopped from before the
-funding transfer until the run finishes: offline, nothing pauses the poller.
+...`) and needs SSH to the bot host.
+Offline, nothing holds the funding transfer, so `external` there needs the
+service stopped from before the funding transfer until the run finishes.
 
 ## Step 2: Diagnose the failure
 

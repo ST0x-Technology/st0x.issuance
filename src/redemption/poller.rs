@@ -14,7 +14,6 @@ use super::{
     IssuerRedemptionRequestId, Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
-    poller_pause::PollerPause,
     redeem_call_manager::RedeemCallManager,
     transfer::{
         RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
@@ -155,7 +154,7 @@ where
     ///
     /// On error, logs the failure and retries after `RETRY_INTERVAL`. Each
     /// vault's cursor is persisted, so no blocks are re-scanned unnecessarily.
-    pub(crate) async fn run(&self, mut pause: PollerPause) {
+    pub(crate) async fn run(&self) {
         // One-time migration from the legacy global checkpoint to per-vault
         // checkpoints. Non-fatal: without it a vault simply re-scans from
         // `backfill_start_block`, which is safe (redemption detection is
@@ -176,14 +175,12 @@ where
         // outage is indistinguishable from a single blip in the logs.
         let mut consecutive_failures = 0_usize;
         loop {
-            pause.wait_while_paused().await;
-
             match self.poll_once().await {
                 Err(error) => {
                     consecutive_failures += 1;
                     log_poll_failure(&error, consecutive_failures);
                     self.telemetry.record_transfer_poll_failure(self.network);
-                    pause.interruptible_sleep(RETRY_INTERVAL).await;
+                    tokio::time::sleep(RETRY_INTERVAL).await;
                     continue;
                 }
                 Ok(lag_blocks) => {
@@ -193,7 +190,7 @@ where
             }
 
             consecutive_failures = 0;
-            pause.interruptible_sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -277,7 +274,7 @@ where
     /// re-point mid-pass cannot turn an already-fetched log into a
     /// non-transient skip (the vault its log came from is always present in
     /// the snapshot the pass was built from).
-    async fn poll_once(&self) -> Result<u64, TransferPollError> {
+    pub(crate) async fn poll_once(&self) -> Result<u64, TransferPollError> {
         // Re-read the monitored asset set every pass so assets added or
         // re-pointed at runtime are covered without a restart — scoped to
         // this poller's network, so no pass scans (or checkpoints) another
@@ -389,7 +386,8 @@ where
 
     /// Scans one vault from `cursor` (its start block, from [`Self::start_cursor`])
     /// up to `head`, processing each Transfer and advancing the vault's
-    /// checkpoint per chunk.
+    /// checkpoint per chunk. A held expected-funding Transfer ends the scan
+    /// with the checkpoint just before its block.
     async fn poll_vault(
         &self,
         assets: &[TokenizedAssetView],
@@ -434,17 +432,32 @@ where
                 "Processed block range"
             );
 
-            let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
+            let mut dropped: Vec<(Option<TxHash>, Option<u64>)> = Vec::new();
+            let mut held_block = None;
             for log in &logs {
-                if let ProcessedLog::DroppedNonTransient { tx_hash } =
-                    self.process_log(assets, log).await?
-                {
-                    dropped_tx_hashes.push(tx_hash);
+                match self.process_log(assets, log).await? {
+                    ProcessedLog::Handled => {}
+                    ProcessedLog::DroppedNonTransient { tx_hash } => {
+                        dropped.push((tx_hash, log.block_number));
+                    }
+                    ProcessedLog::HeldExpectedFunding { block_number } => {
+                        held_block = Some(block_number);
+                        break;
+                    }
                 }
             }
 
-            advance_transfer_poll(&self.pool, self.network, vault, chunk_to)
-                .await?;
+            // A held funding Transfer stops the checkpoint before its block,
+            // so it and every later Transfer on this vault are read again on
+            // each pass until its burn-excess stream excludes it (then it is
+            // skipped) or closes (then it is detected). Nothing is skipped
+            // in the meantime.
+            let processed_through =
+                held_block.map_or(Some(chunk_to), |block| block.checked_sub(1));
+            if let Some(block) = processed_through {
+                advance_transfer_poll(&self.pool, self.network, vault, block)
+                    .await?;
+            }
 
             // The advance above moved the cursor past these transfers, making
             // the skip permanent: real user tokens in the redemption wallet
@@ -453,7 +466,16 @@ where
             // operator's only signal — emitted here, not after the loop, so a
             // transient error in a later chunk cannot swallow it. Any earlier
             // `?` abort leaves this chunk's checkpoint unadvanced, so its
-            // drops are re-detected on the next pass.
+            // drops are re-detected on the next pass, as are drops in a held
+            // Transfer's block, which the advance did not pass.
+            let dropped_tx_hashes: Vec<Option<TxHash>> = dropped
+                .into_iter()
+                .filter(|(_, block)| match (held_block, block) {
+                    (Some(held_at), Some(block)) => *block < held_at,
+                    _ => true,
+                })
+                .map(|(tx_hash, _)| tx_hash)
+                .collect();
             if !dropped_tx_hashes.is_empty() {
                 warn!(
                     target: "redemption",
@@ -461,6 +483,17 @@ where
                     tx_hashes = ?dropped_tx_hashes,
                     "Permanently skipped non-retryable transfer logs; these transfers will not be redeemed automatically"
                 );
+            }
+
+            if let Some(block_number) = held_block {
+                debug!(
+                    target: "redemption",
+                    %vault,
+                    network = %self.network,
+                    block_number,
+                    "Holding vault at expected burn-excess funding transfer"
+                );
+                return Ok(());
             }
         }
 
@@ -558,18 +591,23 @@ where
             | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedNoAccount
             | TransferOutcome::SkippedAdminRecovery => {}
+            TransferOutcome::HeldExpectedFunding { block_number } => {
+                return Ok(ProcessedLog::HeldExpectedFunding { block_number });
+            }
         }
 
         Ok(ProcessedLog::Handled)
     }
 }
 
-/// Outcome of processing a single Transfer log: either handled (including
-/// benign skips like already-detected) or permanently dropped because of a
-/// non-transient decode/detection failure.
+/// Outcome of processing a single Transfer log: handled (including benign
+/// skips like already-detected), permanently dropped because of a
+/// non-transient decode/detection failure, or held as a live burn-excess
+/// stream's expected funding Transfer.
 enum ProcessedLog {
     Handled,
     DroppedNonTransient { tx_hash: Option<TxHash> },
+    HeldExpectedFunding { block_number: u64 },
 }
 
 /// Watches a spawned redemption-flow task. A dropped `JoinHandle` swallows
@@ -663,59 +701,37 @@ pub(crate) fn block_ranges(
 #[cfg(test)]
 mod tests {
     use alloy::network::EthereumWallet;
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
-    use event_sorcery::{Store, StoreBuilder, test_store};
+    use chrono::Utc;
+    use event_sorcery::StoreBuilder;
     use sqlx::SqlitePool;
-    use st0x_alpaca::issuer::mock::MockIssuerApi;
-    use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::{TransferPollError, watch_redemption_flow};
-    use crate::config::VaultModeConfig;
-    use crate::network_telemetry::NetworkTelemetry;
-    use crate::notifications::NoopLifecycleNotifier;
+    use crate::burn_excess::exclusion::record_funding_exclusion;
+    use crate::burn_excess::expectation::{
+        clear_funding_expectation, record_funding_expectation,
+    };
+    use crate::burn_excess::{ExcessBurnBind, FundingTransferId};
+    use crate::mint::IssuerMintRequestId;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
     };
-    use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptInventory, ReceiptService,
-    };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
+        transfer_poller_for_tests,
     };
-    use crate::redemption::{
-        IssuerRedemptionRequestId, Redemption, RedemptionServices,
-    };
-    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
-    use crate::vault::mock::MockVaultService;
     use st0x_issuance_dto::AssetKey;
-
-    /// `pool` must already have migrations applied — the stores write to the
-    /// `events` table on first command dispatch.
-    fn setup_test_store(
-        pool: &SqlitePool,
-    ) -> (Arc<Store<Redemption>>, Arc<dyn ReceiptService>) {
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-        let vault_service: Arc<dyn crate::vault::VaultService> =
-            Arc::new(MockVaultService::new_success());
-        let store = Arc::new(test_store::<Redemption>(
-            pool.clone(),
-            RedemptionServices::with_single_vault(Network::Base, vault_service),
-        ));
-        let receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(CqrsReceiptService::new(receipt_store));
-
-        (store, receipt_service)
-    }
 
     struct TestPollerSetup<P: alloy::providers::Provider + Clone> {
         poller: super::TransferPoller<P>,
@@ -756,60 +772,18 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
-        let (store, receipt_service) = setup_test_store(&pool);
-
-        let alpaca_service = Arc::new(MockIssuerApi::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(
-            crate::redemption::redeem_call_manager::RedeemCallManager::new(
-                alpaca_service.clone(),
-                store.clone(),
-                pool.clone(),
-                Arc::new(NoopLifecycleNotifier),
-            ),
-        );
-        let journal_manager =
-            Arc::new(crate::redemption::journal_manager::JournalManager::new(
-                alpaca_service,
-                store.clone(),
-                pool.clone(),
-            ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-
-        let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
-            .await
-            .expect("apalis test pool should connect");
-        let burn_manager = Arc::new(
-            crate::redemption::burn_manager::BurnManager::new_for_tests(
-                vault_service,
-                pool.clone(),
-                store.clone(),
-                receipt_service,
-                bot_wallet,
-                ANVIL_CHAIN_ID,
-                apalis_pool,
-            ),
-        );
-
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter.clone());
 
-        let poller = super::TransferPoller::new(super::TransferPollerConfig {
+        let poller = transfer_poller_for_tests(
             network,
             provider,
             bot_wallet,
             backfill_start_block,
-            store,
-            pool: pool.clone(),
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-            vault_mode_config: VaultModeConfig::default(),
-            telemetry: Arc::new(NetworkTelemetry::new([network])),
-        });
+            pool.clone(),
+        )
+        .await;
 
         TestPollerSetup { poller, pool }
     }
@@ -937,6 +911,141 @@ mod tests {
             tracing::Level::DEBUG,
             &["Polling vault for transfer events"]
         ));
+    }
+
+    /// A live burn-excess stream expects its funding Transfer before it is
+    /// broadcast. The pass that reads it must neither redeem it nor move the
+    /// checkpoint past it, so it and every later Transfer on the vault wait;
+    /// once the stream excludes it, the next pass skips it and redeems the
+    /// rest. Transfers before it are unaffected.
+    #[traced_test]
+    #[tokio::test]
+    async fn poll_holds_the_vault_at_an_expected_funding_transfer() {
+        let vault = address!("0x7777777777777777777777777777777777777777");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let other_amount = U256::from(1_000_000_000_000_000_000u64);
+        let before_tx = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let funding_tx = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let after_tx = b256!(
+            "0x3333333333333333333333333333333333333333333333333333333333333333"
+        );
+        let before = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            other_amount,
+            before_tx,
+            120,
+        );
+        let funding = create_transfer_log(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150,
+        );
+        let after = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            other_amount,
+            after_tx,
+            170,
+        );
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![before, funding.clone(), after.clone()]);
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149),
+            "the checkpoint must stop just before the held Transfer's block"
+        );
+        assert!(redemption_exists(&setup, before_tx).await);
+        assert!(!redemption_exists(&setup, funding_tx).await);
+        assert!(
+            !redemption_exists(&setup, after_tx).await,
+            "Transfers after the held one wait for it"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Holding vault at expected burn-excess funding transfer",
+                &vault.to_string(),
+                "150",
+            ]
+        ));
+
+        let funding_log_id = FundingTransferId {
+            network: Network::Base,
+            vault,
+            tx_hash: funding_tx,
+            log_index: 0,
+            from: ap_wallet,
+            to: bot_wallet,
+            amount: shares,
+        };
+        record_funding_exclusion(
+            &setup.pool,
+            &funding_log_id,
+            bind.deposit_tx_hash,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        clear_funding_expectation(&setup.pool, bind.deposit_tx_hash)
+            .await
+            .unwrap();
+
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding, after]);
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(200)
+        );
+        assert!(!redemption_exists(&setup, funding_tx).await);
+        assert!(redemption_exists(&setup, after_tx).await);
+    }
+
+    async fn redemption_exists<P: alloy::providers::Provider + Clone>(
+        setup: &TestPollerSetup<P>,
+        tx_hash: B256,
+    ) -> bool {
+        setup
+            .poller
+            .store
+            .load(&IssuerRedemptionRequestId::new(tx_hash))
+            .await
+            .unwrap()
+            .is_some()
     }
 
     /// Each per-network poller must scan only its OWN network's vaults: with

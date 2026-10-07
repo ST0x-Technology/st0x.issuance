@@ -1,19 +1,37 @@
 use alloy::primitives::{
     Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, b256,
 };
+use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
-use event_sorcery::StoreBuilder;
+use event_sorcery::{StoreBuilder, test_store};
 use sqlx::SqlitePool;
+use st0x_alpaca::issuer::mock::MockIssuerApi;
+use std::sync::Arc;
 
+use super::burn_manager::BurnManager;
+use super::journal_manager::JournalManager;
+use super::poller::{TransferPoller, TransferPollerConfig};
+use super::redeem_call_manager::RedeemCallManager;
+use super::{Redemption, RedemptionServices};
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
+use crate::alpaca::AlpacaService;
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::config::VaultModeConfig;
+use crate::network_telemetry::NetworkTelemetry;
+use crate::notifications::NoopLifecycleNotifier;
+use crate::receipt_inventory::{
+    CqrsReceiptService, ReceiptInventory, ReceiptService,
+};
+use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{
     AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
+use crate::vault::VaultService;
+use crate::vault::mock::MockVaultService;
 
 /// Creates an in-memory SQLite database with migrations applied, a seeded
 /// tokenized asset (AAPL/tAAPL on base), and optionally a registered+linked
@@ -53,36 +71,103 @@ pub(crate) async fn setup_test_db_with_asset(
         .unwrap();
 
     if let Some(wallet) = ap_wallet {
-        let (account_store, _account_projection) =
-            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
-
-        let client_id = ClientId::new();
-        let email = Email::new("test@example.com").unwrap();
-
-        account_store
-            .send(&client_id, AccountCommand::Register { client_id, email })
-            .await
-            .unwrap();
-
-        account_store
-            .send(
-                &client_id,
-                AccountCommand::LinkToAlpaca {
-                    alpaca_account: AlpacaAccountNumber(
-                        "ALPACA123".to_string(),
-                    ),
-                },
-            )
-            .await
-            .unwrap();
-
-        account_store
-            .send(&client_id, AccountCommand::WhitelistWallet { wallet })
-            .await
-            .unwrap();
+        link_ap_wallet(&pool, wallet).await;
     }
 
     pool
+}
+
+/// Registers an account, links it to Alpaca, and whitelists `wallet`, so a
+/// Transfer from `wallet` into the redemption wallet reads as a redemption.
+pub(crate) async fn link_ap_wallet(pool: &SqlitePool, wallet: Address) {
+    let (account_store, _account_projection) =
+        StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+    let client_id = ClientId::new();
+    let email = Email::new("test@example.com").unwrap();
+
+    account_store
+        .send(&client_id, AccountCommand::Register { client_id, email })
+        .await
+        .unwrap();
+
+    account_store
+        .send(
+            &client_id,
+            AccountCommand::LinkToAlpaca {
+                alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    account_store
+        .send(&client_id, AccountCommand::WhitelistWallet { wallet })
+        .await
+        .unwrap();
+}
+
+/// A transfer poller over `provider` whose redemption flow runs against
+/// mocked Alpaca and vault services. `pool` must already have migrations
+/// applied.
+pub(crate) async fn transfer_poller_for_tests<P: Provider + Clone>(
+    network: Network,
+    provider: P,
+    bot_wallet: Address,
+    backfill_start_block: u64,
+    pool: SqlitePool,
+) -> TransferPoller<P> {
+    let receipt_store =
+        Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+    let receipt_service: Arc<dyn ReceiptService> =
+        Arc::new(CqrsReceiptService::new(receipt_store));
+    let vault_service: Arc<dyn VaultService> =
+        Arc::new(MockVaultService::new_success());
+    let store = Arc::new(test_store::<Redemption>(
+        pool.clone(),
+        RedemptionServices::with_single_vault(Network::Base, vault_service),
+    ));
+
+    let alpaca_service =
+        Arc::new(MockIssuerApi::new_success()) as Arc<dyn AlpacaService>;
+    let redeem_call_manager = Arc::new(RedeemCallManager::new(
+        alpaca_service.clone(),
+        store.clone(),
+        pool.clone(),
+        Arc::new(NoopLifecycleNotifier),
+    ));
+    let journal_manager = Arc::new(JournalManager::new(
+        alpaca_service,
+        store.clone(),
+        pool.clone(),
+    ));
+
+    let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
+        .await
+        .expect("apalis test pool should connect");
+    let burn_manager = Arc::new(BurnManager::new_for_tests(
+        Arc::new(MockVaultService::new_success()),
+        pool.clone(),
+        store.clone(),
+        receipt_service,
+        bot_wallet,
+        ANVIL_CHAIN_ID,
+        apalis_pool,
+    ));
+
+    TransferPoller::new(TransferPollerConfig {
+        network,
+        provider,
+        bot_wallet,
+        backfill_start_block,
+        store,
+        pool,
+        redeem_call_manager,
+        journal_manager,
+        burn_manager,
+        vault_mode_config: VaultModeConfig::default(),
+        telemetry: Arc::new(NetworkTelemetry::new([network])),
+    })
 }
 
 pub(crate) fn create_transfer_log(

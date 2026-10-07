@@ -769,8 +769,8 @@ impl<'de> Deserialize<'de> for DecimalShares {
     }
 }
 
-/// Fields shared by both burn-excess request bodies. `#[serde(flatten)]` folds
-/// these into each, so a field added here changes both routes' contract at
+/// Fields shared by every burn-excess request body. `#[serde(flatten)]` folds
+/// these into each, so a field added here changes every route's contract at
 /// once, never just one.
 ///
 /// Internal operator wire type; not exported to the dashboard bindings.
@@ -792,11 +792,13 @@ pub struct BurnExcessCommon {
     /// Validated against the network's configured chain entry.
     pub chain_id: u64,
     /// Perform the mutation (sign and broadcast the burn; the external path
-    /// also writes the funding exclusion). Default is a dry-run that proves the
-    /// plan without touching chain or state.
+    /// also writes the funding exclusion; `expect-funding` records the
+    /// expectation). Default is a dry-run that proves the plan without
+    /// touching chain or state.
     #[serde(default)]
     pub execute: bool,
-    /// Close a dead intended/submitted stream instead of burning.
+    /// Close the stream instead of burning: a dead intended/submitted burn,
+    /// or an expectation whose funding was never sent.
     #[serde(default)]
     pub close: bool,
 }
@@ -804,6 +806,14 @@ pub struct BurnExcessCommon {
 /// Request body of `POST /ops/breakglass/burn-excess/internal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BurnExcessInternalRequest {
+    #[serde(flatten)]
+    pub common: BurnExcessCommon,
+}
+
+/// Request body of `POST /ops/breakglass/burn-excess/expect-funding`, sent
+/// before the external path's funding Transfer is broadcast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnExcessExpectFundingRequest {
     #[serde(flatten)]
     pub common: BurnExcessCommon,
 }

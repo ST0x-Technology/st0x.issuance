@@ -11,18 +11,21 @@ use crate::tokenized_asset::Network;
 use crate::vault::ReceiptInformation;
 use crate::vault::rain_meta;
 
-/// Operator-selected CLI mode keyword (`internal` | `external`).
+/// Operator-selected mode keyword: `internal` | `external` on the offline CLI,
+/// plus the live route's `expect-funding` step, which opens a Path B stream
+/// before its funding Transfer is broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BurnExcessMode {
     Internal,
     External,
+    ExpectFunding,
 }
 
 impl BurnExcessMode {
     pub(crate) const fn as_path(self) -> BurnExcessPath {
         match self {
             Self::Internal => BurnExcessPath::Internal,
-            Self::External => BurnExcessPath::External,
+            Self::External | Self::ExpectFunding => BurnExcessPath::External,
         }
     }
 
@@ -30,6 +33,7 @@ impl BurnExcessMode {
         match self {
             Self::Internal => "internal",
             Self::External => "external",
+            Self::ExpectFunding => "expect-funding",
         }
     }
 }
@@ -220,7 +224,10 @@ pub(crate) fn resolve_path(
 
     match state {
         None => Ok(PathResolution::Start(requested)),
-        Some(BurnExcess::FundingExcluded { .. }) => {
+        Some(
+            BurnExcess::AwaitingFunding { .. }
+            | BurnExcess::FundingExcluded { .. },
+        ) => {
             require_path(mode, BurnExcessPath::External)?;
             Ok(PathResolution::Resume(BurnExcessPath::External))
         }

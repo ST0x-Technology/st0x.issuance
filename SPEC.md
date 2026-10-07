@@ -590,9 +590,10 @@ read the event (or the ERROR log) plus on-chain Deposit history, then remediate
 excess supply through the internal burn-excess path — the offline
 `issuer burn-excess internal` CLI or the live
 `/ops/breakglass/burn-excess/internal` route, neither of which touches the
-redemption transfer poller (only the external path quiesces it) — never by
-forcing another mint. Do not manually force a second deposit when confirm is
-uncertain; leave `TxSubmitted` and wait for re-observe or restart.
+redemption transfer poller (only the external path holds its funding Transfer
+there) — never by forcing another mint. Do not manually force a second deposit
+when confirm is uncertain; leave `TxSubmitted` and wait for re-observe or
+restart.
 
 **Vault-direct vs orchestrator:** vault-direct mints confirm via vault `Deposit`
 logs and receipt inventory. Orchestrator mints (when enabled) use the
@@ -1584,6 +1585,7 @@ funding tx hash as recorded.
 | Aggregate state                 | Locked path  | Required mode            | Funding hash                |
 | ------------------------------- | ------------ | ------------------------ | --------------------------- |
 | `NotStarted`                    | from keyword | `internal` or `external` | required only if `external` |
+| `AwaitingFunding`               | External     | `external` only          | proven on first `external`  |
 | `FundingExcluded`               | External     | `external` only          | must match recorded         |
 | `Intended`/`Submitted` External | External     | `external` only          | must match recorded         |
 | `Intended`/`Submitted` Internal | Internal     | `internal` only          | N/A                         |
@@ -1654,26 +1656,47 @@ through it. `Intended` / `Submitted` count because they hold a signed nonce.
 `FundingExcluded` counts too: it holds no signed transaction yet, but its
 exclusion write is already permanent and the stream will sign against the same
 issuer wallet, so a Path B recovery abandoned before intend must be resumed or
-`--close`d rather than raced. Gates are re-read at the irreversible sign
+`--close`d rather than raced. `AwaitingFunding` does not count: it holds neither
+a signature nor an exclusion. Gates are re-read at the irreversible sign
 boundary, together with the issuer receipt and exact share balances — the
 operator confirm prompt blocks for an unbounded time, so balances proven at plan
 time are re-read immediately before `prepare_burn_tx` signs. Deposit and funding
 proofs are mined history and are not re-read.
 
-**The poller must be quiesced for Path B.** `FundingAlreadyRedeemed` is
-re-checked immediately before the exclusion write, but that is a check, not a
-cross-process lock: a running transfer poller can open a `Redemption` for the
-funding Transfer first and steer incident remediation onto the ordinary Alpaca
-path. The offline `issuer burn-excess external` CLI meets this by running with
-the whole issuer service (and poller) stopped, in the same family as the
-`migrate-receipts` sequence, and the Path B plan output states the precondition
-before the confirmation prompt. The `POST /ops/breakglass/burn-excess/external`
-route pauses the network's poller only for the run, from when the request
-arrives until it returns. That does not cover the window between the funding
-Transfer being mined and the request arriving, nor the gap between a dry run and
-its `execute`, so until [RAI-2958](https://linear.app/makeitrain/issue/RAI-2958)
-closes that window the offline CLI with the service stopped stays the operating
-path for Path B.
+**The funding Transfer must never be detected as a redemption.**
+`FundingAlreadyRedeemed` is re-checked immediately before the exclusion write,
+but that is a check, not a lock: a running transfer poller can open a
+`Redemption` for the funding Transfer first and steer incident remediation onto
+the ordinary Alpaca path. Two operator sequences prevent that:
+
+- **Offline:** `issuer burn-excess external` runs with the whole issuer service
+  (and poller) stopped from before the funding Transfer is broadcast until the
+  run finishes, in the same family as the `migrate-receipts` sequence. Its plan
+  output states that precondition before the confirmation prompt.
+- **Live:** before the funding Transfer is broadcast,
+  `POST /ops/breakglass/burn-excess/expect-funding` proves the deposit bind and,
+  on `execute`, records `FundingExpected`: the stream enters `AwaitingFunding`
+  and the expected Transfer
+  `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`
+  enters a durable SQL index. A Transfer matching an open expectation and not
+  yet excluded is held: the poller stops that vault's checkpoint before the
+  Transfer's block, so neither it nor any later Transfer on that vault is
+  detected until the expectation clears. Other vaults keep flowing and nothing
+  is skipped. `POST /ops/breakglass/burn-excess/external` refuses a stream that
+  never recorded the expectation (`FundingNotExpected`); its `execute` records
+  the exclusion first and clears the expectation after, so the poller's next
+  pass skips the funding log and resumes the vault. A dry run changes nothing,
+  so the hold spans the dry-run-to-execute gap. Its plan output states the live
+  precondition: the expectation recorded before the funding Transfer was
+  broadcast.
+
+`--close` of an `AwaitingFunding` stream clears the expectation, and a held
+Transfer is then detected as an ordinary redemption, so close only when the
+funding was never sent or should be redeemed. An expectation recorded after the
+poller already detected the funding Transfer protects nothing: the open
+`Redemption` still refuses the exclusion (`FundingAlreadyRedeemedTx`). The
+engine dual-writes the expectation index on record and on clear, and startup and
+store open rebuild it from every stream whose latest event is `FundingExpected`.
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -5006,7 +5029,7 @@ with `{ outcome, tx_hash }`:
 The client prints the 202 body and exits 0 like any success, so a script must
 branch on `outcome`, not the exit code.
 
-Both `burn-excess` routes respond with `{ executed, outcome }`: `executed`
+Every `burn-excess` route responds with `{ executed, outcome }`: `executed`
 echoes whether a mutation was requested, and `outcome` is a tagged `plan`,
 `terminal`, or `close` view. For a `Start` or `Resume` request with
 `close=false`, a dry-run (`execute=false`) returns a `plan` so an operator
@@ -5021,34 +5044,22 @@ exclusion write), and `false` for an executed plan. The optional `funding_log`,
 they apply (an internal plan omits `funding_log`; an external plan includes it)
 and are omitted rather than sent as null. The `ReportOnly` path returns a
 `terminal` view regardless of `execute` or `close`; `close=true` on `Start` or
-`Resume` returns a `close` view. `burn-excess/external` records a
-funding-Transfer exclusion the live redemption transfer poller would otherwise
-read as an AP redemption, so for both a dry-run and an execute it quiesces that
-network's poller (the current tick finished, no new one started) for the run and
-resumes it on every exit path; it returns 422 when the request's `chain_id` does
-not match its network or no poller runs for that network. Two further failures
-follow from the quiescence design and differ in what the operator does next. 503
-when the poller cannot be paused within 30 seconds, a window that includes any
-wait for another breakglass operation already holding that network's poller, so
-a second external run is refused rather than queued behind the first: nothing
-happened (no exclusion written, nothing signed). The refusal is logged with the
-request's `issuer_request_id` and one of three causes: another breakglass run
-still holds the poller (including one released too late in the window for the
-poller to re-park), so retry once it finishes; the poller did not park; or the
-poller has exited. The last two mean redemption detection on that network is
-itself broken, so the operator treats that as the incident before retrying. 504
-when the run exceeds 120 seconds, where the safe next step depends on the mode:
-a dry-run wrote nothing either — no events, exclusion, or signed intent — so it
-is likewise safe to retry, while an execute leaves the outcome unknown (the burn
-may be excluded, intended, or submitted), so the operator re-invokes the route
-for the same deposit to read the persisted stream and resume it from wherever it
-stopped.
+`Resume` returns a `close` view. `burn-excess/expect-funding` signs nothing: on
+`execute` it records the funding expectation (see "Burn excess shares") and
+returns the plan, whose `precondition` names the exact Transfer to broadcast; a
+stream already past `AwaitingFunding` gets a `terminal` view. With `close=true`
+it closes the stream and releases the poller's hold. `burn-excess/external`
+returns 409 for a stream that never recorded that expectation, before reading
+the chain. The routes return 422 when the request's `chain_id` does not match
+its network, and 504 when the run exceeds 120 seconds, where the safe next step
+depends on the mode: a dry-run wrote nothing — no events, expectation,
+exclusion, or signed intent — so it is safe to retry, while an execute leaves
+the outcome unknown (the burn may be excluded, intended, or submitted), so the
+operator re-invokes the route for the same deposit to read the persisted stream
+and resume it from wherever it stopped. The burn routes hold the wallet lock
+across signing; no route pauses the poller.
 
-The internal route holds the wallet lock across signing but pauses no poller, so
-it has no 503; it is bounded the same way, returning 504 when its run exceeds
-120 seconds, with the same dry-run-versus-execute distinction above.
-
-Both `burn-excess` routes take the network's RPC endpoint from the service's
+Every `burn-excess` route takes the network's RPC endpoint from the service's
 startup-verified chain configuration, never from a request-time environment
 read, so a deployment that supplies its RPC as a flag rather than an env var
 serves them too; a network with no chain configuration is a 500. The chain id is
@@ -5220,6 +5231,7 @@ symbol when it has one and for warnings otherwise.
 | `breakglass close-redemption <id> --reason`                           | `POST /ops/breakglass/close/redemption/<id>`                         |
 | `breakglass close-mint <id> --reason`                                 | `POST /ops/breakglass/close/mint/<id>`                               |
 | `breakglass burn-excess internal --issuer-request-id ... [--execute]` | `POST /ops/breakglass/burn-excess/internal`                          |
+| `breakglass burn-excess expect-funding --issuer-request-id ...`       | `POST /ops/breakglass/burn-excess/expect-funding`                    |
 | `breakglass burn-excess external --funding-tx-hash ... [--execute]`   | `POST /ops/breakglass/burn-excess/external`                          |
 
 ### Recover Stuck Aggregates

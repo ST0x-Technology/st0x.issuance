@@ -16,6 +16,7 @@ use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
 use crate::burn_excess::exclusion::is_excluded_funding_log;
+use crate::burn_excess::expectation::is_expected_funding;
 use crate::config::{MissingOrchestratorAddress, VaultModeConfig};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
@@ -34,6 +35,13 @@ pub(crate) enum TransferOutcome {
     SkippedNoAccount,
     /// Path B burn-excess funding Transfer — not a real AP redemption.
     SkippedAdminRecovery,
+    /// Matches a live burn-excess stream's expected funding Transfer that is
+    /// not yet excluded. Neither redeemed nor skipped: the poller must not
+    /// move this vault's checkpoint past `block_number` until the
+    /// expectation clears.
+    HeldExpectedFunding {
+        block_number: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,6 +153,27 @@ pub(crate) async fn detect_transfer(
             "Skipping admin recovery funding transfer"
         );
         return Ok(TransferOutcome::SkippedAdminRecovery);
+    }
+
+    if is_expected_funding(
+        pool,
+        network,
+        vault,
+        transfer_event.from,
+        transfer_event.to,
+        transfer_event.value,
+    )
+    .await?
+    {
+        debug!(
+            target: "redemption",
+            %tx_hash,
+            log_index,
+            %vault,
+            block_number,
+            "Holding expected admin recovery funding transfer"
+        );
+        return Ok(TransferOutcome::HeldExpectedFunding { block_number });
     }
 
     let account_view = find_by_wallet(pool, &transfer_event.from).await?;

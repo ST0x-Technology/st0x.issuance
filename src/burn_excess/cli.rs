@@ -10,7 +10,9 @@ use st0x_issuance_dto::DecimalShares;
 use std::io;
 use std::str::FromStr;
 
-use super::engine::{BurnExcessOutcome, BurnExcessRequest, run_burn_excess};
+use super::engine::{
+    BurnExcessOutcome, BurnExcessRequest, PollerGuard, run_burn_excess,
+};
 use super::proof::BurnExcessMode;
 use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::{
@@ -149,6 +151,7 @@ pub(crate) async fn run_burn_excess_cli(
         chain_id: shared.chain_id,
         execute: shared.execute,
         close: shared.close,
+        poller_guard: PollerGuard::ServiceStopped,
     };
 
     // The offline CLI has no service config to consult: it resolves the RPC

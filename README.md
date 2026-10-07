@@ -208,14 +208,12 @@ endpoints.
 ## Operator Client
 
 `st0x-issuance-client` (`crates/ops-client`) is the S01 operator's typed client
-for the IAP-gated `/ops/{read,debug,capital,breakglass}` routes, all 24 of them.
+for the IAP-gated `/ops/{read,debug,capital,breakglass}` routes, all 25 of them.
 It replaces the shared-key `/admin` calls and the offline `issuer` CLI verbs
-that have an `/ops` route; `move-receipts`, `confirm-custody`, the offline
+that have an `/ops` route; `move-receipts`, `confirm-custody`, and the offline
 `force-complete-redemption` (the legacy path for a `Failed` redemption, unlike
-the client verb of the same name), and `burn-excess external` (until
-[RAI-2958](https://linear.app/makeitrain/issue/RAI-2958)) stay offline. It
-prints each response as one JSON line and exits 0, 2 (setup), 77 (auth/access),
-or 1.
+the client verb of the same name) stay offline. It prints each response as one
+JSON line and exits 0, 2 (setup), 77 (auth/access), or 1.
 
 ```bash
 cargo run -p st0x-issuance-ops -- --env staging read stuck

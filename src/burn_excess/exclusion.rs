@@ -16,14 +16,15 @@ use event_sorcery::{EntityList, Never, Reactor, deps};
 use sqlx::{Pool, Sqlite, SqlitePool};
 use tracing::{debug, info};
 
+use super::expectation::clear_funding_expectation;
 use super::{BurnExcess, BurnExcessEvent, FundingTransferId};
 use crate::tokenized_asset::Network;
 
-fn address_key(address: Address) -> String {
+pub(super) fn address_key(address: Address) -> String {
     address.to_string().to_ascii_lowercase()
 }
 
-fn hash_key(hash: B256) -> String {
+pub(super) fn hash_key(hash: B256) -> String {
     format!("{hash:#x}")
 }
 
@@ -215,7 +216,10 @@ deps!(FundingExclusionReactor, [BurnExcess]);
 
 /// Writes Path B funding identities into the SQL exclusion index when the
 /// aggregate records them, so the transfer poller can skip without scanning
-/// the event store.
+/// the event store, then drops the stream's funding expectation: the
+/// exclusion now covers the funding log, and the expectation must not go on
+/// holding another Transfer of the same shape. Writing before dropping means
+/// the poller is never left with neither.
 ///
 /// Live-only: `StoreBuilder` does not catch_up custom reactors for
 /// `Materialized = Nil` entities. Use [`rebuild_funding_exclusion_index`] on
@@ -247,6 +251,7 @@ impl FundingExclusionReactor {
                 *excluded_at,
             )
             .await?;
+            clear_funding_expectation(&self.pool, deposit_tx_hash).await?;
             info!(
                 target: "burn_excess",
                 %deposit_tx_hash,

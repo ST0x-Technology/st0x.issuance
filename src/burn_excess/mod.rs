@@ -10,6 +10,7 @@ mod cmd;
 pub(crate) mod engine;
 mod event;
 pub(crate) mod exclusion;
+pub(crate) mod expectation;
 pub(crate) mod proof;
 
 use alloy::primitives::{Address, B256, U256};
@@ -101,6 +102,14 @@ impl std::str::FromStr for BurnExcessId {
 /// Lifecycle of one excess-burn recovery stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum BurnExcess {
+    /// Path B, live route: the funding Transfer is expected but not yet
+    /// proven; the poller holds a matching log until the exclusion lands.
+    AwaitingFunding {
+        bind: ExcessBurnBind,
+        reason: String,
+        incident_id: Option<String>,
+        expected_at: DateTime<Utc>,
+    },
     FundingExcluded {
         bind: ExcessBurnBind,
         funding_log_id: FundingTransferId,
@@ -184,7 +193,9 @@ pub(crate) enum BurnExcessError {
 impl BurnExcess {
     pub(crate) const fn path(&self) -> BurnExcessPath {
         match self {
-            Self::FundingExcluded { .. } => BurnExcessPath::External,
+            Self::AwaitingFunding { .. } | Self::FundingExcluded { .. } => {
+                BurnExcessPath::External
+            }
             Self::Intended { path, .. }
             | Self::Submitted { path, .. }
             | Self::Completed { path, .. }
@@ -194,6 +205,7 @@ impl BurnExcess {
 
     pub(crate) const fn state_name(&self) -> &'static str {
         match self {
+            Self::AwaitingFunding { .. } => "AwaitingFunding",
             Self::FundingExcluded { .. } => "FundingExcluded",
             Self::Intended { .. } => "Intended",
             Self::Submitted { .. } => "Submitted",
@@ -204,6 +216,7 @@ impl BurnExcess {
 
     pub(crate) const fn funding_log_id(&self) -> Option<&FundingTransferId> {
         match self {
+            Self::AwaitingFunding { .. } => None,
             Self::FundingExcluded { funding_log_id, .. } => {
                 Some(funding_log_id)
             }
@@ -216,6 +229,19 @@ impl BurnExcess {
 
     fn apply_event(&mut self, event: BurnExcessEvent) {
         match event {
+            BurnExcessEvent::FundingExpected {
+                bind,
+                reason,
+                incident_id,
+                expected_at,
+            } => {
+                *self = Self::AwaitingFunding {
+                    bind,
+                    reason,
+                    incident_id,
+                    expected_at,
+                };
+            }
             BurnExcessEvent::FundingExclusionRecorded {
                 bind,
                 funding_log_id,
@@ -295,7 +321,9 @@ impl BurnExcess {
                         BurnExcessPath::External,
                         Some(funding_log_id.clone()),
                     ),
-                    Self::Completed { .. } | Self::Closed { .. } => return,
+                    Self::AwaitingFunding { .. }
+                    | Self::Completed { .. }
+                    | Self::Closed { .. } => return,
                 };
                 *self = Self::Completed {
                     bind,
@@ -308,6 +336,9 @@ impl BurnExcess {
             }
             BurnExcessEvent::ExcessBurnClosed { reason, closed_at } => {
                 let (bind, path, funding_log_id) = match self {
+                    Self::AwaitingFunding { bind, .. } => {
+                        (bind.clone(), BurnExcessPath::External, None)
+                    }
                     Self::FundingExcluded { bind, funding_log_id, .. } => (
                         bind.clone(),
                         BurnExcessPath::External,
@@ -396,6 +427,11 @@ impl BurnExcess {
                     intended_at: Utc::now(),
                 }])
             }
+            Self::AwaitingFunding { .. } => {
+                Err(BurnExcessError::ExternalRequiresExclusion {
+                    found: self.state_name().to_string(),
+                })
+            }
             other => Err(BurnExcessError::InvalidState {
                 expected:
                     "FundingExcluded (external) or uninitialized (internal)"
@@ -465,6 +501,17 @@ impl EventSourced for BurnExcess {
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
+            BurnExcessEvent::FundingExpected {
+                bind,
+                reason,
+                incident_id,
+                expected_at,
+            } => Some(Self::AwaitingFunding {
+                bind: bind.clone(),
+                reason: reason.clone(),
+                incident_id: incident_id.clone(),
+                expected_at: *expected_at,
+            }),
             BurnExcessEvent::FundingExclusionRecorded {
                 bind,
                 funding_log_id,
@@ -513,6 +560,14 @@ impl EventSourced for BurnExcess {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
+            BurnExcessCommand::ExpectFunding { bind, reason, incident_id } => {
+                Ok(vec![BurnExcessEvent::FundingExpected {
+                    bind,
+                    reason,
+                    incident_id,
+                    expected_at: Utc::now(),
+                }])
+            }
             BurnExcessCommand::RecordFundingExclusion {
                 bind,
                 funding_log_id,
@@ -567,12 +622,47 @@ impl EventSourced for BurnExcess {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            BurnExcessCommand::RecordFundingExclusion { .. } => {
-                Err(BurnExcessError::InvalidState {
-                    expected: "Uninitialized".to_string(),
-                    found: self.state_name().to_string(),
-                })
+            BurnExcessCommand::ExpectFunding { bind: command_bind, .. } => {
+                match self {
+                    // Re-expecting the same funding is a no-op, so a retried
+                    // request cannot fail on a hold it already placed.
+                    Self::AwaitingFunding { bind, .. }
+                        if *bind == command_bind =>
+                    {
+                        Ok(vec![])
+                    }
+                    Self::AwaitingFunding { .. } => {
+                        Err(BurnExcessError::BindMismatch)
+                    }
+                    other => Err(BurnExcessError::InvalidState {
+                        expected: "Uninitialized or AwaitingFunding"
+                            .to_string(),
+                        found: other.state_name().to_string(),
+                    }),
+                }
             }
+            BurnExcessCommand::RecordFundingExclusion {
+                bind: command_bind,
+                funding_log_id,
+                reason,
+                incident_id,
+            } => match self {
+                Self::AwaitingFunding { bind, .. } if *bind == command_bind => {
+                    Ok(Self::handle_record_funding_exclusion(
+                        command_bind,
+                        funding_log_id,
+                        reason,
+                        incident_id,
+                    ))
+                }
+                Self::AwaitingFunding { .. } => {
+                    Err(BurnExcessError::BindMismatch)
+                }
+                other => Err(BurnExcessError::InvalidState {
+                    expected: "Uninitialized or AwaitingFunding".to_string(),
+                    found: other.state_name().to_string(),
+                }),
+            },
             command @ BurnExcessCommand::IntendExcessBurn { .. } => {
                 self.handle_intend(command)
             }
@@ -609,7 +699,8 @@ impl EventSourced for BurnExcess {
                 }),
             },
             BurnExcessCommand::CloseExcessBurn { reason } => match self {
-                Self::FundingExcluded { .. }
+                Self::AwaitingFunding { .. }
+                | Self::FundingExcluded { .. }
                 | Self::Intended { .. }
                 | Self::Submitted { .. } => {
                     Ok(vec![BurnExcessEvent::ExcessBurnClosed {
@@ -618,7 +709,8 @@ impl EventSourced for BurnExcess {
                     }])
                 }
                 other => Err(BurnExcessError::InvalidState {
-                    expected: "FundingExcluded, Intended, or Submitted"
+                    expected: "AwaitingFunding, FundingExcluded, Intended, or \
+                               Submitted"
                         .to_string(),
                     found: other.state_name().to_string(),
                 }),
@@ -780,6 +872,134 @@ mod tests {
         };
         assert_eq!(*path, BurnExcessPath::External);
         assert_eq!(funding_log_id.as_ref(), Some(&funding));
+    }
+
+    fn funding_expected(bind: &ExcessBurnBind) -> BurnExcessEvent {
+        BurnExcessEvent::FundingExpected {
+            bind: bind.clone(),
+            reason: "duplicate mint".into(),
+            incident_id: None,
+            expected_at: Utc::now(),
+        }
+    }
+
+    fn other_bind() -> ExcessBurnBind {
+        ExcessBurnBind { shares: U256::from(1u64), ..sample_bind() }
+    }
+
+    /// The expectation names the stream's bind; the exclusion that ends the
+    /// hold must be for that same bind, or a different recovery could release
+    /// the hold this one placed.
+    #[tokio::test]
+    async fn awaiting_funding_records_the_exclusion_only_for_its_own_bind() {
+        let bind = sample_bind();
+
+        let err = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&bind)])
+            .when(BurnExcessCommand::RecordFundingExclusion {
+                bind: other_bind(),
+                funding_log_id: funding_id(),
+                reason: "duplicate mint".into(),
+                incident_id: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            err,
+            LifecycleError::Apply(BurnExcessError::BindMismatch)
+        ));
+
+        let events = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&bind)])
+            .when(BurnExcessCommand::RecordFundingExclusion {
+                bind: bind.clone(),
+                funding_log_id: funding_id(),
+                reason: "duplicate mint".into(),
+                incident_id: None,
+            })
+            .await
+            .events();
+        assert!(matches!(
+            events.as_slice(),
+            [BurnExcessEvent::FundingExclusionRecorded { funding_log_id, .. }]
+                if *funding_log_id == funding_id()
+        ));
+    }
+
+    /// An expectation is not an exclusion: nothing may sign a burn until the
+    /// funding Transfer is proven and excluded.
+    #[tokio::test]
+    async fn awaiting_funding_refuses_intend_before_the_exclusion() {
+        let bind = sample_bind();
+        let err = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&bind)])
+            .when(BurnExcessCommand::IntendExcessBurn {
+                bind,
+                path: BurnExcessPath::External,
+                funding_log_id: Some(funding_id()),
+                reason: "duplicate mint".into(),
+                incident_id: None,
+                sendable_tx: sample_sendable(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            err,
+            LifecycleError::Apply(
+                BurnExcessError::ExternalRequiresExclusion { .. }
+            )
+        ));
+    }
+
+    /// A retried expect request must not fail on the hold it already placed,
+    /// but it cannot re-point that hold at a different bind.
+    #[tokio::test]
+    async fn re_expecting_funding_is_a_no_op_only_for_the_same_bind() {
+        let bind = sample_bind();
+
+        let events = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&bind)])
+            .when(BurnExcessCommand::ExpectFunding {
+                bind: bind.clone(),
+                reason: "retry".into(),
+                incident_id: None,
+            })
+            .await
+            .events();
+        assert!(events.is_empty());
+
+        let err = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&bind)])
+            .when(BurnExcessCommand::ExpectFunding {
+                bind: other_bind(),
+                reason: "retry".into(),
+                incident_id: None,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            err,
+            LifecycleError::Apply(BurnExcessError::BindMismatch)
+        ));
+    }
+
+    /// Closing an expectation that was never funded (or should redeem after
+    /// all) is the way to release its hold.
+    #[tokio::test]
+    async fn awaiting_funding_can_be_closed() {
+        let events = TestHarness::<BurnExcess>::with(())
+            .given(vec![funding_expected(&sample_bind())])
+            .when(BurnExcessCommand::CloseExcessBurn {
+                reason: "funding never sent".into(),
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [BurnExcessEvent::ExcessBurnClosed { .. }]
+        ));
     }
 
     #[tokio::test]

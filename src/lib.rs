@@ -32,6 +32,7 @@ use crate::alpaca::AlpacaService;
 use crate::auth::{FailedAuthRateLimiter, OpsApiVerifiers, build_jwks_client};
 use crate::burn_excess::{
     BurnExcess, exclusion::rebuild_funding_exclusion_index,
+    expectation::rebuild_funding_expectation_index,
 };
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
@@ -71,7 +72,6 @@ use crate::redemption::{
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     poller::{TransferPoller, TransferPollerConfig},
-    poller_pause::{PollerPauses, poller_pause},
     redeem_call_manager::RedeemCallManager,
     view::{RedemptionViewReactor, rebuild_redemption_view},
 };
@@ -412,20 +412,19 @@ pub async fn initialize_rocket(
         ),
     );
 
-    let (per_network_handles, poller_pauses) =
-        spawn_per_network_tasks(&PerNetworkTaskDeps {
-            chain_registry: &chain_registry,
-            config: &config,
-            pool: &pool,
-            apalis_pool: &apalis_pool,
-            receipt_inventory_store: &receipt_inventory_store,
-            redemption_store: &redemption_store,
-            managers: &managers,
-            bot_wallet,
-            lifecycle_notifier: &lifecycle_notifier,
-            network_telemetry: &network_telemetry,
-            shutdown: &shutdown_rx,
-        });
+    let per_network_handles = spawn_per_network_tasks(&PerNetworkTaskDeps {
+        chain_registry: &chain_registry,
+        config: &config,
+        pool: &pool,
+        apalis_pool: &apalis_pool,
+        receipt_inventory_store: &receipt_inventory_store,
+        redemption_store: &redemption_store,
+        managers: &managers,
+        bot_wallet,
+        lifecycle_notifier: &lifecycle_notifier,
+        network_telemetry: &network_telemetry,
+        shutdown: &shutdown_rx,
+    });
     background_task_handles.extend(per_network_handles);
 
     maintain_background_job_tables(&pool, &apalis_pool).await;
@@ -466,7 +465,6 @@ pub async fn initialize_rocket(
         ),
         ops_verifiers,
         underlying_store,
-        poller_pauses,
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
@@ -663,10 +661,6 @@ struct RocketState {
     /// The Underlying aggregate store backing the capital-tier freeze/unfreeze
     /// and read-tier status ops routes.
     underlying_store: Arc<Store<Underlying>>,
-    /// Per-network controls to pause the redemption transfer poller so a
-    /// breakglass op (burn-excess external) can write a funding-Transfer
-    /// exclusion without racing a live poll.
-    poller_pauses: PollerPauses,
     background_tasks: BackgroundTasks,
 }
 
@@ -878,7 +872,6 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.receipts)
         .manage(state.network_telemetry)
         .manage(state.underlying_store)
-        .manage(state.poller_pauses)
         .mount(
             "/",
             routes![
@@ -926,6 +919,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::freeze_underlying_ops,
                 admin::unfreeze_underlying_ops,
                 burn_excess::api::burn_excess_internal_ops,
+                burn_excess::api::burn_excess_expect_funding_ops,
                 burn_excess::api::burn_excess_external_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
@@ -1005,16 +999,16 @@ async fn setup_aggregate_cqrs(
         .build(redemption_services)
         .await?;
 
-    // BurnExcess has no Table projection; the funding-exclusion SQL index is a
-    // derived read model, and this rebuild is what the server needs: it
-    // repopulates the index before the transfer pollers spawn, so a restored
-    // DB cannot leave the poller free to open a Redemption for an excluded
-    // funding Transfer. No reactor is wired here — the server dispatches no
-    // `BurnExcess` command, and the CLI builds its own store in
-    // `burn_excess_store`, so a reactor on a server-side store would never
-    // fire.
+    // BurnExcess has no Table projection; the funding exclusion and
+    // expectation SQL indexes are derived read models, and these rebuilds are
+    // what the server needs: they repopulate both before the transfer pollers
+    // spawn, so a restored DB cannot leave the poller free to open a
+    // Redemption for an excluded or expected funding Transfer. No reactor is
+    // wired here: the burn-excess routes and the CLI build their own store in
+    // `burn_excess_store`, which attaches the reactors.
     prepare_event_sourced_startup::<BurnExcess>(pool).await?;
     rebuild_funding_exclusion_index(pool).await?;
+    rebuild_funding_expectation_index(pool).await?;
 
     Ok(AggregateCqrsSetup { mint_store, redemption_store })
 }
@@ -1985,12 +1979,11 @@ struct PerNetworkTaskDeps<'a, P> {
 /// transfer watcher per configured chain.
 fn spawn_per_network_tasks<P>(
     deps: &PerNetworkTaskDeps<'_, P>,
-) -> (Vec<JoinHandle<()>>, PollerPauses)
+) -> Vec<JoinHandle<()>>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
     let mut handles = Vec::new();
-    let mut poller_pauses = HashMap::new();
 
     for (network, runtime) in deps.chain_registry.runtimes() {
         handles.push(spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
@@ -2032,13 +2025,10 @@ where
             telemetry: deps.network_telemetry.clone(),
         });
 
-        let (control, pause) = poller_pause();
-        poller_pauses.insert(*network, control);
-
         let mut poller_shutdown = deps.shutdown.clone();
         handles.push(tokio::spawn(async move {
             tokio::select! {
-                () = poller.run(pause) => {}
+                () = poller.run() => {}
                 _ = poller_shutdown.changed() => {}
             }
         }));
@@ -2055,7 +2045,7 @@ where
 
     handles.extend(spawn_wrapped_transfer_monitors(deps));
 
-    (handles, PollerPauses::new(poller_pauses))
+    handles
 }
 
 /// Spawns one inbound wrapped-token transfer watcher per configured chain
