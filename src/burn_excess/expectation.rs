@@ -107,6 +107,34 @@ pub(crate) async fn is_expected_funding(
     .await
 }
 
+/// Whether a stream other than `deposit_tx_hash` already expects its funding
+/// Transfer on this vault. The issuer wallet can hold only one stream's
+/// funding on a vault, because each `external` run needs its exact share
+/// balance there.
+pub(crate) async fn has_other_funding_expectation(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    deposit_tx_hash: B256,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM burn_excess_funding_expectations
+            WHERE network = ?
+              AND vault = ?
+              AND deposit_tx_hash != ?
+        )
+        ",
+    )
+    .bind(network.as_str())
+    .bind(address_key(vault))
+    .bind(hash_key(deposit_tx_hash))
+    .fetch_one(pool)
+    .await
+}
+
 /// How the redemption poller must treat one Transfer log with respect to
 /// Path B burn-excess funding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

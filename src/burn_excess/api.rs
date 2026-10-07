@@ -317,24 +317,26 @@ pub(crate) async fn burn_excess_external_ops(
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a
-/// wallet not quiesced, or an external run without its funding expectation, is
-/// a 409; a bad proof or input is a 422; an on-chain/RPC fault is a 502;
-/// anything else (including a burn that landed but whose bookkeeping failed)
-/// is a 500 for operator intervention.
+/// wallet not quiesced, an external run without its funding expectation, or
+/// another stream's expectation open on the vault is a 409; a bad proof or
+/// input is a 422; an on-chain/RPC fault is a 502; anything else (including a
+/// burn that landed but whose bookkeeping failed) is a 500 for operator
+/// intervention.
 const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
     use BurnExcessEngineError::{
-        AmbiguousDepositTx, AmbiguousShareTransferOut, Contract,
-        DeadBurnIntent, DepositTxInvalid, FundingNotExpected, FundingTxInvalid,
-        MintMissingAsset, MintNetworkMismatch, MintNotFound, Proof, Provider,
-        UnresolvedExcessBurnIntent, UnresolvedSignerIntent, Vault,
-        VaultNotListed,
+        AmbiguousDepositTx, AmbiguousShareTransferOut, AnotherFundingExpected,
+        Contract, DeadBurnIntent, DepositTxInvalid, FundingNotExpected,
+        FundingTxInvalid, MintMissingAsset, MintNetworkMismatch, MintNotFound,
+        Proof, Provider, UnresolvedExcessBurnIntent, UnresolvedSignerIntent,
+        Vault, VaultNotListed,
     };
 
     match error {
         MintNotFound { .. } => Status::NotFound,
         UnresolvedSignerIntent { .. }
         | UnresolvedExcessBurnIntent
-        | FundingNotExpected => Status::Conflict,
+        | FundingNotExpected
+        | AnotherFundingExpected { .. } => Status::Conflict,
         Proof(_)
         | MintMissingAsset { .. }
         | MintNetworkMismatch { .. }

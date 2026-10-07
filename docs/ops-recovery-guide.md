@@ -164,7 +164,12 @@ infers it:
   `IssuerShareBalanceNotExact` before the burn is signed, then with
   `UnresolvedSignerIntent` (409) while it is in flight. Retry once it lands.
   `expect-funding` refuses (409) while another burn-excess recovery is
-  unresolved; finish or close that one first. If the shares will not be sent,
+  unresolved, and while another recovery's expectation is open on the same
+  vault: only one expectation per vault can be open at a time, because the
+  issuer wallet must hold exactly one stream's funding. Finish or close that one
+  first, and send each funding transfer only after its own `expect-funding`
+  succeeded. It refuses (422) a deposit whose original recipient is the issuer
+  wallet: use `internal` for that one. If the shares will not be sent,
   `expect-funding --close --execute` releases the hold; a transfer that did
   arrive is then redeemed as usual.
 

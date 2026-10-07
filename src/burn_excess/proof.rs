@@ -213,6 +213,14 @@ pub(crate) enum BurnExcessProofError {
         original_recipient: Address,
         issuer_wallet: Address,
     },
+
+    #[error(
+        "the deposit's original recipient is the issuer wallet \
+         ({issuer_wallet:?}), so its excess shares are already there: use \
+         `burn-excess internal`. `expect-funding` is only for shares that \
+         must be sent back to the issuer"
+    )]
+    FundingFromIssuer { issuer_wallet: Address },
 }
 
 /// D0.3–D0.4: resolve path from mode keyword and optional loaded aggregate.
