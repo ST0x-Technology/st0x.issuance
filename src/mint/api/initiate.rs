@@ -5,7 +5,7 @@ use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
 use super::{
     MintApiError, MintResponse, validate_asset_exists, validate_client_eligible,
@@ -80,6 +80,8 @@ pub(crate) async fn initiate_mint(
         let mint_mode =
             config.vault_mode_for(&request.underlying, request.network)?;
 
+        let underlying = request.underlying.clone();
+
         let command = MintCommand::Initiate {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: request.tokenization_request_id,
@@ -100,6 +102,14 @@ pub(crate) async fn initiate_mint(
                 MintApiError::CommandExecutionFailed(error)
             },
         )?;
+
+        // The fill rate alert counts this line (and the redemption detection
+        // one) by `event`, so it is emitted exactly once per accepted mint and
+        // only after the `Initiated` event is persisted.
+        info!(target: "mint", event = "fill_accepted", %issuer_request_id,
+            underlying = %underlying.as_str(),
+            "Mint request accepted"
+        );
 
         Ok::<_, MintApiError>(issuer_request_id)
     })
@@ -145,7 +155,7 @@ mod tests {
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
         view::find_by_issuer_request_id,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
     use crate::underlying::{Underlying, UnderlyingCommand};
 
@@ -693,6 +703,85 @@ mod tests {
         // "created" mint response, so issuance demonstrably resumed.
         assert!(!mint_response.issuer_request_id.to_string().is_empty());
         assert_eq!(mint_response.status, "created");
+    }
+
+    /// Each accepted mint emits one `fill_accepted` INFO log: the line the
+    /// Grafana fill rate alert counts. `issuer_request_id` is unique per
+    /// request, so the count cannot be polluted by other tests sharing the
+    /// log buffer.
+    #[traced_test]
+    #[tokio::test]
+    async fn initiate_counts_an_accepted_mint_as_one_fill() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+            ..
+        } = harness;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(
+                serde_json::json!({
+                    "tokenization_request_id": "alp-fill-accepted",
+                    "qty": "100.5",
+                    "underlying_symbol": underlying.as_str(),
+                    "token_symbol": token.0,
+                    "network": network.as_str(),
+                    "client_id": client_id,
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let mint_response: MintResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+        let issuer_request_id = mint_response.issuer_request_id.to_string();
+
+        let snippets = [
+            r#"event="fill_accepted""#,
+            "Mint request accepted",
+            issuer_request_id.as_str(),
+            underlying.as_str(),
+        ];
+        assert!(
+            logs_contain_at!(tracing::Level::INFO, &snippets),
+            "an accepted mint must log a fill"
+        );
+        assert_eq!(
+            log_count_at!(tracing::Level::INFO, &snippets),
+            1,
+            "one accepted mint is one fill"
+        );
     }
 
     #[tokio::test]

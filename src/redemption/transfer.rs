@@ -196,7 +196,10 @@ pub(crate) async fn detect_transfer(
         Err(err) => return Err(err.into()),
     }
 
-    info!(target: "redemption", %issuer_request_id,
+    // The fill rate alert counts this line (and the mint accepted one) by
+    // `event`, so it is emitted exactly once per newly detected redemption:
+    // an already detected transfer returned above.
+    info!(target: "redemption", event = "fill_accepted", %issuer_request_id,
         from = %transfer_event.from,
         burn_mode = ?burn_mode,
         "Redemption transfer detected"
@@ -389,7 +392,7 @@ fn find_matching_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use event_sorcery::{Store, StoreBuilder, test_store};
     use sqlx::SqlitePool;
@@ -405,7 +408,7 @@ mod tests {
         create_transfer_log, create_transfer_log_with_index,
         setup_test_db_with_asset,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
@@ -1144,6 +1147,77 @@ mod tests {
             tracing::Level::DEBUG,
             &["Skipping transfer from unknown/unlinked wallet"]
         ));
+    }
+
+    /// Each newly detected redemption emits one `fill_accepted` INFO log, the
+    /// line the Grafana fill rate alert counts, and a rescan of the same
+    /// transfer must not count it again. A random `tx_hash` makes the
+    /// `issuer_request_id` unique, so other tests sharing the log buffer
+    /// cannot pollute the count.
+    #[traced_test]
+    #[tokio::test]
+    async fn detect_transfer_counts_each_redemption_as_one_fill() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
+
+        let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
+        let tx_hash = B256::random();
+        let log = create_transfer_log(
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
+        );
+        let assets = list_enabled_assets(&pool).await.unwrap();
+
+        let first = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
+        let Ok(TransferOutcome::Detected { issuer_request_id, .. }) = first
+        else {
+            panic!("first detection should succeed, got {first:?}");
+        };
+        let issuer_request_id = issuer_request_id.to_string();
+        let snippets = [
+            r#"event="fill_accepted""#,
+            "Redemption transfer detected",
+            issuer_request_id.as_str(),
+        ];
+
+        assert_eq!(
+            log_count_at!(tracing::Level::INFO, &snippets),
+            1,
+            "a detected redemption is one fill"
+        );
+
+        let second = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
+        assert!(
+            matches!(second, Ok(TransferOutcome::AlreadyDetected)),
+            "second detection should be a no-op, got {second:?}"
+        );
+
+        assert_eq!(
+            log_count_at!(tracing::Level::INFO, &snippets),
+            1,
+            "a rescanned transfer must not count as another fill"
+        );
     }
 
     #[traced_test]
