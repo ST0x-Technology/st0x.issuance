@@ -146,10 +146,20 @@ infers it:
   shares sent back; the bot's redemption poller holds that Transfer instead of
   redeeming it. Then run `breakglass burn-excess external` with the same flags
   plus `--funding-tx-hash <that transfer's tx>`; the bot refuses (409) a stream
-  with no expectation. While the expectation is open, later transfers into the
-  issuer wallet on that vault wait behind the held one, so finish the run
-  promptly. If the shares will not be sent, `expect-funding --close --execute`
-  releases the hold; a transfer that did arrive is then redeemed as usual.
+  with no expectation. If that 409 comes after the shares were already sent, do
+  not record an expectation now: the poller may already have redeemed the
+  transfer. Search the bot's logs for that transaction hash (a detected
+  redemption is keyed by it). If none was detected, stop the issuer service and
+  finish with the offline CLI below; if one was, burn-excess refuses that
+  transfer (`FundingAlreadyRedeemedTx`) and the redemption it opened is the
+  incident to handle, not something to retry through burn-excess. While the
+  expectation is open, later transfers into the issuer wallet on that vault wait
+  behind the held one (the bot logs a
+  `held at expected burn-excess
+  funding transfers` WARN when a hold starts or
+  changes and every five minutes while it lasts), so finish the run promptly. If
+  the shares will not be sent, `expect-funding --close --execute` releases the
+  hold; a transfer that did arrive is then redeemed as usual.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's

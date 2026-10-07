@@ -8,6 +8,7 @@ use event_sorcery::{StoreBuilder, test_store};
 use sqlx::SqlitePool;
 use st0x_alpaca::issuer::mock::MockIssuerApi;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use super::burn_manager::BurnManager;
 use super::journal_manager::JournalManager;
@@ -142,9 +143,15 @@ pub(crate) async fn transfer_poller_for_tests<P: Provider + Clone>(
         pool.clone(),
     ));
 
-    let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
-        .await
-        .expect("apalis test pool should connect");
+    // A bare `:memory:` names its database `file:sqlx-in-memory-<n>` with a
+    // per-sqlx-version counter, so this sqlx 0.8 pool can share a database
+    // with a sqlx 0.9 test pool of the same number and hit a schema lock.
+    let apalis_pool = apalis_sqlite::SqlitePool::connect(&format!(
+        "sqlite:file:apalis-test-{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    ))
+    .await
+    .expect("apalis test pool should connect");
     let burn_manager = Arc::new(BurnManager::new_for_tests(
         Arc::new(MockVaultService::new_success()),
         pool.clone(),

@@ -80,8 +80,8 @@ pub(crate) struct BurnExcessSharedArgs {
     #[arg(long)]
     execute: bool,
 
-    /// Close a dead Intended/Submitted/FundingExcluded stream instead of
-    /// burning.
+    /// Close a dead AwaitingFunding/FundingExcluded/Intended/Submitted stream
+    /// instead of burning.
     #[arg(long)]
     close: bool,
 

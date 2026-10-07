@@ -1573,6 +1573,11 @@ Mode-specific:
 | `internal` | (none beyond shared)                       | `--funding-tx-hash` is not on this subcommand |
 | `external` | `--funding-tx-hash <0x…>` required by clap | —                                             |
 
+The live `/ops` route adds a third keyword, `expect-funding` (Path B, no
+`--funding-tx-hash`): it is run before the funding Transfer is broadcast, and
+with `execute` records `FundingExpected` (with `close` it closes the stream).
+The offline CLI has no `expect-funding`; it relies on the stopped service.
+
 **Fresh run:** path is chosen **only** from the mode keyword. Issuer share
 balance, original recipient == issuer, freeze status, and funding-hash presence
 do **not** select path.
@@ -1582,14 +1587,14 @@ already exists, **stored path wins**. Re-invoke must use the same mode keyword;
 switching modes is `PathConflict`. External resumes also require the same
 funding tx hash as recorded.
 
-| Aggregate state                 | Locked path  | Required mode            | Funding hash                |
-| ------------------------------- | ------------ | ------------------------ | --------------------------- |
-| `NotStarted`                    | from keyword | `internal` or `external` | required only if `external` |
-| `AwaitingFunding`               | External     | `external` only          | proven on first `external`  |
-| `FundingExcluded`               | External     | `external` only          | must match recorded         |
-| `Intended`/`Submitted` External | External     | `external` only          | must match recorded         |
-| `Intended`/`Submitted` Internal | Internal     | `internal` only          | N/A                         |
-| `Completed` / `Closed`          | locked       | report-only              | no re-path                  |
+| Aggregate state                 | Locked path  | Required mode                                                              | Funding hash                |
+| ------------------------------- | ------------ | -------------------------------------------------------------------------- | --------------------------- |
+| `NotStarted`                    | from keyword | `internal`, `external`, or `expect-funding` (live)                         | required only if `external` |
+| `AwaitingFunding`               | External     | `external` (proves funding) or `expect-funding` (no-op re-run, or `close`) | proven on first `external`  |
+| `FundingExcluded`               | External     | `external` only                                                            | must match recorded         |
+| `Intended`/`Submitted` External | External     | `external` only                                                            | must match recorded         |
+| `Intended`/`Submitted` Internal | Internal     | `internal` only                                                            | N/A                         |
+| `Completed` / `Closed`          | locked       | report-only                                                                | no re-path                  |
 
 #### Path behaviour
 
@@ -1630,10 +1635,14 @@ funding Transfer. If a `Redemption` already exists for that funding tx → refus
 Transfer logs without `log_index` fail closed (`MissingLogIndex`) so Detect
 cannot open a redemption for an unidentifiable excluded funding log.
 
-**Dead intent / Closed.** `--close` clears the wallet nonce gate only. `Closed`
-is report-only terminal for that deposit stream (no re-intend on the same
-`deposit_tx_hash`). Reverted/ProvablyDead on resume surfaces `DeadBurnIntent`
-with that guidance.
+**Dead intent / Closed.** `--close` clears the wallet nonce gate, and for an
+`AwaitingFunding` stream also the funding expectation (see below). `Closed` is
+report-only terminal for that deposit stream (no re-intend on the same
+`deposit_tx_hash`), except that an executed re-run of a terminal stream drops a
+funding expectation that outlived it (a clear that failed after the close or the
+exclusion): always for `Closed`, and for `Completed` only once its exclusion row
+is confirmed. Reverted/ProvablyDead on resume surfaces `DeadBurnIntent` with
+that guidance.
 
 **Post-burn inventory.** After on-chain verify the stream completes, then
 inventory is reconciled. Reconcile failure fails the CLI (non-zero) even though
@@ -1695,8 +1704,11 @@ Transfer is then detected as an ordinary redemption, so close only when the
 funding was never sent or should be redeemed. An expectation recorded after the
 poller already detected the funding Transfer protects nothing: the open
 `Redemption` still refuses the exclusion (`FundingAlreadyRedeemedTx`). The
-engine dual-writes the expectation index on record and on clear, and startup and
-store open rebuild it from every stream whose latest event is `FundingExpected`.
+engine dual-writes the expectation index on record and on clear, and service
+startup rebuilds it, before the pollers spawn, from every stream whose latest
+event is `FundingExpected`. Opening the store per request does not: the rebuild
+deletes rows, and could drop the expectation of a stream that has committed its
+exclusion event but not yet written the exclusion.
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -4981,7 +4993,7 @@ Tiers and routes:
   `orchestrator-approve/<network>/<underlying>`.
 - **breakglass** (`/ops/breakglass/*`): `force-complete/redemption/<id>`,
   `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
-  `burn-excess/external`.
+  `burn-excess/expect-funding`, `burn-excess/external`.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
@@ -5043,21 +5055,23 @@ exclusion write), and `false` for an executed plan. The optional `funding_log`,
 `resume_note`, `freeze_advisory`, and `precondition` fields appear only when
 they apply (an internal plan omits `funding_log`; an external plan includes it)
 and are omitted rather than sent as null. The `ReportOnly` path returns a
-`terminal` view regardless of `execute` or `close`; `close=true` on `Start` or
-`Resume` returns a `close` view. `burn-excess/expect-funding` signs nothing: on
-`execute` it records the funding expectation (see "Burn excess shares") and
-returns the plan, whose `precondition` names the exact Transfer to broadcast; a
-stream already past `AwaitingFunding` gets a `terminal` view. With `close=true`
-it closes the stream and releases the poller's hold. `burn-excess/external`
-returns 409 for a stream that never recorded that expectation, before reading
-the chain. The routes return 422 when the request's `chain_id` does not match
-its network, and 504 when the run exceeds 120 seconds, where the safe next step
-depends on the mode: a dry-run wrote nothing — no events, expectation,
-exclusion, or signed intent — so it is safe to retry, while an execute leaves
-the outcome unknown (the burn may be excluded, intended, or submitted), so the
-operator re-invokes the route for the same deposit to read the persisted stream
-and resume it from wherever it stopped. The burn routes hold the wallet lock
-across signing; no route pauses the poller.
+`terminal` view regardless of `execute` or `close`; with `execute` it also drops
+a funding expectation the terminal stream left behind (see "Dead intent /
+Closed"). `close=true` on `Start` or `Resume` returns a `close` view.
+`burn-excess/expect-funding` signs nothing: on `execute` it records the funding
+expectation (see "Burn excess shares") and returns the plan, whose
+`precondition` names the exact Transfer to broadcast; a stream already past
+`AwaitingFunding` gets a `terminal` view. With `close=true` it closes the stream
+and releases the poller's hold. `burn-excess/external` returns 409 for a stream
+that never recorded that expectation, before reading the chain. The routes
+return 422 when the request's `chain_id` does not match its network, and 504
+when the run exceeds 120 seconds, where the safe next step depends on the mode:
+a dry-run wrote nothing — no events, expectation, exclusion, or signed intent —
+so it is safe to retry, while an execute leaves the outcome unknown (the burn
+may be excluded, intended, or submitted), so the operator re-invokes the route
+for the same deposit to read the persisted stream and resume it from wherever it
+stopped. The burn routes hold the wallet lock across signing; no route pauses
+the poller.
 
 Every `burn-excess` route takes the network's RPC endpoint from the service's
 startup-verified chain configuration, never from a request-time environment
@@ -5147,19 +5161,19 @@ Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
 (`RegisterAccountRequest`, `WhitelistWalletRequest`, `AddTokenizedAssetRequest`,
 `ScheduleFreezeWindowRequest`, `ForceCompleteRedemptionRequest`,
 `CloseRedemptionRequest`, `CloseMintRequest`, `BurnExcessInternalRequest`,
-`BurnExcessExternalRequest`), so client and bot cannot drift on a body shape.
-Every underlying symbol argument is upper-cased at parse time, as the offline
-`issuer` CLI does, because the bot keys a listing or freeze window by the symbol
-exactly as a body carries it. The burn-excess `shares` amount is a
-`DecimalShares`: its decimal string is parsed to 18-decimal fixed point at
-construction, so the client refuses a zero, negative, or over-precise amount
-before sending, with the same rules the bot and the offline CLI apply. Path
-segments are percent-encoded and redirects are never followed. A request may run
-up to 180 seconds, above the external burn-excess route's own 30-second poller
-pause plus 120-second run bound, so the bot's 503 or 504 reaches the operator
-instead of a client-side timeout. That also requires the load balancer's backend
-timeout for the breakglass tier to exceed those 150 seconds; a shorter one cuts
-the request off first with its own 504.
+`BurnExcessExpectFundingRequest`, `BurnExcessExternalRequest`), so client and
+bot cannot drift on a body shape. Every underlying symbol argument is
+upper-cased at parse time, as the offline `issuer` CLI does, because the bot
+keys a listing or freeze window by the symbol exactly as a body carries it. The
+burn-excess `shares` amount is a `DecimalShares`: its decimal string is parsed
+to 18-decimal fixed point at construction, so the client refuses a zero,
+negative, or over-precise amount before sending, with the same rules the bot and
+the offline CLI apply. Path segments are percent-encoded and redirects are never
+followed. A request may run up to 180 seconds, above the burn-excess routes' own
+120-second run bound, so the bot's 504 reaches the operator instead of a
+client-side timeout. That also requires the load balancer's backend timeout for
+the breakglass tier to exceed those 120 seconds; a shorter one cuts the request
+off first with its own 504.
 
 On success, stdout carries exactly the response body as one compact JSON line
 (the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
@@ -5180,11 +5194,10 @@ outage during sign-in. Failures are explained:
 - **404:** an unknown id or asset, or `/ops` is not mounted on that deployment
   (no `OPS_API_*_AUDIENCE` configured).
 - **503:** the deployment could not serve the request, for example the bot could
-  not fetch Google's IAP keys, a burn-excess transfer poller could not be paused
-  in time (it did not park, or another breakglass run held it), an
-  `approve-orchestrator` ran out of time before broadcasting anything (nothing
-  sent), or the load balancer had no healthy backend. A read can be retried;
-  before retrying a write, the logs show whether it was applied.
+  not fetch Google's IAP keys, an `approve-orchestrator` ran out of time before
+  broadcasting anything (nothing sent), or the load balancer had no healthy
+  backend. A read can be retried; before retrying a write, the logs show whether
+  it was applied.
 - **502 or 504:** a gateway gave up waiting, either the load balancer's backend
   timeout (a long burn-excess run can outlast it) or the bot's own bound (its
   wait on the chain, or a burn-excess run's), so the outcome is unknown. An

@@ -8,24 +8,24 @@
 //! Redemption for it. The index is a derived read model of `FundingExpected`
 //! events: the engine dual-writes it, [`FundingExpectationReactor`] keeps it
 //! current on live commits, and [`rebuild_funding_expectation_index`] resets
-//! it from the event store on startup and store open.
+//! it from the event store at service startup, before the pollers spawn.
 
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EntityList, Never, Reactor, deps};
-use sqlx::{Pool, Sqlite, SqlitePool};
+use sqlx::{Executor, Pool, Sqlite, SqlitePool};
 use tracing::{debug, info};
 
-use super::exclusion::{address_key, hash_key};
-use super::{BurnExcess, BurnExcessEvent, ExcessBurnBind};
+use super::exclusion::{address_key, hash_key, log_index_key};
+use super::{BurnExcess, BurnExcessEvent, ExcessBurnBind, FundingTransferId};
 use crate::tokenized_asset::Network;
 
 /// Persist the funding Transfer `bind` expects so the poller holds it.
 ///
 /// Idempotent on the stream's deposit transaction hash.
 pub(crate) async fn record_funding_expectation(
-    pool: &Pool<Sqlite>,
+    executor: impl Executor<'_, Database = Sqlite>,
     bind: &ExcessBurnBind,
     expected_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
@@ -51,19 +51,19 @@ pub(crate) async fn record_funding_expectation(
     .bind(address_key(bind.issuer_wallet))
     .bind(bind.shares.to_string())
     .bind(expected_at.to_rfc3339())
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
 /// Drop the expectation of the stream for `deposit_tx_hash`, releasing any
-/// Transfer the poller holds for it.
+/// Transfer the poller holds for it. Returns whether a row was dropped.
 pub(crate) async fn clear_funding_expectation(
     pool: &Pool<Sqlite>,
     deposit_tx_hash: B256,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "
         DELETE FROM burn_excess_funding_expectations
         WHERE deposit_tx_hash = ?
@@ -73,7 +73,7 @@ pub(crate) async fn clear_funding_expectation(
     .execute(pool)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Whether a stream expects exactly this Transfer as its funding.
@@ -105,6 +105,71 @@ pub(crate) async fn is_expected_funding(
     .bind(amount.to_string())
     .fetch_one(pool)
     .await
+}
+
+/// How the redemption poller must treat one Transfer log with respect to
+/// Path B burn-excess funding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FundingTransferStatus {
+    /// A stream proved and excluded this exact log: skip it.
+    Excluded,
+    /// A stream expects a Transfer of this shape and has not excluded it yet:
+    /// hold it.
+    Expected,
+    /// No burn-excess stream claims it: an ordinary Transfer.
+    Unrelated,
+}
+
+/// Classifies one Transfer log against the exclusion and expectation indexes
+/// in a single statement, so it reads both from one SQLite snapshot. The
+/// external route writes the exclusion and then clears the expectation; two
+/// separate reads could fall between those writes, see neither, and let the
+/// poller redeem the funding Transfer.
+pub(crate) async fn classify_funding_transfer(
+    pool: &Pool<Sqlite>,
+    transfer: &FundingTransferId,
+) -> Result<FundingTransferStatus, sqlx::Error> {
+    let (excluded, expected) = sqlx::query_as::<_, (bool, bool)>(
+        "
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM burn_excess_funding_exclusions
+                WHERE network = ?
+                  AND vault = ?
+                  AND tx_hash = ?
+                  AND log_index = ?
+            ),
+            EXISTS (
+                SELECT 1
+                FROM burn_excess_funding_expectations
+                WHERE network = ?
+                  AND vault = ?
+                  AND from_address = ?
+                  AND to_address = ?
+                  AND amount = ?
+            )
+        ",
+    )
+    .bind(transfer.network.as_str())
+    .bind(address_key(transfer.vault))
+    .bind(hash_key(transfer.tx_hash))
+    .bind(log_index_key(transfer.log_index)?)
+    .bind(transfer.network.as_str())
+    .bind(address_key(transfer.vault))
+    .bind(address_key(transfer.from))
+    .bind(address_key(transfer.to))
+    .bind(transfer.amount.to_string())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(if excluded {
+        FundingTransferStatus::Excluded
+    } else if expected {
+        FundingTransferStatus::Expected
+    } else {
+        FundingTransferStatus::Unrelated
+    })
 }
 
 /// Reset the index to exactly the streams whose latest event is
@@ -160,29 +225,8 @@ pub(crate) async fn rebuild_funding_expectation_index(
             continue;
         };
 
-        sqlx::query(
-            "
-            INSERT INTO burn_excess_funding_expectations (
-                deposit_tx_hash,
-                network,
-                vault,
-                from_address,
-                to_address,
-                amount,
-                expected_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(hash_key(bind.deposit_tx_hash))
-        .bind(bind.network.as_str())
-        .bind(address_key(bind.vault))
-        .bind(address_key(bind.original_recipient))
-        .bind(address_key(bind.issuer_wallet))
-        .bind(bind.shares.to_string())
-        .bind(expected_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
+        record_funding_expectation(&mut *transaction, &bind, expected_at)
+            .await?;
         recorded = recorded.saturating_add(1);
     }
 
@@ -215,7 +259,7 @@ deps!(FundingExpectationReactor, [BurnExcess]);
 /// [`super::exclusion::FundingExclusionReactor`]'s job, after it writes the
 /// exclusion, so the poller is never left with neither.
 ///
-/// Live-only, like the exclusion reactor: startup and store open call
+/// Live-only, like the exclusion reactor: service startup calls
 /// [`rebuild_funding_expectation_index`].
 pub(crate) struct FundingExpectationReactor {
     pool: SqlitePool,
@@ -286,6 +330,7 @@ mod tests {
     use event_sorcery::StoreBuilder;
 
     use super::*;
+    use crate::burn_excess::exclusion::record_funding_exclusion;
     use crate::burn_excess::{
         BurnExcessCommand, BurnExcessId, FundingTransferId,
     };
@@ -356,6 +401,47 @@ mod tests {
             .await
             .unwrap();
         assert!(!expects(&pool, &expected).await);
+    }
+
+    /// Each state the external route's handoff passes through (expectation
+    /// only, then exclusion written, then expectation cleared) classifies the
+    /// funding log as held or skipped, never as an ordinary Transfer, and the
+    /// exclusion wins once it exists. That both indexes are read from one
+    /// snapshot rests on `classify_funding_transfer` being one statement.
+    #[tokio::test]
+    async fn every_handoff_state_holds_or_skips_the_funding_log() {
+        let pool = pool().await;
+        let bind = bind(B256::random());
+        let funding = FundingTransferId {
+            network: bind.network,
+            vault: bind.vault,
+            tx_hash: B256::random(),
+            log_index: 3,
+            from: bind.original_recipient,
+            to: bind.issuer_wallet,
+            amount: bind.shares,
+        };
+        let classify = async |pool: &Pool<Sqlite>| {
+            classify_funding_transfer(pool, &funding).await.unwrap()
+        };
+
+        assert_eq!(classify(&pool).await, FundingTransferStatus::Unrelated);
+
+        record_funding_expectation(&pool, &bind, Utc::now()).await.unwrap();
+        assert_eq!(classify(&pool).await, FundingTransferStatus::Expected);
+
+        record_funding_exclusion(
+            &pool,
+            &funding,
+            bind.deposit_tx_hash,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(classify(&pool).await, FundingTransferStatus::Excluded);
+
+        clear_funding_expectation(&pool, bind.deposit_tx_hash).await.unwrap();
+        assert_eq!(classify(&pool).await, FundingTransferStatus::Excluded);
     }
 
     /// The rebuild must restore a lost row for a stream still awaiting its

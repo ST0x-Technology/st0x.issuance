@@ -28,7 +28,7 @@ pub(super) fn hash_key(hash: B256) -> String {
     format!("{hash:#x}")
 }
 
-fn log_index_key(log_index: u64) -> Result<i64, sqlx::Error> {
+pub(super) fn log_index_key(log_index: u64) -> Result<i64, sqlx::Error> {
     // Encode, not Decode: this converts a value on its way into a bind
     // parameter, so a "decode" error would point an operator at the read path.
     i64::try_from(log_index).map_err(|error| {
