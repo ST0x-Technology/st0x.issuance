@@ -153,13 +153,20 @@ infers it:
   finish with the offline CLI below; if one was, burn-excess refuses that
   transfer (`FundingAlreadyRedeemedTx`) and the redemption it opened is the
   incident to handle, not something to retry through burn-excess. While the
-  expectation is open, later transfers into the issuer wallet on that vault wait
-  behind the held one (the bot logs a
+  expectation is open, only the matching transfer is held; later redemptions on
+  that vault are still processed, but the vault's poll checkpoint stays before
+  the held transfer (the bot logs a
   `held at expected burn-excess
   funding transfers` WARN when a hold starts or
   changes and every five minutes while it lasts), so finish the run promptly. If
-  the shares will not be sent, `expect-funding --close --execute` releases the
-  hold; a transfer that did arrive is then redeemed as usual.
+  a later redemption's shares reach the issuer wallet before `external` runs,
+  `external` refuses until that redemption's burn lands: with
+  `IssuerShareBalanceNotExact` before the burn is signed, then with
+  `UnresolvedSignerIntent` (409) while it is in flight. Retry once it lands.
+  `expect-funding` refuses (409) while another burn-excess recovery is
+  unresolved; finish or close that one first. If the shares will not be sent,
+  `expect-funding --close --execute` releases the hold; a transfer that did
+  arrive is then redeemed as usual.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's

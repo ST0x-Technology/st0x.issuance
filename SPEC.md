@@ -1687,17 +1687,24 @@ the ordinary Alpaca path. Two operator sequences prevent that:
   on `execute`, records `FundingExpected`: the stream enters `AwaitingFunding`
   and the expected Transfer
   `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`
-  enters a durable SQL index. A Transfer matching an open expectation and not
-  yet excluded is held: the poller stops that vault's checkpoint before the
-  Transfer's block, so neither it nor any later Transfer on that vault is
-  detected until the expectation clears. Other vaults keep flowing and nothing
-  is skipped. `POST /ops/breakglass/burn-excess/external` refuses a stream that
+  enters a durable SQL index. It refuses (`UnresolvedExcessBurnIntent`, 409)
+  while another burn-excess stream is `FundingExcluded`, `Intended`, or
+  `Submitted`, since that stream's intent would refuse every `external` run on
+  this one and leave the hold open. A Transfer matching an open expectation and
+  not yet excluded is held: it is not detected, and the poller stops that
+  vault's checkpoint before its block. Every other Transfer on the vault, later
+  ones included, is still detected (later ones are read again each pass while
+  the hold lasts; detection is idempotent per tx hash). Holding them too would
+  deadlock: a later redemption's shares would stay in the issuer wallet, and
+  `external` needs the exact excess balance there before it records the
+  exclusion that releases the hold. Other vaults keep flowing and nothing is
+  skipped. `POST /ops/breakglass/burn-excess/external` refuses a stream that
   never recorded the expectation (`FundingNotExpected`); its `execute` records
   the exclusion first and clears the expectation after, so the poller's next
-  pass skips the funding log and resumes the vault. A dry run changes nothing,
-  so the hold spans the dry-run-to-execute gap. Its plan output states the live
-  precondition: the expectation recorded before the funding Transfer was
-  broadcast.
+  pass skips the funding log and moves the checkpoint on. A dry run changes
+  nothing, so the hold spans the dry-run-to-execute gap. Its plan output states
+  the live precondition: the expectation recorded before the funding Transfer
+  was broadcast.
 
 `--close` of an `AwaitingFunding` stream clears the expectation, and a held
 Transfer is then detected as an ordinary redemption, so close only when the
@@ -1708,7 +1715,12 @@ engine dual-writes the expectation index on record and on clear, and service
 startup rebuilds it, before the pollers spawn, from every stream whose latest
 event is `FundingExpected`. Opening the store per request does not: the rebuild
 deletes rows, and could drop the expectation of a stream that has committed its
-exclusion event but not yet written the exclusion.
+exclusion event but not yet written the exclusion. A retried `expect-funding`
+re-sends a no-op command, so a concurrent `external` or `--close` can clear the
+expectation before the retry writes it back; the retry re-reads the stream after
+its write and, when it is past `AwaitingFunding`, drops the row (a closed stream
+always, any other only once its exclusion row is in) and returns the `terminal`
+view.
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -5061,17 +5073,18 @@ Closed"). `close=true` on `Start` or `Resume` returns a `close` view.
 `burn-excess/expect-funding` signs nothing: on `execute` it records the funding
 expectation (see "Burn excess shares") and returns the plan, whose
 `precondition` names the exact Transfer to broadcast; a stream already past
-`AwaitingFunding` gets a `terminal` view. With `close=true` it closes the stream
-and releases the poller's hold. `burn-excess/external` returns 409 for a stream
-that never recorded that expectation, before reading the chain. The routes
-return 422 when the request's `chain_id` does not match its network, and 504
-when the run exceeds 120 seconds, where the safe next step depends on the mode:
-a dry-run wrote nothing — no events, expectation, exclusion, or signed intent —
-so it is safe to retry, while an execute leaves the outcome unknown (the burn
-may be excluded, intended, or submitted), so the operator re-invokes the route
-for the same deposit to read the persisted stream and resume it from wherever it
-stopped. The burn routes hold the wallet lock across signing; no route pauses
-the poller.
+`AwaitingFunding` gets a `terminal` view. It returns 409 while another
+burn-excess stream holds an unresolved intent. With `close=true` it closes the
+stream and releases the poller's hold. `burn-excess/external` returns 409 for a
+stream that never recorded that expectation, before reading the chain. The
+routes return 422 when the request's `chain_id` does not match its network, and
+504 when the run exceeds 120 seconds, where the safe next step depends on the
+mode: a dry-run wrote nothing — no events, expectation, exclusion, or signed
+intent — so it is safe to retry, while an execute leaves the outcome unknown
+(the burn may be excluded, intended, or submitted), so the operator re-invokes
+the route for the same deposit to read the persisted stream and resume it from
+wherever it stopped. The burn routes hold the wallet lock across signing; no
+route pauses the poller.
 
 Every `burn-excess` route takes the network's RPC endpoint from the service's
 startup-verified chain configuration, never from a request-time environment

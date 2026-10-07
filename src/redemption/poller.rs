@@ -381,8 +381,8 @@ where
         Ok(lag_blocks)
     }
 
-    /// A held vault detects no redemptions until its burn-excess stream
-    /// excludes the funding Transfer or closes, so the on-call must see it,
+    /// A held vault's checkpoint stays before the held Transfer until its
+    /// burn-excess stream excludes it or closes, so the on-call must see it,
     /// but a hold is meant to last a whole Path B run: WARN when the held set
     /// changes and again every [`HELD_VAULT_WARN_INTERVAL`] while it lasts,
     /// DEBUG on the passes in between.
@@ -414,8 +414,9 @@ where
                 held_vault_count = held_vaults.len(),
                 held_vaults = ?held_vaults,
                 "Transfer poll pass left vaults held at expected burn-excess \
-                 funding transfers; redemptions on them wait until the stream \
-                 records its exclusion or is closed"
+                 funding transfers; their checkpoints stay before the held \
+                 Transfer until the stream records its exclusion or is closed, \
+                 and later Transfers on them are still detected"
             );
         } else if !held_vaults.is_empty() {
             debug!(
@@ -451,8 +452,10 @@ where
 
     /// Scans one vault from `cursor` (its start block, from [`Self::start_cursor`])
     /// up to `head`, processing each Transfer and advancing the vault's
-    /// checkpoint per chunk. A held expected-funding Transfer ends the scan
-    /// with the checkpoint just before its block and returns that block.
+    /// checkpoint per chunk. A held expected-funding Transfer stops the
+    /// checkpoint just before its block, and that block is returned; the
+    /// scan still processes every later Transfer, so redemptions on the vault
+    /// are detected while the hold lasts.
     async fn poll_vault(
         &self,
         assets: &[TokenizedAssetView],
@@ -481,15 +484,12 @@ where
             "Polling vault for transfer events"
         );
 
+        let mut held_at: Option<u64> = None;
         for (chunk_from, chunk_to) in
             block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
         {
-            // The hold stops the checkpoint at the first expected Transfer,
-            // so every log before it must be processed first; `eth_getLogs`
-            // does not promise an order.
-            let mut logs =
+            let logs =
                 self.fetch_transfer_logs(vault, chunk_from, chunk_to).await?;
-            logs.sort_by_key(|log| (log.block_number, log.log_index));
 
             trace!(
                 target: "redemption",
@@ -501,8 +501,14 @@ where
                 "Processed block range"
             );
 
+            // Later Transfers are processed too, not deferred behind the
+            // hold: a redemption that only waited would leave its shares in
+            // the issuer wallet, which keeps the burn-excess run from proving
+            // its exact balance and so from ever releasing the hold. Logs
+            // after the hold are read again on every pass until it clears;
+            // detection is idempotent, so a detected one is not redone.
+            let held_before_chunk = held_at.is_some();
             let mut dropped: Vec<(Option<TxHash>, Option<u64>)> = Vec::new();
-            let mut held_block = None;
             for log in &logs {
                 match self.process_log(assets, log).await? {
                     ProcessedLog::Handled => {}
@@ -510,22 +516,29 @@ where
                         dropped.push((tx_hash, log.block_number));
                     }
                     ProcessedLog::HeldExpectedFunding { block_number } => {
-                        held_block = Some(block_number);
-                        break;
+                        held_at =
+                            Some(held_at.map_or(block_number, |earlier| {
+                                earlier.min(block_number)
+                            }));
                     }
                 }
             }
 
-            // A held funding Transfer stops the checkpoint before its block,
-            // so it and every later Transfer on this vault are read again on
-            // each pass until its burn-excess stream excludes it (then it is
-            // skipped) or closes (then it is detected). Nothing is skipped
-            // in the meantime.
-            let processed_through =
-                held_block.map_or(Some(chunk_to), |block| block.checked_sub(1));
-            if let Some(block) = processed_through {
-                advance_transfer_poll(&self.pool, self.network, vault, block)
+            // Once held, the checkpoint stays before the held Transfer, so it
+            // is read again on each pass until its burn-excess stream excludes
+            // it (then it is skipped) or closes (then it is detected).
+            if !held_before_chunk {
+                let processed_through = held_at
+                    .map_or(Some(chunk_to), |block| block.checked_sub(1));
+                if let Some(block) = processed_through {
+                    advance_transfer_poll(
+                        &self.pool,
+                        self.network,
+                        vault,
+                        block,
+                    )
                     .await?;
+                }
             }
 
             // The advance above moved the cursor past these transfers, making
@@ -535,12 +548,14 @@ where
             // operator's only signal — emitted here, not after the loop, so a
             // transient error in a later chunk cannot swallow it. Any earlier
             // `?` abort leaves this chunk's checkpoint unadvanced, so its
-            // drops are re-detected on the next pass, as are drops in a held
-            // Transfer's block, which the advance did not pass.
+            // drops are re-detected on the next pass, as are drops at or after
+            // a held Transfer's block, which the checkpoint has not passed.
             let dropped_tx_hashes: Vec<Option<TxHash>> = dropped
                 .into_iter()
-                .filter(|(_, block)| match (held_block, block) {
-                    (Some(held_at), Some(block)) => *block < held_at,
+                .filter(|(_, dropped_block)| match (held_at, dropped_block) {
+                    (Some(held_block), Some(dropped_block)) => {
+                        *dropped_block < held_block
+                    }
                     // Not passed: the checkpoint stops before the hold.
                     (Some(_), None) => false,
                     (None, _) => true,
@@ -555,20 +570,19 @@ where
                     "Permanently skipped non-retryable transfer logs; these transfers will not be redeemed automatically"
                 );
             }
-
-            if let Some(block_number) = held_block {
-                debug!(
-                    target: "redemption",
-                    %vault,
-                    network = %self.network,
-                    block_number,
-                    "Holding vault at expected burn-excess funding transfer"
-                );
-                return Ok(Some(block_number));
-            }
         }
 
-        Ok(None)
+        if let Some(block_number) = held_at {
+            debug!(
+                target: "redemption",
+                %vault,
+                network = %self.network,
+                block_number,
+                "Holding vault at expected burn-excess funding transfer"
+            );
+        }
+
+        Ok(held_at)
     }
 
     /// Fetches Transfer logs for one vault where topic2 (to) == bot_wallet.
@@ -986,9 +1000,12 @@ mod tests {
 
     /// A live burn-excess stream expects its funding Transfer before it is
     /// broadcast. The pass that reads it must neither redeem it nor move the
-    /// checkpoint past it, so it and every later Transfer on the vault wait;
-    /// once the stream excludes it, the next pass skips it and redeems the
-    /// rest. Transfers before it are unaffected.
+    /// checkpoint past it, but a later AP redemption on the same vault must
+    /// still be detected: if it waited, its shares would sit in the issuer
+    /// wallet and the burn-excess run, which needs an exact balance, could
+    /// never record the exclusion that ends the hold. Re-reading it on the
+    /// next held pass detects nothing twice; once the stream excludes the
+    /// funding log, the checkpoint moves past both.
     #[traced_test]
     #[tokio::test]
     async fn poll_holds_the_vault_at_an_expected_funding_transfer() {
@@ -1059,8 +1076,8 @@ mod tests {
         assert!(redemption_exists(&setup, before_tx).await);
         assert!(!redemption_exists(&setup, funding_tx).await);
         assert!(
-            !redemption_exists(&setup, after_tx).await,
-            "Transfers after the held one wait for it"
+            redemption_exists(&setup, after_tx).await,
+            "a redemption after the held Transfer must not wait for the hold"
         );
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
@@ -1078,6 +1095,24 @@ mod tests {
                 &vault.to_string(),
             ]
         ));
+
+        // Still held: the next pass reads the held log and the detected one
+        // again, detects nothing twice, and leaves the checkpoint where it is.
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone(), after.clone()]);
+        setup.poller.poll_once().await.unwrap();
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149)
+        );
+        assert_eq!(
+            redemption_detected_count(&setup).await,
+            2,
+            "only the Transfers before and after the held one are detected, \
+             each once"
+        );
 
         let funding_log_id = FundingTransferId {
             network: Network::Base,
@@ -1112,74 +1147,6 @@ mod tests {
         );
         assert!(!redemption_exists(&setup, funding_tx).await);
         assert!(redemption_exists(&setup, after_tx).await);
-    }
-
-    /// `eth_getLogs` promises no order. A redemption from a block before the
-    /// held funding Transfer must still be detected when the RPC returns it
-    /// after the funding log; otherwise the checkpoint would stop past it and
-    /// skip it forever.
-    #[traced_test]
-    #[tokio::test]
-    async fn an_earlier_redemption_returned_after_the_held_log_is_detected() {
-        let vault = address!("0x7777777777777777777777777777777777777777");
-        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
-        let shares = U256::from(750_000_000_000_000_000u64);
-        let before_tx = b256!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        let funding_tx = b256!(
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
-        let before = create_transfer_log(
-            vault,
-            ap_wallet,
-            bot_wallet,
-            U256::from(1_000_000_000_000_000_000u64),
-            before_tx,
-            120,
-        );
-        let funding = create_transfer_log(
-            vault, ap_wallet, bot_wallet, shares, funding_tx, 150,
-        );
-
-        let asserter = Asserter::new();
-        asserter.push_success(&U256::from(200u64));
-        asserter.push_success(&vec![funding, before]);
-        let setup =
-            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
-                .await;
-        let bind = ExcessBurnBind {
-            issuer_request_id: IssuerMintRequestId::random(),
-            deposit_tx_hash: B256::random(),
-            receipt_id: U256::from(7u64),
-            shares,
-            original_recipient: ap_wallet,
-            vault,
-            network: Network::Base,
-            issuer_wallet: bot_wallet,
-        };
-        record_funding_expectation(&setup.pool, &bind, Utc::now())
-            .await
-            .unwrap();
-
-        setup.poller.poll_once().await.unwrap();
-
-        assert!(
-            redemption_exists(&setup, before_tx).await,
-            "the earlier redemption must be detected despite the RPC order"
-        );
-        assert!(!redemption_exists(&setup, funding_tx).await);
-        assert_eq!(
-            load_transfer_poll(&setup.pool, Network::Base, vault)
-                .await
-                .unwrap(),
-            Some(149)
-        );
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["Holding vault at expected burn-excess funding transfer", "150"]
-        ));
     }
 
     /// A hold lasts a whole Path B run, so repeated passes over the same held
@@ -1261,6 +1228,24 @@ mod tests {
             .await
             .unwrap()
             .is_some()
+    }
+
+    async fn redemption_detected_count<
+        P: alloy::providers::Provider + Clone,
+    >(
+        setup: &TestPollerSetup<P>,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND event_type = 'RedemptionEvent::Detected'
+            ",
+        )
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap()
     }
 
     /// Each per-network poller must scan only its OWN network's vaults: with
