@@ -1,14 +1,14 @@
-//! Durable SQL index of Path B funding Transfers a stream expects but has not
-//! yet proven and excluded.
+//! Durable SQL index of Path B funding Transfers a live stream expects.
 //!
 //! The live route runs with the redemption poller up, and the funding
 //! Transfer is mined before its hash can be proven, so the poller may read it
-//! first. While a stream is `AwaitingFunding`, the poller holds a Transfer
-//! matching its `(network, vault, from, to, amount)` instead of opening a
-//! Redemption for it. The index is a derived read model of `FundingExpected`
-//! events: the engine dual-writes it, [`FundingExpectationReactor`] keeps it
-//! current on live commits, and [`rebuild_funding_expectation_index`] resets
-//! it from the event store at service startup, before the pollers spawn.
+//! first. From `FundingExpected` until the stream completes or closes, the
+//! poller holds a Transfer matching its `(network, vault, from, to, amount)`
+//! instead of opening a Redemption for it, unless the stream has excluded that
+//! exact log. The index is a derived read model of the stream's events: the
+//! engine dual-writes it, [`FundingExpectationReactor`] keeps it current on
+//! live commits, and [`rebuild_funding_expectation_index`] resets it from the
+//! event store at service startup, before the pollers spawn.
 
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
@@ -149,10 +149,11 @@ pub(crate) enum FundingTransferStatus {
 }
 
 /// Classifies one Transfer log against the exclusion and expectation indexes
-/// in a single statement, so it reads both from one SQLite snapshot. The
-/// external route writes the exclusion and then clears the expectation; two
-/// separate reads could fall between those writes, see neither, and let the
-/// poller redeem the funding Transfer.
+/// in a single statement, so it reads both from one SQLite snapshot. A stream
+/// writes its exclusion while its expectation still stands and clears the
+/// expectation only once it completes or closes; two separate reads could
+/// fall around a clear, see neither, and let the poller redeem the funding
+/// Transfer.
 pub(crate) async fn classify_funding_transfer(
     pool: &Pool<Sqlite>,
     transfer: &FundingTransferId,
@@ -200,11 +201,11 @@ pub(crate) async fn classify_funding_transfer(
     })
 }
 
-/// Reset the index to exactly the streams whose latest event is
-/// `FundingExpected`, i.e. still `AwaitingFunding`.
+/// Reset the index to exactly the streams that recorded `FundingExpected` and
+/// have not completed or closed.
 ///
 /// Unlike the exclusion index, which only ever grows, an expectation must
-/// disappear once its stream moves on: a stale row would hold an unrelated
+/// disappear once its stream finishes: a stale row would hold an unrelated
 /// Transfer of the same shape. So this deletes and re-inserts in one
 /// transaction rather than only inserting.
 pub(crate) async fn rebuild_funding_expectation_index(
@@ -226,14 +227,16 @@ pub(crate) async fn rebuild_funding_expectation_index(
           AND expected.event_type = ?
           AND NOT EXISTS (
               SELECT 1
-              FROM events AS later
-              WHERE later.aggregate_type = expected.aggregate_type
-                AND later.aggregate_id = expected.aggregate_id
-                AND later.sequence > expected.sequence
+              FROM events AS finished
+              WHERE finished.aggregate_type = expected.aggregate_type
+                AND finished.aggregate_id = expected.aggregate_id
+                AND finished.event_type IN (?, ?)
           )
         ",
     )
     .bind(BurnExcessEvent::FUNDING_EXPECTED)
+    .bind(BurnExcessEvent::EXCESS_BURN_COMPLETED)
+    .bind(BurnExcessEvent::EXCESS_BURN_CLOSED)
     .fetch_all(&mut *transaction)
     .await?;
 
@@ -283,9 +286,9 @@ pub(crate) enum RebuildFundingExpectationError {
 deps!(FundingExpectationReactor, [BurnExcess]);
 
 /// Writes an expectation into the SQL index when a stream records it, and
-/// drops it when the stream closes. Clearing on `FundingExclusionRecorded` is
-/// [`super::exclusion::FundingExclusionReactor`]'s job, after it writes the
-/// exclusion, so the poller is never left with neither.
+/// drops it when the stream completes or closes. A stream that has excluded
+/// its funding log keeps the row until then, so other Transfers of the same
+/// shape stay held while its burn is pending.
 ///
 /// Live-only, like the exclusion reactor: service startup calls
 /// [`rebuild_funding_expectation_index`].
@@ -315,13 +318,13 @@ impl FundingExpectationReactor {
                     "Recorded funding expectation for admin recovery"
                 );
             }
-            BurnExcessEvent::ExcessBurnClosed { .. } => {
+            BurnExcessEvent::ExcessBurnCompleted { .. }
+            | BurnExcessEvent::ExcessBurnClosed { .. } => {
                 clear_funding_expectation(&self.pool, deposit_tx_hash).await?;
             }
             BurnExcessEvent::FundingExclusionRecorded { .. }
             | BurnExcessEvent::ExcessBurnIntended { .. }
-            | BurnExcessEvent::ExcessBurnSubmitted { .. }
-            | BurnExcessEvent::ExcessBurnCompleted { .. } => {}
+            | BurnExcessEvent::ExcessBurnSubmitted { .. } => {}
         }
         Ok(())
     }
@@ -472,11 +475,13 @@ mod tests {
         assert_eq!(classify(&pool).await, FundingTransferStatus::Excluded);
     }
 
-    /// The rebuild must restore a lost row for a stream still awaiting its
-    /// funding, and drop a stale row for a stream that moved on, which would
-    /// otherwise hold an unrelated Transfer of the same shape forever.
+    /// The rebuild must restore a lost row for every stream whose burn is
+    /// still pending, including one that has excluded its funding log (it
+    /// still holds same-shape Transfers), and drop a stale row for a stream
+    /// that closed, which would otherwise hold an unrelated Transfer of the
+    /// same shape forever.
     #[tokio::test]
-    async fn rebuild_keeps_only_streams_still_awaiting_funding() {
+    async fn rebuild_keeps_only_streams_that_have_not_finished() {
         let pool = pool().await;
         let store = StoreBuilder::<BurnExcess>::new(pool.clone())
             .build(())
@@ -488,7 +493,11 @@ mod tests {
             original_recipient: Address::random(),
             ..bind(B256::random())
         };
-        for stream in [&awaiting, &excluded] {
+        let closed = ExcessBurnBind {
+            original_recipient: Address::random(),
+            ..bind(B256::random())
+        };
+        for stream in [&awaiting, &excluded, &closed] {
             store
                 .send(
                     &BurnExcessId::new(stream.deposit_tx_hash),
@@ -523,13 +532,23 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .send(
+                &BurnExcessId::new(closed.deposit_tx_hash),
+                BurnExcessCommand::CloseExcessBurn {
+                    reason: "funding never sent".into(),
+                },
+            )
+            .await
+            .unwrap();
 
-        // The store above runs no reactors: the awaiting stream's row is
-        // missing, and a stale row is left for the excluded one.
-        record_funding_expectation(&pool, &excluded, Utc::now()).await.unwrap();
+        // The store above runs no reactors: the pending streams' rows are
+        // missing, and a stale row is left for the closed one.
+        record_funding_expectation(&pool, &closed, Utc::now()).await.unwrap();
 
-        assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 1);
+        assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 2);
         assert!(expects(&pool, &awaiting).await);
-        assert!(!expects(&pool, &excluded).await);
+        assert!(expects(&pool, &excluded).await);
+        assert!(!expects(&pool, &closed).await);
     }
 }

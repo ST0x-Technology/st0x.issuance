@@ -103,7 +103,9 @@ impl std::str::FromStr for BurnExcessId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum BurnExcess {
     /// Path B, live route: the funding Transfer is expected but not yet
-    /// proven; the poller holds a matching log until the exclusion lands.
+    /// proven; the poller holds a matching log. The hold on Transfers of that
+    /// shape outlives this state until the stream completes or closes, while
+    /// the funding log itself is skipped once excluded.
     AwaitingFunding {
         bind: ExcessBurnBind,
         reason: String,

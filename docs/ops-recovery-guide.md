@@ -152,14 +152,10 @@ infers it:
   redemption is keyed by it). If none was detected, stop the issuer service and
   finish with the offline CLI below; if one was, burn-excess refuses that
   transfer (`FundingAlreadyRedeemedTx`) and the redemption it opened is the
-  incident to handle, not something to retry through burn-excess. The
-  expectation matches by network, vault, sender, recipient, and amount, not by
-  transaction hash or time. It therefore holds both the funding Transfer and any
-  genuine redemption from the original recipient for exactly the excess amount,
-  including one mined before `expect-funding` but not yet scanned. The AP must
-  not send such a redemption until `external` completes. Later Transfers that do
-  not match this shape are still processed, but the vault's poll checkpoint
-  stays before the held transfer (the bot logs a
+  incident to handle, not something to retry through burn-excess. While the
+  expectation is open, only transfers matching it (same sender, amount, and
+  vault) are held; other redemptions on that vault are still processed, but the
+  vault's poll checkpoint stays before the held transfer (the bot logs a
   `held at expected burn-excess
   funding transfers` WARN when a hold starts or
   changes and every five minutes while it lasts), so finish the run promptly. If
@@ -170,16 +166,19 @@ infers it:
   normally; if its shares reach the issuer wallet before `external` runs,
   `external` refuses until that redemption's burn lands: with
   `IssuerShareBalanceNotExact` before the burn is signed, then with
-  `UnresolvedSignerIntent` (409) while it is in flight. Retry once it lands.
-  `expect-funding` refuses (409) while another burn-excess recovery is
-  unresolved, and while another recovery's expectation is open on the same
-  vault: only one expectation per vault can be open at a time, because the
-  issuer wallet must hold exactly one stream's funding. Finish or close that one
-  first, and send each funding transfer only after its own `expect-funding`
-  succeeded. It refuses (422) a deposit whose original recipient is the issuer
-  wallet: use `internal` for that one. If the shares will not be sent,
-  `expect-funding --close --execute` releases the hold. Use it only when no
-  matching Transfer arrived; otherwise escalate.
+  `UnresolvedSignerIntent` (409) while it is in flight. Retry once it lands. A
+  genuine redemption that happens to match the expectation (the same sender
+  sending exactly the excess amount) is held with the funding transfer;
+  `external` counts its shares toward the expected balance, and once the burn
+  completes it is redeemed as usual. `expect-funding` refuses (409) while
+  another burn-excess recovery is unresolved, and while another recovery's
+  expectation is open on the same vault: only one expectation per vault can be
+  open at a time, because the issuer wallet must hold exactly one stream's
+  funding. Finish or close that one first, and send each funding transfer only
+  after its own `expect-funding` succeeded. It refuses (422) a deposit whose
+  original recipient is the issuer wallet: use `internal` for that one. If the
+  shares will not be sent, `expect-funding --close --execute` releases the hold;
+  a transfer that did arrive is then redeemed as usual.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's

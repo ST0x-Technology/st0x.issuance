@@ -7,7 +7,8 @@
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{Filter, Log, TransactionReceipt};
+use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use event_sorcery::{Store, StoreBuilder};
 use serde::Serialize;
@@ -38,11 +39,13 @@ use super::{
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::{IssuerMintRequestId, Mint, has_unresolved_signer_intent};
+use crate::poll_checkpoint::{CheckpointError, load_transfer_poll};
 use crate::receipt_inventory::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
     load_inventory, send_receipt_inventory_command,
 };
 use crate::redemption::IssuerRedemptionRequestId;
+use crate::redemption::poller::{BLOCK_CHUNK_SIZE, block_ranges};
 use crate::tokenized_asset::view::find_vault;
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
@@ -252,6 +255,9 @@ pub(crate) enum BurnExcessEngineError {
     RebuildFundingExclusion(
         #[from] super::exclusion::RebuildFundingExclusionError,
     ),
+
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
 }
 
 impl From<event_sorcery::SendError<BurnExcess>> for BurnExcessEngineError {
@@ -339,7 +345,7 @@ pub(crate) async fn run_burn_excess<P: Provider>(
     match path_resolution {
         PathResolution::ReportOnly(path) => {
             if request.execute {
-                release_moved_on_expectation(pool, state.as_ref()).await?;
+                release_terminal_expectation(pool, state.as_ref()).await?;
             }
             Ok(BurnExcessOutcome::Terminal(terminal_view(path, state.as_ref())))
         }
@@ -423,56 +429,57 @@ pub(crate) async fn run_burn_excess<P: Provider>(
             )
             .await?;
 
+            // The expectation held same-shape Transfers through the burn; a
+            // completed stream releases them to the redemption flow.
+            let finished = store.load(&aggregate_id).await?;
+            release_terminal_expectation(pool, finished.as_ref()).await?;
+
             Ok(BurnExcessOutcome::Plan(Box::new(view)))
         }
     }
 }
 
-/// Drops the funding expectation of a stream that is past `AwaitingFunding`,
-/// where it can only be stale: left by a clear that failed after the close or
-/// the exclusion, or put back by a retried `expect-funding` that raced them.
-/// A closed stream releases its hold by definition; any other stream only once
+/// Drops the funding expectation of a terminal stream. A live Path B stream
+/// keeps its expectation through the burn so other Transfers of the same shape
+/// stay held (see `require_issuer_share_balance`); once the stream completes
+/// or closes there is nothing left to hold. Also heals a row left by a clear
+/// that failed, or put back by a retried `expect-funding` that raced the run.
+/// A closed stream releases its hold by definition; a completed one only once
 /// its exclusion row is in, so the funding log always has one guard.
-async fn release_moved_on_expectation(
+async fn release_terminal_expectation(
     pool: &Pool<Sqlite>,
     state: Option<&BurnExcess>,
 ) -> Result<(), BurnExcessEngineError> {
     let releasable = match state {
         Some(BurnExcess::Closed { bind, .. }) => Some(bind),
-        Some(
-            moved_on @ (BurnExcess::FundingExcluded { bind, .. }
-            | BurnExcess::Intended { bind, .. }
-            | BurnExcess::Submitted { bind, .. }
-            | BurnExcess::Completed { bind, .. }),
-        ) => match moved_on.funding_log_id() {
-            Some(funding)
-                if is_excluded_funding_log(
-                    pool,
-                    funding.network,
-                    funding.vault,
-                    funding.tx_hash,
-                    funding.log_index,
-                )
-                .await? =>
-            {
-                Some(bind)
-            }
-            _ => None,
-        },
-        Some(BurnExcess::AwaitingFunding { .. }) | None => None,
+        Some(BurnExcess::Completed {
+            bind,
+            funding_log_id: Some(funding),
+            ..
+        }) if is_excluded_funding_log(
+            pool,
+            funding.network,
+            funding.vault,
+            funding.tx_hash,
+            funding.log_index,
+        )
+        .await? =>
+        {
+            Some(bind)
+        }
+        _ => None,
     };
 
-    if let (Some(bind), Some(moved_on)) = (releasable, state)
+    if let (Some(bind), Some(terminal)) = (releasable, state)
         && clear_funding_expectation(pool, bind.deposit_tx_hash).await?
     {
         info!(
             target: "burn_excess",
             deposit_tx_hash = %bind.deposit_tx_hash,
             vault = %bind.vault,
-            state = moved_on.state_name(),
-            "Released a stale funding expectation of a stream past \
-             AwaitingFunding; a Transfer it held is now detected as an \
-             ordinary redemption unless excluded"
+            state = terminal.state_name(),
+            "Released the funding expectation of a terminal stream; Transfers \
+             it held are now detected as ordinary redemptions unless excluded"
         );
     }
     Ok(())
@@ -601,7 +608,7 @@ async fn prove_plan<P: Provider>(
                 let balance = vault_service
                     .get_share_balance(listed_vault, issuer_wallet)
                     .await?;
-                require_exact_issuer_share_balance(balance, request.shares)?;
+                require_exact_issuer_share_balance(balance, request.shares, 0)?;
                 let note = match state {
                     Some(
                         BurnExcess::Intended { .. }
@@ -623,10 +630,14 @@ async fn prove_plan<P: Provider>(
                     .funding_tx_hash
                     .ok_or(BurnExcessProofError::FundingTxHashRequired)?;
                 require_funding_hash_match(funding_hash_arg, funding_log_id)?;
-                let balance = vault_service
-                    .get_share_balance(listed_vault, issuer_wallet)
-                    .await?;
-                require_exact_issuer_share_balance(balance, request.shares)?;
+                require_issuer_share_balance(
+                    pool,
+                    provider,
+                    vault_service,
+                    &bind,
+                    Some(funding_log_id),
+                )
+                .await?;
                 (
                     Some(funding_log_id.clone()),
                     Some(*excluded_at),
@@ -650,10 +661,14 @@ async fn prove_plan<P: Provider>(
                     .funding_tx_hash
                     .ok_or(BurnExcessProofError::FundingTxHashRequired)?;
                 require_funding_hash_match(funding_hash_arg, funding_log_id)?;
-                let balance = vault_service
-                    .get_share_balance(listed_vault, issuer_wallet)
-                    .await?;
-                require_exact_issuer_share_balance(balance, request.shares)?;
+                require_issuer_share_balance(
+                    pool,
+                    provider,
+                    vault_service,
+                    &bind,
+                    Some(funding_log_id),
+                )
+                .await?;
                 (
                     Some(funding_log_id.clone()),
                     None,
@@ -677,10 +692,14 @@ async fn prove_plan<P: Provider>(
                     },
                 )
                 .await?;
-                let balance = vault_service
-                    .get_share_balance(listed_vault, issuer_wallet)
-                    .await?;
-                require_exact_issuer_share_balance(balance, request.shares)?;
+                require_issuer_share_balance(
+                    pool,
+                    provider,
+                    vault_service,
+                    &bind,
+                    Some(&funding_log_id),
+                )
+                .await?;
                 (Some(funding_log_id), None, None)
             }
         };
@@ -945,13 +964,14 @@ async fn expect_funding<P: Provider>(
     record_funding_expectation(pool, &bind, expected_at).await?;
 
     // A retried request sends a no-op command, so `external` or `--close`
-    // may have moved the stream on and cleared its expectation before the
-    // write above put it back. Re-read the stream after the write: if it is
-    // past `AwaitingFunding`, release the row (safely, see
-    // `release_moved_on_expectation`) and report the stream as it is.
+    // may have moved the stream on, and a terminal stream cleared its
+    // expectation, before the write above put it back. Re-read the stream
+    // after the write: past `AwaitingFunding`, the row is the stream's own
+    // until it completes or closes, so release it only then (see
+    // `release_terminal_expectation`) and report the stream as it is.
     let current = store.load(&aggregate_id).await?;
     if !matches!(current, Some(BurnExcess::AwaitingFunding { .. })) {
-        release_moved_on_expectation(pool, current.as_ref()).await?;
+        release_terminal_expectation(pool, current.as_ref()).await?;
         return Ok(BurnExcessOutcome::Terminal(terminal_view(
             BurnExcessPath::External,
             current.as_ref(),
@@ -1307,10 +1327,6 @@ async fn record_exclusion(
         });
     }
 
-    // Only once the exclusion is durable: the poller must never see the
-    // funding Transfer with neither an exclusion nor an expectation.
-    clear_funding_expectation(pool, aggregate_id.deposit_tx_hash()).await?;
-
     info!(
         target: "burn_excess",
         deposit = %aggregate_id,
@@ -1372,10 +1388,6 @@ async fn ensure_path_b_exclusion_indexed(
     )
     .await?
     {
-        // The exclusion is durable, so the stream's expectation can go: a
-        // clear that failed after the exclusion event would otherwise keep
-        // holding later Transfers of the same shape until a restart.
-        clear_funding_expectation(pool, plan.bind.deposit_tx_hash).await?;
         return Ok(());
     }
     Err(BurnExcessEngineError::FundingExclusionIndexMissing {
@@ -1392,9 +1404,11 @@ async fn ensure_path_b_exclusion_indexed(
 /// `prepare_burn_tx` signs and fixes a nonce. The deposit proof and the funding
 /// Transfer are mined history and cannot change, so only balances are re-read.
 async fn require_issuer_balances<P: Provider>(
+    pool: &Pool<Sqlite>,
     provider: &P,
     vault_service: &dyn VaultService,
     bind: &ExcessBurnBind,
+    funding: Option<&FundingTransferId>,
 ) -> Result<(), BurnExcessEngineError> {
     let receipt_contract =
         receipt_contract_address(provider, bind.vault).await?;
@@ -1411,11 +1425,145 @@ async fn require_issuer_balances<P: Provider>(
         bind.shares,
     )?;
 
-    let share_balance =
-        vault_service.get_share_balance(bind.vault, bind.issuer_wallet).await?;
-    require_exact_issuer_share_balance(share_balance, bind.shares)?;
+    require_issuer_share_balance(pool, provider, vault_service, bind, funding)
+        .await
+}
 
+/// The issuer must hold exactly the excess, plus the shares of the other
+/// Transfers this stream's open funding expectation holds with `funding`.
+/// The expectation matches by shape, so a genuine AP redemption of exactly the
+/// excess from the original recipient is held with the funding Transfer until
+/// the stream completes; its shares are in the wallet and will be redeemed
+/// then, so they are counted. Any other surplus still refuses.
+async fn require_issuer_share_balance<P: Provider>(
+    pool: &Pool<Sqlite>,
+    provider: &P,
+    vault_service: &dyn VaultService,
+    bind: &ExcessBurnBind,
+    funding: Option<&FundingTransferId>,
+) -> Result<(), BurnExcessEngineError> {
+    let balance =
+        vault_service.get_share_balance(bind.vault, bind.issuer_wallet).await?;
+    if balance == bind.shares {
+        return Ok(());
+    }
+
+    let held = held_same_shape_transfers(pool, provider, bind, funding).await?;
+    require_exact_issuer_share_balance(balance, bind.shares, held.len())?;
+
+    let held_tx_hashes: Vec<B256> =
+        held.iter().map(|transfer| transfer.tx_hash).collect();
+    info!(
+        target: "burn_excess",
+        deposit_tx_hash = %bind.deposit_tx_hash,
+        vault = %bind.vault,
+        held_transfers = held.len(),
+        held_tx_hashes = ?held_tx_hashes,
+        %balance,
+        "Counted same-shape Transfers held with the funding Transfer toward \
+         the issuer share balance; they are redeemed once the stream completes"
+    );
     Ok(())
+}
+
+/// Transfers the open funding expectation of `bind`'s shape holds besides
+/// `funding`: on the vault, from the original recipient to the issuer wallet,
+/// of exactly the excess amount, past the vault's poll checkpoint (the poller
+/// stops it before the first held Transfer, so every held one is past it),
+/// neither excluded nor already a `Redemption`. With no such expectation (the
+/// offline CLI, Path A) the poller holds nothing, and with no checkpoint it
+/// has not read the vault yet; either way none are counted.
+async fn held_same_shape_transfers<P: Provider>(
+    pool: &Pool<Sqlite>,
+    provider: &P,
+    bind: &ExcessBurnBind,
+    funding: Option<&FundingTransferId>,
+) -> Result<Vec<FundingTransferId>, BurnExcessEngineError> {
+    if !is_expected_funding(
+        pool,
+        bind.network,
+        bind.vault,
+        bind.original_recipient,
+        bind.issuer_wallet,
+        bind.shares,
+    )
+    .await?
+    {
+        return Ok(Vec::new());
+    }
+    let Some(from_block) = load_transfer_poll(pool, bind.network, bind.vault)
+        .await?
+        .and_then(|checkpoint| checkpoint.checked_add(1))
+    else {
+        return Ok(Vec::new());
+    };
+    let head_block = provider.get_block_number().await?;
+    if from_block > head_block {
+        return Ok(Vec::new());
+    }
+
+    let mut held_transfers = Vec::new();
+    for (chunk_from, chunk_to) in
+        block_ranges(from_block, head_block, BLOCK_CHUNK_SIZE)
+    {
+        let filter = Filter::new()
+            .address(bind.vault)
+            .event_signature(
+                OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
+            )
+            .topic1(bind.original_recipient.into_word())
+            .topic2(bind.issuer_wallet.into_word())
+            .from_block(chunk_from)
+            .to_block(chunk_to);
+        for log in provider.get_logs(&filter).await? {
+            let Some(transfer) = same_shape_transfer(bind, &log) else {
+                continue;
+            };
+            let is_funding = funding.is_some_and(|funding| {
+                funding.tx_hash == transfer.tx_hash
+                    && funding.log_index == transfer.log_index
+            });
+            if is_funding
+                || is_excluded_funding_log(
+                    pool,
+                    transfer.network,
+                    transfer.vault,
+                    transfer.tx_hash,
+                    transfer.log_index,
+                )
+                .await?
+                || redemption_exists_for_tx(pool, transfer.tx_hash).await?
+            {
+                continue;
+            }
+            held_transfers.push(transfer);
+        }
+    }
+    Ok(held_transfers)
+}
+
+/// The log as a Transfer of exactly `bind`'s funding shape, or `None` when it
+/// is not one or lacks the identity the poller holds it by.
+fn same_shape_transfer(
+    bind: &ExcessBurnBind,
+    log: &Log,
+) -> Option<FundingTransferId> {
+    let decoded =
+        log.log_decode::<OffchainAssetReceiptVault::Transfer>().ok()?;
+    let data = decoded.data();
+    let same_shape = log.address() == bind.vault
+        && data.from == bind.original_recipient
+        && data.to == bind.issuer_wallet
+        && data.value == bind.shares;
+    same_shape.then_some(FundingTransferId {
+        network: bind.network,
+        vault: bind.vault,
+        tx_hash: log.transaction_hash?,
+        log_index: log.log_index?,
+        from: data.from,
+        to: data.to,
+        amount: data.value,
+    })
 }
 
 async fn intend_submit_confirm<P: Provider>(
@@ -1435,8 +1583,14 @@ async fn intend_submit_confirm<P: Provider>(
         ctx.request.deposit_tx_hash,
     )
     .await?;
-    require_issuer_balances(ctx.provider, ctx.vault_service, &ctx.plan.bind)
-        .await?;
+    require_issuer_balances(
+        ctx.pool,
+        ctx.provider,
+        ctx.vault_service,
+        &ctx.plan.bind,
+        ctx.plan.funding_log_id.as_ref(),
+    )
+    .await?;
     if ctx.plan.path == BurnExcessPath::External {
         ensure_path_b_exclusion_indexed(ctx.pool, ctx.plan).await?;
     }
@@ -3128,6 +3282,163 @@ mod tests {
         );
     }
 
+    /// The expectation matches by shape, so a genuine AP redemption of exactly
+    /// the excess from the original recipient is held with the funding
+    /// Transfer, and both sets of shares sit in the issuer wallet. `external`
+    /// must count the held redemption's shares instead of refusing for a
+    /// balance that is not exactly the excess, which left only `--close`
+    /// (redeeming the funding Transfer through Alpaca). Once the burn
+    /// completes, the held redemption is detected as an ordinary one and the
+    /// funding Transfer never is.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_same_shape_redemption_held_with_the_funding_is_counted() {
+        let pool = pool().await;
+        let (evm, service, provider, _) = prepared_evm().await;
+        let ExternalDeposit {
+            issuer_request_id,
+            receipt_id,
+            deposit_tx,
+            recipient,
+        } = setup_external_deposit(&pool, &evm).await;
+        let recipient_address = recipient.address();
+        link_ap_wallet(&pool, recipient_address).await;
+
+        // A second deposit gives the recipient another excess amount, so it
+        // can redeem exactly that much on its own account.
+        let shares = excess_shares();
+        let issuer_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&evm.private_key).unwrap(),
+            ))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let vault_issuer =
+            OffchainAssetReceiptVault::new(evm.vault_address, &issuer_provider);
+        let deposit_call = vault_issuer
+            .deposit(
+                shares,
+                evm.wallet_address,
+                U256::from(10).pow(U256::from(18)),
+                sample_receipt_info(IssuerMintRequestId::random())
+                    .encode()
+                    .unwrap(),
+            )
+            .calldata()
+            .clone();
+        let transfer_call =
+            vault_issuer.transfer(recipient_address, shares).calldata().clone();
+        vault_issuer
+            .multicall(vec![deposit_call, transfer_call])
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let live = |mode, funding_tx_hash| BurnExcessRequest {
+            poller_guard: PollerGuard::FundingExpected,
+            ..request(
+                mode,
+                issuer_request_id.clone(),
+                deposit_tx,
+                receipt_id,
+                funding_tx_hash,
+                true,
+            )
+        };
+        run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            live(BurnExcessMode::ExpectFunding, None),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        let recipient_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(recipient.clone()))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let (funding_tx, _) = send_external_funding(&evm, recipient).await;
+        let redemption_tx = OffchainAssetReceiptVault::new(
+            evm.vault_address,
+            &recipient_provider,
+        )
+        .transfer(evm.wallet_address, shares)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap()
+        .transaction_hash;
+
+        let poller = transfer_poller_for_tests(
+            Network::Base,
+            provider.clone(),
+            evm.wallet_address,
+            0,
+            pool.clone(),
+        )
+        .await;
+        poller.poll_once().await.unwrap();
+        assert!(
+            redemption_aggregate_ids(&pool).await.is_empty(),
+            "both Transfers match the expectation, so both are held"
+        );
+
+        run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            live(BurnExcessMode::External, Some(funding_tx)),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        let store = burn_excess_store(pool.clone()).await.unwrap();
+        assert!(matches!(
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap().unwrap(),
+            BurnExcess::Completed { path: BurnExcessPath::External, .. }
+        ));
+        let deposit_key = deposit_tx.to_string();
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains(" INFO ")
+                        && line.contains(
+                            "Counted same-shape Transfers held with the \
+                             funding Transfer",
+                        )
+                        && line.contains(&deposit_key)
+                        && line.contains("held_transfers=1")
+                })
+                .then_some(())
+                .ok_or_else(|| "no INFO counting the held redemption".into())
+        });
+
+        poller.poll_once().await.unwrap();
+        assert_eq!(
+            redemption_aggregate_ids(&pool).await,
+            vec![IssuerRedemptionRequestId::new(redemption_tx).to_string()],
+            "only the held redemption opens once the stream completes"
+        );
+        let head = provider.get_block_number().await.unwrap();
+        assert_eq!(
+            load_transfer_poll(&pool, Network::Base, evm.vault_address)
+                .await
+                .unwrap(),
+            Some(head)
+        );
+    }
+
     async fn redemption_aggregate_ids(pool: &Pool<Sqlite>) -> Vec<String> {
         sqlx::query_scalar(
             "
@@ -4171,19 +4482,19 @@ mod tests {
         );
     }
 
-    /// A retried `expect-funding` can put the expectation back after the
-    /// stream moved past `AwaitingFunding`. Releasing that row must never
-    /// leave the funding log unguarded: a stream that excluded its funding
-    /// log drops the row only once the exclusion row is in.
+    /// A Path B stream keeps its expectation until it completes or closes, so
+    /// other Transfers of the same shape stay held while its burn is pending.
+    /// A completed stream releases it only once its exclusion row is in, so
+    /// the funding log always has one guard.
     #[tokio::test]
-    async fn a_moved_on_stream_releases_its_expectation_only_once_excluded() {
+    async fn only_a_terminal_stream_releases_its_expectation() {
         let pool = pool().await;
         let issuer_request_id = IssuerMintRequestId::random();
         let deposit_tx = B256::random();
         let store =
             seed_funding_excluded(&pool, &issuer_request_id, deposit_tx).await;
         let bind = test_bind(&issuer_request_id, deposit_tx);
-        let state = store.load(&BurnExcessId::new(deposit_tx)).await.unwrap();
+        let funding = test_funding_log(&bind);
         let expected = || {
             is_expected_funding(
                 &pool,
@@ -4194,23 +4505,39 @@ mod tests {
                 bind.shares,
             )
         };
+        record_funding_expectation(&pool, &bind, Utc::now()).await.unwrap();
 
+        let excluded =
+            store.load(&BurnExcessId::new(deposit_tx)).await.unwrap();
+        release_terminal_expectation(&pool, excluded.as_ref()).await.unwrap();
+        assert!(
+            expected().await.unwrap(),
+            "a stream whose burn is pending must keep holding same-shape \
+             Transfers"
+        );
+
+        let completed = BurnExcess::Completed {
+            bind: bind.clone(),
+            path: BurnExcessPath::External,
+            funding_log_id: Some(funding.clone()),
+            burn_tx_hash: B256::random(),
+            block_number: 1,
+            completed_at: Utc::now(),
+        };
         sqlx::query("DELETE FROM burn_excess_funding_exclusions")
             .execute(&pool)
             .await
             .unwrap();
-        record_funding_expectation(&pool, &bind, Utc::now()).await.unwrap();
-        release_moved_on_expectation(&pool, state.as_ref()).await.unwrap();
+        release_terminal_expectation(&pool, Some(&completed)).await.unwrap();
         assert!(
             expected().await.unwrap(),
             "without its exclusion row the expectation is the only guard"
         );
 
-        let funding = test_funding_log(&bind);
         record_funding_exclusion(&pool, &funding, deposit_tx, Utc::now())
             .await
             .unwrap();
-        release_moved_on_expectation(&pool, state.as_ref()).await.unwrap();
+        release_terminal_expectation(&pool, Some(&completed)).await.unwrap();
         assert!(!expected().await.unwrap());
     }
 
@@ -4658,8 +4985,8 @@ mod tests {
                 .any(|line| {
                     line.contains(" INFO ")
                         && line.contains(
-                            "Released a stale funding expectation of a \
-                             stream past AwaitingFunding",
+                            "Released the funding expectation of a terminal \
+                             stream",
                         )
                         && line.contains(&deposit_key)
                         && line.contains("Closed")

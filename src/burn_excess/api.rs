@@ -5,7 +5,8 @@
 //! shares that arrived through a funding Transfer the live poller would
 //! otherwise read as an AP redemption, so it runs in two steps: `expect-funding`
 //! records the Transfer the stream expects before the operator broadcasts it,
-//! and the poller holds a matching log until `external` excludes it. Both burn
+//! and the poller holds a matching log until `external` excludes it (and any
+//! other log of that shape until the burn completes). Both burn
 //! routes sign through the running service's vault service, so the burn shares
 //! the wallet lock and nonce manager every live mint and redemption burn uses,
 //! and both self-gate on wallet quiescence under that lock (an unresolved

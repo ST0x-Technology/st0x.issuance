@@ -103,10 +103,15 @@ pub(crate) enum BurnExcessProofError {
 
     #[error(
         "issuer share balance {balance} is not exactly the excess amount \
-         {amount}; move exact excess to the issuer, or use \
-         `burn-excess external --funding-tx-hash …` after funding"
+         {amount} plus {held_transfers} held Transfer(s) of that amount; move \
+         exact excess to the issuer, or use `burn-excess external \
+         --funding-tx-hash …` after funding"
     )]
-    IssuerShareBalanceNotExact { balance: U256, amount: U256 },
+    IssuerShareBalanceNotExact {
+        balance: U256,
+        amount: U256,
+        held_transfers: usize,
+    },
 
     #[error(
         "issuer receipt balance {balance} for receipt {receipt_id} is below \
@@ -279,17 +284,25 @@ pub(crate) fn require_funding_hash_match(
     }
 }
 
-/// Path A / Path B share balance gate: issuer must hold exactly `amount`.
+/// Path A / Path B share balance gate: issuer must hold exactly `amount`, plus
+/// `amount` again for each of `held_transfers`, the other Transfers of that
+/// exact amount a live Path B stream's open funding expectation holds with its
+/// funding log.
 pub(crate) fn require_exact_issuer_share_balance(
     balance: U256,
     amount: U256,
+    held_transfers: usize,
 ) -> Result<(), BurnExcessProofError> {
-    if balance == amount {
+    let expected = held_transfers
+        .checked_add(1)
+        .and_then(|count| amount.checked_mul(U256::from(count)));
+    if expected == Some(balance) {
         Ok(())
     } else {
         Err(BurnExcessProofError::IssuerShareBalanceNotExact {
             balance,
             amount,
+            held_transfers,
         })
     }
 }
@@ -617,12 +630,45 @@ mod tests {
     #[test]
     fn exact_share_balance_gate() {
         let amount = U256::from(750_000_000_000_000_000u64);
-        require_exact_issuer_share_balance(amount, amount).unwrap();
-        let err = require_exact_issuer_share_balance(U256::from(1u64), amount)
-            .unwrap_err();
+        require_exact_issuer_share_balance(amount, amount, 0).unwrap();
+        let err =
+            require_exact_issuer_share_balance(U256::from(1u64), amount, 0)
+                .unwrap_err();
         assert!(matches!(
             err,
             BurnExcessProofError::IssuerShareBalanceNotExact { .. }
+        ));
+    }
+
+    /// Each held same-shape Transfer adds exactly one more excess amount: the
+    /// gate must neither ignore it nor accept any other surplus.
+    #[test]
+    fn share_balance_gate_counts_held_transfers_exactly() {
+        let amount = U256::from(750_000_000_000_000_000u64);
+        require_exact_issuer_share_balance(
+            amount * U256::from(3u64),
+            amount,
+            2,
+        )
+        .unwrap();
+        for (balance, held) in [
+            (amount * U256::from(2u64), 0),
+            (amount * U256::from(2u64), 2),
+            (amount * U256::from(2u64) + U256::from(1u64), 1),
+        ] {
+            assert!(
+                matches!(
+                    require_exact_issuer_share_balance(balance, amount, held),
+                    Err(
+                        BurnExcessProofError::IssuerShareBalanceNotExact { .. }
+                    )
+                ),
+                "balance {balance} with {held} held must refuse"
+            );
+        }
+        assert!(matches!(
+            require_exact_issuer_share_balance(U256::MAX, U256::MAX, 1),
+            Err(BurnExcessProofError::IssuerShareBalanceNotExact { .. })
         ));
     }
 

@@ -1611,8 +1611,9 @@ pause conflicting producers as needed.
 
 **Exact issuer share balance.** After path-specific funding (Path B) or
 immediately (Path A), issuer ERC-20 share balance must **exactly** equal the
-excess amount. Any extra shares at the issuer refuse
-(`IssuerShareBalanceNotExact`).
+excess amount, plus, for a live Path B stream, the shares of the other Transfers
+its open funding expectation holds (see "Same-shape Transfers" below). Any other
+extra shares at the issuer refuse (`IssuerShareBalanceNotExact`).
 
 **Path A recipient gate.** `internal` refuses when the deposit's original share
 recipient is not the issuer wallet (`InternalRequiresIssuerAsRecipient`); ops
@@ -1635,14 +1636,13 @@ funding Transfer. If a `Redemption` already exists for that funding tx → refus
 Transfer logs without `log_index` fail closed (`MissingLogIndex`) so Detect
 cannot open a redemption for an unidentifiable excluded funding log.
 
-**Dead intent / Closed.** `--close` clears the wallet nonce gate, and for an
-`AwaitingFunding` stream also the funding expectation (see below). `Closed` is
-report-only terminal for that deposit stream (no re-intend on the same
-`deposit_tx_hash`), except that an executed re-run of a terminal stream drops a
-funding expectation that outlived it (a clear that failed after the close or the
-exclusion): always for `Closed`, and for `Completed` only once its exclusion row
-is confirmed. Reverted/ProvablyDead on resume surfaces `DeadBurnIntent` with
-that guidance.
+**Dead intent / Closed.** `--close` clears the wallet nonce gate and the
+stream's funding expectation (see below). `Closed` is report-only terminal for
+that deposit stream (no re-intend on the same `deposit_tx_hash`), except that an
+executed re-run of a terminal stream drops a funding expectation that outlived
+it (a clear that failed after the close or the completion): always for `Closed`,
+and for `Completed` only once its exclusion row is confirmed.
+Reverted/ProvablyDead on resume surfaces `DeadBurnIntent` with that guidance.
 
 **Post-burn inventory.** After on-chain verify the stream completes, then
 inventory is reconciled. Reconcile failure fails the CLI (non-zero) even though
@@ -1703,45 +1703,56 @@ the ordinary Alpaca path. Two operator sequences prevent that:
   written, dry run included: its excess is already there and burns through
   `internal`. A Transfer matching an open expectation and not yet excluded is
   held: it is not detected, and the poller stops that vault's checkpoint before
-  its block. Matching is by
-  `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`,
-  not by transaction hash or time. Therefore a genuine redemption from the
-  original recipient for exactly the excess amount is also held while the
-  expectation is open, even if it was mined before `expect-funding` but had not
-  yet been scanned. The AP must not send such a redemption until `external`
-  completes. Transfers that do not match this shape, later ones included, are
-  still detected. While the hold lasts each pass re-reads only the held block
-  and blocks no pass has read yet, tracked in memory; after a restart, or once
-  the hold clears, the vault is rescanned once from its checkpoint (detection is
-  idempotent per tx hash). A same-shape redemption would deadlock recovery: its
-  shares stay in the issuer wallet, so `external` sees twice the excess and
-  cannot record the exclusion that releases either hold. If that happens,
-  escalate; do not close the expectation, because closing would detect both
-  Transfers as ordinary redemptions and send the funding Transfer down the
-  Alpaca redemption path. Other vaults keep flowing and nothing is skipped.
+  its block. Every Transfer of another shape on the vault, later ones included,
+  is still detected. While the hold lasts each pass re-reads only the held block
+  and the blocks no pass has read yet, tracked in memory; after a restart, or
+  once the hold clears, the vault is rescanned once from its checkpoint
+  (detection is idempotent per tx hash). Holding other shapes too would
+  deadlock: a later redemption's shares would stay in the issuer wallet, and
+  `external` needs the exact balance there before it can burn and release the
+  hold. Other vaults keep flowing and nothing is skipped.
   `POST /ops/breakglass/burn-excess/external` refuses a stream that never
-  recorded the expectation (`FundingNotExpected`); its `execute` records the
-  exclusion first and clears the expectation after, so the poller's next pass
-  skips the funding log and moves the checkpoint on. A dry run changes nothing,
-  so the hold spans the dry-run-to-execute gap. Its plan output states the live
+  recorded the expectation (`FundingNotExpected`). Its `execute` records the
+  exclusion and keeps the expectation until the burn completes: the poller's
+  next pass skips the excluded funding log and moves the checkpoint on, up to
+  any other Transfer the expectation still holds. A dry run changes nothing, so
+  the hold spans the dry-run-to-execute gap. Its plan output states the live
   precondition: the expectation recorded before the funding Transfer was
   broadcast.
 
-`--close` of an `AwaitingFunding` stream clears the expectation, and a held
-Transfer is then detected as an ordinary redemption, so close only when the
-funding was never sent or should be redeemed. An expectation recorded after the
-poller already detected the funding Transfer protects nothing: the open
-`Redemption` still refuses the exclusion (`FundingAlreadyRedeemedTx`). The
-engine dual-writes the expectation index on record and on clear, and service
-startup rebuilds it, before the pollers spawn, from every stream whose latest
-event is `FundingExpected`. Opening the store per request does not: the rebuild
-deletes rows, and could drop the expectation of a stream that has committed its
-exclusion event but not yet written the exclusion. A retried `expect-funding`
-re-sends a no-op command, so a concurrent `external` or `--close` can clear the
-expectation before the retry writes it back; the retry re-reads the stream after
-its write and, when it is past `AwaitingFunding`, drops the row (a closed stream
-always, any other only once its exclusion row is in) and returns the `terminal`
-view.
+**Same-shape Transfers.** An expectation matches by shape, not by hash (the hash
+does not exist when it is recorded), so a genuine AP redemption of exactly the
+excess amount from the original recipient, sent while the expectation is open,
+is held with the funding Transfer. Its shares sit in the issuer wallet, so every
+Path B balance check (fresh, resume, and at the sign boundary) expects the
+excess plus the shares of every held Transfer other than the funding log:
+Transfers on the vault from the original recipient to the issuer wallet of
+exactly the excess amount, past the vault's poll checkpoint, neither excluded
+nor already a `Redemption`. These are counted only while an expectation of that
+shape is open and only when the balance is not already exact; the offline CLI,
+which records none, still needs the exact excess, and a vault with no poll
+checkpoint counts none. The expectation therefore stays open while the stream is
+`FundingExcluded`, `Intended`, or `Submitted`: released earlier, the held
+Transfer would be detected and journaled, its shares would no longer count, and
+its burn would wait behind this stream's unresolved intent while this stream
+waits for an exact balance. Completing or closing the stream clears the
+expectation, and the held Transfers are then detected as ordinary redemptions.
+
+`--close` clears the expectation, and a held Transfer is then detected as an
+ordinary redemption, so close an `AwaitingFunding` stream only when the funding
+was never sent or should be redeemed. An expectation recorded after the poller
+already detected the funding Transfer protects nothing: the open `Redemption`
+still refuses the exclusion (`FundingAlreadyRedeemedTx`). The engine dual-writes
+the expectation index on record and on clear, and service startup rebuilds it,
+before the pollers spawn, from every stream that recorded `FundingExpected` and
+has not completed or closed. Opening the store per request does not: the rebuild
+deletes rows, and run beside a request it could drop an expectation that request
+has just written. A retried `expect-funding` re-sends a no-op command, so a
+concurrent `external` or `--close` can move the stream on before the retry
+writes the row back; the retry re-reads the stream after its write and, when it
+is past `AwaitingFunding`, returns the `terminal` view, dropping the row if the
+stream has completed or closed (a closed stream always, a completed one only
+once its exclusion row is in).
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general

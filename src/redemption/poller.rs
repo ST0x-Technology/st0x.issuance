@@ -396,7 +396,8 @@ where
     }
 
     /// A held vault's checkpoint stays before the held Transfer until its
-    /// burn-excess stream excludes it or closes, so the on-call must see it,
+    /// burn-excess stream excludes it, completes, or closes, so the on-call
+    /// must see it,
     /// but a hold is meant to last a whole Path B run: WARN when the held set
     /// changes and again every [`HELD_VAULT_WARN_INTERVAL`] while it lasts,
     /// DEBUG on the passes in between.
@@ -429,7 +430,7 @@ where
                 held_vaults = ?held_vaults,
                 "Transfer poll pass left vaults held at expected burn-excess \
                  funding transfers; their checkpoints stay before the held \
-                 Transfer until the stream records its exclusion or is closed, \
+                 Transfer until the stream excludes it, completes, or closes, \
                  and non-matching later Transfers on them are still detected"
             );
         } else if !held_vaults.is_empty() {
@@ -570,7 +571,7 @@ where
 
             // Once held, the checkpoint stays before the held Transfer, so it
             // is read again until its burn-excess stream excludes it (then it
-            // is skipped) or closes (then it is detected).
+            // is skipped) or completes or closes (then it is detected).
             if !held_before_chunk {
                 let processed_through = held_at
                     .map_or(Some(chunk_to), |block| block.checked_sub(1));
