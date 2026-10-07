@@ -4976,26 +4976,27 @@ with `{ outcome, tx_hash }`:
 - `approved` (200): the receipt succeeded and the re-read allowance is
   unlimited.
 - `submitted_unconfirmed` (202): the approval was signed and broadcast (or its
-  broadcast's answer was lost or cut off), but the receipt and the allowance
-  re-read did not both come back within the deadline, so it may still land. The
-  operator looks `tx_hash` up on chain instead of retrying: once it lands a
-  retry sends nothing; if the chain does not know it, nothing was sent and a
-  retry is safe. The wallet lock is released at the deadline, as a live mint's
-  is after broadcast. If the approval then stays pending without mining, it
-  keeps its nonce and later mints and burns on that network queue behind it
-  until it mines or the operator replaces that nonce through Turnkey; re-running
-  the approve only adds another transaction behind it.
+  broadcast's answer was lost, cut off, "already known", or an error that does
+  not prove a refusal), but the receipt and the allowance re-read did not both
+  come back within the deadline (failed reads are retried until then), so it may
+  still land. The operator looks `tx_hash` up on chain instead of retrying: once
+  it lands a retry sends nothing; if the chain does not know it, nothing was
+  sent and a retry is safe. The wallet lock is released at the deadline, as a
+  live mint's is after broadcast. If the approval then stays pending without
+  mining, it keeps its nonce and later mints and burns on that network queue
+  behind it until it mines or the operator replaces that nonce through Turnkey;
+  re-running the approve only adds another transaction behind it.
 - 404: no vault is listed for that symbol on that network.
 - 422, nothing signed or sent: the network is unknown or the symbol empty, the
   network has no `[orchestrator.addresses]` entry or no vault service, the
   signer is not Turnkey, or the configured orchestrator did not verify
   (`vaultLogicIsExpected()` false). The bot's warning for the request says
   which; the operator fixes it before retrying.
-- 422, refused: the node answered the broadcast with an error (insufficient
-  funds, underpriced, nonce too low) and a lookup did not find the transaction
-  there. The bot logs the node's reason. If it also logs that the lookup failed
-  or ran out of time, the operator checks `tx_hash` on chain before retrying;
-  otherwise nothing is pending and retrying after fixing the cause is safe.
+- 422, refused: the node answered the broadcast with an error that proves the
+  pool refused it (insufficient funds, underpriced, nonce too low, a malformed
+  request) and a lookup found no such transaction. The bot logs the node's
+  reason with `tx_hash`; nothing is pending and retrying after fixing the cause
+  is safe.
 - 409: an unresolved mint or redemption signer intent holds the network's wallet
   nonce; nothing was signed or sent, and the approve is re-run once that flow
   resolves.

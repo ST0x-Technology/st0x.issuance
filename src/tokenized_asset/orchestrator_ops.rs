@@ -549,8 +549,7 @@ fn parse_assets(assets: &[String]) -> Result<Vec<UnderlyingSymbol>, Status> {
 const fn map_onboarding_error(error: &OnboardingError) -> Status {
     use OnboardingError::{
         ApprovalNotEffective, ApprovalReverted, BroadcastRejected, Contract,
-        DeadlineBeforeBroadcast, PendingTransaction, SigningRejected,
-        Transport, Unsigned,
+        DeadlineBeforeBroadcast, SigningRejected, Transport, Unsigned,
     };
 
     match error {
@@ -560,7 +559,6 @@ const fn map_onboarding_error(error: &OnboardingError) -> Status {
         DeadlineBeforeBroadcast => Status::ServiceUnavailable,
         Unsigned => Status::InternalServerError,
         Contract(_)
-        | PendingTransaction(_)
         | Transport(_)
         | ApprovalReverted { .. }
         | ApprovalNotEffective { .. } => Status::BadGateway,

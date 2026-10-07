@@ -17,7 +17,8 @@ use alloy::network::{
 };
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::fillers::{FillProvider, TxFiller};
-use alloy::providers::{PendingTransactionBuilder, Provider, SendableTx};
+use alloy::providers::{Provider, SendableTx};
+use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use alloy::transports::RpcError;
@@ -26,6 +27,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use super::service::{
+    is_already_known_message, is_definitive_broadcast_rejection,
+    is_nonce_too_low_message,
+};
 use crate::bindings::{
     IST0xOrchestratorV1, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt, ST0xOrchestrator,
@@ -210,8 +215,6 @@ pub(crate) enum OnboardingError {
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
     #[error(transparent)]
-    PendingTransaction(#[from] alloy::providers::PendingTransactionError),
-    #[error(transparent)]
     Transport(#[from] alloy::transports::TransportError),
     #[error(
         "the approval deadline passed before its transaction was broadcast; \
@@ -343,11 +346,11 @@ pub(crate) async fn check_orchestrator_readiness<P: Provider>(
 ///
 /// Everything runs against `deadline`. The approval is signed before it is
 /// broadcast, so its hash is known from then on: running out of time before
-/// the broadcast sends nothing, and any later shortfall (no receipt, a hung
-/// read, a broadcast whose answer was lost or cut off) reports the hash as
-/// [`ApprovalOutcome::SubmittedUnconfirmed`]. A broadcast the node answers
-/// with an error, unless a lookup shows it holds the transaction anyway, was
-/// refused and is an error.
+/// the broadcast sends nothing, and any later shortfall (no receipt, reads
+/// that kept failing, a broadcast whose answer was lost, cut off, or not
+/// conclusive) reports the hash as [`ApprovalOutcome::SubmittedUnconfirmed`].
+/// Only a broadcast the pool provably refused, and that the node then does
+/// not hold, is an error.
 ///
 /// # Errors
 ///
@@ -414,6 +417,7 @@ where
     )
     .await?;
 
+    let mut last_read_error = None;
     let confirmed = tokio::time::timeout_at(
         deadline,
         confirm_approval(
@@ -422,6 +426,7 @@ where
             tx_hash,
             bot,
             orchestrator,
+            &mut last_read_error,
         ),
     )
     .await;
@@ -439,23 +444,10 @@ where
             );
             Ok(ApprovalOutcome::Approved { tx_hash })
         }
-        // Only a failed receipt poll or read can leave a landed approval
-        // unconfirmed; any other error is the approval's own verdict.
-        Ok(Err(
-            error @ (OnboardingError::PendingTransaction(_)
-            | OnboardingError::Contract(_)
-            | OnboardingError::Transport(_)),
-        )) => {
-            warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
-                %error,
-                "Approval sent but not confirmed: a receipt or allowance read \
-                 failed; reporting it unconfirmed"
-            );
-            Ok(ApprovalOutcome::SubmittedUnconfirmed { tx_hash })
-        }
         Ok(Err(error)) => Err(error),
         Err(_) => {
             warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
+                last_read_error = last_read_error.as_ref().map(display),
                 "Approval signed but not confirmed within the deadline; \
                  reporting it unconfirmed"
             );
@@ -464,14 +456,15 @@ where
     }
 }
 
-/// Broadcasts the signed approval. A node that answers with an error
-/// (insufficient funds, underpriced, nonce too low) refused it, which is
-/// [`OnboardingError::BroadcastRejected`] carrying the node's reason, unless a
-/// lookup within the deadline shows the node holds the transaction anyway
-/// (already known). A lookup that fails or runs out of time leaves the
-/// refusal standing. A send that fails in transport or runs out of time may
-/// still have reached the node, so it is returned as sent and confirmed by
-/// hash.
+/// Broadcasts the signed approval. An error answer that proves the pool
+/// refused the bytes (insufficient funds, underpriced, nonce too low, or a
+/// malformed request) is [`OnboardingError::BroadcastRejected`] carrying the
+/// node's reason, unless a lookup within the deadline shows the node holds
+/// the transaction anyway. Every other outcome may have left the approval
+/// pending, so it is returned as sent and confirmed by hash: an "already
+/// known" answer, any other server error (a load-balanced provider may have
+/// forwarded the bytes before failing), a lookup that fails or runs out of
+/// time, and a send that fails in transport or runs out of time.
 async fn broadcast_approval<F, P>(
     signing_provider: &FillProvider<F, P>,
     envelope: &TxEnvelope,
@@ -501,9 +494,22 @@ where
         }
     };
 
-    if !matches!(error, RpcError::ErrorResp(_)) {
+    let RpcError::ErrorResp(response) = &error else {
         warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce, %error,
             "Approval broadcast failed in transport; it may be pending"
+        );
+        return Ok(());
+    };
+    if is_already_known_message(&response.message) {
+        info!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
+            "The node already holds the approval; confirming it by hash"
+        );
+        return Ok(());
+    }
+    if !is_pool_refusal(response) {
+        warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce, %error,
+            "Approval broadcast answered with an inconclusive error; it may \
+             be pending"
         );
         return Ok(());
     }
@@ -518,25 +524,39 @@ where
     )
     .await;
     match lookup {
-        Ok(Ok(Some(_))) => return Ok(()),
-        Ok(Ok(None)) => {}
+        Ok(Ok(None)) => {
+            Err(OnboardingError::BroadcastRejected { tx_hash, source: error })
+        }
+        Ok(Ok(Some(_))) => Ok(()),
         Ok(Err(lookup_error)) => {
             warn!(target: "vault", %tx_hash, %lookup_error,
-                "Lookup after the refusal failed; treating it as refused"
+                "Lookup after the refusal failed; it may be pending"
             );
+            Ok(())
         }
         Err(_) => {
             warn!(target: "vault", %tx_hash,
-                "Lookup after the refusal ran out of time; treating it as \
-                 refused"
+                "Lookup after the refusal ran out of time; it may be pending"
             );
+            Ok(())
         }
     }
-
-    Err(OnboardingError::BroadcastRejected { tx_hash, source: error })
 }
 
-/// Waits for the sent approval's receipt and re-reads the allowance.
+/// An error answer that proves the pool did not accept the bytes: a
+/// malformed request, or a pool rule the transaction failed.
+fn is_pool_refusal(response: &ErrorPayload) -> bool {
+    let message = response.message.to_ascii_lowercase();
+    is_definitive_broadcast_rejection(response.code)
+        || is_nonce_too_low_message(&message)
+        || message.contains("insufficient funds")
+        || message.contains("underpriced")
+}
+
+/// Waits for the sent approval's receipt and re-reads the allowance. A failed
+/// poll or read is retried until the caller's deadline cuts this off, so one
+/// transient error (a 429, a dropped connection) cannot end the wait early;
+/// the last one is kept for the caller's log.
 async fn confirm_approval<F, P>(
     signing_provider: &FillProvider<F, P>,
     vault_contract: &OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance<
@@ -545,22 +565,33 @@ async fn confirm_approval<F, P>(
     tx_hash: B256,
     bot: Address,
     orchestrator: Address,
+    last_read_error: &mut Option<OnboardingError>,
 ) -> Result<(), OnboardingError>
 where
     F: TxFiller,
     P: Provider,
 {
-    let receipt = PendingTransactionBuilder::new(
-        signing_provider.root().clone(),
-        tx_hash,
-    )
-    .get_receipt()
-    .await?;
+    let poll_interval = signing_provider.client().poll_interval();
+
+    let receipt = loop {
+        match signing_provider.get_transaction_receipt(tx_hash).await {
+            Ok(Some(receipt)) => break receipt,
+            Ok(None) => {}
+            Err(error) => *last_read_error = Some(error.into()),
+        }
+        tokio::time::sleep(poll_interval).await;
+    };
     if !receipt.status() {
         return Err(OnboardingError::ApprovalReverted { tx_hash });
     }
 
-    let allowance = vault_contract.allowance(bot, orchestrator).call().await?;
+    let allowance = loop {
+        match vault_contract.allowance(bot, orchestrator).call().await {
+            Ok(allowance) => break allowance,
+            Err(error) => *last_read_error = Some(error.into()),
+        }
+        tokio::time::sleep(poll_interval).await;
+    };
     if allowance != U256::MAX {
         return Err(OnboardingError::ApprovalNotEffective {
             tx_hash,
@@ -744,9 +775,16 @@ const fn pass_fail(passed: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{SignableTransaction, TxEip1559};
+    use alloy::eips::eip2930::AccessList;
+    use alloy::primitives::TxKind;
     use alloy::providers::ext::AnvilApi;
     use alloy::providers::fillers::FillerControlFlow;
+    use alloy::providers::mock::Asserter;
     use alloy::providers::{ProviderBuilder, RootProvider};
+    use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::rpc::types::Transaction as RpcTransaction;
+    use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::TransportResult;
     use httpmock::MockServer;
@@ -1186,9 +1224,154 @@ mod tests {
         );
     }
 
+    /// Signed bytes for a broadcast the mocked node answers; never mined.
+    fn signed_approval() -> TxEnvelope {
+        let signer = PrivateKeySigner::random();
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 60_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        TxEnvelope::from(tx.into_signed(signature))
+    }
+
+    /// What the mocked node answers to the hash lookup after an error answer.
+    enum Lookup {
+        Missing,
+        Fails,
+        NotAsked,
+    }
+
+    /// Only an error that proves the pool refused the bytes, with the node
+    /// then not holding them, is a refusal (422 with nothing pending). An
+    /// "already known" answer, an ambiguous server error, or a lookup that
+    /// fails leaves the approval possibly pending, so it must go on to be
+    /// confirmed by hash (202 with the hash) instead.
+    #[traced_test]
+    #[tokio::test]
+    async fn only_a_known_pool_refusal_the_node_does_not_hold_is_refused() {
+        for (code, message, lookup, refused) in [
+            (
+                -32000,
+                "insufficient funds for gas * price + value",
+                Lookup::Missing,
+                true,
+            ),
+            (
+                -32000,
+                "nonce too low: next nonce 8, tx nonce 7",
+                Lookup::Missing,
+                true,
+            ),
+            (-32000, "already known", Lookup::NotAsked, false),
+            (-32603, "internal error", Lookup::NotAsked, false),
+            (-32000, "transaction underpriced", Lookup::Fails, false),
+        ] {
+            let envelope = signed_approval();
+            let tx_hash = *envelope.tx_hash();
+            let asserter = Asserter::new();
+            asserter.push_failure(ErrorPayload {
+                code,
+                message: message.into(),
+                data: None,
+            });
+            match lookup {
+                Lookup::Missing => {
+                    asserter.push_success(&Option::<RpcTransaction>::None);
+                }
+                Lookup::Fails => {
+                    asserter.push_failure_msg("lookup failed (test)");
+                }
+                Lookup::NotAsked => {}
+            }
+            let provider =
+                ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+            let result = broadcast_approval(
+                &provider,
+                &envelope,
+                deadline_after(Duration::from_secs(5)),
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x11),
+            )
+            .await;
+
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(OnboardingError::BroadcastRejected { .. })
+                ),
+                refused,
+                "{message}: {result:?}"
+            );
+            assert!(asserter.read_q().is_empty(), "{message}: unread answers");
+            if refused {
+                assert!(logs_contain_at!(
+                    Level::WARN,
+                    &["refused by the node", &tx_hash.to_string()]
+                ));
+            }
+        }
+    }
+
+    /// One failed receipt poll or allowance read (a 429, a dropped
+    /// connection) must not end the wait while time is left: the next poll
+    /// can still confirm the approval.
+    #[tokio::test]
+    async fn a_failed_receipt_or_allowance_read_is_retried() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let receipt = OffchainAssetReceiptVault::new(
+            evm.vault_address,
+            signing_provider(&evm).await,
+        )
+        .approve(orchestrator, U256::MAX)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("receipt poll failed (test)");
+        asserter.push_success(&Some(receipt.clone()));
+        asserter.push_failure_msg("allowance read failed (test)");
+        asserter.push_success(&Bytes::from(U256::MAX.to_be_bytes::<32>()));
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let vault_contract =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider);
+
+        let mut last_read_error = None;
+        let confirmed = tokio::time::timeout(
+            Duration::from_secs(10),
+            confirm_approval(
+                &provider,
+                &vault_contract,
+                receipt.transaction_hash,
+                evm.wallet_address,
+                orchestrator,
+                &mut last_read_error,
+            ),
+        )
+        .await
+        .expect("the retried reads must confirm well within the guard");
+
+        assert!(confirmed.is_ok(), "{confirmed:?}");
+    }
+
     /// A broadcast the node refuses (here a wallet with no gas) is an error
     /// carrying the hash and the node's reason, answered at once, not a
     /// 202 for a transaction that will never exist.
+    #[traced_test]
     #[tokio::test]
     async fn refused_broadcast_is_an_error_not_an_unconfirmed_approval() {
         let evm = LocalEvm::new().await.unwrap();
@@ -1222,6 +1405,10 @@ mod tests {
             provider.get_transaction_by_hash(tx_hash).await.unwrap().is_none(),
             "the refused approval must not be held by the node"
         );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["refused by the node", &tx_hash.to_string()]
+        ));
     }
 
     #[test]
