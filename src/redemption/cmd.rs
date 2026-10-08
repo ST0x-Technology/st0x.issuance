@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::{
     BurnExternalTxId, BurnNonceTooLowProof, BurnSubmitRejectedProof,
-    IssuerRedemptionRequestId,
+    IssuerRedemptionRequestId, RedemptionAccountAttribution,
 };
 use crate::Quantity;
 use crate::config::VaultMode;
@@ -72,6 +72,10 @@ pub(crate) enum RedemptionCommand {
         /// commands are not persisted, so a default here would only mask a
         /// caller that forgot to resolve the mode.
         burn_mode: VaultMode,
+        /// Immutable account identity admitted with this transfer. New
+        /// detections persist it; `None` is reserved for historical/test
+        /// construction that must exercise legacy recovery.
+        account_attribution: Option<RedemptionAccountAttribution>,
     },
     /// Durably claims ownership of the external Alpaca call after the freeze
     /// admission check. A committed claim establishes that the call precedes

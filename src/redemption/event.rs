@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BurnExternalTxId, IssuerRedemptionRequestId, default_redemption_network,
+    BurnExternalTxId, IssuerRedemptionRequestId, RedemptionAccountAttribution,
+    default_redemption_network,
 };
 use crate::config::VaultMode;
 use crate::mint::{Quantity, TokenizationRequestId};
@@ -147,6 +148,14 @@ pub(crate) enum RedemptionEvent {
         /// `VaultDirect`.
         #[serde(default)]
         burn_mode: VaultMode,
+    },
+    /// Immutable account identity admitted with the detected on-chain
+    /// transfer. Kept separate from `Detected` to preserve its permanent wire
+    /// shape while allowing both events to commit atomically.
+    AccountAttributionAnchored {
+        issuer_request_id: IssuerRedemptionRequestId,
+        attribution: RedemptionAccountAttribution,
+        anchored_at: DateTime<Utc>,
     },
     /// Durable admission record written before the external Alpaca call.
     AlpacaCallClaimed {
@@ -415,6 +424,9 @@ impl DomainEvent for RedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Detected { .. } => "RedemptionEvent::Detected".to_string(),
+            Self::AccountAttributionAnchored { .. } => {
+                "RedemptionEvent::AccountAttributionAnchored".to_string()
+            }
             Self::AlpacaCallClaimed { .. } => {
                 "RedemptionEvent::AlpacaCallClaimed".to_string()
             }

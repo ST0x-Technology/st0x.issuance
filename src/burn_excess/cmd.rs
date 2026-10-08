@@ -1,8 +1,21 @@
 use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
 
-use super::{BurnExcessPath, ExcessBurnBind, FundingTransferId};
+use super::{
+    BurnExcessPath, ExcessBurnBind, FundingTransferId, HeldTransferRedemption,
+};
 use crate::vault::{SendableTxWithHash, TxId};
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BurnExcessCloseProof {
+    #[default]
+    Unsigned,
+    FinalizedReverted,
+    ProvablyDead,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum BurnExcessCommand {
@@ -34,6 +47,14 @@ pub(crate) enum BurnExcessCommand {
         reason: String,
         incident_id: Option<String>,
         sendable_tx: SendableTxWithHash,
+        /// Persisted atomically with the signed intent so a crash cannot lose
+        /// the AP attribution the balance proof relied on.
+        held_redemptions: Vec<HeldTransferRedemption>,
+    },
+    /// Anchor genuine AP Transfers held with Path B funding before the signed
+    /// excess burn can be broadcast.
+    AnchorHeldRedemptions {
+        held_redemptions: Vec<HeldTransferRedemption>,
     },
     RecordExcessBurnSubmitted {
         tx_id: TxId,
@@ -45,5 +66,7 @@ pub(crate) enum BurnExcessCommand {
     },
     CloseExcessBurn {
         reason: String,
+        proof: BurnExcessCloseProof,
+        release_through_block: Option<u64>,
     },
 }

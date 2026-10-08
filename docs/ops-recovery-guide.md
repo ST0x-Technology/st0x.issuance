@@ -159,31 +159,74 @@ infers it:
   `held at expected burn-excess
   funding transfers` WARN when a hold starts or
   changes and every five minutes while it lasts), so finish the run promptly. If
-  `external` reports twice the excess in the issuer wallet, escalate and do
-  **not** run `expect-funding --close`: closing would release both same-shape
-  Transfers as ordinary redemptions and send the funding Transfer down the
-  Alpaca redemption path. A different-shape later redemption is processed
-  normally; if its shares reach the issuer wallet before `external` runs,
-  `external` refuses until that redemption's burn lands: with
-  `IssuerShareBalanceNotExact` before the burn is signed, then with
-  `UnresolvedSignerIntent` (409) while it is in flight. Retry once it lands. A
-  genuine redemption that happens to match the expectation (the same sender
-  sending exactly the excess amount) is held with the funding transfer;
-  `external` counts its shares toward the expected balance, and once the burn
-  completes it is redeemed as usual. `expect-funding` refuses (409) while
-  another burn-excess recovery is unresolved, and while another recovery's
-  expectation is open on the same vault: only one expectation per vault can be
-  open at a time, because the issuer wallet must hold exactly one stream's
-  funding. Finish or close that one first, and send each funding transfer only
-  after its own `expect-funding` succeeded. It refuses (422) a deposit whose
-  original recipient is the issuer wallet: use `internal` for that one. If the
-  shares will not be sent, `expect-funding --close --execute` releases the hold;
-  a transfer that did arrive is then redeemed as usual.
+  a later redemption's shares reach the issuer wallet before `external` runs,
+  `external` refuses with `UnresolvedIssuerShareTransfer` until the redemption
+  burn durably completes; a concurrent burn may also surface
+  `UnresolvedSignerIntent` (409). Retry once completion is recorded. A genuine
+  redemption that happens to match the expectation (the same sender sending
+  exactly the excess amount) is held with the funding transfer; `external`
+  counts its shares toward the expected balance and lists it under
+  `held_transfers` in the plan (check that `funding_log` is the transfer sent as
+  funding). The proof scans every issuer-wallet inbound share Transfer since the
+  duplicate deposit, not only matching logs and not from the poll checkpoint. It
+  reconciles completed redemptions/exclusions and refuses every unresolved
+  different-shape inflow, so unrelated inbound shares cannot mask an outbound
+  transfer. The block range and balance are hash-pinned to one connected chain
+  snapshot; immediately before signing the bot repeats the proof at a no-older
+  snapshot and refuses if the exact held log set or attribution changed. The
+  signed intent and `HeldRedemptionsAnchored` commit atomically before
+  broadcast, recording the exact log, AP account, original asset, and burn mode.
+  A later stream checks durable anchor events before it signs and may share that
+  exact log only with identical attribution. Once the excess burn completes, the
+  poller keeps scanning that vault even if the asset was repointed. Persisting
+  an anchor rewinds any checkpoint already past the held log, so it is replayed
+  and detected with the anchored context. The Redemption persists the account
+  identity through restart, freeze, journal, and pre-Alpaca reprocess recovery.
+  Unlinking the wallet after the plan executes therefore does not strand this
+  already-mined redemption. If another stream instead proves the exact log as
+  its funding, its permanent exclusion retires the held attribution and the
+  poller skips it. A signed stream releases the shape hold only after its exact
+  transaction is finalized-reverted or provably dead; `--close` refuses while it
+  is still mineable or uncertain. If such a transfer was batched in one
+  transaction with any other non-mint Transfer into the issuer wallet,
+  `external` refuses (`HeldTransfersShareTransaction`) even when the other vault
+  is not configured or its sender is not linked yet; both can change before
+  release. Equal sender/amount logs remain ambiguous even if the competing vault
+  is no longer configured. Treat it as an incident: closing releases the hold
+  but cannot create a second Redemption, and the shares need manual
+  reconciliation. `HeldTransferSenderNotLinked` means the sender was not a
+  linked AP wallet when the plan was proven: link the wallet, or treat the
+  shares as an incident. `FundingLogExcludedForAnotherDeposit` means
+  `--funding-tx-hash` names another stream's funding transfer; pass this
+  stream's own. `ChainBehindProvenPlan`, `ChainBehindDeposit`, or a
+  disconnected-snapshot error (502) means the RPC cannot provide the coherent
+  chain proof; retry against a caught-up healthy node. `expect-funding` refuses
+  (409) only while another stream is `FundingExcluded`, `Intended`, or
+  `Submitted`; finish or safely close that one first. Multiple `AwaitingFunding`
+  expectations may coexist because they own neither signed bytes nor a permanent
+  exclusion. Recording the funding exclusion (or an internal burn intent)
+  atomically reserves the network's signer nonce domain in SQLite across service
+  and CLI processes; completion releases it. `expect-funding` and defensive
+  unsigned close require the original recipient to be uniquely linked. The
+  expectation atomically blocks wallet-link mutations and vault repointing.
+  Completion and every close mark an existing expectation released and persist a
+  chain boundary, raised to the poller's durable monotonic high-water mark, that
+  the poller must safely scan through without dropping or ambiguously
+  deduplicating a log. Successful cleanup atomically records a per-stream
+  completion tombstone, preventing startup rebuild from resurrecting the
+  handoff. An unsafe log retains the row, checkpoint, and guards for incident
+  handling. A defensive check refuses close if a pre-existing stream was already
+  repointed; restore the listing first. A signed stream closes only after exact
+  classification proves finalized revert or a dead nonce. Before confirming
+  unsigned close, verify no funding or same-shape Transfer remains pending
+  beyond the recorded head.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's
-outcome unknown; re-running the same command reads the persisted burn and
-resumes it.
+outcome unknown; re-running the same command reads the persisted bind and burn,
+uses its original vault even if the listing was repointed, and resumes it.
+`Submitted` recovery rebroadcasts the persisted exact bytes when the transaction
+is still mineable; it never prepares a replacement.
 
 The offline CLI takes the same flags
 (`issuer burn-excess internal|external

@@ -18,13 +18,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
 
+use crate::account::{AlpacaAccountNumber, ClientId};
+use crate::config::VaultMode;
 use crate::mint::IssuerMintRequestId;
-use crate::tokenized_asset::Network;
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{SendableTxWithHash, TxId};
 
-pub(crate) use cmd::BurnExcessCommand;
+pub(crate) use cmd::{BurnExcessCloseProof, BurnExcessCommand};
 pub(crate) use event::BurnExcessEvent;
 
 /// Operator / aggregate path after selection (persisted on first progress).
@@ -56,6 +57,23 @@ pub(crate) struct FundingTransferId {
     pub(crate) amount: U256,
 }
 
+/// Durable attribution for a genuine AP Transfer held by a live Path B
+/// funding expectation. The account snapshot is anchored before the excess
+/// burn is broadcast, so a later wallet unlink cannot strand this already
+/// mined redemption when the expectation releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HeldTransferRedemption {
+    pub(crate) transfer: FundingTransferId,
+    /// Block containing the held log. Zero is the legacy compatibility value.
+    #[serde(default)]
+    pub(crate) block_number: u64,
+    pub(crate) client_id: ClientId,
+    pub(crate) alpaca_account: AlpacaAccountNumber,
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) burn_mode: VaultMode,
+}
+
 /// Proven deposit bind shared across the burn-excess stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExcessBurnBind {
@@ -66,6 +84,11 @@ pub(crate) struct ExcessBurnBind {
     pub(crate) original_recipient: Address,
     pub(crate) vault: Address,
     pub(crate) network: Network,
+    /// RPC chain proven when the bind was first recorded. Zero is the
+    /// compatibility sentinel for pre-field history: signed resumes verify the
+    /// decoded envelope chain, while unsigned resumes use the request chain.
+    #[serde(default)]
+    pub(crate) chain_id: u64,
     pub(crate) issuer_wallet: Address,
 }
 
@@ -126,6 +149,8 @@ pub(crate) enum BurnExcess {
         reason: String,
         incident_id: Option<String>,
         sendable_tx: SendableTxWithHash,
+        held_redemptions: Vec<HeldTransferRedemption>,
+        held_redemptions_anchored: bool,
         intended_at: DateTime<Utc>,
     },
     Submitted {
@@ -135,6 +160,8 @@ pub(crate) enum BurnExcess {
         reason: String,
         incident_id: Option<String>,
         sendable_tx: SendableTxWithHash,
+        held_redemptions: Vec<HeldTransferRedemption>,
+        held_redemptions_anchored: bool,
         tx_id: TxId,
         burn_tx_hash: B256,
         intended_at: DateTime<Utc>,
@@ -153,6 +180,7 @@ pub(crate) enum BurnExcess {
         path: BurnExcessPath,
         funding_log_id: Option<FundingTransferId>,
         reason: String,
+        release_through_block: Option<u64>,
         closed_at: DateTime<Utc>,
     },
 }
@@ -190,6 +218,9 @@ pub(crate) enum BurnExcessError {
 
     #[error("deposit bind does not match the stream bind")]
     BindMismatch,
+
+    #[error("held-redemption attribution does not match the persisted set")]
+    HeldRedemptionsMismatch,
 }
 
 impl BurnExcess {
@@ -202,6 +233,17 @@ impl BurnExcess {
             | Self::Submitted { path, .. }
             | Self::Completed { path, .. }
             | Self::Closed { path, .. } => *path,
+        }
+    }
+
+    pub(crate) const fn bind(&self) -> &ExcessBurnBind {
+        match self {
+            Self::AwaitingFunding { bind, .. }
+            | Self::FundingExcluded { bind, .. }
+            | Self::Intended { bind, .. }
+            | Self::Submitted { bind, .. }
+            | Self::Completed { bind, .. }
+            | Self::Closed { bind, .. } => bind,
         }
     }
 
@@ -276,8 +318,32 @@ impl BurnExcess {
                     incident_id,
                     sendable_tx,
                     intended_at,
+                    held_redemptions: Vec::new(),
+                    held_redemptions_anchored: false,
                 };
             }
+            BurnExcessEvent::HeldRedemptionsAnchored {
+                held_redemptions,
+                ..
+            } => match self {
+                Self::Intended {
+                    held_redemptions: anchored,
+                    held_redemptions_anchored,
+                    ..
+                }
+                | Self::Submitted {
+                    held_redemptions: anchored,
+                    held_redemptions_anchored,
+                    ..
+                } => {
+                    *anchored = held_redemptions;
+                    *held_redemptions_anchored = true;
+                }
+                Self::AwaitingFunding { .. }
+                | Self::FundingExcluded { .. }
+                | Self::Completed { .. }
+                | Self::Closed { .. } => {}
+            },
             BurnExcessEvent::ExcessBurnSubmitted {
                 tx_id,
                 burn_tx_hash,
@@ -290,6 +356,8 @@ impl BurnExcess {
                     reason,
                     incident_id,
                     sendable_tx,
+                    held_redemptions,
+                    held_redemptions_anchored,
                     intended_at,
                 } = self.clone()
                 else {
@@ -302,6 +370,8 @@ impl BurnExcess {
                     reason,
                     incident_id,
                     sendable_tx,
+                    held_redemptions,
+                    held_redemptions_anchored,
                     tx_id,
                     burn_tx_hash,
                     intended_at,
@@ -336,7 +406,12 @@ impl BurnExcess {
                     completed_at,
                 };
             }
-            BurnExcessEvent::ExcessBurnClosed { reason, closed_at } => {
+            BurnExcessEvent::ExcessBurnClosed {
+                reason,
+                release_through_block,
+                closed_at,
+                ..
+            } => {
                 let (bind, path, funding_log_id) = match self {
                     Self::AwaitingFunding { bind, .. } => {
                         (bind.clone(), BurnExcessPath::External, None)
@@ -357,6 +432,7 @@ impl BurnExcess {
                     path,
                     funding_log_id,
                     reason,
+                    release_through_block,
                     closed_at,
                 };
             }
@@ -389,6 +465,7 @@ impl BurnExcess {
             reason,
             incident_id,
             sendable_tx,
+            held_redemptions,
         } = command
         else {
             return Err(BurnExcessError::InvalidState {
@@ -419,15 +496,22 @@ impl BurnExcess {
                         });
                     }
                 }
-                Ok(vec![BurnExcessEvent::ExcessBurnIntended {
-                    bind: command_bind,
-                    path,
-                    funding_log_id,
-                    reason,
-                    incident_id,
-                    sendable_tx,
-                    intended_at: Utc::now(),
-                }])
+                let intended_at = Utc::now();
+                Ok(vec![
+                    BurnExcessEvent::ExcessBurnIntended {
+                        bind: command_bind,
+                        path,
+                        funding_log_id,
+                        reason,
+                        incident_id,
+                        sendable_tx,
+                        intended_at,
+                    },
+                    BurnExcessEvent::HeldRedemptionsAnchored {
+                        held_redemptions,
+                        anchored_at: intended_at,
+                    },
+                ])
             }
             Self::AwaitingFunding { .. } => {
                 Err(BurnExcessError::ExternalRequiresExclusion {
@@ -442,49 +526,6 @@ impl BurnExcess {
             }),
         }
     }
-}
-
-/// Returns whether any excess-burn stream is an unresolved recovery in
-/// progress, without a terminal complete/close.
-///
-/// `Intended` / `Submitted` hold a signed nonce. `FundingExcluded` holds no
-/// signed transaction yet, but its exclusion write is already permanent and the
-/// stream will sign against the same issuer wallet, so it counts too: a Path B
-/// recovery abandoned before intend must be resumed or `--close`d, never raced
-/// by a second recovery or by mint/redemption burn prepare.
-pub(crate) async fn has_unresolved_excess_burn_intent(
-    pool: &Pool<Sqlite>,
-    excluding: Option<&BurnExcessId>,
-) -> Result<bool, sqlx::Error> {
-    let excluding = excluding.map(ToString::to_string).unwrap_or_default();
-    let exists = sqlx::query_scalar::<_, bool>(
-        "
-        SELECT EXISTS (
-            SELECT 1
-            FROM events AS intent
-            WHERE intent.aggregate_type = 'BurnExcess'
-              AND intent.event_type IN (?, ?, ?)
-              AND intent.aggregate_id != ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM events AS terminal
-                  WHERE terminal.aggregate_type = intent.aggregate_type
-                    AND terminal.aggregate_id = intent.aggregate_id
-                    AND terminal.event_type IN (?, ?)
-              )
-        )
-        ",
-    )
-    .bind(BurnExcessEvent::FUNDING_EXCLUSION_RECORDED)
-    .bind(BurnExcessEvent::EXCESS_BURN_INTENDED)
-    .bind(BurnExcessEvent::EXCESS_BURN_SUBMITTED)
-    .bind(excluding)
-    .bind(BurnExcessEvent::EXCESS_BURN_COMPLETED)
-    .bind(BurnExcessEvent::EXCESS_BURN_CLOSED)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(exists)
 }
 
 #[async_trait]
@@ -542,6 +583,8 @@ impl EventSourced for BurnExcess {
                 reason: reason.clone(),
                 incident_id: incident_id.clone(),
                 sendable_tx: sendable_tx.clone(),
+                held_redemptions: Vec::new(),
+                held_redemptions_anchored: false,
                 intended_at: *intended_at,
             }),
             _ => None,
@@ -588,6 +631,7 @@ impl EventSourced for BurnExcess {
                 reason,
                 incident_id,
                 sendable_tx,
+                held_redemptions,
             } => {
                 if path != BurnExcessPath::Internal {
                     return Err(BurnExcessError::ExternalRequiresExclusion {
@@ -597,17 +641,25 @@ impl EventSourced for BurnExcess {
                 if funding_log_id.is_some() {
                     return Err(BurnExcessError::InternalMustNotExclude);
                 }
-                Ok(vec![BurnExcessEvent::ExcessBurnIntended {
-                    bind,
-                    path,
-                    funding_log_id: None,
-                    reason,
-                    incident_id,
-                    sendable_tx,
-                    intended_at: Utc::now(),
-                }])
+                let intended_at = Utc::now();
+                Ok(vec![
+                    BurnExcessEvent::ExcessBurnIntended {
+                        bind,
+                        path,
+                        funding_log_id: None,
+                        reason,
+                        incident_id,
+                        sendable_tx,
+                        intended_at,
+                    },
+                    BurnExcessEvent::HeldRedemptionsAnchored {
+                        held_redemptions,
+                        anchored_at: intended_at,
+                    },
+                ])
             }
-            BurnExcessCommand::RecordExcessBurnSubmitted { .. }
+            BurnExcessCommand::AnchorHeldRedemptions { .. }
+            | BurnExcessCommand::RecordExcessBurnSubmitted { .. }
             | BurnExcessCommand::CompleteExcessBurn { .. }
             | BurnExcessCommand::CloseExcessBurn { .. } => {
                 Err(BurnExcessError::InvalidState {
@@ -668,11 +720,38 @@ impl EventSourced for BurnExcess {
             command @ BurnExcessCommand::IntendExcessBurn { .. } => {
                 self.handle_intend(command)
             }
+            BurnExcessCommand::AnchorHeldRedemptions { held_redemptions } => {
+                match self {
+                    Self::Intended {
+                        held_redemptions_anchored: false, ..
+                    }
+                    | Self::Submitted {
+                        held_redemptions_anchored: false,
+                        ..
+                    } => Ok(vec![BurnExcessEvent::HeldRedemptionsAnchored {
+                        held_redemptions,
+                        anchored_at: Utc::now(),
+                    }]),
+                    Self::Intended { held_redemptions: anchored, .. }
+                    | Self::Submitted { held_redemptions: anchored, .. }
+                        if *anchored == held_redemptions =>
+                    {
+                        Ok(vec![])
+                    }
+                    Self::Intended { .. } | Self::Submitted { .. } => {
+                        Err(BurnExcessError::HeldRedemptionsMismatch)
+                    }
+                    other => Err(BurnExcessError::InvalidState {
+                        expected: "Intended or Submitted".to_string(),
+                        found: other.state_name().to_string(),
+                    }),
+                }
+            }
             BurnExcessCommand::RecordExcessBurnSubmitted {
                 tx_id,
                 burn_tx_hash,
             } => match self {
-                Self::Intended { .. } => {
+                Self::Intended { held_redemptions_anchored: true, .. } => {
                     Ok(vec![BurnExcessEvent::ExcessBurnSubmitted {
                         tx_id,
                         burn_tx_hash,
@@ -688,7 +767,8 @@ impl EventSourced for BurnExcess {
                 burn_tx_hash,
                 block_number,
             } => match self {
-                Self::Submitted { .. } | Self::Intended { .. } => {
+                Self::Submitted { held_redemptions_anchored: true, .. }
+                | Self::Intended { held_redemptions_anchored: true, .. } => {
                     Ok(vec![BurnExcessEvent::ExcessBurnCompleted {
                         burn_tx_hash,
                         block_number,
@@ -700,23 +780,40 @@ impl EventSourced for BurnExcess {
                     found: other.state_name().to_string(),
                 }),
             },
-            BurnExcessCommand::CloseExcessBurn { reason } => match self {
-                Self::AwaitingFunding { .. }
-                | Self::FundingExcluded { .. }
-                | Self::Intended { .. }
-                | Self::Submitted { .. } => {
-                    Ok(vec![BurnExcessEvent::ExcessBurnClosed {
-                        reason,
-                        closed_at: Utc::now(),
-                    }])
+            BurnExcessCommand::CloseExcessBurn {
+                reason,
+                proof,
+                release_through_block,
+            } => {
+                let allowed = matches!(
+                    (self, proof, release_through_block),
+                    (
+                        Self::AwaitingFunding { .. }
+                            | Self::FundingExcluded { .. },
+                        BurnExcessCloseProof::Unsigned,
+                        Some(_)
+                    ) | (
+                        Self::Intended { .. } | Self::Submitted { .. },
+                        BurnExcessCloseProof::FinalizedReverted
+                            | BurnExcessCloseProof::ProvablyDead,
+                        Some(_)
+                    )
+                );
+                if !allowed {
+                    return Err(BurnExcessError::InvalidState {
+                        expected: "closable stream with release boundary and \
+                                   state-compatible safety proof"
+                            .to_string(),
+                        found: format!("{} with {proof:?}", self.state_name()),
+                    });
                 }
-                other => Err(BurnExcessError::InvalidState {
-                    expected: "AwaitingFunding, FundingExcluded, Intended, or \
-                               Submitted"
-                        .to_string(),
-                    found: other.state_name().to_string(),
-                }),
-            },
+                Ok(vec![BurnExcessEvent::ExcessBurnClosed {
+                    reason,
+                    proof,
+                    release_through_block,
+                    closed_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -725,9 +822,11 @@ impl EventSourced for BurnExcess {
 mod tests {
     use alloy::primitives::{U256, address, b256};
     use event_sorcery::{LifecycleError, TestHarness};
+    use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
 
     use super::*;
+    use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::mint::IssuerMintRequestId;
 
     fn issuer_request() -> IssuerMintRequestId {
@@ -749,6 +848,7 @@ mod tests {
             ),
             vault: address!("0x1111111111111111111111111111111111111111"),
             network: Network::Base,
+            chain_id: 8453,
             issuer_wallet: address!(
                 "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
             ),
@@ -766,6 +866,24 @@ mod tests {
             from: address!("0xA9C16673F65AE808688cB18952AFE3d9658C808f"),
             to: address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"),
             amount: U256::from(750_000_000_000_000_000u64),
+        }
+    }
+
+    fn held_redemption() -> HeldTransferRedemption {
+        HeldTransferRedemption {
+            transfer: FundingTransferId {
+                tx_hash: b256!(
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                ),
+                log_index: 4,
+                ..funding_id()
+            },
+            block_number: 100,
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("account".into()),
+            underlying: UnderlyingSymbol::new("PTY").unwrap(),
+            token: TokenSymbol::new("tPTY"),
+            burn_mode: VaultMode::VaultDirect,
         }
     }
 
@@ -795,11 +913,12 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: Some("inc-1".into()),
                 sendable_tx: sendable.clone(),
+                held_redemptions: Vec::new(),
             })
             .await
             .events();
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         let BurnExcessEvent::ExcessBurnIntended {
             path,
             funding_log_id,
@@ -814,6 +933,13 @@ mod tests {
         assert!(funding_log_id.is_none());
         assert_eq!(event_bind, &bind);
         assert_eq!(sendable_tx, &sendable);
+        assert!(matches!(
+            &events[1],
+            BurnExcessEvent::HeldRedemptionsAnchored {
+                held_redemptions,
+                ..
+            } if held_redemptions.is_empty()
+        ));
     }
 
     #[tokio::test]
@@ -828,6 +954,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -844,6 +971,7 @@ mod tests {
     async fn external_exclusion_then_intend() {
         let bind = sample_bind();
         let funding = funding_id();
+        let held = held_redemption();
         let excluded_at = Utc::now();
 
         let events = TestHarness::<BurnExcess>::with(())
@@ -861,19 +989,25 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: vec![held.clone()],
             })
             .await
             .events();
 
-        assert_eq!(events.len(), 1);
-        let BurnExcessEvent::ExcessBurnIntended {
-            path, funding_log_id, ..
-        } = &events[0]
-        else {
-            panic!("expected ExcessBurnIntended");
-        };
-        assert_eq!(*path, BurnExcessPath::External);
-        assert_eq!(funding_log_id.as_ref(), Some(&funding));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                BurnExcessEvent::ExcessBurnIntended {
+                    path: BurnExcessPath::External,
+                    funding_log_id: Some(event_funding),
+                    ..
+                },
+                BurnExcessEvent::HeldRedemptionsAnchored {
+                    held_redemptions,
+                    ..
+                },
+            ] if *event_funding == funding && held_redemptions == &[held]
+        ));
     }
 
     fn funding_expected(bind: &ExcessBurnBind) -> BurnExcessEvent {
@@ -942,6 +1076,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -994,6 +1129,8 @@ mod tests {
             .given(vec![funding_expected(&sample_bind())])
             .when(BurnExcessCommand::CloseExcessBurn {
                 reason: "funding never sent".into(),
+                proof: BurnExcessCloseProof::Unsigned,
+                release_through_block: Some(100),
             })
             .await
             .events();
@@ -1023,6 +1160,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1057,6 +1195,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1088,6 +1227,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1132,6 +1272,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                held_redemptions: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1182,30 +1323,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_from_intended() {
+    async fn signed_intent_cannot_be_closed() {
         let bind = sample_bind();
-        let intended_at = Utc::now();
-        let events = TestHarness::<BurnExcess>::with(())
+        let err = TestHarness::<BurnExcess>::with(())
             .given(vec![BurnExcessEvent::ExcessBurnIntended {
-                bind: bind.clone(),
+                bind,
                 path: BurnExcessPath::Internal,
                 funding_log_id: None,
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
-                intended_at,
+                intended_at: Utc::now(),
             }])
             .when(BurnExcessCommand::CloseExcessBurn {
                 reason: "abandoned".into(),
+                proof: BurnExcessCloseProof::Unsigned,
+                release_through_block: Some(100),
             })
             .await
-            .events();
+            .then_expect_error();
 
-        assert_eq!(events.len(), 1);
         assert!(matches!(
-            &events[0],
-            BurnExcessEvent::ExcessBurnClosed { reason, .. }
-                if reason == "abandoned"
+            err,
+            LifecycleError::Apply(BurnExcessError::InvalidState { .. })
         ));
     }
 
@@ -1216,15 +1356,21 @@ mod tests {
         let sendable = sample_sendable();
 
         let submitted = TestHarness::<BurnExcess>::with(())
-            .given(vec![BurnExcessEvent::ExcessBurnIntended {
-                bind: bind.clone(),
-                path: BurnExcessPath::Internal,
-                funding_log_id: None,
-                reason: "duplicate mint".into(),
-                incident_id: None,
-                sendable_tx: sendable.clone(),
-                intended_at,
-            }])
+            .given(vec![
+                BurnExcessEvent::ExcessBurnIntended {
+                    bind: bind.clone(),
+                    path: BurnExcessPath::Internal,
+                    funding_log_id: None,
+                    reason: "duplicate mint".into(),
+                    incident_id: None,
+                    sendable_tx: sendable.clone(),
+                    intended_at,
+                },
+                BurnExcessEvent::HeldRedemptionsAnchored {
+                    held_redemptions: Vec::new(),
+                    anchored_at: Utc::now(),
+                },
+            ])
             .when(BurnExcessCommand::RecordExcessBurnSubmitted {
                 tx_id: TxId::from(sendable.hash),
                 burn_tx_hash: sendable.hash,
@@ -1248,6 +1394,10 @@ mod tests {
                     sendable_tx: sendable.clone(),
                     intended_at,
                 },
+                BurnExcessEvent::HeldRedemptionsAnchored {
+                    held_redemptions: Vec::new(),
+                    anchored_at: Utc::now(),
+                },
                 BurnExcessEvent::ExcessBurnSubmitted {
                     tx_id: TxId::from(sendable.hash),
                     burn_tx_hash: sendable.hash,
@@ -1267,6 +1417,57 @@ mod tests {
                 block_number: 99,
                 ..
             } if *burn_tx_hash == sendable.hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_submitted_stream_can_anchor_empty_before_completion() {
+        let bind = sample_bind();
+        let sendable = sample_sendable();
+        let legacy_events = vec![
+            BurnExcessEvent::ExcessBurnIntended {
+                bind,
+                path: BurnExcessPath::Internal,
+                funding_log_id: None,
+                reason: "duplicate mint".into(),
+                incident_id: None,
+                sendable_tx: sendable.clone(),
+                intended_at: Utc::now(),
+            },
+            BurnExcessEvent::ExcessBurnSubmitted {
+                tx_id: TxId::from(sendable.hash),
+                burn_tx_hash: sendable.hash,
+                submitted_at: Utc::now(),
+            },
+        ];
+        let anchored = TestHarness::<BurnExcess>::with(())
+            .given(legacy_events.clone())
+            .when(BurnExcessCommand::AnchorHeldRedemptions {
+                held_redemptions: Vec::new(),
+            })
+            .await
+            .events();
+        assert!(matches!(
+            anchored.as_slice(),
+            [BurnExcessEvent::HeldRedemptionsAnchored {
+                held_redemptions,
+                ..
+            }] if held_redemptions.is_empty()
+        ));
+
+        let completed = TestHarness::<BurnExcess>::with(())
+            .given(
+                legacy_events.into_iter().chain(anchored).collect::<Vec<_>>(),
+            )
+            .when(BurnExcessCommand::CompleteExcessBurn {
+                burn_tx_hash: sendable.hash,
+                block_number: 99,
+            })
+            .await
+            .events();
+        assert!(matches!(
+            completed.as_slice(),
+            [BurnExcessEvent::ExcessBurnCompleted { .. }]
         ));
     }
 
@@ -1301,83 +1502,354 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_excess_burn_intent_tracks_intended_and_submitted() {
+    async fn independent_stores_cannot_reserve_one_signer_network() {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-        assert!(!has_unresolved_excess_burn_intent(&pool, None).await.unwrap());
-
-        let store = event_sorcery::test_store::<BurnExcess>(pool.clone(), ());
-        let bind = sample_bind();
-        let id = BurnExcessId::new(bind.deposit_tx_hash);
-        store
+        let first_store =
+            event_sorcery::test_store::<BurnExcess>(pool.clone(), ());
+        let second_store =
+            event_sorcery::test_store::<BurnExcess>(pool.clone(), ());
+        let first_bind = sample_bind();
+        let first_id = BurnExcessId::new(first_bind.deposit_tx_hash);
+        first_store
             .send(
-                &id,
+                &first_id,
                 BurnExcessCommand::IntendExcessBurn {
-                    bind: bind.clone(),
+                    bind: first_bind,
                     path: BurnExcessPath::Internal,
                     funding_log_id: None,
-                    reason: "dup".into(),
+                    reason: "first".into(),
                     incident_id: None,
                     sendable_tx: sample_sendable(),
+                    held_redemptions: Vec::new(),
                 },
             )
             .await
             .unwrap();
 
-        assert!(has_unresolved_excess_burn_intent(&pool, None).await.unwrap());
-        assert!(
-            !has_unresolved_excess_burn_intent(&pool, Some(&id)).await.unwrap()
-        );
-
-        store
+        let second_bind = ExcessBurnBind {
+            deposit_tx_hash: b256!(
+                "0x2bb6afc590e58095099373a8fea2242017b31acc7940bcd0d6b68820ebeb8ebd"
+            ),
+            ..sample_bind()
+        };
+        let second_id = BurnExcessId::new(second_bind.deposit_tx_hash);
+        let competing_error = second_store
             .send(
-                &id,
-                BurnExcessCommand::CloseExcessBurn { reason: "done".into() },
+                &second_id,
+                BurnExcessCommand::IntendExcessBurn {
+                    bind: second_bind.clone(),
+                    path: BurnExcessPath::Internal,
+                    funding_log_id: None,
+                    reason: "second".into(),
+                    incident_id: None,
+                    sendable_tx: sample_sendable(),
+                    held_redemptions: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{competing_error:?}")
+                .contains("signer network already reserved"),
+            "database arbitration must expose the signer conflict: \
+             {competing_error:?}"
+        );
+        assert!(second_store.load(&second_id).await.unwrap().is_none());
+        let burn_tx_hash = sample_sendable().hash;
+        first_store
+            .send(
+                &first_id,
+                BurnExcessCommand::CompleteExcessBurn {
+                    burn_tx_hash,
+                    block_number: 1,
+                },
             )
             .await
             .unwrap();
-        assert!(!has_unresolved_excess_burn_intent(&pool, None).await.unwrap());
+        second_store
+            .send(
+                &second_id,
+                BurnExcessCommand::IntendExcessBurn {
+                    bind: second_bind,
+                    path: BurnExcessPath::Internal,
+                    funding_log_id: None,
+                    reason: "second".into(),
+                    incident_id: None,
+                    sendable_tx: sample_sendable(),
+                    held_redemptions: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn unresolved_excess_burn_intent_tracks_funding_excluded() {
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-        let store = event_sorcery::test_store::<BurnExcess>(pool.clone(), ());
-        let bind = sample_bind();
-        let id = BurnExcessId::new(bind.deposit_tx_hash);
-        store
-            .send(
-                &id,
-                BurnExcessCommand::RecordFundingExclusion {
-                    bind: bind.clone(),
-                    funding_log_id: funding_id(),
-                    reason: "dup".into(),
-                    incident_id: None,
-                },
-            )
+    async fn signer_reservation_migration_backfills_burn_excess_history() {
+        const MIGRATION: &str = include_str!(
+            "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
             .await
             .unwrap();
+        sqlx::raw_sql(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER,
+                payload JSON NOT NULL
+            );
+            CREATE TABLE burn_excess_funding_expectations (
+                deposit_tx_hash TEXT PRIMARY KEY,
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                from_address TEXT NOT NULL,
+                to_address TEXT NOT NULL,
+                amount TEXT NOT NULL
+            );
+            CREATE TABLE tokenized_asset_vault_owners (
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL
+            );
+            CREATE TABLE active_signer_intents (
+                network TEXT NOT NULL PRIMARY KEY,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                UNIQUE (aggregate_type, aggregate_id)
+            );
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // Path B before intend holds no signed nonce, but the exclusion write
-        // is permanent and the stream still owns the issuer wallet.
-        assert!(has_unresolved_excess_burn_intent(&pool, None).await.unwrap());
-        assert!(
-            !has_unresolved_excess_burn_intent(&pool, Some(&id)).await.unwrap()
+        let bind = sample_bind();
+        let aggregate_id = BurnExcessId::new(bind.deposit_tx_hash).to_string();
+        let payload =
+            serde_json::to_string(&BurnExcessEvent::FundingExclusionRecorded {
+                bind,
+                funding_log_id: funding_id(),
+                reason: "duplicate mint".into(),
+                incident_id: None,
+                excluded_at: Utc::now(),
+            })
+            .unwrap();
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload
+            )
+            VALUES (
+                'BurnExcess',
+                ?,
+                'BurnExcessEvent::FundingExclusionRecorded',
+                ?
+            )
+            ",
+        )
+        .bind(&aggregate_id)
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+        let reservation: (String, String, String) = sqlx::query_as(
+            "
+            SELECT network, aggregate_type, aggregate_id
+            FROM active_signer_intents
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reservation,
+            ("base".into(), "BurnExcess".into(), aggregate_id.clone())
         );
 
-        store
-            .send(
-                &id,
-                BurnExcessCommand::CloseExcessBurn {
-                    reason: "abandoned".into(),
-                },
+        let invalid_close = sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload
             )
+            VALUES (
+                'BurnExcess',
+                ?,
+                'BurnExcessEvent::ExcessBurnClosed',
+                '{\"ExcessBurnClosed\":{\"reason\":\"unsafe\"}}'
+            )
+            ",
+        )
+        .bind(&aggregate_id)
+        .execute(&pool)
+        .await;
+        assert!(invalid_close.is_err());
+        let reservation_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM active_signer_intents
+            WHERE aggregate_type = 'BurnExcess'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reservation_count, 1);
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload
+            )
+            VALUES (
+                'BurnExcess',
+                ?,
+                'BurnExcessEvent::ExcessBurnClosed',
+                '{\"ExcessBurnClosed\":{
+                    \"reason\":\"safe\",
+                    \"proof\":\"unsigned\",
+                    \"release_through_block\":100
+                }}'
+            )
+            ",
+        )
+        .bind(&aggregate_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reservation_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM active_signer_intents
+            WHERE aggregate_type = 'BurnExcess'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reservation_count, 0);
+    }
+
+    #[tokio::test]
+    async fn signer_reservation_migration_keeps_legacy_signed_close_reserved() {
+        const MIGRATION: &str = include_str!(
+            "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
             .await
             .unwrap();
-        assert!(!has_unresolved_excess_burn_intent(&pool, None).await.unwrap());
+        sqlx::raw_sql(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER,
+                payload JSON NOT NULL
+            );
+            CREATE TABLE burn_excess_funding_expectations (
+                deposit_tx_hash TEXT PRIMARY KEY,
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                from_address TEXT NOT NULL,
+                to_address TEXT NOT NULL,
+                amount TEXT NOT NULL
+            );
+            CREATE TABLE tokenized_asset_vault_owners (
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL
+            );
+            CREATE TABLE active_signer_intents (
+                network TEXT NOT NULL PRIMARY KEY,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                UNIQUE (aggregate_type, aggregate_id)
+            );
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bind = sample_bind();
+        let aggregate_id = BurnExcessId::new(bind.deposit_tx_hash).to_string();
+        let intended =
+            serde_json::to_string(&BurnExcessEvent::ExcessBurnIntended {
+                bind,
+                path: BurnExcessPath::Internal,
+                funding_log_id: None,
+                reason: "legacy signed close".into(),
+                incident_id: None,
+                sendable_tx: sample_sendable(),
+                intended_at: Utc::now(),
+            })
+            .unwrap();
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload
+            )
+            VALUES
+                (
+                    'BurnExcess',
+                    ?,
+                    'BurnExcessEvent::ExcessBurnIntended',
+                    ?
+                ),
+                (
+                    'BurnExcess',
+                    ?,
+                    'BurnExcessEvent::ExcessBurnClosed',
+                    '{\"ExcessBurnClosed\":{\"reason\":\"legacy\"}}'
+                )
+            ",
+        )
+        .bind(&aggregate_id)
+        .bind(intended)
+        .bind(&aggregate_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+        let reservation_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM active_signer_intents
+            WHERE aggregate_type = 'BurnExcess'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reservation_count, 1);
     }
 
     #[test]
@@ -1400,6 +1872,8 @@ mod tests {
             reason: "r".into(),
             incident_id: None,
             sendable_tx: sample_sendable(),
+            held_redemptions: Vec::new(),
+            held_redemptions_anchored: true,
             intended_at: Utc::now(),
         };
         assert_eq!(intended.path(), BurnExcessPath::Internal);

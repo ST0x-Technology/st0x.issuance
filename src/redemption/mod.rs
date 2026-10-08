@@ -24,23 +24,22 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::Quantity;
+use crate::account::{AlpacaAccountNumber, ClientId};
 use crate::config::{VaultMode, VaultModeKind};
 use crate::mint::TokenizationRequestId;
 use crate::redemption::burn_manager::{
     extract_tx_hash, is_pending_burn_confirmation, should_release_reserved_burn,
 };
 
-/// Returns whether any signed transaction on the same signer network — a
-/// burn or a mint — is still awaiting its terminal outcome, excluding at
-/// most this redemption's own reservation.
+/// Returns whether another mint, redemption burn, or burn-excess recovery on
+/// the same signer network still owns its nonce domain, excluding at most this
+/// redemption's own reservation.
 ///
 /// Reads the trigger-maintained `active_signer_intents` table rather than
-/// re-deriving the answer from event streams: the triggers update the table
-/// in the same transaction that appends the intent event, so the table is
-/// the single source of truth and cannot drift from the reserve/release
-/// rules the migration encodes. Because the table is keyed by network, an
-/// outstanding Mint intent blocks a burn on the same nonce domain too —
-/// both flows sign with the same key.
+/// re-deriving the answer from event streams: triggers update the table in the
+/// same transaction that appends each durable intent or exclusion event.
+/// Because the table is keyed by network, every flow signing with the same key
+/// is serialized across processes.
 pub(crate) async fn has_unresolved_signer_intent(
     pool: &Pool<Sqlite>,
     network: Network,
@@ -250,6 +249,12 @@ pub(crate) use view::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RedemptionAccountAttribution {
+    pub(crate) client_id: ClientId,
+    pub(crate) alpaca_account: AlpacaAccountNumber,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RedemptionMetadata {
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     pub(crate) underlying: UnderlyingSymbol,
@@ -266,6 +271,11 @@ pub(crate) struct RedemptionMetadata {
     /// and states persisted before orchestrator mode default to `VaultDirect`.
     #[serde(default)]
     pub(crate) burn_mode: VaultMode,
+    /// Account identity admitted when the on-chain transfer was detected.
+    /// Historical redemptions predate this anchor and fall back to the live
+    /// account view during recovery.
+    #[serde(default)]
+    pub(crate) account_attribution: Option<Box<RedemptionAccountAttribution>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1224,8 +1234,10 @@ impl Redemption {
             });
         };
 
-        Ok(vec![RedemptionEvent::Reprocessed {
-            issuer_request_id,
+        let account_attribution = metadata.account_attribution;
+        let reprocessed_at = Utc::now();
+        let mut events = vec![RedemptionEvent::Reprocessed {
+            issuer_request_id: issuer_request_id.clone(),
             underlying: metadata.underlying,
             token: metadata.token,
             network: metadata.network,
@@ -1235,9 +1247,17 @@ impl Redemption {
             block_number: metadata.block_number,
             detected_at: metadata.detected_at,
             previous_state: self.state_name().to_string(),
-            reprocessed_at: Utc::now(),
+            reprocessed_at,
             burn_mode: metadata.burn_mode,
-        }])
+        }];
+        if let Some(attribution) = account_attribution {
+            events.push(RedemptionEvent::AccountAttributionAnchored {
+                issuer_request_id,
+                attribution: *attribution,
+                anchored_at: reprocessed_at,
+            });
+        }
+        Ok(events)
     }
 
     /// Resumes a post-Alpaca failed redemption directly to Burning state.
@@ -2451,6 +2471,7 @@ impl EventSourced for Redemption {
                     block_number: *block_number,
                     detected_at: *detected_at,
                     burn_mode: *burn_mode,
+                    account_attribution: None,
                 },
             }),
             _ => None,
@@ -2481,18 +2502,30 @@ impl EventSourced for Redemption {
                 tx_hash,
                 block_number,
                 burn_mode,
-            } => Ok(vec![RedemptionEvent::Detected {
-                issuer_request_id,
-                underlying,
-                token,
-                network,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-                detected_at: Utc::now(),
-                burn_mode,
-            }]),
+                account_attribution,
+            } => {
+                let detected_at = Utc::now();
+                let mut events = vec![RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    network,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                    detected_at,
+                    burn_mode,
+                }];
+                if let Some(attribution) = account_attribution {
+                    events.push(RedemptionEvent::AccountAttributionAnchored {
+                        issuer_request_id,
+                        attribution,
+                        anchored_at: detected_at,
+                    });
+                }
+                Ok(events)
+            }
             RedemptionCommand::ClaimAlpacaCall { .. }
             | RedemptionCommand::RecordAlpacaCall { .. }
             | RedemptionCommand::RecordAlpacaFailure { .. }
@@ -3209,6 +3242,19 @@ impl Redemption {
             | RedemptionEvent::Reprocessed { .. } => {
                 self.apply_detection_event(event);
             }
+            RedemptionEvent::AccountAttributionAnchored {
+                attribution, ..
+            } => {
+                let Self::Detected { metadata } = self else {
+                    warn!(
+                        current_state = %self.state_name(),
+                        "Ignoring account attribution outside Detected state"
+                    );
+                    return;
+                };
+                metadata.account_attribution =
+                    Some(Box::new(attribution.clone()));
+            }
             RedemptionEvent::AlpacaCallClaimed {
                 issuer_request_id,
                 claimed_at,
@@ -3315,6 +3361,7 @@ impl Redemption {
                 block_number,
                 detected_at,
                 burn_mode,
+                account_attribution: None,
             },
         };
     }
@@ -3520,6 +3567,7 @@ impl Redemption {
                 block_number,
                 detected_at,
                 burn_mode,
+                account_attribution: None,
             },
             tokenization_request_id,
             alpaca_quantity,
@@ -3722,11 +3770,12 @@ mod tests {
         BurnExternalTxId, BurnFailureClassification, BurnNonceTooLowProof,
         BurnParams, BurnRecord, BurnRecoveryAction, BurnSubmitRejectedProof,
         ExistingBurnProof, IssuerRedemptionRequestId, Redemption,
-        RedemptionCommand, RedemptionError, RedemptionEvent,
-        RedemptionMetadata, RedemptionServices, TokensBurnedData,
-        has_unresolved_signer_intent,
+        RedemptionAccountAttribution, RedemptionCommand, RedemptionError,
+        RedemptionEvent, RedemptionMetadata, RedemptionServices,
+        TokensBurnedData, has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
+    use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::config::{VaultMode, VaultModeKind};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
@@ -4366,6 +4415,7 @@ mod tests {
             .given_no_previous_events()
             .when(RedemptionCommand::Detect {
                 burn_mode: VaultMode::VaultDirect,
+                account_attribution: None,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -4434,6 +4484,7 @@ mod tests {
             }])
             .when(RedemptionCommand::Detect {
                 burn_mode: VaultMode::VaultDirect,
+                account_attribution: None,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
@@ -4500,6 +4551,7 @@ mod tests {
                     detected_tx_hash: tx_hash,
                     block_number,
                     detected_at,
+                    account_attribution: None,
                 }
             }
         );
@@ -4525,6 +4577,7 @@ mod tests {
                 block_number: 1,
                 burn_mode: orchestrator_mode(),
                 network: Network::Base,
+                account_attribution: None,
             })
             .await
             .events();
@@ -4537,6 +4590,49 @@ mod tests {
             ),
             "Detected must carry the orchestrator anchor, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn detect_commits_account_attribution_with_detection() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given_no_previous_events()
+            .when(RedemptionCommand::Detect {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                network: Network::Base,
+                wallet: Address::random(),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: B256::random(),
+                block_number: 1,
+                burn_mode: VaultMode::VaultDirect,
+                account_attribution: Some(attribution.clone()),
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RedemptionEvent::Detected {
+                    issuer_request_id: detected_id,
+                    ..
+                },
+                RedemptionEvent::AccountAttributionAnchored {
+                    issuer_request_id: anchored_id,
+                    attribution: event_attribution,
+                    ..
+                },
+            ] if detected_id == &issuer_request_id
+                && anchored_id == &issuer_request_id
+                && event_attribution == &attribution
+        ));
     }
 
     /// The mode anchor must survive replay through the whole pre-burn
@@ -4661,13 +4757,17 @@ mod tests {
         assert_eq!(metadata.burn_mode, orchestrator_mode());
     }
 
-    /// `Reprocess` and `ResumeBurn` handlers copy the caller-supplied
-    /// metadata's anchor onto the emitted event, so the persisted history
-    /// keeps the orchestrator mode across admin recovery.
+    /// `Reprocess` persists the caller-supplied burn mode and durable account
+    /// attribution in the same append, so admin recovery cannot fall back to
+    /// mutable account configuration after a restart.
     #[tokio::test]
-    async fn reprocess_command_preserves_orchestrator_burn_mode() {
+    async fn reprocess_command_preserves_recovery_anchors() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let detected_tx_hash = B256::random();
+        let account_attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
         let metadata = RedemptionMetadata {
             issuer_request_id: issuer_request_id.clone(),
             underlying: UnderlyingSymbol::new("RKLB").unwrap(),
@@ -4679,6 +4779,7 @@ mod tests {
             detected_at: Utc::now(),
             burn_mode: orchestrator_mode(),
             network: Network::Base,
+            account_attribution: Some(Box::new(account_attribution.clone())),
         };
 
         let events = TestHarness::<Redemption>::with(mock_services())
@@ -4710,10 +4811,16 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [RedemptionEvent::Reprocessed { burn_mode, .. }]
-                    if *burn_mode == orchestrator_mode()
+                [
+                    RedemptionEvent::Reprocessed { burn_mode, .. },
+                    RedemptionEvent::AccountAttributionAnchored {
+                        attribution,
+                        ..
+                    }
+                ] if *burn_mode == orchestrator_mode()
+                    && attribution == &account_attribution
             ),
-            "Reprocessed must carry the orchestrator anchor, got {events:?}"
+            "Reprocessed must carry both recovery anchors, got {events:?}"
         );
     }
 
@@ -5331,6 +5438,7 @@ mod tests {
                     detected_tx_hash: tx_hash,
                     block_number,
                     detected_at,
+                    account_attribution: None,
                 },
                 tokenization_request_id,
                 alpaca_quantity,
@@ -6683,6 +6791,7 @@ mod tests {
                     detected_tx_hash: tx_hash,
                     block_number,
                     detected_at,
+                    account_attribution: None,
                 },
                 tokenization_request_id,
                 alpaca_quantity,
@@ -9519,6 +9628,7 @@ mod tests {
             ),
             block_number: 12345,
             detected_at: Utc::now(),
+            account_attribution: None,
         }
     }
 
@@ -9799,6 +9909,7 @@ mod tests {
                     block_number: metadata.block_number,
                     detected_at: metadata.detected_at,
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                 }
             }
         );

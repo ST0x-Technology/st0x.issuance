@@ -11,6 +11,8 @@ pub(crate) enum AccountViewError {
     Database(#[from] sqlx::Error),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+    #[error("wallet {wallet} is linked to multiple accounts")]
+    WalletLinkedToMultipleAccounts { wallet: Address },
 }
 
 /// Read model for an account, projected from the `account_view` table.
@@ -99,7 +101,7 @@ pub(crate) async fn find_by_wallet(
     wallet: &Address,
 ) -> Result<Option<AccountView>, AccountViewError> {
     let wallet_str = format!("{wallet:#x}");
-    let row = sqlx::query!(
+    let rows = sqlx::query!(
         r#"
         SELECT json_extract(payload, '$.Live') as "live: String"
         FROM account_view
@@ -111,16 +113,18 @@ pub(crate) async fn find_by_wallet(
         "#,
         wallet_str
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
-
-    let Some(live) = row.and_then(|row| row.live) else {
+    let mut live_rows = rows.into_iter().filter_map(|row| row.live);
+    let Some(live) = live_rows.next() else {
         return Ok(None);
     };
-
-    let view: AccountView = serde_json::from_str(&live)?;
-
-    Ok(Some(view))
+    if live_rows.next().is_some() {
+        return Err(AccountViewError::WalletLinkedToMultipleAccounts {
+            wallet: *wallet,
+        });
+    }
+    Ok(Some(serde_json::from_str(&live)?))
 }
 
 #[cfg(test)]
@@ -384,6 +388,36 @@ mod tests {
 
         assert_eq!(found_client_id, client_id);
         assert!(whitelisted_wallets.contains(&wallet));
+    }
+
+    #[tokio::test]
+    async fn find_by_wallet_refuses_ambiguous_account_ownership() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+        for (email, alpaca_account) in [
+            ("first@example.com", "ALPACA-1"),
+            ("second@example.com", "ALPACA-2"),
+        ] {
+            let client_id = ClientId::new();
+            harness
+                .register_account(client_id, Email::new(email).unwrap())
+                .await;
+            harness
+                .link_to_alpaca(
+                    &client_id,
+                    AlpacaAccountNumber(alpaca_account.to_string()),
+                )
+                .await;
+            harness.whitelist_wallet(&client_id, wallet).await;
+        }
+
+        assert!(matches!(
+            find_by_wallet(pool, &wallet).await.unwrap_err(),
+            AccountViewError::WalletLinkedToMultipleAccounts {
+                wallet: ambiguous
+            } if ambiguous == wallet
+        ));
     }
 
     #[tokio::test]

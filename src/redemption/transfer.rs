@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+    IssuerRedemptionRequestId, Redemption, RedemptionAccountAttribution,
+    RedemptionCommand,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     redeem_call_manager::{DetectedRecoveryOutcome, RedeemCallManager},
@@ -17,7 +18,8 @@ use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
 use crate::burn_excess::FundingTransferId;
 use crate::burn_excess::expectation::{
-    FundingTransferStatus, classify_funding_transfer,
+    FundingExpectationStatus, FundingTransferIndexError, FundingTransferStatus,
+    classify_funding_transfer, clear_held_redemption,
 };
 use crate::config::{MissingOrchestratorAddress, VaultModeConfig};
 use crate::tokenized_asset::{
@@ -44,6 +46,9 @@ pub(crate) enum TransferOutcome {
     HeldExpectedFunding {
         block_number: u64,
     },
+    /// A released expectation appeared after this pass classified its logs.
+    /// Retry so the next pass can validate the full transaction first.
+    RetryReleasedExpectation,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +85,17 @@ pub(crate) enum TransferProcessingError {
     AmbiguousVault { vault: Address },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    FundingTransferIndex(#[from] FundingTransferIndexError),
+
+    #[error(
+        "held-redemption attribution identity mismatch: indexed={indexed:?}, \
+         observed={observed:?}"
+    )]
+    HeldAttributionMismatch {
+        indexed: Box<FundingTransferId>,
+        observed: Box<FundingTransferId>,
+    },
 }
 
 // `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
@@ -109,10 +125,17 @@ impl TransferProcessingError {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransferGuardSnapshot {
+    pub(crate) vault: Address,
+    pub(crate) expectation_status: Option<FundingExpectationStatus>,
+}
+
 /// Decodes a Transfer log, looks up the account view and the asset (from the
 /// caller's per-pass snapshot, so attribution is consistent with the vault set
 /// the pass was built from), and executes `RedemptionCommand::Detect`.
 /// Idempotent — returns `AlreadyDetected` on duplicate.
+#[cfg(test)]
 pub(crate) async fn detect_transfer(
     log: &alloy::rpc::types::Log,
     vault: Address,
@@ -122,6 +145,29 @@ pub(crate) async fn detect_transfer(
     pool: &Pool<Sqlite>,
     vault_modes: &VaultModeConfig,
 ) -> Result<TransferOutcome, TransferProcessingError> {
+    detect_transfer_with_expectation_status(
+        log,
+        TransferGuardSnapshot { vault, expectation_status: None },
+        network,
+        assets,
+        store,
+        pool,
+        vault_modes,
+    )
+    .await
+}
+
+pub(crate) async fn detect_transfer_with_expectation_status(
+    log: &alloy::rpc::types::Log,
+    guard: TransferGuardSnapshot,
+    network: Network,
+    assets: &[TokenizedAssetView],
+    store: &Store<Redemption>,
+    pool: &Pool<Sqlite>,
+    vault_modes: &VaultModeConfig,
+) -> Result<TransferOutcome, TransferProcessingError> {
+    let vault = guard.vault;
+    let expectation_status = guard.expectation_status;
     let transfer_event =
         bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
 
@@ -154,7 +200,20 @@ pub(crate) async fn detect_transfer(
         to: transfer_event.to,
         amount: transfer_event.value,
     };
-    match classify_funding_transfer(pool, &funding_candidate).await? {
+    if expectation_status == Some(FundingExpectationStatus::Active) {
+        debug!(
+            target: "redemption",
+            %tx_hash,
+            log_index,
+            %vault,
+            block_number,
+            "Holding expected admin recovery funding transfer"
+        );
+        return Ok(TransferOutcome::HeldExpectedFunding { block_number });
+    }
+    let attributed = match classify_funding_transfer(pool, &funding_candidate)
+        .await?
+    {
         FundingTransferStatus::Excluded => {
             debug!(
                 target: "redemption",
@@ -176,34 +235,68 @@ pub(crate) async fn detect_transfer(
             );
             return Ok(TransferOutcome::HeldExpectedFunding { block_number });
         }
-        FundingTransferStatus::Unrelated => {}
-    }
-
-    let account_view = find_by_wallet(pool, &transfer_event.from).await?;
-
-    let Some(AccountView::LinkedToAlpaca { client_id, alpaca_account, .. }) =
-        account_view
-    else {
-        debug!(target: "redemption", from = %transfer_event.from,
-            tx_hash = %tx_hash,
-            "Skipping transfer from unknown/unlinked wallet"
-        );
-        return Ok(TransferOutcome::SkippedNoAccount);
+        FundingTransferStatus::Released
+            if expectation_status
+                == Some(FundingExpectationStatus::Released) =>
+        {
+            None
+        }
+        FundingTransferStatus::Released => {
+            return Ok(TransferOutcome::RetryReleasedExpectation);
+        }
+        FundingTransferStatus::Attributed(held) => {
+            let held = *held;
+            if held.transfer != funding_candidate {
+                return Err(TransferProcessingError::HeldAttributionMismatch {
+                    indexed: Box::new(held.transfer),
+                    observed: Box::new(funding_candidate),
+                });
+            }
+            Some(held)
+        }
+        FundingTransferStatus::Unrelated => None,
     };
 
-    let (underlying, token, network) =
-        find_matching_asset(assets, vault, network)?;
+    let attributed_transfer =
+        attributed.as_ref().map(|held| held.transfer.clone());
+    let (client_id, alpaca_account, underlying, token, burn_mode) =
+        if let Some(held) = attributed {
+            (
+                held.client_id,
+                held.alpaca_account,
+                held.underlying,
+                held.token,
+                held.burn_mode,
+            )
+        } else {
+            let account = find_by_wallet(pool, &transfer_event.from)
+                .await?
+                .and_then(|view| match view {
+                    AccountView::LinkedToAlpaca {
+                        client_id,
+                        alpaca_account,
+                        ..
+                    } => Some((client_id, alpaca_account)),
+                    AccountView::Registered { .. } => None,
+                });
+            let Some((client_id, alpaca_account)) = account else {
+                debug!(target: "redemption", from = %transfer_event.from,
+                    tx_hash = %tx_hash,
+                    "Skipping transfer from unknown/unlinked wallet"
+                );
+                return Ok(TransferOutcome::SkippedNoAccount);
+            };
+            let (underlying, token, _) =
+                find_matching_asset(assets, vault, network)?;
+            let burn_mode = vault_modes.mode_for(&underlying, network)?;
+            (client_id, alpaca_account, underlying, token, burn_mode)
+        };
 
     let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
     let quantity = Quantity::from_u256_with_18_decimals(transfer_event.value)?;
 
-    // Anchor the asset's currently-configured mode on the Detected event:
-    // every later burn step derives from this persisted value, so an asset
-    // cutover mid-redemption never switches an in-flight redemption's path.
-    // The address resolves per the asset's network; a missing entry errors
-    // loudly here (the startup cross-check makes it unreachable in a
-    // validated deploy) rather than anchoring a wrong mode.
-    let burn_mode = vault_modes.mode_for(&underlying, network)?;
+    // The attributed path uses the asset and mode admitted before the excess
+    // burn. Ordinary detections anchor the current mapping at this boundary.
 
     let command = RedemptionCommand::Detect {
         issuer_request_id: issuer_request_id.clone(),
@@ -215,11 +308,22 @@ pub(crate) async fn detect_transfer(
         tx_hash,
         block_number,
         burn_mode,
+        account_attribution: Some(RedemptionAccountAttribution {
+            client_id,
+            alpaca_account: alpaca_account.clone(),
+        }),
     };
 
     match store.send(&issuer_request_id, command).await {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some(transfer) = &attributed_transfer {
+                clear_held_redemption(pool, transfer).await?;
+            }
+        }
         Err(AggregateError::UserError(LifecycleError::Apply(_))) => {
+            if let Some(transfer) = &attributed_transfer {
+                clear_held_redemption(pool, transfer).await?;
+            }
             debug!(target: "redemption", %issuer_request_id,
                 "Transfer already detected"
             );
@@ -421,7 +525,7 @@ fn find_matching_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use event_sorcery::{Store, StoreBuilder, test_store};
     use sqlx::SqlitePool;
@@ -429,13 +533,19 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
+    use crate::account::{AlpacaAccountNumber, ClientId};
+    use crate::burn_excess::expectation::{
+        held_redemption_vaults, record_held_redemptions,
+    };
+    use crate::burn_excess::{FundingTransferId, HeldTransferRedemption};
     use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
-    use crate::redemption::IssuerRedemptionRequestId;
-    use crate::redemption::Redemption;
     use crate::redemption::RedemptionServices;
     use crate::redemption::test_utils::{
         create_transfer_log, create_transfer_log_with_index,
         setup_test_db_with_asset,
+    };
+    use crate::redemption::{
+        IssuerRedemptionRequestId, Redemption, RedemptionAccountAttribution,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::list_enabled_assets;
@@ -841,6 +951,84 @@ mod tests {
             tracing::Level::DEBUG,
             &["Skipping admin recovery funding transfer"]
         ));
+    }
+
+    #[tokio::test]
+    async fn attributed_transfer_uses_anchored_context_after_vault_repoint() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
+        let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
+        let tx_hash = b256!(
+            "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        );
+        let transfer = FundingTransferId {
+            network: Network::Base,
+            vault,
+            tx_hash,
+            log_index: 7,
+            from: ap_wallet,
+            to: bot_wallet,
+            amount: value,
+        };
+        let attribution = HeldTransferRedemption {
+            transfer: transfer.clone(),
+            block_number: 12_345,
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored-account".into()),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: TokenSymbol::new("tAAPL"),
+            burn_mode: VaultMode::VaultDirect,
+        };
+        record_held_redemptions(
+            &pool,
+            B256::random(),
+            std::slice::from_ref(&attribution),
+        )
+        .await
+        .unwrap();
+        let log = create_transfer_log_with_index(
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345, 7,
+        );
+
+        let outcome = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &[],
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let TransferOutcome::Detected { issuer_request_id, .. } = outcome
+        else {
+            panic!("anchored transfer must detect after vault repoint");
+        };
+        let redemption = store.load(&issuer_request_id).await.unwrap().unwrap();
+        let Redemption::Detected { metadata } = redemption else {
+            panic!("anchored transfer must persist Detected");
+        };
+        assert_eq!(
+            metadata.account_attribution,
+            Some(Box::new(RedemptionAccountAttribution {
+                client_id: attribution.client_id,
+                alpaca_account: attribution.alpaca_account,
+            }))
+        );
+        assert_eq!(metadata.underlying, attribution.underlying);
+        assert_eq!(metadata.token, attribution.token);
+        assert!(
+            held_redemption_vaults(&pool, Network::Base)
+                .await
+                .unwrap()
+                .is_empty(),
+            "detection must retire the old-vault scan obligation"
+        );
     }
 
     #[traced_test]

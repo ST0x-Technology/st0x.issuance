@@ -325,19 +325,19 @@ pub(crate) async fn burn_excess_external_ops(
 /// intervention.
 const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
     use BurnExcessEngineError::{
-        AmbiguousDepositTx, AmbiguousShareTransferOut, AnotherFundingExpected,
+        AmbiguousDepositTx, AmbiguousShareTransferOut, ChainBehindProvenPlan,
         Contract, DeadBurnIntent, DepositTxInvalid, FundingNotExpected,
-        FundingTxInvalid, MintMissingAsset, MintNetworkMismatch, MintNotFound,
-        Proof, Provider, UnresolvedExcessBurnIntent, UnresolvedSignerIntent,
-        Vault, VaultNotListed,
+        FundingTxInvalid, HeldTransferReceiptMissing, MintMissingAsset,
+        MintNetworkMismatch, MintNotFound, Proof, Provider,
+        UnresolvedExcessBurnIntent, UnresolvedSignerIntent, Vault,
+        VaultNotListed,
     };
 
     match error {
         MintNotFound { .. } => Status::NotFound,
         UnresolvedSignerIntent { .. }
         | UnresolvedExcessBurnIntent
-        | FundingNotExpected
-        | AnotherFundingExpected { .. } => Status::Conflict,
+        | FundingNotExpected => Status::Conflict,
         Proof(_)
         | MintMissingAsset { .. }
         | MintNetworkMismatch { .. }
@@ -347,7 +347,11 @@ const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
         | AmbiguousShareTransferOut { .. }
         | FundingTxInvalid { .. }
         | DeadBurnIntent { .. } => Status::UnprocessableEntity,
-        Provider(_) | Contract(_) | Vault(_) => Status::BadGateway,
+        Provider(_)
+        | Contract(_)
+        | Vault(_)
+        | HeldTransferReceiptMissing { .. }
+        | ChainBehindProvenPlan { .. } => Status::BadGateway,
         _ => Status::InternalServerError,
     }
 }

@@ -156,10 +156,28 @@ pub(crate) enum BurnExcessProofError {
     FundingTransferNotFound { tx_hash: B256 },
 
     #[error(
-        "ambiguous funding Transfer: {count} logs match vault/from/to/amount \
-         in transaction {tx_hash:?}"
+        "a held Transfer of the funding shape shares transaction {tx_hash:?} \
+         with another inbound Transfer the redemption poller redeems or would \
+         redeem (any polled vault, linked sender); a redemption is keyed by \
+         its transaction, so it could never be redeemed on its own. The run \
+         refuses before burning; closing the stream does not redeem it \
+         either, so its shares need manual reconciliation"
     )]
-    FundingTransferAmbiguous { tx_hash: B256, count: usize },
+    HeldTransfersShareTransaction { tx_hash: B256 },
+
+    #[error(
+        "Transfers of the funding shape are held from {wallet:?}, which is not \
+         a linked AP wallet: once released the redemption poller would skip \
+         them, so their shares cannot count toward the issuer balance"
+    )]
+    HeldTransferSenderNotLinked { wallet: Address },
+
+    #[error(
+        "funding Transfer {tx_hash:?} log_index={log_index} is already \
+         excluded for another burn-excess deposit; pass this stream's own \
+         funding Transfer"
+    )]
+    FundingLogExcludedForAnotherDeposit { tx_hash: B256, log_index: u64 },
 
     #[error(
         "funding Transfer from {found:?} does not match original mint \
@@ -383,12 +401,16 @@ pub(crate) fn bind_deposit_proof(
     Ok(())
 }
 
-/// Select the unique funding Transfer log matching Path B expectations.
+/// Select the funding Transfer log matching Path B expectations. Logs of the
+/// exact shape in one transaction (same vault, sender, recipient, amount) are
+/// interchangeable, so the lowest log index is the funding log; a live
+/// stream's expectation holds the others and counts them toward the issuer
+/// balance as redemptions.
 pub(crate) fn select_funding_transfer(
     expectation: &FundingTransferExpectation,
     candidates: &[FundingTransferCandidate],
 ) -> Result<FundingTransferId, BurnExcessProofError> {
-    let matches: Vec<&FundingTransferCandidate> = candidates
+    let funding = candidates
         .iter()
         .filter(|candidate| {
             candidate.vault == expectation.vault
@@ -396,34 +418,27 @@ pub(crate) fn select_funding_transfer(
                 && candidate.to == expectation.to
                 && candidate.amount == expectation.amount
         })
-        .collect();
+        .min_by_key(|candidate| candidate.log_index);
 
-    match matches.as_slice() {
-        [] => {
-            if let Some(mismatch) =
-                first_shape_mismatch(expectation, candidates)
-            {
-                return Err(mismatch);
-            }
-
-            Err(BurnExcessProofError::FundingTransferNotFound {
-                tx_hash: expectation.tx_hash,
-            })
+    let Some(funding) = funding else {
+        if let Some(mismatch) = first_shape_mismatch(expectation, candidates) {
+            return Err(mismatch);
         }
-        [only] => Ok(FundingTransferId {
-            network: expectation.network,
-            vault: only.vault,
+
+        return Err(BurnExcessProofError::FundingTransferNotFound {
             tx_hash: expectation.tx_hash,
-            log_index: only.log_index,
-            from: only.from,
-            to: only.to,
-            amount: only.amount,
-        }),
-        many => Err(BurnExcessProofError::FundingTransferAmbiguous {
-            tx_hash: expectation.tx_hash,
-            count: many.len(),
-        }),
-    }
+        });
+    };
+
+    Ok(FundingTransferId {
+        network: expectation.network,
+        vault: funding.vault,
+        tx_hash: expectation.tx_hash,
+        log_index: funding.log_index,
+        from: funding.from,
+        to: funding.to,
+        amount: funding.amount,
+    })
 }
 
 fn first_shape_mismatch(
@@ -516,6 +531,7 @@ mod tests {
             ),
             vault: address!("0x1111111111111111111111111111111111111111"),
             network: Network::Base,
+            chain_id: 8453,
             issuer_wallet: address!(
                 "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
             ),
@@ -583,6 +599,8 @@ mod tests {
             reason: "dup".into(),
             incident_id: None,
             sendable_tx: crate::vault::SendableTxWithHash::default(),
+            held_redemptions: Vec::new(),
+            held_redemptions_anchored: true,
             intended_at: Utc::now(),
         };
 
@@ -796,8 +814,11 @@ mod tests {
         assert_eq!(selected.tx_hash, expectation.tx_hash);
     }
 
+    /// Identical funding-shape logs in one transaction are interchangeable;
+    /// picking the lowest index keeps the choice stable across reruns, so a
+    /// resume proves the same log the first run excluded.
     #[test]
-    fn select_funding_transfer_not_found_and_ambiguous() {
+    fn select_funding_transfer_not_found_and_identical_matches() {
         let expectation = FundingTransferExpectation {
             network: Network::Base,
             vault: address!("0x1111111111111111111111111111111111111111"),
@@ -814,24 +835,21 @@ mod tests {
         ));
 
         let match_shape = FundingTransferCandidate {
-            log_index: 0,
+            log_index: 4,
             vault: expectation.vault,
             from: expectation.from,
             to: expectation.to,
             amount: expectation.amount,
         };
-        let ambiguous = select_funding_transfer(
+        let selected = select_funding_transfer(
             &expectation,
             &[
                 match_shape.clone(),
                 FundingTransferCandidate { log_index: 1, ..match_shape },
             ],
         )
-        .unwrap_err();
-        assert!(matches!(
-            ambiguous,
-            BurnExcessProofError::FundingTransferAmbiguous { count: 2, .. }
-        ));
+        .unwrap();
+        assert_eq!(selected.log_index, 1);
     }
 
     #[test]

@@ -351,8 +351,12 @@ impl RedeemCallManager {
             }
         }
 
-        let (client_id, _) =
-            self.lookup_account_for_recovery(&metadata.wallet).await?;
+        let client_id = if let Some(attribution) = &metadata.account_attribution
+        {
+            attribution.client_id
+        } else {
+            self.lookup_account_for_recovery(&metadata.wallet).await?.0
+        };
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
@@ -893,8 +897,8 @@ mod tests {
     };
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
-        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionServices, UnderlyingSymbol,
+        IssuerRedemptionRequestId, Redemption, RedemptionAccountAttribution,
+        RedemptionCommand, RedemptionServices, UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
@@ -1066,19 +1070,16 @@ mod tests {
             self.redemption_store
                 .send(
                     issuer_request_id,
-                    RedemptionCommand::Detect {
-                        issuer_request_id: issuer_request_id.clone(),
-                        underlying: underlying.clone(),
-                        token: TokenSymbol::new(format!("t{}", underlying.as_str())),
-                        network: *network,
-                        wallet,
-                        quantity: Quantity::new(Decimal::from(100)),
-                        tx_hash: b256!(
-                            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                        ),
-                        block_number: 12345,
-                        burn_mode: VaultMode::VaultDirect,
-                    },
+                    RedemptionCommand::Detect { issuer_request_id: issuer_request_id.clone(), account_attribution: None, underlying: underlying.clone(),
+                    token: TokenSymbol::new(format!("t{}", underlying.as_str())),
+                    network: *network,
+                    wallet,
+                    quantity: Quantity::new(Decimal::from(100)),
+                    tx_hash: b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                    block_number: 12345,
+                    burn_mode: VaultMode::VaultDirect, },
                 )
                 .await
                 .expect("Failed to detect redemption");
@@ -1286,6 +1287,7 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::Detect {
                     issuer_request_id: issuer_request_id.clone(),
+                    account_attribution: None,
                     underlying,
                     token,
                     network: Network::Ethereum,
@@ -2560,19 +2562,16 @@ mod tests {
             .redemption_store
             .send(
                 &issuer_request_id,
-                RedemptionCommand::Detect {
-                    issuer_request_id: issuer_request_id.clone(),
-                    underlying,
-                    token: TokenSymbol::new(""),
-                    network,
-                    wallet,
-                    quantity: Quantity::new(Decimal::from(100)),
-                    tx_hash: b256!(
-                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
-                    block_number: 12345,
-                    burn_mode: VaultMode::VaultDirect,
-                },
+                RedemptionCommand::Detect { issuer_request_id: issuer_request_id.clone(), account_attribution: None, underlying,
+                token: TokenSymbol::new(""),
+                network,
+                wallet,
+                quantity: Quantity::new(Decimal::from(100)),
+                tx_hash: b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                block_number: 12345,
+                burn_mode: VaultMode::VaultDirect, },
             )
             .await
             .unwrap();
@@ -2629,6 +2628,59 @@ mod tests {
             ),
             "Expected AccountNotFound, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn anchored_account_recovers_detected_after_wallet_unlink() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockIssuerApi::new_success());
+        let manager = harness.create_manager(alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>);
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        harness.add_asset(&underlying, &Network::Base).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
+        harness
+            .redemption_store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    tx_hash: b256!(
+                        "0xdededededededededededededededededededededededededededededededede"
+                    ),
+                    block_number: 12345,
+                    burn_mode: VaultMode::VaultDirect,
+                    account_attribution: Some(attribution),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome =
+            manager.recover_single_detected(&issuer_request_id).await.unwrap();
+
+        assert_eq!(outcome, DetectedRecoveryOutcome::Recovered);
+        assert_eq!(alpaca_service_mock.get_call_count(), 1);
+        assert!(matches!(
+            harness
+                .redemption_store
+                .load(&issuer_request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            Redemption::AlpacaCalled { .. }
+        ));
     }
 
     #[traced_test]

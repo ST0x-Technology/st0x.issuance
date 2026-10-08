@@ -19,16 +19,25 @@ use super::{
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
     transfer::{
-        RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
-        detect_transfer, drive_redemption_flow,
+        RedemptionFlowCtx, TransferGuardSnapshot, TransferOutcome,
+        TransferProcessingError, detect_transfer_with_expectation_status,
+        drive_redemption_flow,
     },
 };
 use crate::bindings;
+use crate::burn_excess::FundingTransferId;
+use crate::burn_excess::exclusion::is_excluded_funding_log;
+use crate::burn_excess::expectation::{
+    FundingExpectationStatus, FundingTransferIndexError,
+    clear_released_funding_expectations, competes_for_redemption_key,
+    funding_expectation_status, funding_expectation_vaults,
+    held_redemption_vaults,
+};
 use crate::config::VaultModeConfig;
 use crate::network_telemetry::NetworkTelemetry;
 use crate::poll_checkpoint::{
     self, CheckpointError, TRANSFER_POLL, advance_transfer_poll,
-    load_transfer_poll,
+    advance_transfer_poll_observed, load_transfer_poll,
 };
 use crate::tokenized_asset::Network;
 use crate::tokenized_asset::TokenizedAssetView;
@@ -170,8 +179,20 @@ pub(crate) enum TransferPollError {
     CheckpointOverflow { last_processed_block: u64 },
     #[error("Tokenized asset view error: {0}")]
     TokenizedAssetView(#[from] TokenizedAssetViewError),
+    #[error("Funding transfer index error: {0}")]
+    FundingTransferIndex(#[from] FundingTransferIndexError),
     #[error("all {total} vaults failed the poll pass")]
     AllVaultsFailed { total: usize },
+    #[error(
+        "burn-excess expectation vault {vault} on {network} is not the current \
+         asset listing; restore the listing before transfer polling resumes"
+    )]
+    ExpectationVaultNotListed { network: Network, vault: Address },
+    #[error(
+        "released burn-excess catch-up on vault {vault} encountered transfer \
+         {tx_hash:?} that was not uniquely admitted; retaining the interlock"
+    )]
+    ReleasedExpectationCatchupUnsafe { vault: Address, tx_hash: Option<TxHash> },
 }
 
 impl<P> TransferPoller<P>
@@ -312,7 +333,25 @@ where
             .into_iter()
             .filter(|asset| asset.network == self.network)
             .collect::<Vec<_>>();
-        let vaults = enabled_vaults(&assets);
+        let mut vaults = enabled_vaults(&assets);
+        for vault in held_redemption_vaults(&self.pool, self.network).await? {
+            if !vaults.contains(&vault) {
+                vaults.push(vault);
+            }
+        }
+        let expectation_vaults =
+            funding_expectation_vaults(&self.pool, self.network).await?;
+        for vault in expectation_vaults {
+            if !assets.iter().any(|asset| asset.vault == vault) {
+                return Err(TransferPollError::ExpectationVaultNotListed {
+                    network: self.network,
+                    vault,
+                });
+            }
+            if !vaults.contains(&vault) {
+                vaults.push(vault);
+            }
+        }
         if vaults.is_empty() {
             return Ok(0);
         }
@@ -359,7 +398,15 @@ where
 
             match self.poll_vault(&assets, vault, head, cursor).await {
                 Ok(Some(held_block)) => held_vaults.push((vault, held_block)),
-                Ok(None) => {}
+                Ok(None) => {
+                    clear_released_funding_expectations(
+                        &self.pool,
+                        self.network,
+                        vault,
+                        head,
+                    )
+                    .await?;
+                }
                 Err(error) => {
                     debug!(
                         target: "redemption",
@@ -515,6 +562,13 @@ where
         for (chunk_from, chunk_to) in
             block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
         {
+            advance_transfer_poll_observed(
+                &self.pool,
+                self.network,
+                vault,
+                chunk_to,
+            )
+            .await?;
             let logs =
                 self.fetch_transfer_logs(vault, chunk_from, chunk_to).await?;
 
@@ -537,9 +591,43 @@ where
             // after the hold clears redoes nothing.
             let held_before_chunk = held_at.is_some();
             let mut dropped: Vec<(Option<TxHash>, Option<u64>)> = Vec::new();
+            let mut guarded_transfers = Vec::with_capacity(logs.len());
             for log in &logs {
-                match self.process_log(assets, log).await? {
+                guarded_transfers
+                    .push(self.guarded_funding_transfer(vault, log).await?);
+            }
+            for (source_log, guarded_transfer) in
+                logs.iter().zip(&guarded_transfers)
+            {
+                if let Some(guarded_transfer) = guarded_transfer {
+                    self.preflight_guarded_funding_transfer(
+                        vault,
+                        source_log,
+                        guarded_transfer,
+                    )
+                    .await?;
+                }
+            }
+            for (log, guarded_transfer) in
+                logs.iter().zip(guarded_transfers.into_iter())
+            {
+                match self
+                    .process_log(
+                        assets,
+                        log,
+                        guarded_transfer.map(|guarded| guarded.status),
+                    )
+                    .await?
+                {
                     ProcessedLog::Handled => {}
+                    ProcessedLog::UnsafeForReleasedCatchup { tx_hash } => {
+                        return Err(
+                            TransferPollError::ReleasedExpectationCatchupUnsafe {
+                                vault,
+                                tx_hash,
+                            },
+                        );
+                    }
                     ProcessedLog::DroppedNonTransient { tx_hash } => {
                         dropped.push((tx_hash, log.block_number));
                     }
@@ -649,8 +737,23 @@ where
 
         let mut still_held = false;
         for log in &self.fetch_transfer_logs(vault, held_at, held_at).await? {
-            if let ProcessedLog::HeldExpectedFunding { .. } =
-                self.process_log(assets, log).await?
+            let guarded_transfer =
+                self.guarded_funding_transfer(vault, log).await?;
+            if let Some(guarded_transfer) = &guarded_transfer {
+                self.preflight_guarded_funding_transfer(
+                    vault,
+                    log,
+                    guarded_transfer,
+                )
+                .await?;
+            }
+            if let ProcessedLog::HeldExpectedFunding { .. } = self
+                .process_log(
+                    assets,
+                    log,
+                    guarded_transfer.map(|guarded| guarded.status),
+                )
+                .await?
             {
                 still_held = true;
             }
@@ -674,7 +777,33 @@ where
                     .fetch_transfer_logs(vault, chunk_from, chunk_to)
                     .await?
                 {
-                    self.process_log(assets, log).await?;
+                    let guarded_transfer =
+                        self.guarded_funding_transfer(vault, log).await?;
+                    if let Some(guarded_transfer) = &guarded_transfer {
+                        self.preflight_guarded_funding_transfer(
+                            vault,
+                            log,
+                            guarded_transfer,
+                        )
+                        .await?;
+                    }
+                    let outcome = self
+                        .process_log(
+                            assets,
+                            log,
+                            guarded_transfer.map(|guarded| guarded.status),
+                        )
+                        .await?;
+                    if let ProcessedLog::UnsafeForReleasedCatchup { tx_hash } =
+                        outcome
+                    {
+                        return Err(
+                            TransferPollError::ReleasedExpectationCatchupUnsafe {
+                                vault,
+                                tx_hash,
+                            },
+                        );
+                    }
                 }
                 scanned_through = chunk_to;
                 self.held_scans
@@ -724,16 +853,84 @@ where
     /// fields, no matching asset) are reported as
     /// [`ProcessedLog::DroppedNonTransient`] and skipped — retrying them
     /// would freeze the checkpoint permanently.
+    async fn preflight_guarded_funding_transfer(
+        &self,
+        vault: Address,
+        source_log: &Log,
+        guarded: &GuardedFundingTransfer,
+    ) -> Result<(), TransferPollError> {
+        if guarded.status == FundingExpectationStatus::Active {
+            return Ok(());
+        }
+        let transfer = &guarded.transfer;
+        if is_excluded_funding_log(
+            &self.pool,
+            transfer.network,
+            transfer.vault,
+            transfer.tx_hash,
+            transfer.log_index,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let source_block_hash = source_log.block_hash.ok_or(
+            TransferPollError::ReleasedExpectationCatchupUnsafe {
+                vault,
+                tx_hash: Some(transfer.tx_hash),
+            },
+        )?;
+        let receipt = self
+            .provider
+            .get_transaction_receipt(transfer.tx_hash)
+            .await?
+            .ok_or(TransferPollError::ReleasedExpectationCatchupUnsafe {
+                vault,
+                tx_hash: Some(transfer.tx_hash),
+            })?;
+        let receipt_contains_transfer =
+            receipt.inner.logs().iter().any(|receipt_log| {
+                let Ok(decoded) = receipt_log.log_decode::<
+                    bindings::OffchainAssetReceiptVault::Transfer,
+                >() else {
+                    return false;
+                };
+                receipt_log.address() == transfer.vault
+                    && receipt_log.log_index == Some(transfer.log_index)
+                    && decoded.data().from == transfer.from
+                    && decoded.data().to == transfer.to
+                    && decoded.data().value == transfer.amount
+            });
+        if receipt.transaction_hash != transfer.tx_hash
+            || receipt.block_hash != Some(source_block_hash)
+            || !receipt_contains_transfer
+            || competes_for_redemption_key(
+                &self.pool,
+                receipt.inner.logs(),
+                transfer,
+                None,
+            )
+            .await?
+        {
+            return Err(TransferPollError::ReleasedExpectationCatchupUnsafe {
+                vault,
+                tx_hash: Some(transfer.tx_hash),
+            });
+        }
+        Ok(())
+    }
+
     async fn process_log(
         &self,
         assets: &[TokenizedAssetView],
         log: &Log,
+        expectation_status: Option<FundingExpectationStatus>,
     ) -> Result<ProcessedLog, TransferPollError> {
         let vault = log.address();
 
-        let outcome = match detect_transfer(
+        let outcome = match detect_transfer_with_expectation_status(
             log,
-            vault,
+            TransferGuardSnapshot { vault, expectation_status },
             self.network,
             assets,
             &self.store,
@@ -750,6 +947,11 @@ where
                     tx_hash = ?log.transaction_hash,
                     "Skipping non-retryable transfer log"
                 );
+                if expectation_status.is_some() {
+                    return Ok(ProcessedLog::UnsafeForReleasedCatchup {
+                        tx_hash: log.transaction_hash,
+                    });
+                }
                 return Ok(ProcessedLog::DroppedNonTransient {
                     tx_hash: log.transaction_hash,
                 });
@@ -782,17 +984,84 @@ where
                     log.transaction_hash,
                 ));
             }
+            TransferOutcome::SkippedNoAccount
+                if expectation_status.is_some() =>
+            {
+                return Ok(ProcessedLog::UnsafeForReleasedCatchup {
+                    tx_hash: log.transaction_hash,
+                });
+            }
             TransferOutcome::AlreadyDetected
-            | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedNoAccount
+            | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedAdminRecovery => {}
             TransferOutcome::HeldExpectedFunding { block_number } => {
                 return Ok(ProcessedLog::HeldExpectedFunding { block_number });
+            }
+            TransferOutcome::RetryReleasedExpectation => {
+                return Ok(ProcessedLog::UnsafeForReleasedCatchup {
+                    tx_hash: log.transaction_hash,
+                });
             }
         }
 
         Ok(ProcessedLog::Handled)
     }
+    async fn guarded_funding_transfer(
+        &self,
+        vault: Address,
+        log: &Log,
+    ) -> Result<Option<GuardedFundingTransfer>, TransferPollError> {
+        let Ok(transfer) =
+            bindings::OffchainAssetReceiptVault::Transfer::decode_log(
+                &log.inner,
+            )
+        else {
+            return Ok(None);
+        };
+        let Some(status) = funding_expectation_status(
+            &self.pool,
+            self.network,
+            vault,
+            transfer.from,
+            transfer.to,
+            transfer.value,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let tx_hash = log.transaction_hash.ok_or(
+            TransferPollError::ReleasedExpectationCatchupUnsafe {
+                vault,
+                tx_hash: None,
+            },
+        )?;
+        let log_index = log.log_index.ok_or(
+            TransferPollError::ReleasedExpectationCatchupUnsafe {
+                vault,
+                tx_hash: Some(tx_hash),
+            },
+        )?;
+        Ok(Some(GuardedFundingTransfer {
+            transfer: FundingTransferId {
+                network: self.network,
+                vault,
+                tx_hash,
+                log_index,
+                from: transfer.from,
+                to: transfer.to,
+                amount: transfer.value,
+            },
+            status,
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GuardedFundingTransfer {
+    transfer: FundingTransferId,
+    status: FundingExpectationStatus,
 }
 
 /// Outcome of processing a single Transfer log: handled (including benign
@@ -801,6 +1070,7 @@ where
 /// stream's expected funding Transfer.
 enum ProcessedLog {
     Handled,
+    UnsafeForReleasedCatchup { tx_hash: Option<TxHash> },
     DroppedNonTransient { tx_hash: Option<TxHash> },
     HeldExpectedFunding { block_number: u64 },
 }
@@ -895,13 +1165,16 @@ pub(crate) fn block_ranges(
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{
+        Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
+    };
     use alloy::network::EthereumWallet;
-    use alloy::primitives::{Address, B256, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bloom, U256, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::client::ClientBuilder;
     use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
-    use alloy::rpc::types::Log;
+    use alloy::rpc::types::{Log, TransactionReceipt};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::mock::MockTransport;
     use alloy::transports::{TransportError, TransportFut};
@@ -916,10 +1189,11 @@ mod tests {
     use tower::{Layer, Service};
     use tracing_test::traced_test;
 
-    use super::{TransferPollError, watch_redemption_flow};
+    use super::{ProcessedLog, TransferPollError, watch_redemption_flow};
     use crate::burn_excess::exclusion::record_funding_exclusion;
     use crate::burn_excess::expectation::{
-        clear_funding_expectation, record_funding_expectation,
+        clear_funding_expectation, has_released_funding_expectation,
+        record_funding_expectation, release_funding_expectation,
     };
     use crate::burn_excess::{ExcessBurnBind, FundingTransferId};
     use crate::mint::IssuerMintRequestId;
@@ -928,10 +1202,11 @@ mod tests {
     };
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::test_utils::{
-        create_transfer_log, setup_test_db_with_asset,
-        transfer_poller_for_tests,
+        create_transfer_log, create_transfer_log_with_index,
+        setup_test_db_with_asset, transfer_poller_for_tests,
     };
     use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
@@ -1101,6 +1376,27 @@ mod tests {
             .unwrap();
     }
 
+    async fn repoint_aapl(pool: &SqlitePool, vault: Address) -> bool {
+        let (asset_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        asset_store
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Add {
+                    underlying,
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .is_ok()
+    }
+
     /// Adds an enabled Ethereum-network asset (TSLA/tTSLA) bound to `vault`,
     /// alongside the Base AAPL asset `setup_test_db_with_asset` seeds.
     async fn add_ethereum_asset(pool: &SqlitePool, vault: Address) {
@@ -1263,6 +1559,7 @@ mod tests {
             original_recipient: ap_wallet,
             vault,
             network: Network::Base,
+            chain_id: 8453,
             issuer_wallet: bot_wallet,
         };
         record_funding_expectation(&setup.pool, &bind, Utc::now())
@@ -1356,6 +1653,297 @@ mod tests {
         assert!(!redemption_exists(&setup, funding_tx).await);
         assert!(redemption_exists(&setup, after_tx).await);
     }
+    fn transaction_receipt(
+        transaction_hash: B256,
+        logs: Vec<Log>,
+    ) -> TransactionReceipt {
+        let receipt = Receipt {
+            status: Eip658Value::Eip658(true),
+            cumulative_gas_used: 21_000,
+            logs,
+        };
+        TransactionReceipt {
+            transaction_hash,
+            transaction_index: Some(0),
+            block_hash: Some(b256!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )),
+            block_number: Some(150),
+            from: Address::ZERO,
+            to: None,
+            gas_used: 21_000,
+            effective_gas_price: 1,
+            contract_address: None,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                receipt,
+                Bloom::default(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_expectation_blocks_repoint_and_keeps_polling_its_vault() {
+        let old_vault = address!("0x1111111111111111111111111111111111111111");
+        let new_vault = address!("0x2222222222222222222222222222222222222222");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding = create_transfer_log(
+            old_vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            150,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding]);
+        let setup = setup_test_poller(
+            old_vault,
+            bot_wallet,
+            Some(ap_wallet),
+            &asserter,
+            0,
+        )
+        .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault: old_vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            !repoint_aapl(&setup.pool, new_vault).await,
+            "an active expectation must atomically block its vault repoint"
+        );
+
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, old_vault)
+                .await
+                .unwrap(),
+            Some(149),
+            "the persisted expectation must keep polling its original vault"
+        );
+    }
+    #[tokio::test]
+    async fn released_expectation_is_detected_before_its_interlock_clears() {
+        let vault = address!("0x3333333333333333333333333333333333333333");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding_tx = B256::random();
+        let funding = create_transfer_log(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_success(&Some(transaction_receipt(
+            funding_tx,
+            vec![funding],
+        )));
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            release_funding_expectation(
+                &setup.pool,
+                bind.deposit_tx_hash,
+                Some(200),
+            )
+            .await
+            .unwrap()
+        );
+
+        setup.poller.poll_once().await.unwrap();
+
+        assert!(redemption_exists(&setup, funding_tx).await);
+        let remaining: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM burn_excess_funding_expectations
+            WHERE deposit_tx_hash = ?
+            ",
+        )
+        .bind(bind.deposit_tx_hash.to_string())
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+    #[tokio::test]
+    async fn released_catchup_skips_funding_and_detects_its_held_sibling() {
+        let vault = address!("0x3333333333333333333333333333333333333333");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding_tx = B256::random();
+        let funding = create_transfer_log_with_index(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150, 0,
+        );
+        let held = create_transfer_log_with_index(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150, 1,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone(), held.clone()]);
+        asserter.push_success(&Some(transaction_receipt(
+            funding_tx,
+            vec![funding, held],
+        )));
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        record_funding_exclusion(
+            &setup.pool,
+            &FundingTransferId {
+                network: Network::Base,
+                vault,
+                tx_hash: funding_tx,
+                log_index: 0,
+                from: ap_wallet,
+                to: bot_wallet,
+                amount: shares,
+            },
+            bind.deposit_tx_hash,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        release_funding_expectation(
+            &setup.pool,
+            bind.deposit_tx_hash,
+            Some(200),
+        )
+        .await
+        .unwrap();
+
+        setup.poller.poll_once().await.unwrap();
+
+        assert!(redemption_exists(&setup, funding_tx).await);
+        assert!(
+            !has_released_funding_expectation(
+                &setup.pool,
+                Network::Base,
+                vault,
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn released_expectation_refuses_a_cross_vault_sibling_log() {
+        let vault = address!("0x3333333333333333333333333333333333333333");
+        let sibling_vault =
+            address!("0x4444444444444444444444444444444444444444");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding_tx = B256::random();
+        let funding = create_transfer_log(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150,
+        );
+        let sibling = create_transfer_log(
+            sibling_vault,
+            ap_wallet,
+            bot_wallet,
+            U256::from(1u64),
+            funding_tx,
+            150,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_success(&Some(transaction_receipt(
+            funding_tx,
+            vec![funding, sibling],
+        )));
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        release_funding_expectation(
+            &setup.pool,
+            bind.deposit_tx_hash,
+            Some(200),
+        )
+        .await
+        .unwrap();
+
+        let result = setup.poller.poll_once().await;
+
+        assert!(matches!(
+            result,
+            Err(TransferPollError::AllVaultsFailed { total: 1 })
+        ));
+        assert!(!redemption_exists(&setup, funding_tx).await);
+        assert!(
+            has_released_funding_expectation(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            None
+        );
+    }
 
     /// A hold can last a whole Path B run. A held pass must read only the
     /// held block (to see whether the hold still stands) and the blocks no
@@ -1406,6 +1994,7 @@ mod tests {
             original_recipient: ap_wallet,
             vault,
             network: Network::Base,
+            chain_id: 8453,
             issuer_wallet: bot_wallet,
         };
         record_funding_expectation(&setup.pool, &bind, Utc::now())
@@ -1604,6 +2193,7 @@ mod tests {
             vault,
             network: Network::Base,
             issuer_wallet: bot_wallet,
+            chain_id: 8453,
         };
         record_funding_expectation(&setup.pool, &bind, Utc::now())
             .await
@@ -1634,6 +2224,56 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn newly_released_shape_retries_before_detection() {
+        let vault = address!("0x3333333333333333333333333333333333333333");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let tx_hash = B256::random();
+        let transfer = create_transfer_log(
+            vault, ap_wallet, bot_wallet, shares, tx_hash, 150,
+        );
+        let asserter = Asserter::new();
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        release_funding_expectation(
+            &setup.pool,
+            bind.deposit_tx_hash,
+            Some(200),
+        )
+        .await
+        .unwrap();
+        let assets = list_enabled_assets(&setup.pool).await.unwrap();
+
+        assert!(matches!(
+            setup
+                .poller
+                .process_log(&assets, &transfer, None)
+                .await
+                .unwrap(),
+            ProcessedLog::UnsafeForReleasedCatchup {
+                tx_hash: Some(found)
+            } if found == tx_hash
+        ));
+        assert!(!redemption_exists(&setup, tx_hash).await);
     }
 
     async fn redemption_exists<P: alloy::providers::Provider + Clone>(

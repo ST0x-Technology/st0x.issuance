@@ -546,7 +546,8 @@ impl RedemptionView {
             },
             // Admission and burn-progress events are internal lifecycle details
             // that do not change the query-facing state.
-            RedemptionEvent::AlpacaCallClaimed { .. }
+            RedemptionEvent::AccountAttributionAnchored { .. }
+            | RedemptionEvent::AlpacaCallClaimed { .. }
             | RedemptionEvent::BurnIntended { .. }
             | RedemptionEvent::BurnTxSubmitted { .. }
             | RedemptionEvent::OrchestratorBurnSubmitted { .. }
