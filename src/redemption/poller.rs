@@ -722,10 +722,12 @@ where
     /// block, to learn whether the hold still stands, and then the blocks
     /// after `scanned_through` that no pass has read yet: the Transfers after
     /// the hold were already processed, and reading them again every pass
-    /// would grow RPC and store work with the hold's age. The checkpoint is
-    /// not touched. Returns `None` once the held block no longer holds; the
-    /// caller then rescans from the checkpoint, which reports any drop the
-    /// checkpoint passes and moves it on.
+    /// would grow RPC and store work with the hold's age. The processing
+    /// checkpoint is not touched; the durable observed high-water mark advances
+    /// before every range read so release catch-up cannot clear guards below
+    /// blocks this fast path already inspected. Returns `None` once the held
+    /// block no longer holds; the caller then rescans from the checkpoint,
+    /// which reports any drop the checkpoint passes and moves it on.
     async fn poll_held_vault(
         &self,
         assets: &[TokenizedAssetView],
@@ -734,6 +736,13 @@ where
         held_scan: HeldScan,
     ) -> Result<Option<u64>, TransferPollError> {
         let HeldScan { held_at, mut scanned_through } = held_scan;
+        advance_transfer_poll_observed(
+            &self.pool,
+            self.network,
+            vault,
+            held_at,
+        )
+        .await?;
 
         let mut still_held = false;
         for log in &self.fetch_transfer_logs(vault, held_at, held_at).await? {
@@ -773,6 +782,13 @@ where
             for (chunk_from, chunk_to) in
                 block_ranges(scanned_through + 1, head, BLOCK_CHUNK_SIZE)
             {
+                advance_transfer_poll_observed(
+                    &self.pool,
+                    self.network,
+                    vault,
+                    chunk_to,
+                )
+                .await?;
                 for log in &self
                     .fetch_transfer_logs(vault, chunk_from, chunk_to)
                     .await?
@@ -1192,13 +1208,15 @@ mod tests {
     use super::{ProcessedLog, TransferPollError, watch_redemption_flow};
     use crate::burn_excess::exclusion::record_funding_exclusion;
     use crate::burn_excess::expectation::{
-        clear_funding_expectation, has_released_funding_expectation,
-        record_funding_expectation, release_funding_expectation,
+        clear_funding_expectation, clear_released_funding_expectations,
+        has_released_funding_expectation, record_funding_expectation,
+        release_funding_expectation,
     };
     use crate::burn_excess::{ExcessBurnBind, FundingTransferId};
     use crate::mint::IssuerMintRequestId;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
+        transfer_poll_observed_name,
     };
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::test_utils::{
@@ -2077,6 +2095,105 @@ mod tests {
         ));
     }
 
+    /// The optimized held-vault path reads blocks beyond the persisted
+    /// checkpoint. Its durable observed marker must include that range so a
+    /// close proven against a lagging head cannot clear the configuration
+    /// guard before those already-seen Transfers are replayed.
+    #[traced_test]
+    #[tokio::test]
+    async fn held_fast_path_blocks_catchup_at_a_lower_release_head() {
+        let vault = address!("0x6969696969696969696969696969696969696969");
+        let next_vault = address!("0x7979797979797979797979797979797979797979");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            90,
+        );
+        let later_same_shape = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            110,
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_success(&U256::from(120u64));
+        asserter.push_success(&vec![funding]);
+        asserter.push_success(&vec![later_same_shape]);
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            chain_id: 8453,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+
+        setup.poller.poll_once().await.unwrap();
+        setup.poller.poll_once().await.unwrap();
+        assert!(
+            release_funding_expectation(
+                &setup.pool,
+                bind.deposit_tx_hash,
+                Some(105),
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(
+            clear_released_funding_expectations(
+                &setup.pool,
+                Network::Base,
+                vault,
+                105,
+            )
+            .await
+            .unwrap(),
+            0,
+            "catch-up below an already observed fast-path range must retain \
+             the expectation and its guards"
+        );
+        let observed: i64 = sqlx::query_scalar(
+            "
+            SELECT block_number
+            FROM poll_checkpoints
+            WHERE name = ?
+            ",
+        )
+        .bind(transfer_poll_observed_name(Network::Base, vault))
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+        assert_eq!(observed, 120);
+        assert!(
+            !repoint_aapl(&setup.pool, next_vault).await,
+            "the retained guard must block a vault repoint"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Re-read held vault", "scanned_through=120"]
+        ));
+    }
+
     /// Once a full rescan discovers a hold, every completed chunk after it is
     /// useful progress. A later RPC failure must resume at the held block and
     /// the first unread chunk rather than restart from the durable checkpoint.
@@ -2112,6 +2229,7 @@ mod tests {
             vault,
             network: Network::Base,
             issuer_wallet: bot_wallet,
+            chain_id: 8453,
         };
         record_funding_expectation(&setup.pool, &bind, Utc::now())
             .await

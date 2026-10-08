@@ -1738,15 +1738,38 @@ async fn require_wallet_intent_gates(
         "
         SELECT EXISTS (
             SELECT 1
-            FROM active_signer_intents
-            WHERE network = ?
-              AND aggregate_type = 'BurnExcess'
-              AND aggregate_id != ?
+            FROM events AS intent
+            WHERE intent.aggregate_type = 'BurnExcess'
+              AND intent.aggregate_id != ?
+              AND intent.event_type IN (
+                  'BurnExcessEvent::FundingExclusionRecorded',
+                  'BurnExcessEvent::ExcessBurnIntended'
+              )
+              AND COALESCE(
+                  json_extract(
+                      intent.payload,
+                      '$.FundingExclusionRecorded.bind.network'
+                  ),
+                  json_extract(
+                      intent.payload,
+                      '$.ExcessBurnIntended.bind.network'
+                  )
+              ) = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM events AS terminal
+                  WHERE terminal.aggregate_type = intent.aggregate_type
+                    AND terminal.aggregate_id = intent.aggregate_id
+                    AND terminal.event_type IN (
+                        'BurnExcessEvent::ExcessBurnCompleted',
+                        'BurnExcessEvent::ExcessBurnClosed'
+                    )
+              )
         )
         ",
     )
-    .bind(network.as_str())
     .bind(aggregate_id)
+    .bind(network.as_str())
     .fetch_one(pool)
     .await?;
     if competing_excess {
@@ -3293,7 +3316,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::account::{AccountEvent, AlpacaAccountNumber, ClientId};
+    use crate::account::{
+        Account, AccountCommand, AccountEvent, AlpacaAccountNumber, ClientId,
+        Email,
+    };
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::burn_excess::BurnExcessEvent;
     use crate::burn_excess::exclusion::is_excluded_funding_log;
@@ -3336,6 +3362,41 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    async fn link_ap_wallet_pair(
+        pool: &Pool<Sqlite>,
+        first: Address,
+        second: Address,
+    ) {
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+        let client_id = ClientId::new();
+        account_store
+            .send(
+                &client_id,
+                AccountCommand::Register {
+                    client_id,
+                    email: Email::new("paired@example.com").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        account_store
+            .send(
+                &client_id,
+                AccountCommand::LinkToAlpaca {
+                    alpaca_account: AlpacaAccountNumber("PAIRED".into()),
+                },
+            )
+            .await
+            .unwrap();
+        for wallet in [first, second] {
+            account_store
+                .send(&client_id, AccountCommand::WhitelistWallet { wallet })
+                .await
+                .unwrap();
+        }
     }
 
     fn excess_shares() -> U256 {
@@ -4956,6 +5017,155 @@ mod tests {
             redemption_aggregate_ids(&pool).await,
             vec![IssuerRedemptionRequestId::new(redemption_tx).to_string()]
         );
+    }
+
+    /// A permanent funding exclusion arbitrates only burn-excess streams until
+    /// bytes are signed. A different-shape redemption detected afterward must
+    /// still be able to reserve the signer, burn its shares, and let the
+    /// `FundingExcluded` stream reprove and finish.
+    #[traced_test]
+    #[tokio::test]
+    async fn funding_excluded_yields_to_a_later_redemption_burn() {
+        let pool = pool().await;
+        let (evm, service, provider, _) = prepared_evm().await;
+        let redemption_shares = U256::from(1_000_000_000_000_000_000u64);
+        let fixture = live_hold_fixture(
+            &pool,
+            &evm,
+            &service,
+            &provider,
+            redemption_shares,
+        )
+        .await;
+        let (funding_tx, _) =
+            send_external_funding(&evm, fixture.recipient.clone()).await;
+
+        run_burn_excess(
+            &pool,
+            &MockVaultService::new_prepare_tx_failure()
+                .with_share_balance(excess_shares()),
+            &provider,
+            evm.wallet_address,
+            fixture.request(BurnExcessMode::External, Some(funding_tx)),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let burn_excess_store = burn_excess_store(pool.clone()).await.unwrap();
+        assert!(matches!(
+            burn_excess_store
+                .load(&BurnExcessId::new(fixture.deposit_tx))
+                .await
+                .unwrap(),
+            Some(BurnExcess::FundingExcluded { .. })
+        ));
+        assert!(
+            !excess_reservation_exists(&pool).await,
+            "an unsigned exclusion must not reserve the signer nonce"
+        );
+
+        let redemption_tx =
+            transfer_to_issuer(&evm, &fixture.recipient, &[redemption_shares])
+                .await;
+        transfer_poller_for_tests(
+            Network::Base,
+            provider.clone(),
+            evm.wallet_address,
+            0,
+            pool.clone(),
+        )
+        .await
+        .poll_once()
+        .await
+        .unwrap();
+        assert_eq!(
+            redemption_aggregate_ids(&pool).await,
+            vec![IssuerRedemptionRequestId::new(redemption_tx).to_string()]
+        );
+
+        let redemption_id =
+            IssuerRedemptionRequestId::new(redemption_tx).to_string();
+        let next_sequence: i64 = sqlx::query_scalar(
+            "
+            SELECT COALESCE(MAX(sequence), 0) + 1
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(&redemption_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Redemption',
+                ?,
+                ?,
+                'RedemptionEvent::BurnIntended',
+                '1.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .bind(&redemption_id)
+        .bind(next_sequence)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::redemption::has_unresolved_signer_intent(
+                &pool,
+                Network::Base,
+                None,
+            )
+            .await
+            .unwrap()
+        );
+
+        let issuer_provider = issuer_provider(&evm).await;
+        OffchainAssetReceiptVault::new(evm.vault_address, &issuer_provider)
+            .transfer(Address::random(), redemption_shares)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        record_redemption_burn_completed(&pool, redemption_tx).await;
+
+        run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            fixture.request(BurnExcessMode::External, Some(funding_tx)),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            burn_excess_store
+                .load(&BurnExcessId::new(fixture.deposit_tx))
+                .await
+                .unwrap(),
+            Some(BurnExcess::Completed { path: BurnExcessPath::External, .. })
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Recorded funding exclusion", &fixture.deposit_tx.to_string()]
+        ));
     }
 
     /// A held same-shape log batched with another Transfer that the poller
@@ -7229,7 +7439,10 @@ mod tests {
         let first_id = IssuerMintRequestId::random();
         let second_id = IssuerMintRequestId::random();
         let first = test_bind(&first_id, B256::random());
-        let second = test_bind(&second_id, B256::random());
+        let second = ExcessBurnBind {
+            shares: first.shares + U256::from(1u64),
+            ..test_bind(&second_id, B256::random())
+        };
         let underlying = seed_listing(&pool, first.vault).await;
         link_ap_wallet(&pool, first.original_recipient).await;
         seed_mint_initiated(&pool, &first_id, &underlying).await;
@@ -7266,6 +7479,68 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn expect_funding_reports_another_expectation_for_a_different_shape()
+    {
+        let pool = pool().await;
+        let (evm, service, provider, _) = prepared_evm().await;
+        let underlying = seed_listing(&pool, evm.vault_address).await;
+        let first = deposit_to_recipient(&pool, &evm, &underlying).await;
+        let second = deposit_to_recipient(&pool, &evm, &underlying).await;
+        link_ap_wallet_pair(
+            &pool,
+            first.recipient.address(),
+            second.recipient.address(),
+        )
+        .await;
+        let expectation = |deposit: &ExternalDeposit| BurnExcessRequest {
+            poller_guard: PollerGuard::FundingExpected,
+            ..request(
+                BurnExcessMode::ExpectFunding,
+                deposit.issuer_request_id.clone(),
+                deposit.deposit_tx,
+                deposit.receipt_id,
+                None,
+                true,
+            )
+        };
+        run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            expectation(&first),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+
+        let error = run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            expectation(&second),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                BurnExcessEngineError::AnotherFundingExpected { vault }
+                    if vault == evm.vault_address
+            ),
+            "got: {error:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Recorded funding expectation", &first.deposit_tx.to_string()]
+        ));
     }
 
     /// Another stream's unresolved recovery refuses every `external` run on
@@ -7453,7 +7728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_dry_run_records_no_event_and_keeps_the_gate_closed() {
+    async fn close_dry_run_records_no_event_and_keeps_stream_open() {
         let pool = pool().await;
         let issuer_request_id = IssuerMintRequestId::random();
         let deposit_tx = B256::random();
@@ -7493,13 +7768,13 @@ mod tests {
             "a dry-run close must not advance the stream"
         );
         assert!(
-            excess_reservation_exists(&pool).await,
-            "a dry-run close must leave the wallet gate held"
+            !excess_reservation_exists(&pool).await,
+            "an unsigned recovery must not reserve the signer nonce"
         );
     }
 
     #[tokio::test]
-    async fn close_execute_releases_the_wallet_gate() {
+    async fn close_execute_releases_the_unsigned_stream() {
         let pool = pool().await;
         let issuer_request_id = IssuerMintRequestId::random();
         let deposit_tx = B256::random();
@@ -7511,8 +7786,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            excess_reservation_exists(&pool).await,
-            "an abandoned Path B recovery must hold the gate before close"
+            !excess_reservation_exists(&pool).await,
+            "an unsigned Path B recovery must not reserve the signer nonce"
         );
         let prompt = Mutex::new(String::new());
 
@@ -7560,8 +7835,7 @@ mod tests {
         ));
         assert!(
             !excess_reservation_exists(&pool).await,
-            "close is the only escape from a stuck stream: it must release \
-             the gate that blocks every mint and redemption burn"
+            "closing an unsigned stream must not create a signer reservation"
         );
         let (released, release_through_block): (i64, i64) = sqlx::query_as(
             "
@@ -7610,7 +7884,7 @@ mod tests {
             stream.load(&BurnExcessId::new(deposit_tx)).await.unwrap(),
             Some(BurnExcess::FundingExcluded { .. })
         ));
-        assert!(excess_reservation_exists(&pool).await);
+        assert!(!excess_reservation_exists(&pool).await);
         assert_eq!(
             find_vault(
                 &pool,

@@ -398,9 +398,9 @@ END;
 
 -- Add burn-excess recovery to the database-backed signer nonce reservation.
 --
--- The wallet mutex is process-local. Reserving on the first durable external
--- exclusion, or on an internal intent, makes SQLite arbitrate overlapping CLI
--- and service processes in the same transaction that appends the event.
+-- The wallet mutex is process-local. SQLite separately arbitrates burn-excess
+-- streams from the first durable external exclusion, while the signer nonce
+-- reservation begins only after exact signed bytes are persisted.
 CREATE TABLE active_signer_intents_rebuild (
     network TEXT NOT NULL,
     aggregate_type TEXT NOT NULL,
@@ -458,24 +458,35 @@ BEGIN
 END;
 
 
--- Backfill every nonterminal recovery. A uniqueness failure means history
--- already contains two unresolved operations for one signer nonce domain;
--- aborting deployment is safer than choosing a winner.
+-- Validate that history does not already contain two unresolved burn-excess
+-- streams for one network. Funding exclusions arbitrate burn-excess recovery,
+-- but are intentionally not signer nonce reservations.
+CREATE TABLE burn_excess_network_arbitration_rebuild (
+    network TEXT NOT NULL PRIMARY KEY
+        CHECK (
+            network IN (
+                'base',
+                'ethereum',
+                'hyperevm',
+                'robinhood',
+                'binance'
+            )
+        ),
+    aggregate_id TEXT NOT NULL
+);
+
 WITH unresolved_burn_excess AS (
     SELECT DISTINCT
-        CASE intent.event_type
-            WHEN 'BurnExcessEvent::FundingExclusionRecorded'
-            THEN json_extract(
+        COALESCE(
+            json_extract(
                 intent.payload,
                 '$.FundingExclusionRecorded.bind.network'
-            )
-            WHEN 'BurnExcessEvent::ExcessBurnIntended'
-            THEN json_extract(
+            ),
+            json_extract(
                 intent.payload,
                 '$.ExcessBurnIntended.bind.network'
             )
-        END AS network,
-        'BurnExcess' AS aggregate_type,
+        ) AS network,
         intent.aggregate_id
     FROM events AS intent
     WHERE intent.aggregate_type = 'BurnExcess'
@@ -483,6 +494,39 @@ WITH unresolved_burn_excess AS (
           'BurnExcessEvent::FundingExclusionRecorded',
           'BurnExcessEvent::ExcessBurnIntended'
       )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM events AS terminal
+          WHERE terminal.aggregate_type = intent.aggregate_type
+            AND terminal.aggregate_id = intent.aggregate_id
+            AND terminal.event_type IN (
+                'BurnExcessEvent::ExcessBurnCompleted',
+                'BurnExcessEvent::ExcessBurnClosed'
+            )
+      )
+)
+INSERT INTO burn_excess_network_arbitration_rebuild (
+    network,
+    aggregate_id
+)
+SELECT network, aggregate_id
+FROM unresolved_burn_excess;
+
+DROP TABLE burn_excess_network_arbitration_rebuild;
+
+-- Backfill only nonterminal signed recoveries. A uniqueness failure means a
+-- signer nonce domain already has another unresolved signed transaction.
+WITH unresolved_burn_excess AS (
+    SELECT DISTINCT
+        json_extract(
+            intent.payload,
+            '$.ExcessBurnIntended.bind.network'
+        ) AS network,
+        'BurnExcess' AS aggregate_type,
+        intent.aggregate_id
+    FROM events AS intent
+    WHERE intent.aggregate_type = 'BurnExcess'
+      AND intent.event_type = 'BurnExcessEvent::ExcessBurnIntended'
       AND NOT EXISTS (
           SELECT 1
           FROM events AS terminal
@@ -504,7 +548,7 @@ FROM unresolved_burn_excess;
 
 DROP TRIGGER reject_burn_excess_signer_backfill_collision;
 
-CREATE TRIGGER validate_burn_excess_signer_intent_origin
+CREATE TRIGGER validate_burn_excess_arbitration_origin
 BEFORE INSERT ON events
 WHEN NEW.aggregate_type = 'BurnExcess'
  AND NEW.event_type IN (
@@ -513,43 +557,39 @@ WHEN NEW.aggregate_type = 'BurnExcess'
  )
 BEGIN
     SELECT CASE
-        WHEN CASE NEW.event_type
-            WHEN 'BurnExcessEvent::FundingExclusionRecorded'
-            THEN json_extract(
+        WHEN COALESCE(
+            json_extract(
                 NEW.payload,
                 '$.FundingExclusionRecorded.bind.network'
-            )
-            WHEN 'BurnExcessEvent::ExcessBurnIntended'
-            THEN json_extract(
+            ),
+            json_extract(
                 NEW.payload,
                 '$.ExcessBurnIntended.bind.network'
             )
-        END IS NULL
-        THEN RAISE(ABORT, 'burn-excess signer intent requires network metadata')
-        WHEN CASE NEW.event_type
-            WHEN 'BurnExcessEvent::FundingExclusionRecorded'
-            THEN json_extract(
+        ) IS NULL
+        THEN RAISE(ABORT, 'burn-excess recovery requires network metadata')
+        WHEN COALESCE(
+            json_extract(
                 NEW.payload,
                 '$.FundingExclusionRecorded.bind.network'
-            )
-            WHEN 'BurnExcessEvent::ExcessBurnIntended'
-            THEN json_extract(
+            ),
+            json_extract(
                 NEW.payload,
                 '$.ExcessBurnIntended.bind.network'
             )
-        END NOT IN (
+        ) NOT IN (
             'base',
             'ethereum',
             'hyperevm',
             'robinhood',
             'binance'
         )
-        THEN RAISE(ABORT, 'burn-excess signer intent has an unknown network')
+        THEN RAISE(ABORT, 'burn-excess recovery has an unknown network')
     END;
 END;
 
-CREATE TRIGGER reserve_burn_excess_signer_intent
-AFTER INSERT ON events
+CREATE TRIGGER arbitrate_burn_excess_stream
+BEFORE INSERT ON events
 WHEN NEW.aggregate_type = 'BurnExcess'
  AND NEW.event_type IN (
      'BurnExcessEvent::FundingExclusionRecorded',
@@ -558,23 +598,65 @@ WHEN NEW.aggregate_type = 'BurnExcess'
 BEGIN
     SELECT RAISE(
         ABORT,
+        'another unresolved burn-excess stream owns this network'
+    )
+    WHERE EXISTS (
+        SELECT 1
+        FROM events AS intent
+        WHERE intent.aggregate_type = 'BurnExcess'
+          AND intent.aggregate_id != NEW.aggregate_id
+          AND intent.event_type IN (
+              'BurnExcessEvent::FundingExclusionRecorded',
+              'BurnExcessEvent::ExcessBurnIntended'
+          )
+          AND COALESCE(
+              json_extract(
+                  intent.payload,
+                  '$.FundingExclusionRecorded.bind.network'
+              ),
+              json_extract(
+                  intent.payload,
+                  '$.ExcessBurnIntended.bind.network'
+              )
+          ) = COALESCE(
+              json_extract(
+                  NEW.payload,
+                  '$.FundingExclusionRecorded.bind.network'
+              ),
+              json_extract(
+                  NEW.payload,
+                  '$.ExcessBurnIntended.bind.network'
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM events AS terminal
+              WHERE terminal.aggregate_type = intent.aggregate_type
+                AND terminal.aggregate_id = intent.aggregate_id
+                AND terminal.event_type IN (
+                    'BurnExcessEvent::ExcessBurnCompleted',
+                    'BurnExcessEvent::ExcessBurnClosed'
+                )
+          )
+    );
+END;
+
+CREATE TRIGGER reserve_burn_excess_signer_intent
+AFTER INSERT ON events
+WHEN NEW.aggregate_type = 'BurnExcess'
+ AND NEW.event_type = 'BurnExcessEvent::ExcessBurnIntended'
+BEGIN
+    SELECT RAISE(
+        ABORT,
         'signer network already reserved by another unresolved intent'
     )
     WHERE EXISTS (
         SELECT 1
         FROM active_signer_intents
-        WHERE network = CASE NEW.event_type
-            WHEN 'BurnExcessEvent::FundingExclusionRecorded'
-            THEN json_extract(
-                NEW.payload,
-                '$.FundingExclusionRecorded.bind.network'
-            )
-            WHEN 'BurnExcessEvent::ExcessBurnIntended'
-            THEN json_extract(
-                NEW.payload,
-                '$.ExcessBurnIntended.bind.network'
-            )
-        END
+        WHERE network = json_extract(
+            NEW.payload,
+            '$.ExcessBurnIntended.bind.network'
+        )
           AND NOT (
               aggregate_type = NEW.aggregate_type
               AND aggregate_id = NEW.aggregate_id
@@ -587,18 +669,10 @@ BEGIN
         aggregate_id
     )
     VALUES (
-        CASE NEW.event_type
-            WHEN 'BurnExcessEvent::FundingExclusionRecorded'
-            THEN json_extract(
-                NEW.payload,
-                '$.FundingExclusionRecorded.bind.network'
-            )
-            WHEN 'BurnExcessEvent::ExcessBurnIntended'
-            THEN json_extract(
-                NEW.payload,
-                '$.ExcessBurnIntended.bind.network'
-            )
-        END,
+        json_extract(
+            NEW.payload,
+            '$.ExcessBurnIntended.bind.network'
+        ),
         NEW.aggregate_type,
         NEW.aggregate_id
     )

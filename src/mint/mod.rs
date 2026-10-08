@@ -37,9 +37,10 @@ pub(crate) use view::{MintView, find_all_recoverable_mints, find_stuck};
 ///
 /// Reads the trigger-maintained `active_signer_intents` table rather than
 /// re-deriving the answer from event streams: triggers update the table in the
-/// same transaction that appends each durable intent or exclusion event.
-/// Because the table is keyed by network, every flow signing with the same key
-/// is serialized across processes.
+/// same transaction that appends each durable signed intent. Unsigned
+/// burn-excess funding exclusions arbitrate only other burn-excess streams.
+/// Because the table is keyed by network, every flow holding signed bytes for
+/// the same key is serialized across processes.
 pub(crate) async fn has_unresolved_signer_intent(
     pool: &Pool<Sqlite>,
     network: Network,

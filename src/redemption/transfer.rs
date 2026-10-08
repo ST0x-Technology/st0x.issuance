@@ -203,17 +203,6 @@ pub(crate) async fn detect_transfer_with_expectation_status(
         to: transfer_event.to,
         amount: transfer_event.value,
     };
-    if expectation_status == Some(FundingExpectationStatus::Active) {
-        debug!(
-            target: "redemption",
-            %tx_hash,
-            log_index,
-            %vault,
-            block_number,
-            "Holding expected admin recovery funding transfer"
-        );
-        return Ok(TransferOutcome::HeldExpectedFunding { block_number });
-    }
     let attributed = match classify_funding_transfer(pool, &funding_candidate)
         .await?
     {
@@ -226,6 +215,17 @@ pub(crate) async fn detect_transfer_with_expectation_status(
                 "Skipping admin recovery funding transfer"
             );
             return Ok(TransferOutcome::SkippedAdminRecovery);
+        }
+        _ if expectation_status == Some(FundingExpectationStatus::Active) => {
+            debug!(
+                target: "redemption",
+                %tx_hash,
+                log_index,
+                %vault,
+                block_number,
+                "Holding expected admin recovery funding transfer"
+            );
+            return Ok(TransferOutcome::HeldExpectedFunding { block_number });
         }
         FundingTransferStatus::Expected => {
             debug!(
@@ -535,11 +535,15 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::{TransferOutcome, TransferProcessingError, detect_transfer};
+    use super::{
+        TransferGuardSnapshot, TransferOutcome, TransferProcessingError,
+        detect_transfer, detect_transfer_with_expectation_status,
+    };
     use crate::account::view::AccountViewError;
     use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::burn_excess::expectation::{
-        held_redemption_vaults, record_held_redemptions,
+        FundingExpectationStatus, held_redemption_vaults,
+        record_held_redemptions,
     };
     use crate::burn_excess::{FundingTransferId, HeldTransferRedemption};
     use crate::config::{VaultMode, VaultModeConfig, VaultModeKind};
@@ -851,9 +855,12 @@ mod tests {
         let excluded = create_transfer_log_with_index(
             vault, ap_wallet, bot_wallet, value, funding_tx, 100, 2,
         );
-        let excluded_outcome = detect_transfer(
+        let excluded_outcome = detect_transfer_with_expectation_status(
             &excluded,
-            vault,
+            TransferGuardSnapshot {
+                vault,
+                expectation_status: Some(FundingExpectationStatus::Active),
+            },
             Network::Base,
             &assets,
             &store,

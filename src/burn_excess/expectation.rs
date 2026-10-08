@@ -812,51 +812,14 @@ pub(crate) async fn rebuild_funding_expectation_index(
         .execute(&mut *transaction)
         .await?;
 
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "
-        SELECT
-            expected.aggregate_id,
-            expected.payload
-        FROM events AS expected
-        WHERE expected.aggregate_type = 'BurnExcess'
-          AND expected.event_type = ?
-          AND (
-              NOT EXISTS (
-                  SELECT 1
-                  FROM events AS intended
-                  WHERE intended.aggregate_type = expected.aggregate_type
-                    AND intended.aggregate_id = expected.aggregate_id
-                    AND intended.event_type = ?
-              )
-              OR EXISTS (
-                  SELECT 1
-                  FROM events AS anchored
-                  WHERE anchored.aggregate_type = expected.aggregate_type
-                    AND anchored.aggregate_id = expected.aggregate_id
-                    AND anchored.event_type = ?
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM events AS prior_submission
-                        WHERE prior_submission.aggregate_type =
-                              anchored.aggregate_type
-                          AND prior_submission.aggregate_id =
-                              anchored.aggregate_id
-                          AND prior_submission.event_type = ?
-                          AND prior_submission.sequence < anchored.sequence
-                    )
-              )
-          )
-        ",
-    )
-    .bind(BurnExcessEvent::FUNDING_EXPECTED)
-    .bind(BurnExcessEvent::EXCESS_BURN_INTENDED)
-    .bind(BurnExcessEvent::HELD_REDEMPTIONS_ANCHORED)
-    .bind(BurnExcessEvent::EXCESS_BURN_SUBMITTED)
-    .fetch_all(&mut *transaction)
-    .await?;
-
+    let rows = load_rebuild_expectations(&mut transaction).await?;
     let mut recorded = 0usize;
-    for (aggregate_id, payload) in rows {
+    let mut legacy_closed_skipped = 0usize;
+    for (aggregate_id, payload, legacy_closed) in rows {
+        if legacy_closed {
+            legacy_closed_skipped = legacy_closed_skipped.saturating_add(1);
+            continue;
+        }
         let event: BurnExcessEvent = serde_json::from_str(&payload)?;
         let BurnExcessEvent::FundingExpected { bind, expected_at, .. } = event
         else {
@@ -997,6 +960,13 @@ pub(crate) async fn rebuild_funding_expectation_index(
             "Rebuilt funding expectation index from FundingExpected events"
         );
     }
+    if legacy_closed_skipped > 0 {
+        info!(
+            target: "burn_excess",
+            skipped = legacy_closed_skipped,
+            "Skipped legacy closed funding expectations during rebuild"
+        );
+    }
     if held_recorded > 0 {
         info!(
             target: "burn_excess",
@@ -1008,6 +978,66 @@ pub(crate) async fn rebuild_funding_expectation_index(
 
     Ok(recorded)
 }
+
+async fn load_rebuild_expectations(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<(String, String, bool)>, sqlx::Error> {
+    sqlx::query_as(
+        "
+        SELECT
+            expected.aggregate_id,
+            expected.payload,
+            EXISTS (
+                SELECT 1
+                FROM events AS closed
+                WHERE closed.aggregate_type = expected.aggregate_type
+                  AND closed.aggregate_id = expected.aggregate_id
+                  AND closed.event_type = ?
+                  AND json_extract(
+                      closed.payload,
+                      '$.ExcessBurnClosed.release_through_block'
+                  ) IS NULL
+            )
+        FROM events AS expected
+        WHERE expected.aggregate_type = 'BurnExcess'
+          AND expected.event_type = ?
+          AND (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM events AS intended
+                  WHERE intended.aggregate_type = expected.aggregate_type
+                    AND intended.aggregate_id = expected.aggregate_id
+                    AND intended.event_type = ?
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM events AS anchored
+                  WHERE anchored.aggregate_type = expected.aggregate_type
+                    AND anchored.aggregate_id = expected.aggregate_id
+                    AND anchored.event_type = ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM events AS prior_submission
+                        WHERE prior_submission.aggregate_type =
+                              anchored.aggregate_type
+                          AND prior_submission.aggregate_id =
+                              anchored.aggregate_id
+                          AND prior_submission.event_type = ?
+                          AND prior_submission.sequence < anchored.sequence
+                    )
+              )
+          )
+        ",
+    )
+    .bind(BurnExcessEvent::EXCESS_BURN_CLOSED)
+    .bind(BurnExcessEvent::FUNDING_EXPECTED)
+    .bind(BurnExcessEvent::EXCESS_BURN_INTENDED)
+    .bind(BurnExcessEvent::HELD_REDEMPTIONS_ANCHORED)
+    .bind(BurnExcessEvent::EXCESS_BURN_SUBMITTED)
+    .fetch_all(&mut **transaction)
+    .await
+}
+
 async fn raise_released_boundaries_to_observed(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), sqlx::Error> {
@@ -2010,6 +2040,123 @@ mod tests {
         .unwrap();
         assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 3);
         assert!(expects(&pool, &replacement).await);
+    }
+
+    /// Before release boundaries existed, close deleted the live handoff row.
+    /// Two sequential recoveries on one vault were therefore valid. Rebuilding
+    /// those histories must not resurrect either expectation and collide on
+    /// the one-expectation-per-vault guard.
+    #[traced_test]
+    #[tokio::test]
+    async fn rebuild_skips_sequential_legacy_closes_on_one_vault() {
+        let pool = pool().await;
+        sqlx::query("DROP TRIGGER validate_burn_excess_close_proof")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let first = bind(B256::random());
+        let second = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(8u64),
+            shares: first.shares + U256::from(1u64),
+            ..first.clone()
+        };
+        seed_expectation_trigger_context(&pool, &[&first]).await;
+        let second_mint = serde_json::json!({
+            "Initiated": {
+                "underlying": "PTY0",
+                "network": second.network.as_str(),
+            }
+        });
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 1, 'MintEvent::Initiated', '1.0', ?, '{}')
+            ",
+        )
+        .bind(second.issuer_request_id.to_string())
+        .bind(second_mint.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for bind in [&first, &second] {
+            let expected = BurnExcessEvent::FundingExpected {
+                bind: bind.clone(),
+                reason: "legacy recovery".into(),
+                incident_id: None,
+                expected_at: Utc::now(),
+            };
+            let closed = serde_json::json!({
+                "ExcessBurnClosed": {
+                    "reason": "legacy close",
+                    "closed_at": Utc::now(),
+                }
+            });
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES
+                    ('BurnExcess', ?, 1, ?, '1.0', ?, '{}'),
+                    ('BurnExcess', ?, 2, ?, '1.0', ?, '{}')
+                ",
+            )
+            .bind(bind.deposit_tx_hash.to_string())
+            .bind(BurnExcessEvent::FUNDING_EXPECTED)
+            .bind(serde_json::to_string(&expected).unwrap())
+            .bind(bind.deposit_tx_hash.to_string())
+            .bind(BurnExcessEvent::EXCESS_BURN_CLOSED)
+            .bind(closed.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "
+                DELETE FROM burn_excess_expectation_guards
+                WHERE deposit_tx_hash = ?
+                ",
+            )
+            .bind(bind.deposit_tx_hash.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 0);
+        let expectation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM burn_excess_funding_expectations",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let guard_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM burn_excess_expectation_guards",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((expectation_count, guard_count), (0, 0));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Skipped legacy closed funding expectations", "skipped=2"]
+        ));
     }
 
     #[tokio::test]

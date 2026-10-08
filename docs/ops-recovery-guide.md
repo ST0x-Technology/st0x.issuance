@@ -248,14 +248,17 @@ infers it:
   for each exact log. Use this only after proving that those shares no longer
   belong to an unresolved liability. The dry-run refuses a missing or
   already-resolved identity and lists every accepted acknowledgement; execute
-  persists the list with the signed intent. The block range and balance are
-  hash-pinned to one connected chain snapshot; immediately before signing the
-  bot revalidates the planned snapshot, scans only blocks added since it, and
-  refuses if the exact held log set or attribution changed. The signed intent
-  and `HeldRedemptionsAnchored` commit atomically before broadcast, recording
-  the exact log, AP account, original asset, and burn mode. A later stream
-  checks durable anchor events before it signs and may share that exact log only
-  with identical attribution. Once the excess burn completes, the poller keeps
+  persists the list with the signed intent. The proof reads 2,000-block
+  block-number ranges, rechecks the deposit and snapshot boundary hashes around
+  the scan, and requires the funding receipt's block hash to match; it relies on
+  the RPC returning each requested range consistently rather than traversing
+  every intermediate parent hash. Immediately before signing the bot revalidates
+  the planned snapshot, scans only blocks added since it, and refuses if the
+  exact held log set or attribution changed. The signed intent and
+  `HeldRedemptionsAnchored` commit atomically before broadcast, recording the
+  exact log, AP account, original asset, and burn mode. A later stream checks
+  durable anchor events before it signs and may share that exact log only with
+  identical attribution. Once the excess burn completes, the poller keeps
   scanning that vault even if the asset was repointed. Persisting an anchor
   rewinds any checkpoint already past the held log, so it is replayed and
   detected with the anchored context. The Redemption persists the account
@@ -281,23 +284,25 @@ infers it:
   chain proof; retry against a caught-up healthy node. `expect-funding` refuses
   with `AnotherFundingExpected` (409) while the vault already has a live or
   released expectation; finish or safely close that stream and let its poller
-  catch-up complete first. It also refuses (409) while another stream is
-  `FundingExcluded`, `Intended`, or `Submitted`. Recording the funding exclusion
-  (or an internal burn intent) atomically reserves the network's signer nonce
-  domain in SQLite across service and CLI processes; completion releases it.
-  `expect-funding` and defensive unsigned close require the original recipient
-  to be uniquely linked. The expectation atomically blocks wallet-link mutations
-  and vault repointing. Completion and every close mark an existing expectation
-  released and persist a chain boundary, raised to the poller's durable
-  monotonic high-water mark, that the poller must safely scan through without
-  dropping or ambiguously deduplicating a log. Successful cleanup atomically
-  records a per-stream completion tombstone, preventing startup rebuild from
-  resurrecting the handoff. An unsafe log retains the row, checkpoint, and
-  guards for incident handling. A defensive check refuses close if a
-  pre-existing stream was already repointed; restore the listing first. A signed
-  stream closes only after exact classification proves finalized revert or a
-  dead nonce. Before confirming unsigned close, verify no funding or same-shape
-  Transfer remains pending beyond the recorded head.
+  catch-up complete first. It also refuses (409) while another burn-excess
+  stream is `FundingExcluded`, `Intended`, or `Submitted`. Recording a funding
+  exclusion atomically arbitrates burn-excess recovery on that network across
+  service and CLI processes, but does not reserve the signer nonce or block a
+  mint or redemption burn. The SQLite signer reservation begins only when an
+  internal or external burn persists exact signed bytes; completion or a safe
+  close releases it. `expect-funding` and defensive unsigned close require the
+  original recipient to be uniquely linked. The expectation atomically blocks
+  wallet-link mutations and vault repointing. Completion and every close mark an
+  existing expectation released and persist a chain boundary, raised to the
+  poller's durable monotonic high-water mark, that the poller must safely scan
+  through without dropping or ambiguously deduplicating a log. Successful
+  cleanup atomically records a per-stream completion tombstone, preventing
+  startup rebuild from resurrecting the handoff. An unsafe log retains the row,
+  checkpoint, and guards for incident handling. A defensive check refuses close
+  if a pre-existing stream was already repointed; restore the listing first. A
+  signed stream closes only after exact classification proves finalized revert
+  or a dead nonce. Before confirming unsigned close, verify no funding or
+  same-shape Transfer remains pending beyond the recorded head.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's

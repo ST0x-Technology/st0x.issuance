@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_stores_cannot_reserve_one_signer_network() {
+    async fn independent_stores_cannot_open_one_burn_excess_network() {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let first_store =
@@ -1582,8 +1582,8 @@ mod tests {
             .unwrap_err();
         assert!(
             format!("{competing_error:?}")
-                .contains("signer network already reserved"),
-            "database arbitration must expose the signer conflict: \
+                .contains("another unresolved burn-excess stream"),
+            "database arbitration must expose the stream conflict: \
              {competing_error:?}"
         );
         assert!(second_store.load(&second_id).await.unwrap().is_none());
@@ -1617,7 +1617,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signer_reservation_migration_backfills_burn_excess_history() {
+    async fn signer_reservation_migration_leaves_unsigned_exclusion_unreserved()
+    {
         const MIGRATION: &str = include_str!(
             "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"
         );
@@ -1706,29 +1707,6 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let mut transaction = pool.begin().await.unwrap();
-        let collision = sqlx::raw_sql(MIGRATION)
-            .execute(&mut *transaction)
-            .await
-            .unwrap_err();
-        assert!(
-            collision.to_string().contains(
-                "burn-excess signer backfill collides with an existing \
-                     network intent"
-            ),
-            "got: {collision}"
-        );
-        transaction.rollback().await.unwrap();
-        sqlx::query(
-            "
-            DELETE FROM active_signer_intents
-            WHERE network = 'base'
-            ",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
         sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
         let reservation: (String, String, String) = sqlx::query_as(
             "
@@ -1741,7 +1719,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reservation,
-            ("base".into(), "BurnExcess".into(), aggregate_id.clone())
+            ("base".into(), "Redemption".into(), "existing-redemption".into())
         );
 
         let invalid_close = sqlx::query(
@@ -1776,7 +1754,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(reservation_count, 1);
+        assert_eq!(reservation_count, 0);
 
         sqlx::query(
             "
