@@ -191,7 +191,17 @@ vault-direct path already signs under Turnkey (Fireblocks stays retired). During
 the per-asset rollout BOTH mint/burn paths run in production simultaneously,
 until RAI-1223 retires vault-direct mode.
 
-Record the policy name(s) in the table below.
+The allowances above are P68, P69 and P70 in turnkey-policy-spec. Each allows a
+request only from a Turnkey user that holds the `s01-orchestrator` tag. So grant
+that tag to the issuance bot's user before step 4. On the droplet, that user is
+`S01 Issuance` (`c1531cb2`), not the GCP user `s01-issuance-kms`. The liquidity
+bot's MintAuth signing (P67) is gated by the `orchestrator-mint-auth` tag. Its
+user `t0-liquidity-production-kms` gets that tag just before the step 7 probes.
+Never put both tags on one user: the orchestrator needs two separate keys for a
+mint.
+
+Record the policy name(s), the tag IDs and each grant's activity ID in the table
+below.
 
 ## 4. Prove the policy by signing (nothing broadcast)
 
@@ -205,7 +215,7 @@ Signs one transaction per shape in the table above — never broadcasting — an
 fails naming the refused shape if the policy denies one. Run it per asset as
 each asset approaches cutover (the approve/transfer shapes are token-scoped). A
 policy gap surfaces here as a named refusal instead of during the pilot's first
-live mint.
+live mint. It can pass only after the `s01-orchestrator` grant in step 3.
 
 ## 5. Execute the approval (per asset, staged with the rollout)
 
@@ -576,9 +586,12 @@ it runs on, so they run per chain too (see the policy bullet):
       2. Executable negative probes, each submitted for the bot wallet with the
          bot's own API key via Turnkey's API/SDK, and each of which must be
          DENIED by policy (nothing is broadcast even if signed; a signature
-         would only prove the policy gap). Record every denied activity ID with
-         the cutover; ANY signed result is a cutover blocker — some policy
-         grants more than the scoped MintAuth shape:
+         would only prove the policy gap). Run them while the bot's signing user
+         holds `orchestrator-mint-auth`: without the tag, Turnkey refuses every
+         request for the wrong reason, and the probes prove nothing. Record
+         every denied activity ID with the cutover; ANY signed result is a
+         cutover blocker — some policy grants more than the scoped MintAuth
+         shape:
          - Bare digest: `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` with
            `PAYLOAD_ENCODING_HEXADECIMAL`, `HASH_FUNCTION_NO_OP`, any 32-byte
            payload — proves no raw-digest grant exists.
@@ -1102,6 +1115,7 @@ criteria ask for.
 | `DEPOSIT`/`WITHDRAW` grants (orchestrator on each vault authorizer) |       |      | `orchestrator-preflight`       |
 | `EMERGENCY_ROLE` holder, per chain (rollback, escalation)           |       |      | step 7 `hasRole` read          |
 | Turnkey policy name(s)                                              |       |      | `verify-orchestrator-signing`  |
+| Turnkey tag IDs and grant activity IDs (both orchestrator tags)     |       |      | `npm run audit-identities`     |
 | Issuance release tag (`$RELEASE_TAG`, `vX.Y.Z`)                     |       |      | `git ls-remote --tags …`       |
 | Orchestrator `eip712Domain()` (one row per chain)                   |       |      | `cast call`                    |
 | Orchestrator beacon, beacon owner, implementation hash (per chain)  |       |      | `cast storage` / `cast keccak` |
