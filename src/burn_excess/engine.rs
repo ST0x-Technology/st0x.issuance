@@ -16,6 +16,7 @@ use event_sorcery::{Store, StoreBuilder};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::AcknowledgedInboundTransfer;
 use std::io;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -28,8 +29,9 @@ use super::exclusion::{
 use super::expectation::{
     FundingExpectationReactor, FundingTransferIndexError,
     competes_for_redemption_key, ensure_held_redemptions_compatible,
-    is_expected_funding, log_release, record_funding_expectation,
-    record_held_redemptions, release_funding_expectation,
+    has_other_funding_expectation, is_expected_funding, log_release,
+    record_funding_expectation, record_held_redemptions,
+    release_funding_expectation,
 };
 use super::proof::{
     BurnExcessMode, BurnExcessProofError, DepositProof,
@@ -61,6 +63,8 @@ use crate::vault::{
 
 /// `eth_getLogs` chunks fetched at once while counting held same-shape
 /// Transfers, so a hold that has lasted days stays inside the route's budget.
+const HELD_SCAN_BLOCK_CHUNK_SIZE: u64 = 2_000;
+const HELD_SCAN_BLOCK_CHUNK_STEP: usize = 2_000;
 const HELD_SCAN_CONCURRENCY: usize = 8;
 
 /// Operator inputs after clap parse (mode keyword already selected).
@@ -75,6 +79,7 @@ pub(crate) struct BurnExcessRequest {
     pub(crate) shares: U256,
     pub(crate) reason: String,
     pub(crate) incident_id: Option<String>,
+    pub(crate) acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     pub(crate) network: Network,
     pub(crate) chain_id: u64,
     pub(crate) execute: bool,
@@ -248,6 +253,11 @@ pub(crate) enum BurnExcessEngineError {
          Transfer log block"
     )]
     HeldTransferReceiptInconsistent { tx_hash: B256 },
+    #[error(
+        "acknowledged issuer-wallet inbound Transfer {tx_hash:?} \
+         log_index={log_index} was not found as an unresolved inflow"
+    )]
+    AcknowledgedInboundNotFound { tx_hash: B256, log_index: u64 },
 
     #[error(
         "held redemption set changed after plan proof; \
@@ -309,6 +319,12 @@ pub(crate) enum BurnExcessEngineError {
          the incident to handle"
     )]
     FundingNotExpected,
+
+    #[error(
+        "another excess-burn recovery already expects its funding Transfer on \
+         vault {vault}; finish or --close it first"
+    )]
+    AnotherFundingExpected { vault: Address },
 
     #[error(
         "funding expectation index missing after ExpectFunding for deposit \
@@ -606,6 +622,7 @@ struct ProvenPlan {
     /// Durable account attribution for `held_transfers`, persisted before the
     /// signed excess burn can be broadcast.
     held_redemptions: Vec<HeldTransferRedemption>,
+    acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     /// Hash-pinned chain snapshot used by an unsigned Path B proof.
     share_balance_snapshot: Option<ChainSnapshot>,
     token: TokenSymbol,
@@ -655,6 +672,8 @@ pub(crate) struct BurnExcessPlanView {
     /// as ordinary redemptions once the burn completes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) held_transfers: Vec<FundingTransferId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     /// A dry-run proves and returns this plan without writing events, signing,
     /// or recording an exclusion.
     pub(crate) dry_run: bool,
@@ -802,6 +821,14 @@ async fn prove_plan<P: Provider>(
     // wallet's receipt and shares. Released pre-anchor streams used an exact
     // balance proof and could not count held redemptions, so both legacy
     // Intended and Submitted states resume with the empty compatibility set.
+    let acknowledged_inflows = match state {
+        Some(
+            BurnExcess::Intended { acknowledged_inflows, .. }
+            | BurnExcess::Submitted { acknowledged_inflows, .. },
+        ) => acknowledged_inflows.clone(),
+        _ => request.acknowledged_inflows.clone(),
+    };
+
     let anchored = match state {
         Some(
             BurnExcess::Intended {
@@ -826,16 +853,19 @@ async fn prove_plan<P: Provider>(
             (held_redemptions, None)
         } else {
             require_issuer_receipt_balance_for(provider, &bind).await?;
-            let proof = require_issuer_share_balance(
-                pool,
-                provider,
-                &bind,
-                funding_log_id.as_ref(),
-                &underlying,
-                &token,
-                burn_mode,
-            )
-            .await?;
+            let scan = HeldRedemptionScan {
+                funding: funding_log_id.as_ref(),
+                asset: HeldRedemptionAsset {
+                    underlying: &underlying,
+                    token: &token,
+                    burn_mode,
+                },
+                scan_after: None,
+                acknowledged_inflows: &acknowledged_inflows,
+            };
+            let proof =
+                require_issuer_share_balance(pool, provider, &bind, scan)
+                    .await?;
             (proof.held_redemptions, Some(proof.snapshot))
         };
     let held_transfers =
@@ -870,6 +900,7 @@ async fn prove_plan<P: Provider>(
         exclusion_excluded_at,
         held_transfers,
         held_redemptions,
+        acknowledged_inflows,
         share_balance_snapshot,
         token,
         burn_mode,
@@ -1044,6 +1075,7 @@ fn plan_view(
         freeze_advisory: plan.freeze_advisory.map(str::to_string),
         precondition,
         held_transfers: plan.held_transfers.clone(),
+        acknowledged_inflows: plan.acknowledged_inflows.clone(),
         dry_run: !execute,
     }
 }
@@ -1112,6 +1144,8 @@ async fn expect_funding<P: Provider>(
         );
     }
 
+    require_no_other_funding_expectation(pool, &bind).await?;
+
     let view = BurnExcessPlanView {
         path: BurnExcessPath::External,
         underlying,
@@ -1128,6 +1162,7 @@ async fn expect_funding<P: Provider>(
             bind.vault
         )),
         held_transfers: Vec::new(),
+        acknowledged_inflows: Vec::new(),
         dry_run: !request.execute,
     };
 
@@ -1143,11 +1178,12 @@ async fn expect_funding<P: Provider>(
         return Err(BurnExcessEngineError::Aborted);
     }
 
-    // The confirmation prompt is unbounded, so re-check the wallet intent
-    // gates under the signer lock immediately before recording the expectation.
+    // The confirmation prompt is unbounded, so re-check the wallet intent and
+    // vault-expectation gates under the signer lock immediately before write.
     let _wallet_guard = vault_service.lock_wallet().await;
     require_wallet_intent_gates(pool, request.network, request.deposit_tx_hash)
         .await?;
+    require_no_other_funding_expectation(pool, &bind).await?;
 
     let aggregate_id = BurnExcessId::new(request.deposit_tx_hash);
     let expected_at = Utc::now();
@@ -1206,6 +1242,25 @@ async fn expect_funding<P: Provider>(
     );
 
     Ok(BurnExcessOutcome::Plan(Box::new(view)))
+}
+
+async fn require_no_other_funding_expectation(
+    pool: &Pool<Sqlite>,
+    bind: &ExcessBurnBind,
+) -> Result<(), BurnExcessEngineError> {
+    if has_other_funding_expectation(
+        pool,
+        bind.network,
+        bind.vault,
+        bind.deposit_tx_hash,
+    )
+    .await?
+    {
+        return Err(BurnExcessEngineError::AnotherFundingExpected {
+            vault: bind.vault,
+        });
+    }
+    Ok(())
 }
 
 fn terminal_view(
@@ -1505,7 +1560,6 @@ async fn execute_plan<P: Provider>(
                 // stream claiming the same log cannot pass these checks while
                 // this one records its exclusion: once recorded, this stream
                 // is an unresolved intent and its row owns the log.
-                let wallet_guard = mutation.vault_service.lock_wallet().await;
                 require_wallet_intent_gates(
                     mutation.pool,
                     mutation.request.network,
@@ -1537,7 +1591,6 @@ async fn execute_plan<P: Provider>(
                     mutation.request.incident_id.clone(),
                 )
                 .await?;
-                drop(wallet_guard);
             }
 
             intend_submit_confirm(&mutation, wallet_guard).await
@@ -1802,15 +1855,29 @@ async fn require_issuer_balances<P: Provider>(
                 token: &plan.token,
                 burn_mode: plan.burn_mode,
             };
-            let held_redemptions = held_same_shape_redemptions(
-                pool,
+            require_snapshot_block(
                 provider,
-                bind,
-                plan.funding_log_id.as_ref(),
-                snapshot,
-                &asset,
+                proven_snapshot.number,
+                proven_snapshot.hash,
             )
             .await?;
+            let mut held_redemptions = plan.held_redemptions.clone();
+            if snapshot.number > proven_snapshot.number {
+                let additions = held_same_shape_redemptions(
+                    pool,
+                    provider,
+                    bind,
+                    snapshot,
+                    HeldRedemptionScan {
+                        funding: plan.funding_log_id.as_ref(),
+                        asset,
+                        scan_after: Some(proven_snapshot.number),
+                        acknowledged_inflows: &[],
+                    },
+                )
+                .await?;
+                held_redemptions.extend(additions);
+            }
             (
                 issuer_share_balance_at(provider, bind, snapshot).await?,
                 held_redemptions,
@@ -1874,10 +1941,19 @@ struct ChainSnapshot {
     hash: B256,
 }
 
+#[derive(Clone, Copy)]
 struct HeldRedemptionAsset<'a> {
     underlying: &'a UnderlyingSymbol,
     token: &'a TokenSymbol,
     burn_mode: crate::config::VaultMode,
+}
+
+#[derive(Clone, Copy)]
+struct HeldRedemptionScan<'a> {
+    funding: Option<&'a FundingTransferId>,
+    asset: HeldRedemptionAsset<'a>,
+    scan_after: Option<u64>,
+    acknowledged_inflows: &'a [AcknowledgedInboundTransfer],
 }
 
 /// The issuer must hold exactly the excess, plus same-shape redemptions an
@@ -1889,19 +1965,14 @@ async fn require_issuer_share_balance<P: Provider>(
     pool: &Pool<Sqlite>,
     provider: &P,
     bind: &ExcessBurnBind,
-    funding: Option<&FundingTransferId>,
-    underlying: &UnderlyingSymbol,
-    token: &TokenSymbol,
-    burn_mode: crate::config::VaultMode,
+    scan: HeldRedemptionScan<'_>,
 ) -> Result<ShareBalanceProof, BurnExcessEngineError> {
     let snapshot = chain_snapshot(provider).await?;
     let balance = issuer_share_balance_at(provider, bind, snapshot).await?;
 
-    let asset = HeldRedemptionAsset { underlying, token, burn_mode };
-    let held_redemptions = held_same_shape_redemptions(
-        pool, provider, bind, funding, snapshot, &asset,
-    )
-    .await?;
+    let held_redemptions =
+        held_same_shape_redemptions(pool, provider, bind, snapshot, scan)
+            .await?;
     require_exact_issuer_share_balance(
         balance,
         bind.shares,
@@ -1952,62 +2023,25 @@ async fn chain_snapshot<P: Provider>(
     Ok(ChainSnapshot { number, hash: block.header.hash })
 }
 
-async fn coherent_block_hashes<P: Provider>(
+async fn require_snapshot_block<P: Provider>(
     provider: &P,
-    from_block: u64,
-    snapshot: ChainSnapshot,
-) -> Result<Vec<B256>, BurnExcessEngineError> {
-    if from_block > snapshot.number {
-        return Err(BurnExcessEngineError::ChainBehindDeposit {
-            deposit_block: from_block,
-            block: snapshot.number,
-        });
-    }
-    let blocks: Vec<(u64, B256, B256)> =
-        stream::iter(from_block..=snapshot.number)
-            .map(|number| async move {
-                let block = provider
-                    .get_block_by_number(BlockNumberOrTag::Number(number))
-                    .await?
-                    .ok_or(
-                        BurnExcessEngineError::ChainSnapshotBlockMissing {
-                            block: number,
-                        },
-                    )?;
-                Ok::<_, BurnExcessEngineError>((
-                    number,
-                    block.header.hash,
-                    block.header.parent_hash,
-                ))
-            })
-            .buffered(HELD_SCAN_CONCURRENCY)
-            .try_collect()
-            .await?;
-
-    for window in blocks.windows(2) {
-        let (_, parent_hash, _) = window[0];
-        let (block, _, actual_parent) = window[1];
-        if actual_parent != parent_hash {
-            return Err(BurnExcessEngineError::ChainSnapshotDisconnected {
-                block,
-                expected_parent: parent_hash,
-                actual_parent,
-            });
-        }
-    }
-    let actual_head = blocks.last().map(|(_, hash, _)| *hash).ok_or(
-        BurnExcessEngineError::ChainSnapshotBlockMissing {
-            block: snapshot.number,
-        },
-    )?;
-    if actual_head != snapshot.hash {
+    number: u64,
+    expected_hash: B256,
+) -> Result<(), BurnExcessEngineError> {
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(number))
+        .await?
+        .ok_or(BurnExcessEngineError::ChainSnapshotBlockMissing {
+            block: number,
+        })?;
+    if block.header.hash != expected_hash {
         return Err(BurnExcessEngineError::ChainSnapshotDisconnected {
-            block: snapshot.number,
-            expected_parent: snapshot.hash,
-            actual_parent: actual_head,
+            block: number,
+            expected_parent: expected_hash,
+            actual_parent: block.header.hash,
         });
     }
-    Ok(blocks.into_iter().map(|(_, hash, _)| hash).collect())
+    Ok(())
 }
 
 /// Transfers into the issuer wallet since the duplicate deposit. Every inflow
@@ -2020,13 +2054,14 @@ async fn coherent_block_hashes<P: Provider>(
 struct InboundTransferScan {
     from_block: u64,
     deposit_transaction_index: u64,
-    chunks: Vec<(B256, Vec<Log>)>,
+    chunks: Vec<Vec<Log>>,
 }
 
 async fn issuer_inbound_transfer_scan<P: Provider>(
     provider: &P,
     bind: &ExcessBurnBind,
     snapshot: ChainSnapshot,
+    scan_after: Option<u64>,
 ) -> Result<InboundTransferScan, BurnExcessEngineError> {
     let deposit_receipt = provider
         .get_transaction_receipt(bind.deposit_tx_hash)
@@ -2068,37 +2103,44 @@ async fn issuer_inbound_transfer_scan<P: Provider>(
             tx_hash: bind.deposit_tx_hash,
         },
     )?;
-    let block_hashes =
-        coherent_block_hashes(provider, from_block, snapshot).await?;
-    let actual_deposit_hash = block_hashes.first().copied().ok_or(
-        BurnExcessEngineError::ChainSnapshotBlockMissing { block: from_block },
-    )?;
-    if actual_deposit_hash != deposit_block_hash {
-        return Err(BurnExcessEngineError::ChainSnapshotDisconnected {
-            block: from_block,
-            expected_parent: deposit_block_hash,
-            actual_parent: actual_deposit_hash,
+    if from_block > snapshot.number {
+        return Err(BurnExcessEngineError::ChainBehindDeposit {
+            deposit_block: from_block,
+            block: snapshot.number,
         });
     }
+    require_snapshot_block(provider, from_block, deposit_block_hash).await?;
+    require_snapshot_block(provider, snapshot.number, snapshot.hash).await?;
+
     // An open expectation can keep the poll checkpoint behind while unrelated
-    // transfers continue. Scan from the duplicate deposit so every issuer
-    // inflow that can mask an outbound is reconciled.
-    let chunks = stream::iter(block_hashes)
-        .map(|block_hash| {
+    // transfers continue. Range queries reconcile every issuer inflow since
+    // the duplicate deposit on the initial proof, and only blocks newer than
+    // the planned snapshot at the sign boundary. Re-reading both boundary
+    // hashes after the scan rejects a reorg that raced the range queries.
+    let scan_from =
+        scan_after.and_then(|block| block.checked_add(1)).unwrap_or(from_block);
+    let ranges =
+        (scan_from..=snapshot.number).step_by(HELD_SCAN_BLOCK_CHUNK_STEP);
+    let chunks = stream::iter(ranges)
+        .map(|chunk_from| {
+            let chunk_to = chunk_from
+                .saturating_add(HELD_SCAN_BLOCK_CHUNK_SIZE - 1)
+                .min(snapshot.number);
             let filter = Filter::new()
                 .address(bind.vault)
                 .event_signature(
                     OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
                 )
                 .topic2(bind.issuer_wallet.into_word())
-                .at_block_hash(block_hash);
-            async move {
-                provider.get_logs(&filter).await.map(|logs| (block_hash, logs))
-            }
+                .from_block(chunk_from)
+                .to_block(chunk_to);
+            async move { provider.get_logs(&filter).await }
         })
         .buffered(HELD_SCAN_CONCURRENCY)
         .try_collect()
         .await?;
+    require_snapshot_block(provider, from_block, deposit_block_hash).await?;
+    require_snapshot_block(provider, snapshot.number, snapshot.hash).await?;
 
     Ok(InboundTransferScan { from_block, deposit_transaction_index, chunks })
 }
@@ -2107,26 +2149,29 @@ async fn held_same_shape_redemptions<P: Provider>(
     pool: &Pool<Sqlite>,
     provider: &P,
     bind: &ExcessBurnBind,
-    funding: Option<&FundingTransferId>,
     snapshot: ChainSnapshot,
-    asset: &HeldRedemptionAsset<'_>,
+    scan: HeldRedemptionScan<'_>,
 ) -> Result<Vec<HeldTransferRedemption>, BurnExcessEngineError> {
+    let HeldRedemptionScan { funding, asset, scan_after, acknowledged_inflows } =
+        scan;
     let InboundTransferScan { from_block, deposit_transaction_index, chunks } =
-        issuer_inbound_transfer_scan(provider, bind, snapshot).await?;
+        issuer_inbound_transfer_scan(provider, bind, snapshot, scan_after)
+            .await?;
 
     let mut held_transfers = Vec::new();
-    let mut funding_seen = funding.is_none();
-    let mut duplicate_deposit_mint_seen = false;
-    for (block_hash, logs) in &chunks {
+    let mut funding_seen = funding.is_none() || scan_after.is_some();
+    let mut duplicate_deposit_mint_seen = scan_after.is_some();
+    let mut acknowledgements_seen = vec![false; acknowledged_inflows.len()];
+    for logs in &chunks {
         for log in logs {
-            if log.block_hash != Some(*block_hash) {
+            let Some(block_hash) = log.block_hash else {
                 return Err(
                     BurnExcessEngineError::IssuerShareTransferMissingIdentity {
                         tx_hash: log.transaction_hash,
                         log_index: log.log_index,
                     },
                 );
-            }
+            };
             let transfer = issuer_inbound_transfer(bind, log)?;
             let is_duplicate_deposit_mint = transfer.tx_hash
                 == bind.deposit_tx_hash
@@ -2178,7 +2223,7 @@ async fn held_same_shape_redemptions<P: Provider>(
                 .ok_or(BurnExcessEngineError::HeldTransferReceiptMissing {
                     tx_hash: transfer.tx_hash,
                 })?;
-            if receipt.block_hash != Some(*block_hash) {
+            if receipt.block_hash != Some(block_hash) {
                 return Err(
                     BurnExcessEngineError::HeldTransferReceiptInconsistent {
                         tx_hash: transfer.tx_hash,
@@ -2203,24 +2248,32 @@ async fn held_same_shape_redemptions<P: Provider>(
                 && redemption_burn_completed(pool, transfer.tx_hash).await?;
             let exclusion_completed =
                 excluded_burn_completed(pool, &transfer).await?;
+            if redemption_completed || exclusion_completed {
+                continue;
+            }
+            if let Some((index, _)) = acknowledged_inflows
+                .iter()
+                .enumerate()
+                .find(|(_, acknowledged)| {
+                    acknowledged.tx_hash == transfer.tx_hash
+                        && acknowledged.log_index == transfer.log_index
+                })
+            {
+                acknowledgements_seen[index] = true;
+                continue;
+            }
             let same_shape = funding.is_some_and(|funding| {
                 transfer.from == funding.from
                     && transfer.amount == funding.amount
             });
 
             if !same_shape {
-                if redemption_completed || exclusion_completed {
-                    continue;
-                }
                 return Err(
                     BurnExcessEngineError::UnresolvedIssuerShareTransfer {
                         tx_hash: transfer.tx_hash,
                         log_index: transfer.log_index,
                     },
                 );
-            }
-            if exclusion_completed {
-                continue;
             }
             if is_excluded_funding_log(
                 pool,
@@ -2281,6 +2334,10 @@ async fn held_same_shape_redemptions<P: Provider>(
             held_transfers.push((transfer, block_number));
         }
     }
+    require_acknowledgements_seen(
+        acknowledged_inflows,
+        &acknowledgements_seen,
+    )?;
     if !duplicate_deposit_mint_seen {
         return Err(BurnExcessEngineError::DepositTxInvalid {
             tx_hash: bind.deposit_tx_hash,
@@ -2292,8 +2349,25 @@ async fn held_same_shape_redemptions<P: Provider>(
         });
     }
 
-    materialize_held_redemptions(pool, bind, asset, held_transfers).await
+    materialize_held_redemptions(pool, bind, &asset, held_transfers).await
 }
+fn require_acknowledgements_seen(
+    acknowledged_inflows: &[AcknowledgedInboundTransfer],
+    acknowledgements_seen: &[bool],
+) -> Result<(), BurnExcessEngineError> {
+    let Some((_, acknowledged)) = acknowledged_inflows
+        .iter()
+        .enumerate()
+        .find(|(index, _)| !acknowledgements_seen[*index])
+    else {
+        return Ok(());
+    };
+    Err(BurnExcessEngineError::AcknowledgedInboundNotFound {
+        tx_hash: acknowledged.tx_hash,
+        log_index: acknowledged.log_index,
+    })
+}
+
 async fn materialize_held_redemptions(
     pool: &Pool<Sqlite>,
     bind: &ExcessBurnBind,
@@ -2554,6 +2628,7 @@ async fn intend_submit_confirm<P: Provider>(
                 incident_id: ctx.request.incident_id.clone(),
                 sendable_tx: sendable_tx.clone(),
                 held_redemptions: ctx.plan.held_redemptions.clone(),
+                acknowledged_inflows: ctx.plan.acknowledged_inflows.clone(),
             },
         )
         .await?;
@@ -3432,6 +3507,7 @@ mod tests {
             shares: excess_shares(),
             reason: "duplicate mint recovery".into(),
             incident_id: Some("rai-1632-test".into()),
+            acknowledged_inflows: Vec::new(),
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             execute,
@@ -3755,6 +3831,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: crate::vault::SendableTxWithHash::default(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -4027,22 +4104,26 @@ mod tests {
             ..
         } = setup_external_path(&pool, &evm).await;
 
-        run_burn_excess(
-            &pool,
-            &service,
-            &provider,
-            evm.wallet_address,
-            request(
-                BurnExcessMode::External,
-                issuer_request_id,
-                deposit_tx,
-                receipt_id,
-                Some(funding_tx),
-                true,
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_burn_excess(
+                &pool,
+                &service,
+                &provider,
+                evm.wallet_address,
+                request(
+                    BurnExcessMode::External,
+                    issuer_request_id,
+                    deposit_tx,
+                    receipt_id,
+                    Some(funding_tx),
+                    true,
+                ),
+                |_| Ok(true),
             ),
-            |_| Ok(true),
         )
         .await
+        .expect("fresh external execute must not deadlock")
         .unwrap();
 
         let redemption_count: i64 = sqlx::query_scalar(
@@ -5193,10 +5274,11 @@ mod tests {
     }
 
     /// Net balance alone cannot distinguish an outbound loss from a different
-    /// AP's inbound redemption of the same amount. Every inbound liability
-    /// since the duplicate deposit must therefore be reconciled before sign.
+    /// AP's inbound redemption of the same amount. The run refuses until the
+    /// operator names that exact inflow; the signed intent then persists the
+    /// acknowledgement for audit.
     #[tokio::test]
-    async fn unrelated_inflow_cannot_mask_an_outbound_transfer() {
+    async fn unrelated_inflow_requires_an_audited_acknowledgement() {
         let pool = pool().await;
         let (evm, service, provider, _) = prepared_evm().await;
         let shares = excess_shares();
@@ -5271,6 +5353,95 @@ mod tests {
                 ..
             } if tx_hash == unrelated_tx
         ));
+        let unrelated_receipt = provider
+            .get_transaction_receipt(unrelated_tx)
+            .await
+            .unwrap()
+            .unwrap();
+        let log_index = unrelated_receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                let transfer = log
+                    .log_decode::<OffchainAssetReceiptVault::Transfer>()
+                    .ok()?;
+                (transfer.data().to == evm.wallet_address)
+                    .then_some(log.log_index)
+                    .flatten()
+            })
+            .unwrap();
+        let unknown_tx_hash = B256::random();
+        let mut unknown_acknowledgement =
+            fixture.request(BurnExcessMode::External, Some(funding_tx));
+        unknown_acknowledgement.acknowledged_inflows = vec![
+            AcknowledgedInboundTransfer { tx_hash: unrelated_tx, log_index },
+            AcknowledgedInboundTransfer { tx_hash: unknown_tx_hash, log_index },
+        ];
+        let error = run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            unknown_acknowledgement,
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BurnExcessEngineError::AcknowledgedInboundNotFound {
+                tx_hash,
+                log_index: found_log_index,
+            } if tx_hash == unknown_tx_hash && found_log_index == log_index
+        ));
+
+        let mut acknowledged_request =
+            fixture.request(BurnExcessMode::External, Some(funding_tx));
+        acknowledged_request.acknowledged_inflows =
+            vec![AcknowledgedInboundTransfer {
+                tx_hash: unrelated_tx,
+                log_index,
+            }];
+
+        run_burn_excess(
+            &pool,
+            &service,
+            &provider,
+            evm.wallet_address,
+            acknowledged_request,
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        let (payload, event_version): (String, String) = sqlx::query_as(
+            "
+            SELECT payload, event_version
+            FROM events
+            WHERE aggregate_type = 'BurnExcess'
+              AND aggregate_id = ?
+              AND event_type = ?
+            ",
+        )
+        .bind(fixture.deposit_tx.to_string())
+        .bind(BurnExcessEvent::EXCESS_BURN_INTENDED)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_version, "2.0");
+        let BurnExcessEvent::ExcessBurnIntended {
+            acknowledged_inflows, ..
+        } = serde_json::from_str(&payload).unwrap()
+        else {
+            panic!("expected ExcessBurnIntended")
+        };
+        assert_eq!(
+            acknowledged_inflows,
+            vec![AcknowledgedInboundTransfer {
+                tx_hash: unrelated_tx,
+                log_index
+            }]
+        );
     }
 
     /// The poller redeems only Transfers from a linked AP wallet. Held
@@ -6274,6 +6445,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: anchor_sendable,
                     held_redemptions: vec![indexed.clone()],
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -6287,7 +6459,6 @@ mod tests {
         };
         plan.held_redemptions = vec![requested];
         let aggregate_id = BurnExcessId::new(deposit_tx);
-        let wallet_guard = service.lock_wallet().await;
         let error = intend_submit_confirm(
             &MutationCtx {
                 pool: &pool,
@@ -6298,7 +6469,7 @@ mod tests {
                 plan: &plan,
                 request: &request,
             },
-            wallet_guard,
+            service.lock_wallet().await,
         )
         .await
         .unwrap_err();
@@ -6503,6 +6674,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sendable.clone(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -6598,6 +6770,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sendable,
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -6679,6 +6852,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sendable.clone(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -7052,6 +7226,54 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// One vault can expose only one expected funding shape at a time. A
+    /// second stream would otherwise make the poller hold both shapes while
+    /// either stream refuses to proceed because the other is unresolved.
+    #[tokio::test]
+    async fn a_second_expectation_on_one_vault_is_refused() {
+        let pool = pool().await;
+        let first_id = IssuerMintRequestId::random();
+        let second_id = IssuerMintRequestId::random();
+        let first = test_bind(&first_id, B256::random());
+        let second = test_bind(&second_id, B256::random());
+        let underlying = seed_listing(&pool, first.vault).await;
+        link_ap_wallet(&pool, first.original_recipient).await;
+        seed_mint_initiated(&pool, &first_id, &underlying).await;
+        seed_mint_initiated(&pool, &second_id, &underlying).await;
+        let store = burn_excess_store(pool.clone()).await.unwrap();
+        store
+            .send(
+                &BurnExcessId::new(first.deposit_tx_hash),
+                BurnExcessCommand::ExpectFunding {
+                    bind: first,
+                    reason: "first recovery".into(),
+                    incident_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .send(
+                &BurnExcessId::new(second.deposit_tx_hash),
+                BurnExcessCommand::ExpectFunding {
+                    bind: second,
+                    reason: "second recovery".into(),
+                    incident_id: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM burn_excess_expectation_guards",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
     /// Another stream's unresolved recovery refuses every `external` run on
     /// this one, so recording this stream's expectation then would hold its
     /// funding Transfer, and the vault's checkpoint, until that other stream
@@ -7191,6 +7413,7 @@ mod tests {
         let pool = pool().await;
         let (evm, service, provider, _) = prepared_evm().await;
         let underlying = seed_listing(&pool, evm.vault_address).await;
+        link_ap_wallet(&pool, evm.wallet_address).await;
         let issuer_request_id = IssuerMintRequestId::random();
         seed_mint_initiated(&pool, &issuer_request_id, &underlying).await;
         let (receipt_id, _, _, deposit_tx) =
@@ -7475,6 +7698,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sendable,
                     held_redemptions: vec![held.clone()],
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -7577,6 +7801,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sendable,
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await

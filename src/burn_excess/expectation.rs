@@ -536,6 +536,31 @@ pub(crate) async fn is_expected_funding(
     .fetch_one(pool)
     .await
 }
+/// Whether another stream still owns the funding handoff for this vault.
+pub(crate) async fn has_other_funding_expectation(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    deposit_tx_hash: B256,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM burn_excess_funding_expectations
+            WHERE network = ?
+              AND vault = ?
+              AND deposit_tx_hash != ?
+        )
+        ",
+    )
+    .bind(network.as_str())
+    .bind(address_key(vault))
+    .bind(hash_key(deposit_tx_hash))
+    .fetch_one(pool)
+    .await
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FundingExpectationStatus {
     Active,
@@ -876,17 +901,24 @@ pub(crate) async fn rebuild_funding_expectation_index(
             amount
         )
         SELECT
-            deposit_tx_hash,
-            network,
-            vault,
-            from_address,
-            to_address,
-            amount
-        FROM burn_excess_funding_expectations
-        WHERE true
+            expectation.deposit_tx_hash,
+            expectation.network,
+            expectation.vault,
+            expectation.from_address,
+            expectation.to_address,
+            json_extract(
+                expected.payload,
+                '$.FundingExpected.bind.shares'
+            )
+        FROM burn_excess_funding_expectations AS expectation
+        JOIN events AS expected
+          ON expected.aggregate_type = 'BurnExcess'
+         AND expected.aggregate_id = expectation.deposit_tx_hash
+         AND expected.event_type = ?
         ON CONFLICT(deposit_tx_hash) DO NOTHING
         ",
     )
+    .bind(BurnExcessEvent::FUNDING_EXPECTED)
     .execute(&mut *transaction)
     .await?;
     sqlx::query(
@@ -1378,22 +1410,26 @@ mod tests {
         pool: &Pool<Sqlite>,
         binds: &[&ExcessBurnBind],
     ) {
-        sqlx::query(
-            "
-            INSERT INTO tokenized_asset_vault_owners (
-                network,
-                vault,
-                aggregate_id
+        for (index, bind) in binds.iter().enumerate() {
+            let underlying = format!("PTY{index}");
+            let aggregate_id =
+                format!("{underlying}:{}", bind.network.as_str());
+            sqlx::query(
+                "
+                INSERT INTO tokenized_asset_vault_owners (
+                    network,
+                    vault,
+                    aggregate_id
+                )
+                VALUES (?, ?, ?)
+                ",
             )
-            VALUES (?, ?, 'PTY:base')
-            ",
-        )
-        .bind(Network::Base.as_str())
-        .bind(address_key(binds[0].vault))
-        .execute(pool)
-        .await
-        .unwrap();
-        for bind in binds {
+            .bind(bind.network.as_str())
+            .bind(address_key(bind.vault))
+            .bind(aggregate_id)
+            .execute(pool)
+            .await
+            .unwrap();
             let account_id = uuid::Uuid::new_v4().to_string();
             let account_payload = serde_json::json!({
                 "WalletWhitelisted": {
@@ -1430,8 +1466,8 @@ mod tests {
             .unwrap();
             let mint_payload = serde_json::json!({
                 "Initiated": {
-                    "underlying": "PTY",
-                    "network": "base",
+                    "underlying": underlying,
+                    "network": bind.network.as_str(),
                 }
             });
             sqlx::query(
@@ -1710,6 +1746,7 @@ mod tests {
                     dust_shares: U256::ZERO,
                 },
                 held_redemptions: vec![held.clone()],
+                acknowledged_inflows: Vec::new(),
             },
             BurnExcessCommand::RecordExcessBurnSubmitted {
                 tx_id: TxId::from(burn_tx_hash),
@@ -1726,6 +1763,47 @@ mod tests {
         held
     }
 
+    async fn assert_rebuilt_guard_amount(
+        pool: &Pool<Sqlite>,
+        bind: &ExcessBurnBind,
+    ) {
+        let amount: String = sqlx::query_scalar(
+            "
+            SELECT amount
+            FROM burn_excess_expectation_guards
+            WHERE deposit_tx_hash = ?
+            ",
+        )
+        .bind(bind.deposit_tx_hash.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            amount,
+            serde_json::to_value(bind.shares).unwrap().as_str().unwrap()
+        );
+    }
+
+    async fn assert_rebuilt_release(
+        pool: &Pool<Sqlite>,
+        bind: &ExcessBurnBind,
+        expected_block: i64,
+    ) {
+        let (released, release_through): (i64, Option<i64>) = sqlx::query_as(
+            "
+            SELECT released, release_through_block
+            FROM burn_excess_funding_expectations
+            WHERE deposit_tx_hash = ?
+            ",
+        )
+        .bind(bind.deposit_tx_hash.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(released, 1);
+        assert_eq!(release_through, Some(expected_block));
+    }
+
     /// The rebuild restores active expectations and terminal handoff rows. A
     /// completed or closed stream is released at its persisted chain boundary,
     /// but keeps its configuration guard until the poller safely catches up.
@@ -1736,15 +1814,16 @@ mod tests {
             .build(())
             .await
             .unwrap();
-        let other_sender = |deposit| ExcessBurnBind {
+        let distinct_stream = |deposit| ExcessBurnBind {
             original_recipient: Address::random(),
+            vault: Address::random(),
             ..bind(deposit)
         };
 
         let awaiting = bind(B256::random());
-        let excluded = other_sender(B256::random());
-        let closed = other_sender(B256::random());
-        let completed = other_sender(B256::random());
+        let excluded = distinct_stream(B256::random());
+        let closed = distinct_stream(B256::random());
+        let completed = distinct_stream(B256::random());
         seed_expectation_trigger_context(
             &pool,
             [&awaiting, &excluded, &closed, &completed].as_slice(),
@@ -1803,6 +1882,14 @@ mod tests {
 
         advance_transfer_poll_observed(
             &pool,
+            closed.network,
+            closed.vault,
+            150,
+        )
+        .await
+        .unwrap();
+        advance_transfer_poll_observed(
+            &pool,
             completed.network,
             completed.vault,
             150,
@@ -1810,35 +1897,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 4);
+        assert_rebuilt_guard_amount(&pool, &awaiting).await;
         assert!(expects(&pool, &awaiting).await);
         assert!(expects(&pool, &excluded).await);
         assert!(!expects(&pool, &closed).await);
-        let (closed_released, release_through): (i64, Option<i64>) =
-            sqlx::query_as(
-                "
-                SELECT released, release_through_block
-                FROM burn_excess_funding_expectations
-                WHERE deposit_tx_hash = ?
-                ",
-            )
-            .bind(closed.deposit_tx_hash.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(closed_released, 1);
-        assert_eq!(release_through, Some(150));
-        let completed_release: Option<i64> = sqlx::query_scalar(
-            "
-            SELECT release_through_block
-            FROM burn_excess_funding_expectations
-            WHERE deposit_tx_hash = ?
-            ",
-        )
-        .bind(completed.deposit_tx_hash.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(completed_release, Some(150));
+        assert_rebuilt_release(&pool, &closed, 150).await;
+        assert_rebuilt_release(&pool, &completed, 150).await;
         assert!(!expects(&pool, &completed).await);
         assert_eq!(
             classify_funding_transfer(&pool, &completed_held.transfer)
@@ -1891,6 +1955,20 @@ mod tests {
             FundingTransferStatus::Released
         );
 
+        advance_transfer_poll(&pool, closed.network, closed.vault, 150)
+            .await
+            .unwrap();
+        assert_eq!(
+            clear_released_funding_expectations(
+                &pool,
+                closed.network,
+                closed.vault,
+                150,
+            )
+            .await
+            .unwrap(),
+            1
+        );
         advance_transfer_poll(&pool, completed.network, completed.vault, 150)
             .await
             .unwrap();
@@ -1903,7 +1981,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            2
+            1
         );
         assert_eq!(rebuild_funding_expectation_index(&pool).await.unwrap(), 2);
         let replacement = ExcessBurnBind {
@@ -2047,6 +2125,7 @@ mod tests {
             reason: "legacy".into(),
             incident_id: None,
             sendable_tx: SendableTxWithHash::default(),
+            acknowledged_inflows: Vec::new(),
             intended_at: Utc::now(),
         };
         sqlx::query(

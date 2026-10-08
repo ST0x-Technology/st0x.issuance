@@ -2,6 +2,7 @@ use alloy::primitives::B256;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
+use st0x_issuance_dto::AcknowledgedInboundTransfer;
 
 use super::{
     BurnExcessCloseProof, BurnExcessPath, ExcessBurnBind, FundingTransferId,
@@ -35,6 +36,8 @@ pub(crate) enum BurnExcessEvent {
         reason: String,
         incident_id: Option<String>,
         sendable_tx: SendableTxWithHash,
+        #[serde(default)]
+        acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
         intended_at: DateTime<Utc>,
     },
     /// Genuine AP Transfers held with Path B funding, durably attributed
@@ -109,6 +112,10 @@ impl DomainEvent for BurnExcessEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        match self {
+            Self::ExcessBurnIntended { .. } => "2.0",
+            _ => "1.0",
+        }
+        .to_string()
     }
 }

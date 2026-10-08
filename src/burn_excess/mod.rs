@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
+use st0x_issuance_dto::AcknowledgedInboundTransfer;
 
 use crate::account::{AlpacaAccountNumber, ClientId};
 use crate::config::VaultMode;
@@ -151,6 +152,8 @@ pub(crate) enum BurnExcess {
         sendable_tx: SendableTxWithHash,
         held_redemptions: Vec<HeldTransferRedemption>,
         held_redemptions_anchored: bool,
+        #[serde(default)]
+        acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
         intended_at: DateTime<Utc>,
     },
     Submitted {
@@ -162,6 +165,8 @@ pub(crate) enum BurnExcess {
         sendable_tx: SendableTxWithHash,
         held_redemptions: Vec<HeldTransferRedemption>,
         held_redemptions_anchored: bool,
+        #[serde(default)]
+        acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
         tx_id: TxId,
         burn_tx_hash: B256,
         intended_at: DateTime<Utc>,
@@ -308,6 +313,7 @@ impl BurnExcess {
                 reason,
                 incident_id,
                 sendable_tx,
+                acknowledged_inflows,
                 intended_at,
             } => {
                 *self = Self::Intended {
@@ -317,6 +323,7 @@ impl BurnExcess {
                     reason,
                     incident_id,
                     sendable_tx,
+                    acknowledged_inflows,
                     intended_at,
                     held_redemptions: Vec::new(),
                     held_redemptions_anchored: false,
@@ -357,6 +364,7 @@ impl BurnExcess {
                     incident_id,
                     sendable_tx,
                     held_redemptions,
+                    acknowledged_inflows,
                     held_redemptions_anchored,
                     intended_at,
                 } = self.clone()
@@ -371,6 +379,7 @@ impl BurnExcess {
                     incident_id,
                     sendable_tx,
                     held_redemptions,
+                    acknowledged_inflows,
                     held_redemptions_anchored,
                     tx_id,
                     burn_tx_hash,
@@ -466,6 +475,7 @@ impl BurnExcess {
             incident_id,
             sendable_tx,
             held_redemptions,
+            acknowledged_inflows,
         } = command
         else {
             return Err(BurnExcessError::InvalidState {
@@ -505,6 +515,7 @@ impl BurnExcess {
                         reason,
                         incident_id,
                         sendable_tx,
+                        acknowledged_inflows,
                         intended_at,
                     },
                     BurnExcessEvent::HeldRedemptionsAnchored {
@@ -575,6 +586,7 @@ impl EventSourced for BurnExcess {
                 reason,
                 incident_id,
                 sendable_tx,
+                acknowledged_inflows,
                 intended_at,
             } => Some(Self::Intended {
                 bind: bind.clone(),
@@ -583,6 +595,7 @@ impl EventSourced for BurnExcess {
                 reason: reason.clone(),
                 incident_id: incident_id.clone(),
                 sendable_tx: sendable_tx.clone(),
+                acknowledged_inflows: acknowledged_inflows.clone(),
                 held_redemptions: Vec::new(),
                 held_redemptions_anchored: false,
                 intended_at: *intended_at,
@@ -632,6 +645,7 @@ impl EventSourced for BurnExcess {
                 incident_id,
                 sendable_tx,
                 held_redemptions,
+                acknowledged_inflows,
             } => {
                 if path != BurnExcessPath::Internal {
                     return Err(BurnExcessError::ExternalRequiresExclusion {
@@ -650,6 +664,7 @@ impl EventSourced for BurnExcess {
                         reason,
                         incident_id,
                         sendable_tx,
+                        acknowledged_inflows,
                         intended_at,
                     },
                     BurnExcessEvent::HeldRedemptionsAnchored {
@@ -914,6 +929,7 @@ mod tests {
                 incident_id: Some("inc-1".into()),
                 sendable_tx: sendable.clone(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .events();
@@ -955,6 +971,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -990,6 +1007,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: vec![held.clone()],
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .events();
@@ -1077,6 +1095,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1161,6 +1180,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1196,6 +1216,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1228,6 +1249,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1262,6 +1284,7 @@ mod tests {
                     reason: "duplicate mint".into(),
                     incident_id: None,
                     sendable_tx: sample_sendable(),
+                    acknowledged_inflows: Vec::new(),
                     intended_at: Utc::now(),
                 },
             ])
@@ -1273,6 +1296,7 @@ mod tests {
                 incident_id: None,
                 sendable_tx: sample_sendable(),
                 held_redemptions: Vec::new(),
+                acknowledged_inflows: Vec::new(),
             })
             .await
             .then_expect_error();
@@ -1333,6 +1357,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                acknowledged_inflows: Vec::new(),
                 intended_at: Utc::now(),
             }])
             .when(BurnExcessCommand::CloseExcessBurn {
@@ -1364,6 +1389,7 @@ mod tests {
                     reason: "duplicate mint".into(),
                     incident_id: None,
                     sendable_tx: sendable.clone(),
+                    acknowledged_inflows: Vec::new(),
                     intended_at,
                 },
                 BurnExcessEvent::HeldRedemptionsAnchored {
@@ -1392,6 +1418,7 @@ mod tests {
                     reason: "duplicate mint".into(),
                     incident_id: None,
                     sendable_tx: sendable.clone(),
+                    acknowledged_inflows: Vec::new(),
                     intended_at,
                 },
                 BurnExcessEvent::HeldRedemptionsAnchored {
@@ -1432,6 +1459,7 @@ mod tests {
                 reason: "duplicate mint".into(),
                 incident_id: None,
                 sendable_tx: sendable.clone(),
+                acknowledged_inflows: Vec::new(),
                 intended_at: Utc::now(),
             },
             BurnExcessEvent::ExcessBurnSubmitted {
@@ -1480,6 +1508,7 @@ mod tests {
             reason: "r".into(),
             incident_id: Some("i".into()),
             sendable_tx: sample_sendable(),
+            acknowledged_inflows: Vec::new(),
             intended_at: Utc::now(),
         };
         let json = serde_json::to_string(&intended).unwrap();
@@ -1522,6 +1551,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sample_sendable(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -1545,6 +1575,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sample_sendable(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -1578,6 +1609,7 @@ mod tests {
                     incident_id: None,
                     sendable_tx: sample_sendable(),
                     held_redemptions: Vec::new(),
+                    acknowledged_inflows: Vec::new(),
                 },
             )
             .await
@@ -1657,6 +1689,42 @@ mod tests {
         )
         .bind(&aggregate_id)
         .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO active_signer_intents (
+                network,
+                aggregate_type,
+                aggregate_id
+            )
+            VALUES ('base', 'Redemption', 'existing-redemption')
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        let collision = sqlx::raw_sql(MIGRATION)
+            .execute(&mut *transaction)
+            .await
+            .unwrap_err();
+        assert!(
+            collision.to_string().contains(
+                "burn-excess signer backfill collides with an existing \
+                     network intent"
+            ),
+            "got: {collision}"
+        );
+        transaction.rollback().await.unwrap();
+        sqlx::query(
+            "
+            DELETE FROM active_signer_intents
+            WHERE network = 'base'
+            ",
+        )
         .execute(&pool)
         .await
         .unwrap();
@@ -1750,7 +1818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signer_reservation_migration_keeps_legacy_signed_close_reserved() {
+    async fn signer_reservation_migration_releases_legacy_signed_close() {
         const MIGRATION: &str = include_str!(
             "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"
         );
@@ -1803,6 +1871,7 @@ mod tests {
                 reason: "legacy signed close".into(),
                 incident_id: None,
                 sendable_tx: sample_sendable(),
+                acknowledged_inflows: Vec::new(),
                 intended_at: Utc::now(),
             })
             .unwrap();
@@ -1849,7 +1918,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(reservation_count, 1);
+        assert_eq!(reservation_count, 0);
     }
 
     #[test]
@@ -1874,6 +1943,7 @@ mod tests {
             sendable_tx: sample_sendable(),
             held_redemptions: Vec::new(),
             held_redemptions_anchored: true,
+            acknowledged_inflows: Vec::new(),
             intended_at: Utc::now(),
         };
         assert_eq!(intended.path(), BurnExcessPath::Internal);

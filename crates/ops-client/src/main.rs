@@ -427,6 +427,7 @@ fn burn_excess_common(args: &BurnExcessArgs) -> BurnExcessCommon {
         shares,
         reason,
         incident_id,
+        acknowledged_inflows,
         network,
         chain_id,
         execute,
@@ -440,6 +441,7 @@ fn burn_excess_common(args: &BurnExcessArgs) -> BurnExcessCommon {
         shares: shares.clone(),
         reason: reason.clone(),
         incident_id: incident_id.clone(),
+        acknowledged_inflows: acknowledged_inflows.clone(),
         network: *network,
         chain_id: *chain_id,
         execute: *execute,
@@ -902,7 +904,13 @@ mod tests {
 
         let mut external =
             burn_excess_flags(&["external", "--funding-tx-hash", HASH_B]);
-        external.extend(["--incident-id", "INC-7", "--execute"]);
+        external.extend([
+            "--incident-id",
+            "INC-7",
+            "--acknowledged-inflow",
+            "0x1111111111111111111111111111111111111111111111111111111111111111:7",
+            "--execute",
+        ]);
         assert_eq!(
             wire(&external),
             (
@@ -915,6 +923,10 @@ mod tests {
                     "shares": "0.750",
                     "reason": "duplicate deposit",
                     "incident_id": "INC-7",
+                    "acknowledged_inflows": [{
+                        "tx_hash": HASH_A,
+                        "log_index": 7
+                    }],
                     "network": "base",
                     "chain_id": 8453,
                     "execute": true,

@@ -1,3 +1,116 @@
+-- Current wallet ownership across Account aggregates. Account-local aggregate
+-- validation cannot prevent two accounts from claiming the same wallet, so
+-- this guard makes the cross-aggregate invariant atomic with the event append.
+CREATE TABLE account_wallet_owners (
+    wallet TEXT PRIMARY KEY NOT NULL,
+    aggregate_id TEXT NOT NULL
+);
+
+CREATE TRIGGER reject_account_wallet_owner_backfill_collision
+BEFORE INSERT ON account_wallet_owners
+WHEN EXISTS (
+    SELECT 1
+    FROM account_wallet_owners AS owner
+    WHERE owner.wallet = NEW.wallet
+      AND owner.aggregate_id != NEW.aggregate_id
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'account wallet is actively linked to multiple accounts'
+    );
+END;
+
+INSERT INTO account_wallet_owners (wallet, aggregate_id)
+SELECT DISTINCT
+    lower(
+        json_extract(
+            whitelisted.payload,
+            '$.WalletWhitelisted.wallet'
+        )
+    ),
+    whitelisted.aggregate_id
+FROM events AS whitelisted
+WHERE whitelisted.aggregate_type = 'Account'
+  AND whitelisted.event_type = 'AccountEvent::WalletWhitelisted'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM events AS unwhitelisted
+      WHERE unwhitelisted.aggregate_type = whitelisted.aggregate_type
+        AND unwhitelisted.aggregate_id = whitelisted.aggregate_id
+        AND unwhitelisted.sequence > whitelisted.sequence
+        AND unwhitelisted.event_type = 'AccountEvent::WalletUnwhitelisted'
+        AND lower(
+            json_extract(
+                unwhitelisted.payload,
+                '$.WalletUnwhitelisted.wallet'
+            )
+        ) = lower(
+            json_extract(
+                whitelisted.payload,
+                '$.WalletWhitelisted.wallet'
+            )
+        )
+  )
+ORDER BY whitelisted.aggregate_id;
+
+DROP TRIGGER reject_account_wallet_owner_backfill_collision;
+
+CREATE TRIGGER reject_account_wallet_owner_collision
+BEFORE INSERT ON events
+WHEN NEW.aggregate_type = 'Account'
+ AND NEW.event_type = 'AccountEvent::WalletWhitelisted'
+ AND EXISTS (
+     SELECT 1
+     FROM account_wallet_owners AS owner
+     WHERE owner.wallet = lower(
+         json_extract(
+             NEW.payload,
+             '$.WalletWhitelisted.wallet'
+         )
+     )
+       AND owner.aggregate_id != NEW.aggregate_id
+ )
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'account wallet is already linked to another account'
+    );
+END;
+
+CREATE TRIGGER record_account_wallet_owner
+AFTER INSERT ON events
+WHEN NEW.aggregate_type = 'Account'
+ AND NEW.event_type = 'AccountEvent::WalletWhitelisted'
+BEGIN
+    INSERT INTO account_wallet_owners (wallet, aggregate_id)
+    VALUES (
+        lower(
+            json_extract(
+                NEW.payload,
+                '$.WalletWhitelisted.wallet'
+            )
+        ),
+        NEW.aggregate_id
+    )
+    ON CONFLICT(wallet) DO NOTHING;
+END;
+
+CREATE TRIGGER release_account_wallet_owner
+AFTER INSERT ON events
+WHEN NEW.aggregate_type = 'Account'
+ AND NEW.event_type = 'AccountEvent::WalletUnwhitelisted'
+BEGIN
+    DELETE FROM account_wallet_owners
+    WHERE aggregate_id = NEW.aggregate_id
+      AND wallet = lower(
+          json_extract(
+              NEW.payload,
+              '$.WalletUnwhitelisted.wallet'
+          )
+      );
+END;
+
 -- Exact AP redemptions held by an expectation, with the account attribution
 -- proven before the excess burn was broadcast. These rows survive expectation
 -- release so a later wallet unlink cannot strand an already-mined redemption.
@@ -33,6 +146,7 @@ CREATE TABLE burn_excess_expectation_guards (
     from_address TEXT NOT NULL,
     to_address TEXT NOT NULL,
     amount TEXT NOT NULL,
+    UNIQUE (network, vault),
     UNIQUE (
         network,
         vault,
@@ -329,6 +443,20 @@ SELECT network, aggregate_type, aggregate_id
 FROM active_signer_intents_rebuild;
 
 DROP TABLE active_signer_intents_rebuild;
+CREATE TRIGGER reject_burn_excess_signer_backfill_collision
+BEFORE INSERT ON active_signer_intents
+WHEN EXISTS (
+    SELECT 1
+    FROM active_signer_intents
+    WHERE network = NEW.network
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'burn-excess signer backfill collides with an existing network intent'
+    );
+END;
+
 
 -- Backfill every nonterminal recovery. A uniqueness failure means history
 -- already contains two unresolved operations for one signer nonce domain;
@@ -360,50 +488,9 @@ WITH unresolved_burn_excess AS (
           FROM events AS terminal
           WHERE terminal.aggregate_type = intent.aggregate_type
             AND terminal.aggregate_id = intent.aggregate_id
-            AND (
-                terminal.event_type =
-                    'BurnExcessEvent::ExcessBurnCompleted'
-                OR (
-                    terminal.event_type =
-                        'BurnExcessEvent::ExcessBurnClosed'
-                    AND (
-                        (
-                            NOT EXISTS (
-                                SELECT 1
-                                FROM events AS signed
-                                WHERE signed.aggregate_type =
-                                    intent.aggregate_type
-                                  AND signed.aggregate_id =
-                                    intent.aggregate_id
-                                  AND signed.event_type =
-                                    'BurnExcessEvent::ExcessBurnIntended'
-                            )
-                            AND COALESCE(
-                                json_extract(
-                                    terminal.payload,
-                                    '$.ExcessBurnClosed.proof'
-                                ),
-                                'unsigned'
-                            ) = 'unsigned'
-                        )
-                        OR (
-                            EXISTS (
-                                SELECT 1
-                                FROM events AS signed
-                                WHERE signed.aggregate_type =
-                                    intent.aggregate_type
-                                  AND signed.aggregate_id =
-                                    intent.aggregate_id
-                                  AND signed.event_type =
-                                    'BurnExcessEvent::ExcessBurnIntended'
-                            )
-                            AND json_extract(
-                                terminal.payload,
-                                '$.ExcessBurnClosed.proof'
-                            ) IN ('finalized_reverted', 'provably_dead')
-                        )
-                    )
-                )
+            AND terminal.event_type IN (
+                'BurnExcessEvent::ExcessBurnCompleted',
+                'BurnExcessEvent::ExcessBurnClosed'
             )
       )
 )
@@ -414,6 +501,8 @@ INSERT INTO active_signer_intents (
 )
 SELECT network, aggregate_type, aggregate_id
 FROM unresolved_burn_excess;
+
+DROP TRIGGER reject_burn_excess_signer_backfill_collision;
 
 CREATE TRIGGER validate_burn_excess_signer_intent_origin
 BEFORE INSERT ON events

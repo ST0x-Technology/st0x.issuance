@@ -116,6 +116,78 @@ receipt-inventory stream, so the evidence survives the backfill checkpoint
 advancing past that block. There is no admin health list of duplicates yet; read
 the event (or the ERROR log fields) for both identities.
 
+Before deploying the signer-reservation migration, inspect legacy signed
+burn-excess closures. They are terminal and are intentionally not backfilled
+into `active_signer_intents`:
+
+```sql
+SELECT DISTINCT intended.aggregate_id
+FROM events AS intended
+WHERE intended.aggregate_type = 'BurnExcess'
+  AND intended.event_type = 'BurnExcessEvent::ExcessBurnIntended'
+  AND EXISTS (
+      SELECT 1
+      FROM events AS closed
+      WHERE closed.aggregate_type = intended.aggregate_type
+        AND closed.aggregate_id = intended.aggregate_id
+        AND closed.event_type = 'BurnExcessEvent::ExcessBurnClosed'
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM events AS completed
+      WHERE completed.aggregate_type = intended.aggregate_type
+        AND completed.aggregate_id = intended.aggregate_id
+        AND completed.event_type = 'BurnExcessEvent::ExcessBurnCompleted'
+  );
+```
+
+Reconcile every returned stream against the incident record before deployment.
+The migration aborts with an explicit collision error if an unresolved
+burn-excess stream would reserve a network already held by another signer
+intent.
+
+Also reject duplicate active wallet ownership before deploy; the migration
+aborts rather than choosing an arbitrary AP account:
+
+```sql
+SELECT
+    lower(
+        json_extract(
+            whitelisted.payload,
+            '$.WalletWhitelisted.wallet'
+        )
+    ) AS wallet,
+    group_concat(DISTINCT whitelisted.aggregate_id) AS account_ids
+FROM events AS whitelisted
+WHERE whitelisted.aggregate_type = 'Account'
+  AND whitelisted.event_type = 'AccountEvent::WalletWhitelisted'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM events AS unwhitelisted
+      WHERE unwhitelisted.aggregate_type = whitelisted.aggregate_type
+        AND unwhitelisted.aggregate_id = whitelisted.aggregate_id
+        AND unwhitelisted.sequence > whitelisted.sequence
+        AND unwhitelisted.event_type = 'AccountEvent::WalletUnwhitelisted'
+        AND lower(
+            json_extract(
+                unwhitelisted.payload,
+                '$.WalletUnwhitelisted.wallet'
+            )
+        ) = lower(
+            json_extract(
+                whitelisted.payload,
+                '$.WalletWhitelisted.wallet'
+            )
+        )
+  )
+GROUP BY wallet
+HAVING COUNT(DISTINCT whitelisted.aggregate_id) > 1;
+```
+
+Resolve every returned wallet to one account before deploying. Runtime event
+guards then prevent the ambiguity from recurring; a legacy ambiguous transfer is
+parked as non-retryable instead of holding the vault checkpoint forever.
+
 Collect these before running anything:
 
 | Input              | Where it comes from                                                 |
@@ -168,19 +240,25 @@ infers it:
   counts its shares toward the expected balance and lists it under
   `held_transfers` in the plan (check that `funding_log` is the transfer sent as
   funding). The proof scans every issuer-wallet inbound share Transfer since the
-  duplicate deposit, not only matching logs and not from the poll checkpoint. It
-  reconciles completed redemptions/exclusions and refuses every unresolved
-  different-shape inflow, so unrelated inbound shares cannot mask an outbound
-  transfer. The block range and balance are hash-pinned to one connected chain
-  snapshot; immediately before signing the bot repeats the proof at a no-older
-  snapshot and refuses if the exact held log set or attribution changed. The
-  signed intent and `HeldRedemptionsAnchored` commit atomically before
-  broadcast, recording the exact log, AP account, original asset, and burn mode.
-  A later stream checks durable anchor events before it signs and may share that
-  exact log only with identical attribution. Once the excess burn completes, the
-  poller keeps scanning that vault even if the asset was repointed. Persisting
-  an anchor rewinds any checkpoint already past the held log, so it is replayed
-  and detected with the anchored context. The Redemption persists the account
+  duplicate deposit in bounded `eth_getLogs` ranges, not only matching logs and
+  not from the poll checkpoint. It reconciles completed redemptions/exclusions
+  and refuses every unresolved different-shape inflow, so unrelated inbound
+  shares cannot mask an outbound transfer. If ops already reconciled such an
+  inflow outside the bot, repeat `--acknowledged-inflow <TX_HASH>:<LOG_INDEX>`
+  for each exact log. Use this only after proving that those shares no longer
+  belong to an unresolved liability. The dry-run refuses a missing or
+  already-resolved identity and lists every accepted acknowledgement; execute
+  persists the list with the signed intent. The block range and balance are
+  hash-pinned to one connected chain snapshot; immediately before signing the
+  bot revalidates the planned snapshot, scans only blocks added since it, and
+  refuses if the exact held log set or attribution changed. The signed intent
+  and `HeldRedemptionsAnchored` commit atomically before broadcast, recording
+  the exact log, AP account, original asset, and burn mode. A later stream
+  checks durable anchor events before it signs and may share that exact log only
+  with identical attribution. Once the excess burn completes, the poller keeps
+  scanning that vault even if the asset was repointed. Persisting an anchor
+  rewinds any checkpoint already past the held log, so it is replayed and
+  detected with the anchored context. The Redemption persists the account
   identity through restart, freeze, journal, and pre-Alpaca reprocess recovery.
   Unlinking the wallet after the plan executes therefore does not strand this
   already-mined redemption. If another stream instead proves the exact log as
@@ -201,25 +279,25 @@ infers it:
   stream's own. `ChainBehindProvenPlan`, `ChainBehindDeposit`, or a
   disconnected-snapshot error (502) means the RPC cannot provide the coherent
   chain proof; retry against a caught-up healthy node. `expect-funding` refuses
-  (409) only while another stream is `FundingExcluded`, `Intended`, or
-  `Submitted`; finish or safely close that one first. Multiple `AwaitingFunding`
-  expectations may coexist because they own neither signed bytes nor a permanent
-  exclusion. Recording the funding exclusion (or an internal burn intent)
-  atomically reserves the network's signer nonce domain in SQLite across service
-  and CLI processes; completion releases it. `expect-funding` and defensive
-  unsigned close require the original recipient to be uniquely linked. The
-  expectation atomically blocks wallet-link mutations and vault repointing.
-  Completion and every close mark an existing expectation released and persist a
-  chain boundary, raised to the poller's durable monotonic high-water mark, that
-  the poller must safely scan through without dropping or ambiguously
-  deduplicating a log. Successful cleanup atomically records a per-stream
-  completion tombstone, preventing startup rebuild from resurrecting the
-  handoff. An unsafe log retains the row, checkpoint, and guards for incident
-  handling. A defensive check refuses close if a pre-existing stream was already
-  repointed; restore the listing first. A signed stream closes only after exact
-  classification proves finalized revert or a dead nonce. Before confirming
-  unsigned close, verify no funding or same-shape Transfer remains pending
-  beyond the recorded head.
+  with `AnotherFundingExpected` (409) while the vault already has a live or
+  released expectation; finish or safely close that stream and let its poller
+  catch-up complete first. It also refuses (409) while another stream is
+  `FundingExcluded`, `Intended`, or `Submitted`. Recording the funding exclusion
+  (or an internal burn intent) atomically reserves the network's signer nonce
+  domain in SQLite across service and CLI processes; completion releases it.
+  `expect-funding` and defensive unsigned close require the original recipient
+  to be uniquely linked. The expectation atomically blocks wallet-link mutations
+  and vault repointing. Completion and every close mark an existing expectation
+  released and persist a chain boundary, raised to the poller's durable
+  monotonic high-water mark, that the poller must safely scan through without
+  dropping or ambiguously deduplicating a log. Successful cleanup atomically
+  records a per-stream completion tombstone, preventing startup rebuild from
+  resurrecting the handoff. An unsafe log retains the row, checkpoint, and
+  guards for incident handling. A defensive check refuses close if a
+  pre-existing stream was already repointed; restore the listing first. A signed
+  stream closes only after exact classification proves finalized revert or a
+  dead nonce. Before confirming unsigned close, verify no funding or same-shape
+  Transfer remains pending beyond the recorded head.
 
 Run it without `--execute` first: the dry run proves the deposit and prints the
 plan without signing or writing an exclusion. A 504 leaves an `--execute` run's

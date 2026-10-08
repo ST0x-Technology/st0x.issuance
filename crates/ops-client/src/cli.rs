@@ -6,7 +6,8 @@ use alloy_primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use st0x_issuance_dto::{
-    DecimalShares, Email, Network, UnderlyingSymbol, UnderlyingSymbolError,
+    AcknowledgedInboundTransfer, DecimalShares, Email, Network,
+    UnderlyingSymbol, UnderlyingSymbolError,
 };
 use uuid::Uuid;
 
@@ -250,6 +251,10 @@ pub(crate) struct BurnExcessArgs {
     /// Optional incident or ticket id for the audit trail.
     #[arg(long)]
     pub(crate) incident_id: Option<String>,
+    /// Exact inbound Transfers reconciled outside the ordinary terminal paths.
+    /// Repeat as `--acknowledged-inflow TX_HASH:LOG_INDEX`.
+    #[arg(long = "acknowledged-inflow")]
+    pub(crate) acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     #[arg(long)]
     pub(crate) network: Network,
     /// Must match the network's chain configured on the bot.

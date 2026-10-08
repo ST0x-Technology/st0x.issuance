@@ -121,6 +121,9 @@ impl TransferProcessingError {
                 | Self::MissingLogIndex
                 | Self::QuantityConversion(_)
                 | Self::NoMatchingAsset { .. }
+                | Self::AccountView(
+                    AccountViewError::WalletLinkedToMultipleAccounts { .. }
+                )
         )
     }
 }
@@ -533,6 +536,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
+    use crate::account::view::AccountViewError;
     use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::burn_excess::expectation::{
         held_redemption_vaults, record_held_redemptions,
@@ -1196,6 +1200,17 @@ mod tests {
             result.as_ref().unwrap_err().is_non_transient(),
             "missing log_index must not retry/freeze checkpoint indefinitely"
         );
+    }
+
+    #[test]
+    fn ambiguous_wallet_ownership_is_non_transient() {
+        let error = TransferProcessingError::AccountView(
+            AccountViewError::WalletLinkedToMultipleAccounts {
+                wallet: Address::random(),
+            },
+        );
+
+        assert!(error.is_non_transient());
     }
 
     #[traced_test]

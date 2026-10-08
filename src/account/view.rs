@@ -391,33 +391,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_by_wallet_refuses_ambiguous_account_ownership() {
+    async fn whitelisting_refuses_wallet_owned_by_another_account() {
         let harness = TestHarness::new().await;
-        let TestHarness { pool, .. } = &harness;
+        let TestHarness { pool, store } = &harness;
         let wallet = address!("0x1111111111111111111111111111111111111111");
-        for (email, alpaca_account) in [
-            ("first@example.com", "ALPACA-1"),
-            ("second@example.com", "ALPACA-2"),
-        ] {
-            let client_id = ClientId::new();
-            harness
-                .register_account(client_id, Email::new(email).unwrap())
-                .await;
-            harness
-                .link_to_alpaca(
-                    &client_id,
-                    AlpacaAccountNumber(alpaca_account.to_string()),
-                )
-                .await;
-            harness.whitelist_wallet(&client_id, wallet).await;
-        }
+        let first = ClientId::new();
+        harness
+            .register_account(first, Email::new("first@example.com").unwrap())
+            .await;
+        harness
+            .link_to_alpaca(&first, AlpacaAccountNumber("ALPACA-1".to_string()))
+            .await;
+        harness.whitelist_wallet(&first, wallet).await;
+        let second = ClientId::new();
+        harness
+            .register_account(second, Email::new("second@example.com").unwrap())
+            .await;
+        harness
+            .link_to_alpaca(
+                &second,
+                AlpacaAccountNumber("ALPACA-2".to_string()),
+            )
+            .await;
 
-        assert!(matches!(
-            find_by_wallet(pool, &wallet).await.unwrap_err(),
-            AccountViewError::WalletLinkedToMultipleAccounts {
-                wallet: ambiguous
-            } if ambiguous == wallet
-        ));
+        let result = store
+            .send(&second, AccountCommand::WhitelistWallet { wallet })
+            .await;
+
+        assert!(result.is_err());
+        let AccountView::LinkedToAlpaca { client_id, .. } =
+            find_by_wallet(pool, &wallet).await.unwrap().unwrap()
+        else {
+            panic!("wallet owner must remain linked")
+        };
+        assert_eq!(client_id, first);
     }
 
     #[tokio::test]

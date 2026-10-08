@@ -601,6 +601,7 @@ mod tests {
             sendable_tx: crate::vault::SendableTxWithHash::default(),
             held_redemptions: Vec::new(),
             held_redemptions_anchored: true,
+            acknowledged_inflows: Vec::new(),
             intended_at: Utc::now(),
         };
 

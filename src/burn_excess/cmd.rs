@@ -1,5 +1,6 @@
 use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
+use st0x_issuance_dto::AcknowledgedInboundTransfer;
 
 use super::{
     BurnExcessPath, ExcessBurnBind, FundingTransferId, HeldTransferRedemption,
@@ -50,6 +51,7 @@ pub(crate) enum BurnExcessCommand {
         /// Persisted atomically with the signed intent so a crash cannot lose
         /// the AP attribution the balance proof relied on.
         held_redemptions: Vec<HeldTransferRedemption>,
+        acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     },
     /// Anchor genuine AP Transfers held with Path B funding before the signed
     /// excess burn can be broadcast.

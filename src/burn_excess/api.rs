@@ -63,6 +63,7 @@ fn into_request(
         shares: common.shares.to_u256(),
         reason: common.reason,
         incident_id: common.incident_id,
+        acknowledged_inflows: common.acknowledged_inflows,
         network: common.network,
         chain_id: common.chain_id,
         execute: common.execute,
@@ -325,10 +326,11 @@ pub(crate) async fn burn_excess_external_ops(
 /// intervention.
 const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
     use BurnExcessEngineError::{
-        AmbiguousDepositTx, AmbiguousShareTransferOut, ChainBehindProvenPlan,
-        Contract, DeadBurnIntent, DepositTxInvalid, FundingNotExpected,
-        FundingTxInvalid, HeldTransferReceiptMissing, MintMissingAsset,
-        MintNetworkMismatch, MintNotFound, Proof, Provider,
+        AcknowledgedInboundNotFound, AmbiguousDepositTx,
+        AmbiguousShareTransferOut, AnotherFundingExpected,
+        ChainBehindProvenPlan, Contract, DeadBurnIntent, DepositTxInvalid,
+        FundingNotExpected, FundingTxInvalid, HeldTransferReceiptMissing,
+        MintMissingAsset, MintNetworkMismatch, MintNotFound, Proof, Provider,
         UnresolvedExcessBurnIntent, UnresolvedSignerIntent, Vault,
         VaultNotListed,
     };
@@ -337,7 +339,8 @@ const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
         MintNotFound { .. } => Status::NotFound,
         UnresolvedSignerIntent { .. }
         | UnresolvedExcessBurnIntent
-        | FundingNotExpected => Status::Conflict,
+        | FundingNotExpected
+        | AnotherFundingExpected { .. } => Status::Conflict,
         Proof(_)
         | MintMissingAsset { .. }
         | MintNetworkMismatch { .. }
@@ -346,6 +349,7 @@ const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
         | AmbiguousDepositTx { .. }
         | AmbiguousShareTransferOut { .. }
         | FundingTxInvalid { .. }
+        | AcknowledgedInboundNotFound { .. }
         | DeadBurnIntent { .. } => Status::UnprocessableEntity,
         Provider(_)
         | Contract(_)
