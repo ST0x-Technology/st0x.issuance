@@ -3533,6 +3533,9 @@ impl Redemption {
             }
             _ => (None, None),
         };
+        let account_attribution = prior_burn_context
+            .as_ref()
+            .and_then(|context| context.metadata.account_attribution.clone());
         let RedemptionEvent::BurnResumed {
             issuer_request_id,
             underlying,
@@ -3568,7 +3571,7 @@ impl Redemption {
                 block_number,
                 detected_at,
                 burn_mode,
-                account_attribution: None,
+                account_attribution,
             },
             tokenization_request_id,
             alpaca_quantity,
@@ -4756,6 +4759,72 @@ mod tests {
             panic!("Expected Burning state, got {resumed:?}");
         };
         assert_eq!(metadata.burn_mode, orchestrator_mode());
+    }
+
+    #[test]
+    fn burn_resume_preserves_failed_context_account_attribution() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let account_attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
+        let sendable_tx = SendableTxWithHash {
+            tx: vec![1, 2, 3],
+            hash: B256::random(),
+            nonce: 7,
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        };
+        let mut history =
+            intended_burn_history(&issuer_request_id, sendable_tx);
+        history.insert(
+            1,
+            RedemptionEvent::AccountAttributionAnchored {
+                issuer_request_id: issuer_request_id.clone(),
+                attribution: account_attribution.clone(),
+                anchored_at: Utc::now(),
+            },
+        );
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "burn failed".into(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: Vec::new(),
+            classification: BurnFailureClassification::Unclassified,
+        });
+        history.push(RedemptionEvent::BurnResumed {
+            issuer_request_id,
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: Quantity::new(Decimal::from(100)),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            block_number: 12345,
+            detected_at: Utc::now(),
+            tokenization_request_id: TokenizationRequestId::new(
+                "alp-replace-456",
+            ),
+            alpaca_quantity: Quantity::new(Decimal::from(100)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
+            called_at: Utc::now(),
+            alpaca_journal_completed_at: Utc::now(),
+            external_tx_id: None,
+            resumed_at: Utc::now(),
+            burn_mode: VaultMode::VaultDirect,
+        });
+
+        let resumed = replay::<Redemption>(history).unwrap().unwrap();
+        let Redemption::Burning { metadata, .. } = resumed else {
+            panic!("Expected Burning state, got {resumed:?}");
+        };
+        assert_eq!(
+            metadata.account_attribution.as_deref(),
+            Some(&account_attribution)
+        );
     }
 
     /// `Reprocess` persists the caller-supplied burn mode and durable account

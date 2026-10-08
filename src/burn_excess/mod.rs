@@ -1796,6 +1796,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signer_reservation_migration_reports_burn_excess_collision() {
+        const MIGRATION: &str = include_str!(
+            "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "
+            CREATE TABLE events (
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER,
+                payload JSON NOT NULL
+            );
+            CREATE TABLE burn_excess_funding_expectations (
+                deposit_tx_hash TEXT PRIMARY KEY,
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                from_address TEXT NOT NULL,
+                to_address TEXT NOT NULL,
+                amount TEXT NOT NULL
+            );
+            CREATE TABLE tokenized_asset_vault_owners (
+                network TEXT NOT NULL,
+                vault TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL
+            );
+            CREATE TABLE active_signer_intents (
+                network TEXT NOT NULL PRIMARY KEY,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                UNIQUE (aggregate_type, aggregate_id)
+            );
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload
+            )
+            VALUES
+                (
+                    'BurnExcess',
+                    'first',
+                    'BurnExcessEvent::FundingExclusionRecorded',
+                    '{\"FundingExclusionRecorded\":{\"bind\":{\"network\":\"base\"}}}'
+                ),
+                (
+                    'BurnExcess',
+                    'second',
+                    'BurnExcessEvent::FundingExclusionRecorded',
+                    '{\"FundingExclusionRecorded\":{\"bind\":{\"network\":\"base\"}}}'
+                );
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("burn-excess network backfill collision"),
+            "migration must identify conflicting unresolved streams: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn signer_reservation_migration_releases_legacy_signed_close() {
         const MIGRATION: &str = include_str!(
             "../../migrations/20261007193733_reserve_burn_excess_signer_intents.sql"

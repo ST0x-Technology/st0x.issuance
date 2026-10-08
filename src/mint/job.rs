@@ -2863,6 +2863,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Seeds an unresolved signed burn-excess recovery on Base.
+    async fn seed_signed_excess_recovery(pool: &Pool<Sqlite>) {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'BurnExcess',
+                '0x00000000000000000000000000000000000000000000000000000000000000e2',
+                1,
+                'BurnExcessEvent::ExcessBurnIntended',
+                '1.0',
+                '{\"ExcessBurnIntended\":{\"bind\":{\"network\":\"base\"}}}',
+                '{}'
+            )
+            ",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     fn submit_ctx(
         harness: &TestHarness,
         vault: Arc<dyn VaultService>,
@@ -3316,6 +3345,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(intent_count, 1, "the mint must persist its signed intent");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn submit_from_minting_waits_for_signed_excess_recovery() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = IssuerMintRequestId::random();
+        seed_mint_events(
+            &harness.pool,
+            &issuer_request_id,
+            events_through_minting(&issuer_request_id),
+        )
+        .await;
+        seed_signed_excess_recovery(&harness.pool).await;
+
+        let vault = Arc::new(MockVaultService::new_success());
+        let ctx = submit_ctx(&harness, vault.clone());
+        let result = SubmitMintJob {
+            issuer_request_id: issuer_request_id.clone(),
+            vault: VAULT,
+            chain_id: ANVIL_CHAIN_ID,
+        }
+        .perform(&ctx)
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MintJobError::UnresolvedWalletIntent {
+                issuer_request_id: blocked_id,
+            }) if blocked_id == issuer_request_id
+        ));
+        assert_eq!(
+            vault.get_call_count(),
+            0,
+            "a signed burn-excess intent must block mint preparation"
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "submit_from_minting_waits_for_signed_excess_recovery",
+                "Deferring mint behind another persisted wallet intent",
+            ]
+        ));
     }
 
     #[tokio::test]

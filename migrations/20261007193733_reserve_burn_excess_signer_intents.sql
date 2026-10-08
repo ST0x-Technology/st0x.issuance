@@ -475,6 +475,21 @@ CREATE TABLE burn_excess_network_arbitration_rebuild (
     aggregate_id TEXT NOT NULL
 );
 
+CREATE TRIGGER reject_burn_excess_network_backfill_collision
+BEFORE INSERT ON burn_excess_network_arbitration_rebuild
+WHEN EXISTS (
+    SELECT 1
+    FROM burn_excess_network_arbitration_rebuild
+    WHERE network = NEW.network
+      AND aggregate_id != NEW.aggregate_id
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'burn-excess network backfill collision: multiple unresolved streams'
+    );
+END;
+
 WITH unresolved_burn_excess AS (
     SELECT DISTINCT
         COALESCE(
@@ -511,6 +526,8 @@ INSERT INTO burn_excess_network_arbitration_rebuild (
 )
 SELECT network, aggregate_id
 FROM unresolved_burn_excess;
+
+DROP TRIGGER reject_burn_excess_network_backfill_collision;
 
 DROP TABLE burn_excess_network_arbitration_rebuild;
 
