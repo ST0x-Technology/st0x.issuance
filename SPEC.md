@@ -1703,14 +1703,22 @@ the ordinary Alpaca path. Two operator sequences prevent that:
   written, dry run included: its excess is already there and burns through
   `internal`. A Transfer matching an open expectation and not yet excluded is
   held: it is not detected, and the poller stops that vault's checkpoint before
-  its block. Every other Transfer on the vault, later ones included, is still
-  detected. While the hold lasts each pass re-reads only the held block and the
-  blocks no pass has read yet, tracked in memory; after a restart, or once the
-  hold clears, the vault is rescanned once from its checkpoint (detection is
-  idempotent per tx hash). Holding them too would deadlock: a later redemption's
-  shares would stay in the issuer wallet, and `external` needs the exact excess
-  balance there before it records the exclusion that releases the hold. Other
-  vaults keep flowing and nothing is skipped.
+  its block. Matching is by
+  `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`,
+  not by transaction hash or time. Therefore a genuine redemption from the
+  original recipient for exactly the excess amount is also held while the
+  expectation is open, even if it was mined before `expect-funding` but had not
+  yet been scanned. The AP must not send such a redemption until `external`
+  completes. Transfers that do not match this shape, later ones included, are
+  still detected. While the hold lasts each pass re-reads only the held block
+  and blocks no pass has read yet, tracked in memory; after a restart, or once
+  the hold clears, the vault is rescanned once from its checkpoint (detection is
+  idempotent per tx hash). A same-shape redemption would deadlock recovery: its
+  shares stay in the issuer wallet, so `external` sees twice the excess and
+  cannot record the exclusion that releases either hold. If that happens,
+  escalate; do not close the expectation, because closing would detect both
+  Transfers as ordinary redemptions and send the funding Transfer down the
+  Alpaca redemption path. Other vaults keep flowing and nothing is skipped.
   `POST /ops/breakglass/burn-excess/external` refuses a stream that never
   recorded the expectation (`FundingNotExpected`); its `execute` records the
   exclusion first and clears the expectation after, so the poller's next pass
