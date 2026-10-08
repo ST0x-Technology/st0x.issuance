@@ -1545,12 +1545,6 @@ async fn execute_plan<P: Provider>(
             // and then refuse each other at the sign boundary.
             let wallet_guard = mutation.vault_service.lock_wallet().await;
             if mutation.plan.path == BurnExcessPath::External {
-                require_wallet_intent_gates(
-                    mutation.pool,
-                    mutation.request.network,
-                    mutation.request.deposit_tx_hash,
-                )
-                .await?;
                 let funding = mutation
                     .plan
                     .funding_log_id
