@@ -2638,6 +2638,7 @@ mod tests {
                     called_at,
                     alpaca_journal_completed_at,
                     external_tx_id: None,
+                    account_attribution: None,
                     resumed_at,
                 },
             )

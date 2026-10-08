@@ -1003,9 +1003,10 @@ raw redemption amounts are emitted in the admission log.
   `alpaca_quantity`, `dust_quantity`, `called_at` (from the original
   `AlpacaCalled` event), `alpaca_journal_completed_at`, optional retry
   `external_tx_id`, and `resumed_at` timestamp. Used for post-Alpaca recovery
-  where the journal already completed. Gains the same additive
-  `#[serde(default)]` `burn_mode` field as `RedemptionDetected`, preserving the
-  mode anchor across a resume.
+  where the journal already completed. Additive `#[serde(default)]` `burn_mode`
+  and `account_attribution` fields preserve the mode and account anchors
+  supplied by recovery; replay prefers attribution retained in an existing
+  failed-burn context when both are present.
 - `OrchestratorBurnSubmitted` (orchestrator mode only) - Burn transaction
   submitted to the signing backend. Carries
   `{issuer_request_id,

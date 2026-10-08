@@ -315,6 +315,10 @@ pub(crate) enum RedemptionEvent {
         /// `Burning`. Absent on pre-orchestrator events (`VaultDirect`).
         #[serde(default)]
         burn_mode: VaultMode,
+        /// Immutable account identity supplied by recovery. Historical events
+        /// predate this field and replay without attribution.
+        #[serde(default)]
+        account_attribution: Option<Box<RedemptionAccountAttribution>>,
     },
     BurnIntended {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -1084,6 +1088,7 @@ mod tests {
             external_tx_id,
             network,
             burn_mode,
+            account_attribution,
             ..
         } = event
         else {
@@ -1093,5 +1098,6 @@ mod tests {
         assert_eq!(external_tx_id, None);
         assert_eq!(network, Network::Base);
         assert_eq!(burn_mode, VaultMode::VaultDirect);
+        assert_eq!(account_attribution, None);
     }
 }

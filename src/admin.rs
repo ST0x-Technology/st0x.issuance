@@ -10371,6 +10371,7 @@ mod tests {
                 called_at: now,
                 alpaca_journal_completed_at: now,
                 external_tx_id: None,
+                account_attribution: None,
                 resumed_at: now,
             },
         ];

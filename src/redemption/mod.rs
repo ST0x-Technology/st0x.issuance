@@ -1281,6 +1281,7 @@ impl Redemption {
                 },
             });
         };
+        let account_attribution = input.metadata.account_attribution.clone();
 
         Ok(vec![RedemptionEvent::BurnResumed {
             issuer_request_id: input.issuer_request_id,
@@ -1300,6 +1301,7 @@ impl Redemption {
             external_tx_id: input.external_tx_id,
             resumed_at: Utc::now(),
             burn_mode: input.metadata.burn_mode,
+            account_attribution,
         }])
     }
 
@@ -3533,7 +3535,7 @@ impl Redemption {
             }
             _ => (None, None),
         };
-        let account_attribution = prior_burn_context
+        let prior_account_attribution = prior_burn_context
             .as_ref()
             .and_then(|context| context.metadata.account_attribution.clone());
         let RedemptionEvent::BurnResumed {
@@ -3553,6 +3555,7 @@ impl Redemption {
             alpaca_journal_completed_at,
             external_tx_id,
             burn_mode,
+            account_attribution: supplied_account_attribution,
             ..
         } = event
         else {
@@ -3571,7 +3574,8 @@ impl Redemption {
                 block_number,
                 detected_at,
                 burn_mode,
-                account_attribution,
+                account_attribution: prior_account_attribution
+                    .or(supplied_account_attribution),
             },
             tokenization_request_id,
             alpaca_quantity,
@@ -4390,6 +4394,7 @@ mod tests {
                 called_at: Utc::now(),
                 alpaca_journal_completed_at: Utc::now(),
                 external_tx_id: Some(retry_external_tx_id.clone()),
+                account_attribution: None,
                 resumed_at: Utc::now(),
             },
         ];
@@ -4750,6 +4755,7 @@ mod tests {
                 external_tx_id: None,
                 resumed_at: Utc::now(),
                 burn_mode: orchestrator_mode(),
+                account_attribution: None,
                 network: Network::Base,
             },
         ])
@@ -4815,6 +4821,7 @@ mod tests {
             external_tx_id: None,
             resumed_at: Utc::now(),
             burn_mode: VaultMode::VaultDirect,
+            account_attribution: None,
         });
 
         let resumed = replay::<Redemption>(history).unwrap().unwrap();
@@ -10001,57 +10008,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resume_burn_from_failed_state_succeeds() {
-        let metadata = test_metadata();
+    async fn resume_after_alpaca_failure_preserves_attribution_on_replay() {
+        let account_attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
+        let mut metadata = test_metadata();
+        metadata.account_attribution =
+            Some(Box::new(account_attribution.clone()));
+        let history = vec![
+            RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                underlying: metadata.underlying.clone(),
+                token: metadata.token.clone(),
+                network: metadata.network,
+                wallet: metadata.wallet,
+                quantity: metadata.quantity.clone(),
+                tx_hash: metadata.detected_tx_hash,
+                block_number: metadata.block_number,
+                detected_at: metadata.detected_at,
+            },
+            RedemptionEvent::AccountAttributionAnchored {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                attribution: account_attribution.clone(),
+                anchored_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "tok-resume-1",
+                ),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                reason: "Alpaca journal timed out".to_string(),
+                failed_at: Utc::now(),
+            },
+        ];
+        assert!(matches!(
+            replay::<Redemption>(history.clone()).unwrap().unwrap(),
+            Redemption::Failed { burn_context: None, .. }
+        ));
 
         let events = TestHarness::<Redemption>::with(mock_services())
-            .given(vec![
-                RedemptionEvent::Detected {
-                    burn_mode: VaultMode::VaultDirect,
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    underlying: metadata.underlying.clone(),
-                    token: metadata.token.clone(),
-                    network: metadata.network,
-                    wallet: metadata.wallet,
-                    quantity: metadata.quantity.clone(),
-                    tx_hash: metadata.detected_tx_hash,
-                    block_number: metadata.block_number,
-                    detected_at: metadata.detected_at,
-                },
-                RedemptionEvent::AlpacaCalled {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    tokenization_request_id: TokenizationRequestId::new(
-                        "tok-resume-1",
-                    ),
-                    alpaca_quantity: Quantity::new(Decimal::from(100)),
-                    dust_quantity: Quantity::new(Decimal::ZERO),
-                    called_at: Utc::now(),
-                },
-                RedemptionEvent::RedemptionFailed {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    reason: "Alpaca journal timed out".to_string(),
-                    failed_at: Utc::now(),
-                },
-            ])
+            .given(history.clone())
             .when(test_resume_burn_command(&metadata))
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-
-        let RedemptionEvent::BurnResumed {
-            issuer_request_id: event_id,
-            tokenization_request_id,
-            ..
-        } = &events[0]
+        let resumed = replay::<Redemption>(
+            history.into_iter().chain(events).collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .unwrap();
+        let Redemption::Burning { metadata: resumed_metadata, .. } = resumed
         else {
-            panic!("Expected BurnResumed event, got {:?}", &events[0]);
+            panic!("Expected Burning state, got {resumed:?}");
         };
-
-        assert_eq!(event_id, &metadata.issuer_request_id);
         assert_eq!(
-            tokenization_request_id,
-            &TokenizationRequestId::new("tok-resume-1")
+            resumed_metadata.account_attribution.as_deref(),
+            Some(&account_attribution)
         );
     }
 
@@ -10196,6 +10217,7 @@ mod tests {
             called_at: Utc::now(),
             alpaca_journal_completed_at: journal_completed_at,
             external_tx_id: None,
+            account_attribution: None,
             resumed_at: Utc::now(),
         });
 
@@ -10260,6 +10282,7 @@ mod tests {
             called_at: Utc::now(),
             alpaca_journal_completed_at: Utc::now(),
             external_tx_id: None,
+            account_attribution: None,
             resumed_at: Utc::now(),
         });
         let burning = replay::<Redemption>(history.clone())
