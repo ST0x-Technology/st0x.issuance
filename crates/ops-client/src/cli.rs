@@ -40,6 +40,9 @@ pub(crate) enum Command {
     /// burns.
     #[command(subcommand)]
     Breakglass(BreakglassCommand),
+    /// Direct account operations through the S01 Alpaca gateway.
+    #[command(subcommand)]
+    Alpaca(crate::alpaca::Command),
 }
 
 #[derive(Debug, Subcommand)]

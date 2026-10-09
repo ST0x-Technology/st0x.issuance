@@ -1242,6 +1242,7 @@ const fn classify_journal_poll_error(
         | AlpacaError::Auth(_)
         | AlpacaError::Api { .. }
         | AlpacaError::RateLimited { .. }
+        | AlpacaError::NotSent(_)
         | AlpacaError::UnsupportedTokenizationNetwork { .. } => (
             Status::BadGateway,
             RecoverRedemptionCode::UpstreamUnavailable,

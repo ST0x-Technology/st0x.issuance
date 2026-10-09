@@ -5282,12 +5282,13 @@ verbs.
 S01 operators reach all four tiers (`read`, `debug`, `capital`, and
 `breakglass`) through the `st0x-issuance-client` binary (workspace package
 `st0x-issuance-ops`, `crates/ops-client`), the S01 counterpart of the T0
-liquidity client. It is a thin typed transport: every verb maps to exactly one
-`/ops/<tier>/...` route, and it holds no production secret and no domain logic,
-since the bot validates and decides everything. Direct Alpaca account operations
-and T0 liquidity are out of its scope. The library of the same name
-(`crates/client`, package `st0x-issuance-client`) is unrelated: it is the
-liquidity bot's `X-API-KEY` client for the service API.
+liquidity client. Its `read`, `debug`, `capital`, and `breakglass` groups are
+thin typed transports: every verb maps to exactly one `/ops/<tier>/...` route,
+and they hold no production secret and no domain logic, since the bot validates
+and decides everything. The separate `alpaca` group calls the account bound S01
+Alpaca gateway as specified below. T0 liquidity is out of scope. The library of
+the same name (`crates/client`, package `st0x-issuance-client`) is unrelated: it
+is the liquidity bot's `X-API-KEY` client for the service API.
 
 Invocation is `st0x-issuance-client --env <staging|production> <group> <verb>`,
 and `--env` has no default. Per environment the client reads
@@ -5415,6 +5416,43 @@ symbol when it has one and for warnings otherwise.
 | `breakglass burn-excess internal --issuer-request-id ... [--execute]` | `POST /ops/breakglass/burn-excess/internal`                          |
 | `breakglass burn-excess expect-funding --issuer-request-id ...`       | `POST /ops/breakglass/burn-excess/expect-funding`                    |
 | `breakglass burn-excess external --funding-tx-hash ... [--execute]`   | `POST /ops/breakglass/burn-excess/external`                          |
+
+#### Alpaca gateway operations
+
+S01 operators call the account bound Alpaca gateway through
+`st0x-issuance-client --env <staging|production> alpaca <verb>`. The environment
+is mandatory and selects only `S01_ALPACA_{STAGING,PROD}_*`; the client has no
+URL override, account identifier, Alpaca credential, secret file input, or
+fallback to the direct Alpaca API. Browser authentication uses the Desktop OAuth
+client for the selected S01 gateway environment, while CI may provide that
+environment's workload identity ID token. The refresh token cache is separate
+from the issuance bot client and every T0 cache.
+
+The S01 and T0 entry points use the same gateway command and output contract,
+but each resolves its own Google identity and target service. Reads use the
+gateway read tier and mutations use its write tier. Each invocation sends one
+gateway operation, prints one compact JSON value on stdout, and sends
+diagnostics only to stderr. Mutation arguments include a nonblank audit reason
+and expose the gateway key that makes a safe retry possible. Errors retain the
+gateway classification for authentication, authorization, timeout, rate limit,
+unknown outcome, and same key retry decisions.
+
+The read surface is `account`, `cash`, `positions`, `position-mark`,
+`activities`, `market-status`, `latest-trade`, `quote`, `asset`, `order-status`,
+`order-find`, `deposit`, `transfer`, `transfers`, `find-deposit`,
+`conversion-status`, `conversion-find`, `tokenization-request`, `mint-status`,
+`redeem`, `tokenization-requests`, and `whitelist-list`. The mutation surface is
+`buy`, `sell`, `cancel`, `withdraw`, `whitelist`, `whitelist-patch-travel-rule`,
+`unwhitelist`, `convert`, `journal`, and `tokenize`. `deposit` only returns the
+account bound deposit address, and `redeem` only finds the Alpaca redemption
+created by a separately submitted chain transaction. `journal` accepts a
+configured counterparty name rather than an Alpaca account identifier. The
+gateway deployment supplies the bound Alpaca account, approved destinations,
+Travel Rule beneficiary, journal counterparties, and tokenization recipients.
+
+The client contains no issuance recovery, CQRS decisions, retry loops, chain
+signing, or composite workflow. Those remain in the issuance service and its
+existing operator groups.
 
 ### Recover Stuck Aggregates
 

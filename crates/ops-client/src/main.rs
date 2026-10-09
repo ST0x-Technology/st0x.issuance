@@ -3,6 +3,7 @@
 //! route, and explains any failure with an exit code and, when the deployment
 //! answered, a link to its Cloud Logging.
 
+mod alpaca;
 mod auth;
 mod cli;
 mod target;
@@ -40,16 +41,25 @@ const EXIT_FAILED: u8 = 1;
 #[tokio::main]
 async fn main() -> ExitCode {
     let Cli { env, command } = Cli::parse();
-    let route = route(&command);
+    let search = log_search(&command);
+    let result = match command {
+        Command::Alpaca(command) => {
+            run_alpaca(env, command, |name| std::env::var(name).ok()).await
+        }
+        command => {
+            let route = route(&command);
+            run(env, &route, |name| std::env::var(name).ok()).await
+        }
+    };
 
-    match run(env, &route, |name| std::env::var(name).ok()).await {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             eprintln!("error: {failure}");
             if failure.reached_server() {
                 eprintln!(
                     "\nS01 Cloud Logging: {}",
-                    cloud_logging_url(env, log_search(&command).as_deref())
+                    cloud_logging_url(env, search.as_deref())
                 );
             }
             ExitCode::from(failure.exit_code())
@@ -67,10 +77,12 @@ enum Failure {
     Auth(#[from] AuthError),
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error(transparent)]
+    Alpaca(#[from] alpaca::Failure),
     #[error(
-        "the S01 ops API answered with success, but the response could not be \
-         written to stdout: {0}\nThe request was completed: a read can simply \
-         be re-run, but do not blindly retry a write."
+        "the selected operation answered with success, but the response could \
+         not be written to stdout: {0}\nThe request was completed: a read can \
+         simply be re-run, but do not blindly retry a write."
     )]
     Output(#[source] std::io::Error),
 }
@@ -84,13 +96,20 @@ impl Failure {
             Self::Transport(error) if error.is_access_denied() => {
                 EXIT_ACCESS_DENIED
             }
-            Self::Auth(_) | Self::Transport(_) | Self::Output(_) => EXIT_FAILED,
+            Self::Alpaca(error) if error.is_access_denied() => {
+                EXIT_ACCESS_DENIED
+            }
+            Self::Auth(_)
+            | Self::Transport(_)
+            | Self::Alpaca(_)
+            | Self::Output(_) => EXIT_FAILED,
         }
     }
 
     const fn reached_server(&self) -> bool {
         match self {
             Self::Transport(error) => error.reached_server(),
+            Self::Alpaca(error) => error.reached_server(),
             Self::Output(_) => true,
             Self::Target(_) | Self::Http(_) | Self::Auth(_) => false,
         }
@@ -103,13 +122,24 @@ async fn run(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(), Failure> {
     let target = target::resolve(env, lookup)?;
-    let token = auth::id_token(env, target.identity).await?;
+    let token = auth::id_token(target.cache_slug, target.identity).await?;
     let client = Client::new(target.base_url, token)?;
     let body = client.send(route).await?;
 
     // A write failure here follows a success the bot already acted on, which
     // is what `Failure::Output` tells the operator.
     print_body(&body).map_err(Failure::Output)
+}
+
+async fn run_alpaca(
+    env: Env,
+    command: alpaca::Command,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), Failure> {
+    let target = target::resolve_alpaca(env, lookup)?;
+    let token = auth::id_token(target.cache_slug, target.identity).await?;
+    let value = alpaca::execute(&target.base_url, token, command).await?;
+    print_body(&value.to_string()).map_err(Failure::Output)
 }
 
 /// Writes the bot's response body to stdout as one line.
@@ -125,6 +155,11 @@ fn route(command: &Command) -> Route {
         Command::Debug(debug) => debug_route(debug),
         Command::Capital(capital) => capital_route(capital),
         Command::Breakglass(breakglass) => breakglass_route(breakglass),
+        Command::Alpaca(_) => {
+            unreachable!(
+                "Alpaca commands are dispatched before bot route construction"
+            )
+        }
     }
 }
 
@@ -498,6 +533,7 @@ fn log_search(command: &Command) -> Option<String> {
             | CapitalCommand::ScheduleFreeze { underlying, .. }
             | CapitalCommand::ApproveOrchestrator { underlying, .. },
         ) => Some(underlying.as_str().to_owned()),
+        Command::Alpaca(command) => command.log_search(),
     }
 }
 

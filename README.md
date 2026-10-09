@@ -207,25 +207,30 @@ endpoints.
 
 ## Operator Client
 
-`st0x-issuance-client` (`crates/ops-client`) is the S01 operator's typed client
-for the IAP-gated `/ops/{read,debug,capital,breakglass}` routes, all 25 of them.
-It replaces the shared-key `/admin` calls and the offline `issuer` CLI verbs
-that have an `/ops` route; `move-receipts`, `confirm-custody`, and the offline
-`force-complete-redemption` (the legacy path for a `Failed` redemption, unlike
-the client verb of the same name) stay offline. It prints each response as one
-JSON line and exits 0, 2 (setup), 77 (auth/access), or 1.
+`st0x-issuance-client` (`crates/ops-client`) is the S01 operator typed client
+for the IAP gated `/ops/{read,debug,capital,breakglass}` routes and the account
+bound S01 Alpaca gateway. It replaces the shared key `/admin` calls and the
+offline `issuer` CLI verbs that have an `/ops` route; `move-receipts`,
+`confirm-custody`, and the offline `force-complete-redemption` command stay
+offline. It prints each response as one JSON line and exits 0, 2 for setup, 77
+for authentication or access denial, or 1 for another failure.
 
 ```bash
 cargo run -p st0x-issuance-ops -- --env staging read stuck
 cargo run -p st0x-issuance-ops -- --env staging capital freeze AAPL
 cargo run -p st0x-issuance-ops -- --env staging debug --help
 cargo run -p st0x-issuance-ops -- --env staging breakglass burn-excess internal --help
+cargo run -p st0x-issuance-ops -- --env staging alpaca account
+cargo run -p st0x-issuance-ops -- --env staging alpaca buy --symbol AAPL --quantity 1 --reason "operator purchase"
 ```
 
-It reads `S01_ISSUANCE_{STAGING,PROD}_URL` plus either the S01 Desktop OAuth
-client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call prints a browser sign-in
-URL for your S01 Google account) or, in CI, a workload-identity ID token
-(`_ID_TOKEN`). See SPEC.md "Operator client" for the full contract.
+The bot routes read `S01_ISSUANCE_{STAGING,PROD}_URL`. Alpaca commands read only
+`S01_ALPACA_{STAGING,PROD}_URL` and the matching `_CLIENT_ID`, `_CLIENT_SECRET`,
+`_CONNECT_TIMEOUT_SECS`, and `_REQUEST_TIMEOUT_SECS` values. Both paths use the
+S01 Desktop OAuth client and the S01 Google account, or a workload identity ID
+token in CI, but keep separate sign in caches. Alpaca commands never accept an
+account identifier. See SPEC.md "Operator client" and "Alpaca gateway
+operations" for the full contract.
 
 ## Mint Flow
 
