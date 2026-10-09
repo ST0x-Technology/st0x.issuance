@@ -5162,6 +5162,37 @@ Tiers and routes:
   `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
   `burn-excess/expect-funding`, `burn-excess/external`.
 
+#### Shared operations audit event
+
+Every request to a mutation-capable operator route emits exactly one structured
+audit event, including denied requests and requests rejected before a handler
+runs. The issuance and liquidity bots use the same versioned event contract so
+Cloud Logging and VictoriaLogs queries do not depend on service-specific log
+messages:
+
+| Field          | Contract                                                                                                                                 |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                     |
+| `service`      | `issuance` or `liquidity`.                                                                                                               |
+| `principal`    | Verified IAP subject; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no identity was verified. |
+| `role`         | The admitted operator tier (`debug`, `capital`, `breakglass`, or `write`); `local` for loopback-only routes.                             |
+| `route`        | Matched route template, not the raw URI.                                                                                                 |
+| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                               |
+| `target_id`    | Colon-separated dynamic path values and recognized request-body identifiers; `not_identified` only when the request names no entity.     |
+| `reason`       | The request's explicit audit reason; `not_provided` when the route has no reason or the body could not be parsed.                        |
+| `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                         |
+| `timestamp`    | UTC RFC 3339 timestamp generated when the audit event is emitted.                                                                        |
+
+The tracing target is `operations_audit`. Success is INFO; every other outcome
+is WARN. A `2xx` response is `success`, `401` or `403` is `denied`, request
+shape and route errors (`400`, `404`, `405`, `413`, `415`, `422`) are
+`validation_failure`, and every other response is `command_failure`. Audit
+delivery is fail-open with respect to the operator command: a recorder failure
+emits an ERROR carrying the same query dimensions and never replaces the
+mutation's response. The production recorder writes to tracing, so the JSON
+stdout collected by Cloud Logging carries these fields; telemetry exporters
+receive the same event without a second schema.
+
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
 

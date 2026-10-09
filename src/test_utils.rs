@@ -1116,6 +1116,10 @@ impl LocalEvm {
 pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     let module = module.strip_suffix("::tests").unwrap_or(module);
 
+    if module.contains("::operations_audit") {
+        return "operations_audit";
+    }
+
     if module.contains("::gas_monitor") {
         return "gas";
     }

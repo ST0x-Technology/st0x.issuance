@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::operations_audit::record_principal;
 use iap::{IapError, OpsPrincipal, OpsTier, authenticate_ops};
 pub(crate) use iap::{OpsApiVerifiers, build_jwks_client};
 pub use ip_whitelist::{InternalIpWhitelist, IpWhitelist};
@@ -151,7 +152,12 @@ async fn ops_outcome<Guard>(
     guard: impl FnOnce(OpsPrincipal) -> Guard,
 ) -> Outcome<Guard, IapError> {
     match authenticate_ops(request, tier).await {
-        Ok(principal) => Outcome::Success(guard(principal)),
+        Ok(principal) => {
+            if tier != OpsTier::Read {
+                record_principal(request, principal.to_string());
+            }
+            Outcome::Success(guard(principal))
+        }
         Err(error) => Outcome::Error((error.status(), error)),
     }
 }

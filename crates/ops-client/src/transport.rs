@@ -17,6 +17,7 @@ use st0x_issuance_dto::{
 };
 use std::time::Duration;
 use url::Url;
+use uuid::Uuid;
 
 /// Overall per-request bound, above the slowest route's own bound: the bot
 /// caps a burn-excess engine run at 120 s and answers 504. Cutting the
@@ -249,7 +250,8 @@ impl Client {
         let request = self
             .http
             .request(route.method.clone(), url.clone())
-            .bearer_auth(&self.token);
+            .bearer_auth(&self.token)
+            .header("x-request-id", Uuid::new_v4().to_string());
 
         // A bodiless write still declares its empty body, since some proxies
         // refuse a POST or DELETE without a length.
@@ -381,6 +383,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{Receiver, channel};
     use url::Url;
+    use uuid::Uuid;
 
     use super::{
         Client, Route, RouteBody, Tier, TransportError, encode_segment,
@@ -484,6 +487,11 @@ mod tests {
             "{request}"
         );
         assert_eq!(header(&request, "authorization"), Some("Bearer id-token"));
+        assert!(
+            header(&request, "x-request-id")
+                .is_some_and(|value| Uuid::parse_str(value).is_ok()),
+            "{request}"
+        );
     }
 
     #[tokio::test]
