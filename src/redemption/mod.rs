@@ -10061,11 +10061,9 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
-        let resumed = replay::<Redemption>(
-            history.into_iter().chain(events).collect::<Vec<_>>(),
-        )
-        .unwrap()
-        .unwrap();
+        let resumed = replay::<Redemption>(history.into_iter().chain(events))
+            .unwrap()
+            .unwrap();
         let Redemption::Burning { metadata: resumed_metadata, .. } = resumed
         else {
             panic!("Expected Burning state, got {resumed:?}");
