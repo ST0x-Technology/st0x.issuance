@@ -1791,6 +1791,10 @@ pub(crate) fn default_log_filter(level: Level) -> String {
         parts.push(format!("{target}={level}"));
     }
 
+    // Mutation audit records are compliance data, not diagnostic verbosity:
+    // successful commands stay visible even when ordinary logs are ERROR-only.
+    parts.push("operations_audit=info".to_string());
+
     parts.join(",")
 }
 
@@ -1993,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn default_filter_includes_credential_rejection_alerts() {
+    fn default_filter_includes_compliance_targets() {
         let filter = tracing_subscriber::EnvFilter::new(default_log_filter(
             Level::ERROR,
         ));
@@ -2002,6 +2006,7 @@ mod tests {
             assert!(
                 tracing::enabled!(target: "operational_alert", Level::ERROR)
             );
+            assert!(tracing::enabled!(target: "operations_audit", Level::INFO));
         });
     }
 
