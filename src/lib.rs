@@ -2197,9 +2197,13 @@ async fn cached_receipt_contract<P: Provider>(
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
-    // WAL lets the apalis (sqlx 0.8) and event-store (sqlx 0.9) pools read and
-    // write the same SQLite file concurrently; busy_timeout makes a writer wait
-    // out the single-writer lock instead of failing with "database is locked".
+    // Neither pool sets `create_if_missing`: a missing file means a bad path or
+    // an unmounted volume, and starting on an empty database would serve with
+    // no history (see docs/nixos-provisioning.md). Only `mode=rwc` in the URL
+    // opts in to creating the file. WAL lets the apalis (sqlx 0.8) and
+    // event-store (sqlx 0.9) pools read and write the same SQLite file
+    // concurrently; busy_timeout makes a writer wait out the single-writer
+    // lock instead of failing with "database is locked".
     let options = SqliteConnectOptions::from_str(&config.database_url)?
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(5));

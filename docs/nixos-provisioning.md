@@ -228,8 +228,10 @@ outage, covered in step 2. `<fqdn>` is the environment's name from
 
 The service opens SQLite with `create_if_missing = false` **on purpose**: a
 missing file means a misconfigured path or an unmounted volume, and silently
-starting a fresh database would be worse than failing. Deployment never creates
-the database either — provisioning it is a deliberate manual step:
+starting a fresh database would be worse than failing. Only `?mode=rwc` in
+`DATABASE_URL` opts in to creating the file; never set it in staging or
+production. Deployment never creates the database either — provisioning it is a
+deliberate manual step:
 
 - **Fresh environment** (no history to preserve):
 
