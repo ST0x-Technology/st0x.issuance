@@ -258,8 +258,9 @@ mod tests {
     #[tokio::test]
     async fn initiate_persists_configured_per_asset_mint_mode() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, network, .. } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, network, wallet, ..
+        } = harness.setup_account_and_asset().await;
 
         // Second asset on the same deployment, left on the vault-direct
         // default.
@@ -328,8 +329,7 @@ mod tests {
                 "token_symbol": token_symbol,
                 "network": "base",
                 "client_id": client_id,
-                "wallet_address":
-                    "0x1234567890abcdef1234567890abcdef12345678"
+                "wallet_address": wallet.to_string()
             });
             let response = client
                 .post("/inkind/issuance")
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn initiate_missing_orchestrator_address_refuses_the_mint() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, .. } =
+        let TestAccountAndAsset { client_id, underlying, wallet, .. } =
             harness.setup_account_and_asset().await;
 
         let TestHarness {
@@ -435,7 +435,7 @@ mod tests {
             "token_symbol": "tAAPL",
             "network": "base",
             "client_id": client_id,
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+            "wallet_address": wallet.to_string()
         });
         let response = client
             .post("/inkind/issuance")
@@ -584,7 +584,11 @@ mod tests {
     async fn test_initiate_mint_accepts_unfrozen_asset() {
         let harness = TestHarness::new().await;
         let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet,
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
@@ -631,7 +635,7 @@ mod tests {
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+            "wallet_address": wallet.to_string()
         });
 
         let frozen_response = client
@@ -913,7 +917,11 @@ mod tests {
     async fn test_events_are_persisted_correctly() {
         let harness = TestHarness::new().await;
         let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet,
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
@@ -943,7 +951,7 @@ mod tests {
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+            "wallet_address": wallet.to_string()
         });
 
         let response = client
@@ -990,7 +998,11 @@ mod tests {
     async fn test_views_are_updated_correctly() {
         let harness = TestHarness::new().await;
         let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet,
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
@@ -1022,7 +1034,7 @@ mod tests {
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+            "wallet_address": wallet.to_string()
         });
 
         let response = client
@@ -1072,10 +1084,7 @@ mod tests {
         assert_eq!(view_token, token);
         assert_eq!(view_network, network);
         assert_eq!(view_client_id, client_id);
-        assert_eq!(
-            view_wallet,
-            address!("0x1234567890abcdef1234567890abcdef12345678")
-        );
+        assert_eq!(view_wallet, wallet);
     }
 
     #[tokio::test]

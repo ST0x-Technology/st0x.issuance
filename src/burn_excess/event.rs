@@ -2,8 +2,12 @@ use alloy::primitives::B256;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
+use st0x_issuance_dto::AcknowledgedInboundTransfer;
 
-use super::{BurnExcessPath, ExcessBurnBind, FundingTransferId};
+use super::{
+    BurnExcessCloseProof, BurnExcessPath, ExcessBurnBind, FundingTransferId,
+    HeldTransferRedemption,
+};
 use crate::vault::{SendableTxWithHash, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,7 +36,15 @@ pub(crate) enum BurnExcessEvent {
         reason: String,
         incident_id: Option<String>,
         sendable_tx: SendableTxWithHash,
+        #[serde(default)]
+        acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
         intended_at: DateTime<Utc>,
+    },
+    /// Genuine AP Transfers held with Path B funding, durably attributed
+    /// before the excess burn can be broadcast.
+    HeldRedemptionsAnchored {
+        held_redemptions: Vec<HeldTransferRedemption>,
+        anchored_at: DateTime<Utc>,
     },
     ExcessBurnSubmitted {
         tx_id: TxId,
@@ -46,20 +58,24 @@ pub(crate) enum BurnExcessEvent {
     },
     ExcessBurnClosed {
         reason: String,
+        #[serde(default)]
+        proof: BurnExcessCloseProof,
+        #[serde(default)]
+        release_through_block: Option<u64>,
         closed_at: DateTime<Utc>,
     },
 }
 
 impl BurnExcessEvent {
-    /// Stored `event_type` values, shared with the raw SQL that filters on
-    /// them: the wallet intent gate (`has_unresolved_excess_burn_intent`) and
-    /// the exclusion and expectation index rebuilds. Bound here so a renamed
-    /// variant is a compile error rather than a query that silently matches
-    /// nothing — a gate that returns zero rows is a gate that is off.
+    /// Stored `event_type` values shared with raw SQL index rebuilds and
+    /// lifecycle queries. Bound here so a renamed variant is a compile error
+    /// rather than a query that silently matches nothing.
     pub(crate) const FUNDING_EXPECTED: &'static str =
         "BurnExcessEvent::FundingExpected";
     pub(crate) const FUNDING_EXCLUSION_RECORDED: &'static str =
         "BurnExcessEvent::FundingExclusionRecorded";
+    pub(crate) const HELD_REDEMPTIONS_ANCHORED: &'static str =
+        "BurnExcessEvent::HeldRedemptionsAnchored";
     pub(crate) const EXCESS_BURN_INTENDED: &'static str =
         "BurnExcessEvent::ExcessBurnIntended";
     pub(crate) const EXCESS_BURN_SUBMITTED: &'static str =
@@ -80,6 +96,9 @@ impl DomainEvent for BurnExcessEvent {
             Self::ExcessBurnIntended { .. } => {
                 Self::EXCESS_BURN_INTENDED.to_string()
             }
+            Self::HeldRedemptionsAnchored { .. } => {
+                Self::HELD_REDEMPTIONS_ANCHORED.to_string()
+            }
             Self::ExcessBurnSubmitted { .. } => {
                 Self::EXCESS_BURN_SUBMITTED.to_string()
             }
@@ -93,6 +112,10 @@ impl DomainEvent for BurnExcessEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        match self {
+            Self::ExcessBurnIntended { .. } => "2.0",
+            _ => "1.0",
+        }
+        .to_string()
     }
 }

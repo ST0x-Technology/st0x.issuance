@@ -103,10 +103,15 @@ pub(crate) enum BurnExcessProofError {
 
     #[error(
         "issuer share balance {balance} is not exactly the excess amount \
-         {amount}; move exact excess to the issuer, or use \
-         `burn-excess external --funding-tx-hash …` after funding"
+         {amount} plus {held_transfers} held Transfer(s) of that amount; move \
+         exact excess to the issuer, or use `burn-excess external \
+         --funding-tx-hash …` after funding"
     )]
-    IssuerShareBalanceNotExact { balance: U256, amount: U256 },
+    IssuerShareBalanceNotExact {
+        balance: U256,
+        amount: U256,
+        held_transfers: usize,
+    },
 
     #[error(
         "issuer receipt balance {balance} for receipt {receipt_id} is below \
@@ -151,10 +156,28 @@ pub(crate) enum BurnExcessProofError {
     FundingTransferNotFound { tx_hash: B256 },
 
     #[error(
-        "ambiguous funding Transfer: {count} logs match vault/from/to/amount \
-         in transaction {tx_hash:?}"
+        "a held Transfer of the funding shape shares transaction {tx_hash:?} \
+         with another inbound Transfer the redemption poller redeems or would \
+         redeem (any polled vault, linked sender); a redemption is keyed by \
+         its transaction, so it could never be redeemed on its own. The run \
+         refuses before burning; closing the stream does not redeem it \
+         either, so its shares need manual reconciliation"
     )]
-    FundingTransferAmbiguous { tx_hash: B256, count: usize },
+    HeldTransfersShareTransaction { tx_hash: B256 },
+
+    #[error(
+        "Transfers of the funding shape are held from {wallet:?}, which is not \
+         a linked AP wallet: once released the redemption poller would skip \
+         them, so their shares cannot count toward the issuer balance"
+    )]
+    HeldTransferSenderNotLinked { wallet: Address },
+
+    #[error(
+        "funding Transfer {tx_hash:?} log_index={log_index} is already \
+         excluded for another burn-excess deposit; pass this stream's own \
+         funding Transfer"
+    )]
+    FundingLogExcludedForAnotherDeposit { tx_hash: B256, log_index: u64 },
 
     #[error(
         "funding Transfer from {found:?} does not match original mint \
@@ -279,17 +302,25 @@ pub(crate) fn require_funding_hash_match(
     }
 }
 
-/// Path A / Path B share balance gate: issuer must hold exactly `amount`.
+/// Path A / Path B share balance gate: issuer must hold exactly `amount`, plus
+/// `amount` again for each of `held_transfers`, the other Transfers of that
+/// exact amount a live Path B stream's open funding expectation holds with its
+/// funding log.
 pub(crate) fn require_exact_issuer_share_balance(
     balance: U256,
     amount: U256,
+    held_transfers: usize,
 ) -> Result<(), BurnExcessProofError> {
-    if balance == amount {
+    let expected = held_transfers
+        .checked_add(1)
+        .and_then(|count| amount.checked_mul(U256::from(count)));
+    if expected == Some(balance) {
         Ok(())
     } else {
         Err(BurnExcessProofError::IssuerShareBalanceNotExact {
             balance,
             amount,
+            held_transfers,
         })
     }
 }
@@ -370,12 +401,16 @@ pub(crate) fn bind_deposit_proof(
     Ok(())
 }
 
-/// Select the unique funding Transfer log matching Path B expectations.
+/// Select the funding Transfer log matching Path B expectations. Logs of the
+/// exact shape in one transaction (same vault, sender, recipient, amount) are
+/// interchangeable, so the lowest log index is the funding log; a live
+/// stream's expectation holds the others and counts them toward the issuer
+/// balance as redemptions.
 pub(crate) fn select_funding_transfer(
     expectation: &FundingTransferExpectation,
     candidates: &[FundingTransferCandidate],
 ) -> Result<FundingTransferId, BurnExcessProofError> {
-    let matches: Vec<&FundingTransferCandidate> = candidates
+    let funding = candidates
         .iter()
         .filter(|candidate| {
             candidate.vault == expectation.vault
@@ -383,34 +418,27 @@ pub(crate) fn select_funding_transfer(
                 && candidate.to == expectation.to
                 && candidate.amount == expectation.amount
         })
-        .collect();
+        .min_by_key(|candidate| candidate.log_index);
 
-    match matches.as_slice() {
-        [] => {
-            if let Some(mismatch) =
-                first_shape_mismatch(expectation, candidates)
-            {
-                return Err(mismatch);
-            }
-
-            Err(BurnExcessProofError::FundingTransferNotFound {
-                tx_hash: expectation.tx_hash,
-            })
+    let Some(funding) = funding else {
+        if let Some(mismatch) = first_shape_mismatch(expectation, candidates) {
+            return Err(mismatch);
         }
-        [only] => Ok(FundingTransferId {
-            network: expectation.network,
-            vault: only.vault,
+
+        return Err(BurnExcessProofError::FundingTransferNotFound {
             tx_hash: expectation.tx_hash,
-            log_index: only.log_index,
-            from: only.from,
-            to: only.to,
-            amount: only.amount,
-        }),
-        many => Err(BurnExcessProofError::FundingTransferAmbiguous {
-            tx_hash: expectation.tx_hash,
-            count: many.len(),
-        }),
-    }
+        });
+    };
+
+    Ok(FundingTransferId {
+        network: expectation.network,
+        vault: funding.vault,
+        tx_hash: expectation.tx_hash,
+        log_index: funding.log_index,
+        from: funding.from,
+        to: funding.to,
+        amount: funding.amount,
+    })
 }
 
 fn first_shape_mismatch(
@@ -503,6 +531,7 @@ mod tests {
             ),
             vault: address!("0x1111111111111111111111111111111111111111"),
             network: Network::Base,
+            chain_id: 8453,
             issuer_wallet: address!(
                 "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
             ),
@@ -570,6 +599,9 @@ mod tests {
             reason: "dup".into(),
             incident_id: None,
             sendable_tx: crate::vault::SendableTxWithHash::default(),
+            held_redemptions: Vec::new(),
+            held_redemptions_anchored: true,
+            acknowledged_inflows: Vec::new(),
             intended_at: Utc::now(),
         };
 
@@ -617,12 +649,45 @@ mod tests {
     #[test]
     fn exact_share_balance_gate() {
         let amount = U256::from(750_000_000_000_000_000u64);
-        require_exact_issuer_share_balance(amount, amount).unwrap();
-        let err = require_exact_issuer_share_balance(U256::from(1u64), amount)
-            .unwrap_err();
+        require_exact_issuer_share_balance(amount, amount, 0).unwrap();
+        let err =
+            require_exact_issuer_share_balance(U256::from(1u64), amount, 0)
+                .unwrap_err();
         assert!(matches!(
             err,
             BurnExcessProofError::IssuerShareBalanceNotExact { .. }
+        ));
+    }
+
+    /// Each held same-shape Transfer adds exactly one more excess amount: the
+    /// gate must neither ignore it nor accept any other surplus.
+    #[test]
+    fn share_balance_gate_counts_held_transfers_exactly() {
+        let amount = U256::from(750_000_000_000_000_000u64);
+        require_exact_issuer_share_balance(
+            amount * U256::from(3u64),
+            amount,
+            2,
+        )
+        .unwrap();
+        for (balance, held) in [
+            (amount * U256::from(2u64), 0),
+            (amount * U256::from(2u64), 2),
+            (amount * U256::from(2u64) + U256::from(1u64), 1),
+        ] {
+            assert!(
+                matches!(
+                    require_exact_issuer_share_balance(balance, amount, held),
+                    Err(
+                        BurnExcessProofError::IssuerShareBalanceNotExact { .. }
+                    )
+                ),
+                "balance {balance} with {held} held must refuse"
+            );
+        }
+        assert!(matches!(
+            require_exact_issuer_share_balance(U256::MAX, U256::MAX, 1),
+            Err(BurnExcessProofError::IssuerShareBalanceNotExact { .. })
         ));
     }
 
@@ -750,8 +815,11 @@ mod tests {
         assert_eq!(selected.tx_hash, expectation.tx_hash);
     }
 
+    /// Identical funding-shape logs in one transaction are interchangeable;
+    /// picking the lowest index keeps the choice stable across reruns, so a
+    /// resume proves the same log the first run excluded.
     #[test]
-    fn select_funding_transfer_not_found_and_ambiguous() {
+    fn select_funding_transfer_not_found_and_identical_matches() {
         let expectation = FundingTransferExpectation {
             network: Network::Base,
             vault: address!("0x1111111111111111111111111111111111111111"),
@@ -768,24 +836,21 @@ mod tests {
         ));
 
         let match_shape = FundingTransferCandidate {
-            log_index: 0,
+            log_index: 4,
             vault: expectation.vault,
             from: expectation.from,
             to: expectation.to,
             amount: expectation.amount,
         };
-        let ambiguous = select_funding_transfer(
+        let selected = select_funding_transfer(
             &expectation,
             &[
                 match_shape.clone(),
                 FundingTransferCandidate { log_index: 1, ..match_shape },
             ],
         )
-        .unwrap_err();
-        assert!(matches!(
-            ambiguous,
-            BurnExcessProofError::FundingTransferAmbiguous { count: 2, .. }
-        ));
+        .unwrap();
+        assert_eq!(selected.log_index, 1);
     }
 
     #[test]

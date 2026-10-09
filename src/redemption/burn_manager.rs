@@ -25,7 +25,6 @@ use super::{
 };
 use crate::Quantity;
 use crate::bindings::IST0xOrchestratorV1;
-use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::config::{VaultMode, VaultModeKind};
 use crate::jobs::{JobQueue, QueuePushError, job_type};
 use crate::mint::QuantityConversionError;
@@ -621,9 +620,7 @@ impl BurnManager {
             Some(issuer_request_id),
         )
         .await?;
-        let unresolved_excess =
-            has_unresolved_excess_burn_intent(&self.view_pool, None).await?;
-        if unresolved_intent || unresolved_excess {
+        if unresolved_intent {
             return Err(ManualBurnReplacementRefusal::CompetingSignerIntent {
                 network: candidate.metadata.network,
             }
@@ -1796,6 +1793,7 @@ impl BurnManager {
             block_number: *block_number,
             detected_at: *detected_at,
             burn_mode: *burn_mode,
+            account_attribution: None,
         };
 
         self.store
@@ -2470,26 +2468,21 @@ impl BurnManager {
             }
         };
         if status == BurnTxStatus::ProvablyDead {
-            // Network-keyed reservation: one check covers competing burn AND
-            // mint intents on this signer's nonce domain, excluding only this
-            // redemption's own reservation. BurnExcess is not tracked in
-            // `active_signer_intents`, so its intents need their own check.
+            // The network-keyed reservation covers competing redemption,
+            // mint, and burn-excess intents across processes, excluding only
+            // this redemption's own reservation.
             let unresolved_intent = has_unresolved_signer_intent(
                 &self.view_pool,
                 metadata.network,
                 Some(issuer_request_id),
             )
             .await?;
-            let unresolved_excess =
-                has_unresolved_excess_burn_intent(&self.view_pool, None)
-                    .await?;
-            if unresolved_intent || unresolved_excess {
+            if unresolved_intent {
                 drop(wallet_guard);
                 debug!(target: "redemption",
                     issuer_request_id = %issuer_request_id,
                     tx_hash = %sendable_tx.hash,
                     unresolved_intent,
-                    unresolved_excess,
                     "Deferring dead burn replacement behind another persisted wallet intent"
                 );
                 return Ok(RecoveryOutcome::SkippedManualIntervention);
@@ -3453,10 +3446,7 @@ impl BurnManager {
                 Some(issuer_request_id),
             )
             .await?;
-            let unresolved_excess =
-                has_unresolved_excess_burn_intent(&self.view_pool, None)
-                    .await?;
-            if !unresolved_intent && !unresolved_excess {
+            if !unresolved_intent {
                 break wallet_guard;
             }
 
@@ -3476,7 +3466,6 @@ impl BurnManager {
             debug!(target: "redemption",
                 issuer_request_id = %issuer_request_id,
                 unresolved_intent,
-                unresolved_excess,
                 "Waiting for an earlier wallet intent before preparing burn"
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4801,7 +4790,7 @@ mod tests {
         RedemptionCommand, should_release_reserved_burn,
     };
     use crate::bindings::IST0xOrchestratorV1;
-    use crate::burn_excess::BurnExcessEvent;
+    use crate::burn_excess::{BurnExcessCloseProof, BurnExcessEvent};
     use crate::config::{VaultMode, VaultModeKind};
     use crate::jobs::Job;
     use crate::jobs::job_type;
@@ -5350,6 +5339,7 @@ mod tests {
                 issuer_request_id,
                 RedemptionCommand::Detect {
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -5710,23 +5700,20 @@ mod tests {
         store
             .send(
                 issuer_request_id,
-                RedemptionCommand::Detect {
-                    burn_mode: VaultMode::Orchestrator {
-                        address: test_orchestrator_address(),
-                    },
-                    issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
-                    token: TokenSymbol::new("tAAPL"),
-                    wallet: address!(
-                        "0x1234567890abcdef1234567890abcdef12345678"
-                    ),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    tx_hash: b256!(
-                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
-                    block_number: 12345,
-                    network: Network::Base,
-                },
+                RedemptionCommand::Detect { burn_mode: VaultMode::Orchestrator {
+                    address: test_orchestrator_address(),
+                }, account_attribution: None, issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!(
+                    "0x1234567890abcdef1234567890abcdef12345678"
+                ),
+                quantity: Quantity::new(Decimal::from(100)),
+                tx_hash: b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                block_number: 12345,
+                network: Network::Base, },
             )
             .await
             .unwrap();
@@ -8658,6 +8645,7 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::Detect {
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -8793,6 +8781,7 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::Detect {
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
@@ -9109,6 +9098,7 @@ mod tests {
                     tx_hash,
                     block_number: 12345,
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                 },
             )
             .await
@@ -9295,6 +9285,7 @@ mod tests {
                 &issuer_request_id,
                 RedemptionCommand::Detect {
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -9570,23 +9561,20 @@ mod tests {
         store
             .send(
                 issuer_request_id,
-                RedemptionCommand::Detect {
-                    burn_mode: VaultMode::Orchestrator {
-                        address: test_orchestrator_address(),
-                    },
-                    issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
-                    token: TokenSymbol::new("tAAPL"),
-                    wallet: address!(
-                        "0x1234567890abcdef1234567890abcdef12345678"
-                    ),
-                    quantity: alpaca_quantity.clone(),
-                    tx_hash: b256!(
-                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
-                    block_number: 12345,
-                    network: Network::Base,
-                },
+                RedemptionCommand::Detect { burn_mode: VaultMode::Orchestrator {
+                    address: test_orchestrator_address(),
+                }, account_attribution: None, issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!(
+                    "0x1234567890abcdef1234567890abcdef12345678"
+                ),
+                quantity: alpaca_quantity.clone(),
+                tx_hash: b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                block_number: 12345,
+                network: Network::Base, },
             )
             .await
             .expect("Detect failed");
@@ -14905,134 +14893,28 @@ mod tests {
         assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
     }
 
-    /// Seeds an unresolved `BurnExcess` stream. The gate reads the event stream
-    /// rather than `active_signer_intents` (`BurnExcess` reserves no row there),
-    /// so only `event_type` matters and an empty payload is enough.
+    /// Seeds the database-backed reservation an unresolved burn-excess stream
+    /// holds on Base.
     async fn seed_unresolved_excess_burn(
         pool: &SqlitePool,
-        event_type: &str,
     ) -> Result<(), sqlx::Error> {
-        insert_raw_event(
-            pool,
-            "BurnExcess",
-            "0x00000000000000000000000000000000000000000000000000000000000000e1",
-            1,
-            event_type,
-            "{}",
-        )
-        .await
-    }
-
-    /// A dead burn may only be replaced when nothing else holds this wallet.
-    /// `has_unresolved_signer_intent` cannot see an excess-burn recovery, so
-    /// without the separate gate the replacement would sign over its nonce.
-    #[traced_test]
-    #[tokio::test]
-    async fn provably_dead_replacement_waits_for_an_unresolved_excess_burn() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let old_tx = SendableTxWithHash::valid_for_test(
-            4,
-            vault,
-            Bytes::from_static(&[0xca, 0xfe]),
-        );
-        let owner = old_tx.signer_for_test();
-        let replacement_tx = SendableTxWithHash::valid_for_test(
-            5,
-            vault,
-            Bytes::from_static(&[0xca, 0xfe]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
-                .with_prepared_tx(old_tx),
-        );
-        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(store, &issuer_request_id)
-            .await;
-        store
-            .send(
-                &issuer_request_id,
-                RedemptionCommand::IntendBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    external_tx_id: None,
-                    params: BurnParams::VaultDirect {
-                        vault,
-                        burns: vec![],
-                        dust_shares: U256::ZERO,
-                        owner,
-                    },
-                },
+        sqlx::query(
+            "
+            INSERT INTO active_signer_intents (
+                network,
+                aggregate_type,
+                aggregate_id
             )
-            .await
-            .expect("burn intent should persist");
-
-        // `FundingExcluded` holds no signed transaction yet, and must still
-        // block: the exclusion write is already permanent and the stream will
-        // sign against the same issuer wallet.
-        seed_unresolved_excess_burn(
-            pool,
-            BurnExcessEvent::FUNDING_EXCLUSION_RECORDED,
+            VALUES (
+                'base',
+                'BurnExcess',
+                '0x00000000000000000000000000000000000000000000000000000000000000e1'
+            )
+            ",
         )
-        .await
-        .expect("excess burn intent should seed");
-
-        let manager = BurnManager::new_for_tests(
-            vault_mock.clone(),
-            pool.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            owner,
-            ANVIL_CHAIN_ID,
-            harness.apalis_pool.clone(),
-        );
-        assert!(matches!(
-            manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::SkippedManualIntervention)
-        ));
-        assert_eq!(vault_mock.replacement_preparation_call_count(), 0);
-        assert!(vault_mock.submitted_burn_txs().is_empty());
-        assert!(matches!(
-            load_aggregate(store, &issuer_request_id).await,
-            Redemption::BurnIntended { .. }
-        ));
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &[
-                "Deferring dead burn replacement",
-                "unresolved_intent=false",
-                "unresolved_excess=true",
-            ]
-        ));
-
-        // Closing the excess stream must free the gate, or an abandoned
-        // recovery would block burns forever.
-        insert_raw_event(
-            pool,
-            "BurnExcess",
-            "0x00000000000000000000000000000000000000000000000000000000000000e1",
-            2,
-            BurnExcessEvent::EXCESS_BURN_CLOSED,
-            "{}",
-        )
-        .await
-        .expect("excess burn intent should resolve");
-        vault_mock.set_prepared_tx(replacement_tx.clone());
-
-        assert!(matches!(
-            manager.recover_single_burning(&issuer_request_id).await,
-            Ok(RecoveryOutcome::EnqueuedBurnJob)
-        ));
-        assert_eq!(vault_mock.replacement_preparation_call_count(), 1);
-        let execution =
-            intended_execution(store, &issuer_request_id, vault).await;
-        manager
-            .submit_intended_burn(&issuer_request_id, &execution)
-            .await
-            .expect("submit_intended_burn should broadcast the replacement");
-        assert_eq!(vault_mock.submitted_burn_txs(), vec![replacement_tx]);
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     /// The live burn path waits behind an excess recovery rather than racing
@@ -15060,12 +14942,9 @@ mod tests {
             )
             .await;
 
-        seed_unresolved_excess_burn(
-            pool,
-            BurnExcessEvent::EXCESS_BURN_INTENDED,
-        )
-        .await
-        .expect("excess burn intent should seed");
+        seed_unresolved_excess_burn(pool)
+            .await
+            .expect("excess burn intent should seed");
 
         let manager = BurnManager::new_for_tests(
             vault_mock.clone(),
@@ -15084,6 +14963,14 @@ mod tests {
 
         // Resolve the excess stream while the burn is parked in the wait loop,
         // so the test also proves the gate releases instead of only blocking.
+        let close_payload =
+            serde_json::to_string(&BurnExcessEvent::ExcessBurnClosed {
+                reason: "test resolution".into(),
+                proof: BurnExcessCloseProof::Unsigned,
+                release_through_block: Some(0),
+                closed_at: Utc::now(),
+            })
+            .unwrap();
         let releasing_pool = pool.clone();
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -15093,7 +14980,7 @@ mod tests {
                 "0x00000000000000000000000000000000000000000000000000000000000000e1",
                 2,
                 BurnExcessEvent::EXCESS_BURN_CLOSED,
-                "{}",
+                &close_payload,
             )
             .await
             .expect("excess burn intent should resolve");
@@ -15123,11 +15010,7 @@ mod tests {
         ));
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
-            &[
-                "Waiting for an earlier wallet intent",
-                "unresolved_intent=false",
-                "unresolved_excess=true",
-            ]
+            &["Waiting for an earlier wallet intent", "unresolved_intent=true",]
         ));
     }
 

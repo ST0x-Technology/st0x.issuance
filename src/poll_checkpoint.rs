@@ -28,6 +28,27 @@ pub(crate) fn transfer_poll_name(network: Network, vault: Address) -> String {
     format!("transfer_poll:{network}:{vault:#x}")
 }
 
+pub(crate) fn transfer_poll_observed_name(
+    network: Network,
+    vault: Address,
+) -> String {
+    format!("transfer_poll_observed:{network}:{vault:#x}")
+}
+
+pub(crate) async fn advance_transfer_poll_observed(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    advance_checkpoint_block(
+        pool,
+        &transfer_poll_observed_name(network, vault),
+        block_number,
+    )
+    .await
+}
+
 /// Loads the transfer poll checkpoint for `network`/`vault`.
 ///
 /// Does **not** fall back to the legacy global [`TRANSFER_POLL`] row: that
@@ -45,19 +66,85 @@ pub(crate) async fn load_transfer_poll(
     load_checkpoint_block(pool, &transfer_poll_name(network, vault)).await
 }
 
-/// Advances the per-network transfer poll checkpoint.
+/// Advances the per-network transfer poll checkpoint without crossing the
+/// earliest durable held-redemption attribution. The floor is part of the same
+/// SQL statement as the monotonic update, so a poll pass that loaded its cursor
+/// before an anchor rewound it cannot advance past that older log.
 pub(crate) async fn advance_transfer_poll(
     pool: &Pool<Sqlite>,
     network: Network,
     vault: Address,
     block_number: u64,
 ) -> Result<(), CheckpointError> {
-    advance_checkpoint_block(
-        pool,
-        &transfer_poll_name(network, vault),
-        block_number,
+    let block_signed = i64::try_from(block_number)?;
+    sqlx::query(
+        "
+        WITH held_floor AS (
+            SELECT MIN(
+                CAST(json_extract(attribution, '$.block_number') AS INTEGER)
+            ) AS block_number
+            FROM burn_excess_held_redemptions
+            WHERE network = ?
+              AND vault = ?
+        ),
+        candidate AS (
+            SELECT CASE
+                WHEN held_floor.block_number IS NULL
+                THEN ?
+                ELSE MIN(?, MAX(held_floor.block_number - 1, 0))
+            END AS block_number
+            FROM held_floor
+        )
+        INSERT INTO poll_checkpoints (name, block_number)
+        SELECT ?, block_number
+        FROM candidate
+        WHERE true
+        ON CONFLICT(name) DO UPDATE
+            SET block_number = excluded.block_number,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE excluded.block_number > poll_checkpoints.block_number
+        ",
     )
-    .await
+    .bind(network.as_str())
+    .bind(format!("{vault:#x}"))
+    .bind(block_signed)
+    .bind(block_signed)
+    .bind(transfer_poll_name(network, vault))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+/// Rewinds an existing per-vault transfer checkpoint so `block_number` is
+/// scanned again. An absent checkpoint is left absent, preserving its configured
+/// backfill start. Block zero removes the row because it has no predecessor.
+pub(crate) async fn rewind_transfer_poll_before(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    let name = transfer_poll_name(network, vault);
+    let Some(previous_block) = block_number.checked_sub(1) else {
+        return remove(pool, &name).await;
+    };
+    let previous_signed = i64::try_from(previous_block)?;
+    sqlx::query(
+        "
+        UPDATE poll_checkpoints
+        SET block_number = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE name = ?
+          AND block_number >= ?
+        ",
+    )
+    .bind(previous_signed)
+    .bind(name)
+    .bind(previous_signed)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// Per-network checkpoint name for the receipt backfiller for a given vault.

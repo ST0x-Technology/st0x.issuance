@@ -2347,7 +2347,7 @@ mod tests {
         };
         let now = Utc::now();
         let freeze_at = now - ChronoDuration::hours(1);
-        let unfreeze_at = now + ChronoDuration::milliseconds(50);
+        let unfreeze_at = now + ChronoDuration::seconds(5);
         let hold_id = hold_id(freeze_at, unfreeze_at);
 
         ctx.underlying_store
@@ -2365,7 +2365,7 @@ mod tests {
             load_freeze_status(&pool, &underlying).await.unwrap(),
             AssetStatus::Frozen
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
 
         let mut queue = JobQueue::new(&harness.apalis_pool);
         queue

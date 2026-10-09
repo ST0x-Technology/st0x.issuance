@@ -6,7 +6,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use clap::{Args, Subcommand};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
-use st0x_issuance_dto::DecimalShares;
+use st0x_issuance_dto::{AcknowledgedInboundTransfer, DecimalShares};
 use std::io;
 use std::str::FromStr;
 
@@ -63,6 +63,10 @@ pub(crate) struct BurnExcessSharedArgs {
     /// Optional incident / ticket id for the audit trail.
     #[arg(long)]
     incident_id: Option<String>,
+    /// Exact inbound Transfers reconciled outside the ordinary terminal paths.
+    /// Repeat as `--acknowledged-inflow TX_HASH:LOG_INDEX`.
+    #[arg(long = "acknowledged-inflow")]
+    acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
 
     /// Network of the vault listing (cross-checked with mint + chain-id).
     /// RPC is taken from the service environment for this network, in the
@@ -80,8 +84,8 @@ pub(crate) struct BurnExcessSharedArgs {
     #[arg(long)]
     execute: bool,
 
-    /// Close a dead AwaitingFunding/FundingExcluded/Intended/Submitted stream
-    /// instead of burning.
+    /// Close an unsigned stream, or a signed stream whose transaction is
+    /// classified as finalized-reverted or provably dead.
     #[arg(long)]
     close: bool,
 
@@ -147,6 +151,7 @@ pub(crate) async fn run_burn_excess_cli(
         shares: shared.shares.to_u256(),
         reason: shared.reason,
         incident_id: shared.incident_id,
+        acknowledged_inflows: shared.acknowledged_inflows,
         network: shared.network,
         chain_id: shared.chain_id,
         execute: shared.execute,

@@ -5,7 +5,8 @@
 //! shares that arrived through a funding Transfer the live poller would
 //! otherwise read as an AP redemption, so it runs in two steps: `expect-funding`
 //! records the Transfer the stream expects before the operator broadcasts it,
-//! and the poller holds a matching log until `external` excludes it. Both burn
+//! and the poller holds a matching log until `external` excludes it (and any
+//! other log of that shape until the burn completes). Both burn
 //! routes sign through the running service's vault service, so the burn shares
 //! the wallet lock and nonce manager every live mint and redemption burn uses,
 //! and both self-gate on wallet quiescence under that lock (an unresolved
@@ -62,6 +63,7 @@ fn into_request(
         shares: common.shares.to_u256(),
         reason: common.reason,
         incident_id: common.incident_id,
+        acknowledged_inflows: common.acknowledged_inflows,
         network: common.network,
         chain_id: common.chain_id,
         execute: common.execute,
@@ -324,11 +326,13 @@ pub(crate) async fn burn_excess_external_ops(
 /// intervention.
 const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
     use BurnExcessEngineError::{
-        AmbiguousDepositTx, AmbiguousShareTransferOut, AnotherFundingExpected,
-        Contract, DeadBurnIntent, DepositTxInvalid, FundingNotExpected,
-        FundingTxInvalid, MintMissingAsset, MintNetworkMismatch, MintNotFound,
-        Proof, Provider, UnresolvedExcessBurnIntent, UnresolvedSignerIntent,
-        Vault, VaultNotListed,
+        AcknowledgedInboundNotFound, AmbiguousDepositTx,
+        AmbiguousShareTransferOut, AnotherFundingExpected,
+        ChainBehindProvenPlan, Contract, DeadBurnIntent, DepositTxInvalid,
+        FundingNotExpected, FundingTxInvalid, HeldTransferReceiptMissing,
+        MintMissingAsset, MintNetworkMismatch, MintNotFound, Proof, Provider,
+        UnresolvedExcessBurnIntent, UnresolvedSignerIntent, Vault,
+        VaultNotListed,
     };
 
     match error {
@@ -345,8 +349,13 @@ const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
         | AmbiguousDepositTx { .. }
         | AmbiguousShareTransferOut { .. }
         | FundingTxInvalid { .. }
+        | AcknowledgedInboundNotFound { .. }
         | DeadBurnIntent { .. } => Status::UnprocessableEntity,
-        Provider(_) | Contract(_) | Vault(_) => Status::BadGateway,
+        Provider(_)
+        | Contract(_)
+        | Vault(_)
+        | HeldTransferReceiptMissing { .. }
+        | ChainBehindProvenPlan { .. } => Status::BadGateway,
         _ => Status::InternalServerError,
     }
 }

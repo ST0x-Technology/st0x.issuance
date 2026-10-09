@@ -448,25 +448,32 @@ independently signing the same nonce during the brief overlap between the old
 process terminating and its replacement starting. `active_signer_intents` is the
 durable, cross-process backstop for that window: one row per network (a signer's
 nonce domain), reserved by a trigger in the same transaction that appends
-`MintTxIntended` or `BurnIntended`, and released by a trigger on that
-aggregate's own definitively-resolved terminal event or recorded submit
-rejection. The reservation key is `network` alone, so it is shared between
-`Mint` and `Redemption` — only one signer intent per nonce domain can be
-outstanding at a time, regardless of which aggregate holds it. This makes the
-event append itself the durable arbitration point: a second instance's competing
-intent is rejected by SQLite before it can commit, rather than relying on an
-in-memory lock or a fallible read-model projection. Recovery bookkeeping,
-including `BurnNonceTooLow`, never releases this reservation; only a
-definitively resolved terminal event or a recorded submit rejection
-(`MintSubmitRejected` / `BurnSubmitRejected`: the node rejected the persisted
-raw transaction and holds no transaction for its hash, so it cannot land) does.
-When the pre-append check finds the network occupied, a mint job returns
-`MintJobError::UnresolvedWalletIntent` and refuses to submit rather than risk a
-nonce collision, leaving the job to retry once the guard clears. When the race
-is lost between that check and the append, the trigger aborts the append with an
-explicit signer-reservation error — worded distinctly from a same-aggregate
-concurrency conflict so an operator reading the failure is pointed at the
-nonce-domain guard, not at a phantom concurrent modification of the aggregate.
+`MintTxIntended`, `BurnIntended`, or `ExcessBurnIntended`. A separate
+event-store trigger rejects a competing burn-excess stream from
+`FundingExclusionRecorded`, without occupying the signer reservation. Mint and
+redemption reservations release on their definitively-resolved or
+submit-rejected events; burn-excess holds its reservation until
+`ExcessBurnCompleted` or a validated `ExcessBurnClosed`. An unsigned stream may
+close with `Unsigned`; a signed stream releases only with a persisted
+`FinalizedReverted` or `ProvablyDead` classification, enforced by both the
+aggregate and the reservation trigger. The reservation key is `network` alone
+and is shared by `Mint`, `Redemption`, and `BurnExcess` — only one signer
+operation per nonce domain can be outstanding, regardless of which aggregate
+holds it. This makes the event append itself the durable arbitration point: a
+second instance's competing event is rejected by SQLite before it can commit or
+broadcast, rather than relying on an in-memory lock or a fallible read-model
+projection. Mint/redemption recovery bookkeeping, including `BurnNonceTooLow`,
+never releases their reservation; only a definitively resolved terminal event or
+recorded submit rejection (`MintSubmitRejected` / `BurnSubmitRejected`: the node
+rejected the persisted raw transaction and holds no transaction for its hash, so
+it cannot land) does. When the pre-append check finds the network occupied, a
+mint job returns `MintJobError::UnresolvedWalletIntent` and refuses to submit
+rather than risk a nonce collision, leaving the job to retry once the guard
+clears. When the race is lost between that check and the append, the trigger
+aborts the append with an explicit signer-reservation error — worded distinctly
+from a same-aggregate concurrency conflict so an operator reading the failure is
+pointed at the nonce-domain guard, not at a phantom concurrent modification of
+the aggregate.
 
 The issuer is a single-writer service: exactly one process may own a given
 SQLite event store and signing wallet at a time. Horizontal replicas sharing a
@@ -996,9 +1003,10 @@ raw redemption amounts are emitted in the admission log.
   `alpaca_quantity`, `dust_quantity`, `called_at` (from the original
   `AlpacaCalled` event), `alpaca_journal_completed_at`, optional retry
   `external_tx_id`, and `resumed_at` timestamp. Used for post-Alpaca recovery
-  where the journal already completed. Gains the same additive
-  `#[serde(default)]` `burn_mode` field as `RedemptionDetected`, preserving the
-  mode anchor across a resume.
+  where the journal already completed. Additive `#[serde(default)]` `burn_mode`
+  and `account_attribution` fields preserve the mode and account anchors
+  supplied by recovery; replay prefers attribution retained in an existing
+  failed-burn context when both are present.
 - `OrchestratorBurnSubmitted` (orchestrator mode only) - Burn transaction
   submitted to the signing backend. Carries
   `{issuer_request_id,
@@ -1294,8 +1302,12 @@ system. The account lifecycle follows these steps:
 | ------------------- | --------------------- | ------------------------------------- |
 | `Register`          | `Registered`          | New AP account created with email     |
 | `LinkToAlpaca`      | `LinkedToAlpaca`      | Existing account linked to Alpaca     |
-| `WhitelistWallet`   | `WalletWhitelisted`   | Wallet authorized (multiple allowed)  |
+| `WhitelistWallet`   | `WalletWhitelisted`   | Multiple wallets allowed per account  |
 | `UnwhitelistWallet` | `WalletUnwhitelisted` | Wallet removed (idempotent if absent) |
+
+A wallet may belong to only one active account. Because that invariant spans
+aggregates, the event store maintains `account_wallet_owners` and atomically
+rejects a `WalletWhitelisted` event if another account owns the address.
 
 **Account State Machine:**
 
@@ -1583,9 +1595,12 @@ balance, original recipient == issuer, freeze status, and funding-hash presence
 do **not** select path.
 
 **Resume:** aggregate id is the **deposit tx hash**. When a `BurnExcess` stream
-already exists, **stored path wins**. Re-invoke must use the same mode keyword;
-switching modes is `PathConflict`. External resumes also require the same
-funding tx hash as recorded.
+already exists, its stored path and full bind win: network, chain, issuer
+wallet, original recipient, vault, receipt id, and shares must still match the
+request. Re-invoke must use the same mode keyword; switching modes is
+`PathConflict`. External resumes also require the recorded funding tx hash. The
+stored vault is used even if the tokenized-asset listing was later repointed;
+recovery never substitutes the current vault into persisted signed calldata.
 
 | Aggregate state                 | Locked path  | Required mode                                                              | Funding hash                |
 | ------------------------------- | ------------ | -------------------------------------------------------------------------- | --------------------------- |
@@ -1609,10 +1624,26 @@ funding tx hash as recorded.
 underlying neither blocks nor unlocks burn-excess. Ops still stop issuance /
 pause conflicting producers as needed.
 
-**Exact issuer share balance.** After path-specific funding (Path B) or
-immediately (Path A), issuer ERC-20 share balance must **exactly** equal the
-excess amount. Any extra shares at the issuer refuse
-(`IssuerShareBalanceNotExact`).
+**Exact issuer share balance and liabilities.** Every unsigned Path A or Path B
+plan scans every inbound share Transfer to the issuer from the duplicate deposit
+through a hash-pinned snapshot in bounded block-number ranges, with deposit and
+snapshot boundary rechecks, then requires the issuer balance to equal the
+remaining excess liability exactly. Completed redemptions and completed
+permanent funding exclusions are retired liabilities; fully-forwarded vault mint
+legs are net-zero. Path A has no held-transfer facility, so every unresolved
+non-deposit inflow is exceptional. Path B excludes its exact funding log and
+counts eligible same-shape AP transfers as held redemption liabilities, both on
+the live expectation route and the offline service-stopped route; every other
+different-shape or unattributed inflow is exceptional. On either path, an
+exceptional inflow refuses unless the operator explicitly acknowledges its exact
+`(tx_hash, log_index)` after reconciling it outside the bot. The proof requires
+every acknowledgement to name an observed unresolved inbound log, and
+`ExcessBurnIntended` persists the list with the signed transaction for audit.
+This prevents an unrelated inflow from masking an outbound transfer while
+preserving the expected net balance (`IssuerShareBalanceNotExact` or
+`UnresolvedIssuerShareTransfer`). A resume of a signed burn (`Intended` /
+`Submitted`) reads no live share balance: the burn was proven against it when
+signed, so resume validates and classifies the persisted transaction instead.
 
 **Path A recipient gate.** `internal` refuses when the deposit's original share
 recipient is not the issuer wallet (`InternalRequiresIssuerAsRecipient`); ops
@@ -1632,17 +1663,50 @@ the index from every `FundingExclusionRecorded` event so a restored or truncated
 index table cannot leave the poller free to open a `Redemption` for an excluded
 funding Transfer. If a `Redemption` already exists for that funding tx → refuse
 (`FundingAlreadyRedeemed`), re-checked immediately before exclusion record.
-Transfer logs without `log_index` fail closed (`MissingLogIndex`) so Detect
-cannot open a redemption for an unidentifiable excluded funding log.
+Several logs of the exact funding shape in the funding transaction are
+interchangeable: the lowest one no other deposit has excluded is the funding
+log, and the others are held Transfers (see below), so two streams funded in one
+batched transaction each find their own. A funding log already excluded for
+another deposit is never taken (`FundingLogExcludedForAnotherDeposit` when no
+other log of that shape is left): the exclusion insert keeps the first owner, so
+a second stream would burn without ever owning its exclusion. The claim is
+checked at proof, again under the wallet lock together with the wallet intent
+gates immediately before the exclusion is recorded, on the written row's owner,
+and at the sign boundary. Transfer logs without `log_index` fail closed
+(`MissingLogIndex`) so Detect cannot open a redemption for an unidentifiable
+excluded funding log.
 
-**Dead intent / Closed.** `--close` clears the wallet nonce gate, and for an
-`AwaitingFunding` stream also the funding expectation (see below). `Closed` is
-report-only terminal for that deposit stream (no re-intend on the same
-`deposit_tx_hash`), except that an executed re-run of a terminal stream drops a
-funding expectation that outlived it (a clear that failed after the close or the
-exclusion): always for `Closed`, and for `Completed` only once its exclusion row
-is confirmed. Reverted/ProvablyDead on resume surfaces `DeadBurnIntent` with
-that guidance.
+**Dead intent / Closed.** `--close` clears the wallet nonce gate and the
+stream's funding expectation only when doing so cannot free a live signed nonce.
+`AwaitingFunding` and `FundingExcluded` close with `Unsigned`.
+`Intended`/`Submitted` close only after exact-hash classification proves
+`FinalizedReverted` or `ProvablyDead`; `StillMineable`, unfinalized revert, and
+uncertain statuses refuse. The close event persists that proof, and the SQLite
+release trigger independently rejects a missing or state-incompatible proof.
+`expect-funding` and defensive unsigned close require the original recipient to
+be uniquely linked to an Alpaca account. The `FundingExpected` event atomically
+installs database guards that block both wallet-link mutations and vault
+repointing through the expectation lifetime. Completion and every close mark an
+existing expectation released rather than deleting it. Completion starts from
+the burn block and close from the observed chain head; both boundaries are
+raised to the poller's durable monotonic high-water mark, so a temporarily
+lagging RPC cannot clear a block the poller previously observed. Matching logs
+become ordinary redemptions, while the guards remain until a catch-up pass
+reaches the boundary without dropping or ambiguously deduplicating a log. A
+successful pass atomically records a per-stream completion tombstone before
+removing the expectation, so startup rebuild cannot resurrect a completed
+handoff. An unsafe log retains the row, checkpoint, and guards for incident
+handling. Only one live or released expectation may own a vault on a network;
+the event append rejects a second shape before either stream can tell an
+operator to broadcast. This avoids a deadlock in which each stream's recovery is
+blocked by the other unresolved expectation. A defensive close check also
+refuses any pre-existing stream whose listing was already repointed; restore the
+listing before closing. Because a transaction can remain pending beyond the
+release head, the close confirmation requires the operator to attest that no
+funding or same-shape Transfer remains pending. `Closed` is report-only terminal
+for that deposit stream (no re-intent on the same `deposit_tx_hash`). An
+executed terminal re-run refreshes a retained handoff row's release-through
+proof; the poller removes the row only after its safe catch-up pass.
 
 **Post-burn inventory.** After on-chain verify the stream completes, then
 inventory is reconciled. Reconcile failure fails the CLI (non-zero) even though
@@ -1657,23 +1721,29 @@ prove) so operators see the same blockers they would hit on `--execute`.
 intend; Path B: exclusion record) and before resume broadcast/confirm of a
 persisted `sendable_tx.hash`.
 
-**Wallet intent gates.** An unresolved excess-burn recovery refuses competing
-mint prepare and redemption burn prepare/replace paths (same family as mint/burn
-intent gates). `BurnExcess` holds no `active_signer_intents` reservation, so it
-is checked separately from the network-keyed signer-intent guard rather than
-through it. `Intended` / `Submitted` count because they hold a signed nonce.
-`FundingExcluded` counts too: it holds no signed transaction yet, but its
-exclusion write is already permanent and the stream will sign against the same
-issuer wallet, so a Path B recovery abandoned before intend must be resumed or
-`--close`d rather than raced. `AwaitingFunding` does not count: it holds neither
-a signature nor an exclusion. Gates are re-read at the irreversible sign
-boundary, together with the issuer receipt and exact share balances — the
-operator confirm prompt blocks for an unbounded time, so balances proven at plan
-time are re-read immediately before `prepare_burn_tx` signs. Deposit and funding
-proofs are mined history and are not re-read. A Path B run takes the network's
-wallet lock before it records the exclusion and re-reads the gates under it,
-holding the lock through the persisted intent, so two runs on different streams
-cannot both record an exclusion and then refuse each other at the sign boundary.
+**Wallet intent gates.** A persisted signed excess-burn intent refuses competing
+mint prepare and redemption burn prepare/replace paths through the same
+network-keyed `active_signer_intents` reservation. `Intended` / `Submitted`
+count because they hold signed bytes for a nonce. `FundingExcluded` does not: it
+has no signed nonce, so a different-shape redemption detected after the
+exclusion can burn before the operator retries `external`. The permanent
+exclusion still atomically prevents another burn-excess stream on that network
+from recording its exclusion or intent until the first stream completes or
+closes. `AwaitingFunding` holds neither a signature nor an exclusion. SQLite
+acquires both forms of arbitration in the same transaction as their boundary
+events, so separate processes cannot both pass a read-before-write gate. Gates
+are re-read at the irreversible sign boundary, together with the issuer receipt,
+exact share balance, and the complete issuer-wallet liability/held-redemption
+set.
+
+The balance is read at a hash-pinned snapshot. The liability proof scans
+2,000-block number ranges from the duplicate-deposit block through that
+snapshot, then re-checks the deposit and snapshot boundary hashes. Every
+non-funding Transfer receipt must identify the same block hash as its range log.
+The proof relies on the RPC returning internally consistent range results
+between those pinned boundaries. The sign-boundary snapshot must be no older
+than the planned snapshot, and the exact held identities and attribution must
+match before `prepare_burn_tx` signs.
 
 **The funding Transfer must never be detected as a redemption.**
 `FundingAlreadyRedeemed` is re-checked immediately before the exclusion write,
@@ -1690,58 +1760,122 @@ the ordinary Alpaca path. Two operator sequences prevent that:
   on `execute`, records `FundingExpected`: the stream enters `AwaitingFunding`
   and the expected Transfer
   `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`
-  enters a durable SQL index. It refuses (`UnresolvedExcessBurnIntent`, 409)
-  while another burn-excess stream is `FundingExcluded`, `Intended`, or
-  `Submitted`, since that stream's intent would refuse every `external` run on
-  this one and leave the hold open. It also refuses (`AnotherFundingExpected`,
-  409) while another stream's expectation is open on the same vault: with both
-  fundings in the issuer wallet neither `external` run could see the exact share
-  balance it burns, so only one expectation per vault is open at a time. Both
-  are re-checked under the network's wallet lock before the write, so two
-  concurrent requests cannot both record. A deposit whose original recipient is
-  the issuer wallet is refused (`FundingFromIssuer`, 422) before anything is
-  written, dry run included: its excess is already there and burns through
-  `internal`. A Transfer matching an open expectation and not yet excluded is
-  held: it is not detected, and the poller stops that vault's checkpoint before
-  its block. Matching is by
-  `(network, vault, from = original recipient, to = issuer wallet, amount = shares)`,
-  not by transaction hash or time. Therefore a genuine redemption from the
-  original recipient for exactly the excess amount is also held while the
-  expectation is open, even if it was mined before `expect-funding` but had not
-  yet been scanned. The AP must not send such a redemption until `external`
-  completes. Transfers that do not match this shape, later ones included, are
-  still detected. While the hold lasts each pass re-reads only the held block
-  and blocks no pass has read yet, tracked in memory; after a restart, or once
-  the hold clears, the vault is rescanned once from its checkpoint (detection is
-  idempotent per tx hash). A same-shape redemption would deadlock recovery: its
-  shares stay in the issuer wallet, so `external` sees twice the excess and
-  cannot record the exclusion that releases either hold. If that happens,
-  escalate; do not close the expectation, because closing would detect both
-  Transfers as ordinary redemptions and send the funding Transfer down the
-  Alpaca redemption path. Other vaults keep flowing and nothing is skipped.
+  enters a durable SQL index. It refuses (`AnotherFundingExpected`, 409) while
+  the vault already has a live or released expectation, and refuses
+  (`UnresolvedExcessBurnIntent`, 409) while another burn-excess stream is
+  `FundingExcluded`, `Intended`, or `Submitted`. Finish or safely close that
+  recovery and its poller catch-up before recording another expectation on the
+  vault. Every active expectation's persisted vault remains in the poll set, and
+  SQLite rejects repointing it before the expectation completes or its
+  released-close catch-up pass finishes. A Transfer matching an open expectation
+  and not yet excluded is held: it is not detected, and the poller stops that
+  vault's checkpoint before its block. Every Transfer of another shape on the
+  vault, later ones included, is still detected (later ones are read again each
+  pass while the hold lasts; detection is idempotent per tx hash). Holding them
+  too would deadlock: a later redemption's shares would stay in the issuer
+  wallet, and `external` needs the exact balance there before it can burn and
+  release the hold. Other vaults keep flowing and nothing is skipped.
   `POST /ops/breakglass/burn-excess/external` refuses a stream that never
-  recorded the expectation (`FundingNotExpected`); its `execute` records the
-  exclusion first and clears the expectation after, so the poller's next pass
-  skips the funding log and moves the checkpoint on. A dry run changes nothing,
-  so the hold spans the dry-run-to-execute gap. Its plan output states the live
+  recorded the expectation (`FundingNotExpected`). Its `execute` records the
+  exclusion and keeps the expectation until the burn completes: the poller's
+  next pass skips the excluded funding log and moves the checkpoint on, up to
+  any other Transfer the expectation still holds. A dry run changes nothing, so
+  the hold spans the dry-run-to-execute gap. Its plan output states the live
   precondition: the expectation recorded before the funding Transfer was
   broadcast.
 
-`--close` of an `AwaitingFunding` stream clears the expectation, and a held
-Transfer is then detected as an ordinary redemption, so close only when the
-funding was never sent or should be redeemed. An expectation recorded after the
+**Issuer-wallet liabilities and same-shape Transfers.** An expectation matches
+by shape, not by hash (the hash does not exist when it is recorded), so a
+genuine AP redemption of exactly the excess amount from the original recipient,
+sent while the expectation is open, is held with the funding Transfer. Its
+shares sit in the issuer wallet, so every Path B balance check (fresh,
+`FundingExcluded` resume, and the sign boundary) expects the excess plus every
+such held Transfer other than the funding log.
+
+The proof does not trust the vault poll checkpoint and does not scan only the
+expected shape. It scans every issuer-wallet inbound share Transfer from the
+duplicate-deposit block through a hash-pinned head in 2,000-block number ranges,
+reconciles completed liabilities, and refuses unresolved inflows of any other
+shape unless the operator acknowledges their exact log identities. An
+acknowledgement that does not match an observed unresolved inflow refuses.
+Same-shape Transfers are counted only when they are not excluded, not already
+redeemed, have an unambiguous transaction key, and have durable AP attribution.
+The scan rechecks the duplicate-deposit and snapshot boundary hashes and
+requires the funding receipt's block hash to match its range log. It does not
+traverse every intermediate parent hash; consistency inside each requested range
+is an RPC trust assumption. The sign boundary validates the planned snapshot,
+scans only blocks added since it, and requires the exact same held set and
+attribution. Thus an offsetting outbound cannot hide a liability behind an
+unchanged balance, and boundary or funding-receipt hash changes refuse. Counted
+shares must be redeemed once released. The command that persists the signed burn
+atomically emits `HeldRedemptionsAnchored`, recording each counted log's exact
+identity, linked AP-account attribution, underlying/token, and burn mode. There
+is no intent-to-anchor crash window. Before another intent is appended, durable
+anchor events (not only the derived row) are checked for the same exact log;
+another stream may share it only with identical attribution. The derived
+exact-log index survives expectation release, rewinds a checkpoint already past
+the anchored log, and makes the poller keep scanning the anchored vault even if
+the asset is repointed. If another stream later proves that log as its funding,
+the permanent exclusion consumes the held row; it is skipped as funding rather
+than opened as a Redemption. Detection uses the anchored asset/account context
+rather than today's listing or wallet whitelist, then persists the account
+identity in the Redemption stream (`AccountAttributionAnchored`) before retiring
+the index row. Detected/Held, Alpaca-called, and pre-Alpaca reprocess recovery
+preserve and use that identity, so a later wallet unlink or process restart
+cannot revoke admission for already-mined tokens the excess burn relied on. A
+held Transfer whose sender is not linked when the plan is proven refuses
+(`HeldTransferSenderNotLinked`). A `Redemption` is keyed by its transaction, so
+a held Transfer that shares its transaction with any other non-mint inbound
+Transfer to the issuer wallet could lose that key if the other vault is enabled
+or sender linked before release. Admission therefore rejects every such receipt
+log regardless of current vault configuration or account linkage, except the
+proven funding log and permanently excluded funding logs. An existing
+`Redemption` is accepted as the held log's own only when its recorded sender and
+amount identify exactly one inbound Transfer in the whole receipt and that exact
+log is the held one; ambiguity fails closed even when the competing vault is no
+longer configured. The run refuses before burning
+(`HeldTransfersShareTransaction`). That log needs manual reconciliation either
+way; `--close` releases the hold but cannot redeem it, and from
+`FundingExcluded` leaves the excess unburned too. The plan names the counted
+Transfers (`held_transfers`) and its `precondition` asks the operator to confirm
+`funding_log` is the Transfer broadcast as funding. The expectation stays open
+while the stream is `FundingExcluded`, `Intended`, or `Submitted`, because a run
+can stop after recording the exclusion (a failed sign, a refused re-check, a
+timeout) and resume from `FundingExcluded`: released at the exclusion, the held
+Transfer would be detected and journaled, the resume would no longer count it,
+and its burn would wait behind this stream's unresolved intent while this stream
+waits for an exact balance. Closing the stream, or completing it once its
+exclusion row is in, clears the shape expectation. Each anchored held Transfer
+is then detected with its persisted asset and AP context; the close confirmation
+says so. Multiple streams may reference the same exact held log only when the
+full attribution is identical; a conflicting attribution refuses.
+
+`--close` clears the expectation, and a held Transfer is then detected as an
+ordinary redemption. Close an `AwaitingFunding` stream only when the funding was
+never sent or should be redeemed. A signed stream cannot close merely because an
+operator wants to abandon it: exact-hash classification must prove it
+finalized-reverted or provably dead. Before a permitted signed close, the engine
+repairs every event-anchored held row; it never releases the shape hold with
+attribution present only in event history. An expectation recorded after the
 poller already detected the funding Transfer protects nothing: the open
 `Redemption` still refuses the exclusion (`FundingAlreadyRedeemedTx`). The
-engine dual-writes the expectation index on record and on clear, and service
-startup rebuilds it, before the pollers spawn, from every stream whose latest
-event is `FundingExpected`. Opening the store per request does not: the rebuild
-deletes rows, and could drop the expectation of a stream that has committed its
-exclusion event but not yet written the exclusion. A retried `expect-funding`
-re-sends a no-op command, so a concurrent `external` or `--close` can clear the
-expectation before the retry writes it back; the retry re-reads the stream after
-its write and, when it is past `AwaitingFunding`, drops the row (a closed stream
-always, any other only once its exclusion row is in) and returns the `terminal`
-view.
+engine dual-writes the expectation and held-attribution indexes from their
+events; service startup rebuilds both before the pollers spawn. The active
+expectation set contains every unfinished stream that recorded
+`FundingExpected`, except a legacy `Intended`/`Submitted` stream with no
+`HeldRedemptionsAnchored` event: those pre-date held-share counting, rebuild no
+shape hold, and resume by anchoring the empty held set before classifying or
+confirming their persisted burn. Exact held-log attribution remains indexed
+after release until detection commits it to the Redemption stream or another
+stream permanently excludes it as funding; startup does not recreate either
+consumed case. Opening the store per request does not rebuild either index: the
+rebuild deletes rows, and run beside a request it could drop an expectation that
+request has just written. A retried `expect-funding` re-sends a no-op command,
+so a concurrent `external` or `--close` can move the stream on before the retry
+writes the row back; the retry re-reads the stream after its write and, when it
+is past `AwaitingFunding`, returns the `terminal` view, dropping the row if the
+stream has completed or closed (a closed stream always, a completed one only
+once its exclusion row is in).
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -5085,28 +5219,28 @@ the target burn; the `bind` object carries the receipt id, shares, vault,
 original recipient, and issuer wallet; and `dry_run` is `true` when
 `execute=false`, marking the request non-mutating (no events, no signing, no
 exclusion write), and `false` for an executed plan. The optional `funding_log`,
-`resume_note`, `freeze_advisory`, and `precondition` fields appear only when
-they apply (an internal plan omits `funding_log`; an external plan includes it)
-and are omitted rather than sent as null. The `ReportOnly` path returns a
-`terminal` view regardless of `execute` or `close`; with `execute` it also drops
-a funding expectation the terminal stream left behind (see "Dead intent /
-Closed"). `close=true` on `Start` or `Resume` returns a `close` view.
-`burn-excess/expect-funding` signs nothing: on `execute` it records the funding
-expectation (see "Burn excess shares") and returns the plan, whose
-`precondition` names the exact Transfer to broadcast; a stream already past
-`AwaitingFunding` gets a `terminal` view. It returns 409 while another
-burn-excess stream holds an unresolved intent or another stream's expectation is
-open on the same vault, and 422 for a deposit minted to the issuer wallet. With
-`close=true` it closes the stream and releases the poller's hold.
-`burn-excess/external` returns 409 for a stream that never recorded that
-expectation, before reading the chain. The routes return 422 when the request's
-`chain_id` does not match its network, and 504 when the run exceeds 120 seconds,
-where the safe next step depends on the mode: a dry-run wrote nothing — no
-events, expectation, exclusion, or signed intent — so it is safe to retry, while
-an execute leaves the outcome unknown (the burn may be excluded, intended, or
-submitted), so the operator re-invokes the route for the same deposit to read
-the persisted stream and resume it from wherever it stopped. The burn routes
-hold the wallet lock across signing; no route pauses the poller.
+`resume_note`, `freeze_advisory`, `precondition`, and `held_transfers` fields
+appear only when they apply (an internal plan omits `funding_log`; an external
+plan includes it; `held_transfers` lists the same-shape Transfers the balance
+gate counted, see "Same-shape Transfers") and are omitted rather than sent as
+null. The `ReportOnly` path returns a `terminal` view regardless of `execute` or
+`close`; with `execute` it also drops a funding expectation the terminal stream
+left behind (see "Dead intent / Closed"). `close=true` on `Start` or `Resume`
+returns a `close` view. `burn-excess/expect-funding` signs nothing: on `execute`
+it records the funding expectation (see "Burn excess shares") and returns the
+plan, whose `precondition` names the exact Transfer to broadcast; a stream
+already past `AwaitingFunding` gets a `terminal` view. It returns 409 while
+another burn-excess stream holds an unresolved intent. With `close=true` it
+closes the stream and releases the poller's hold. `burn-excess/external` returns
+409 for a stream that never recorded that expectation, before reading the chain.
+The routes return 422 when the request's `chain_id` does not match its network,
+and 504 when the run exceeds 120 seconds, where the safe next step depends on
+the mode: a dry-run wrote nothing — no events, expectation, exclusion, or signed
+intent — so it is safe to retry, while an execute leaves the outcome unknown
+(the burn may be excluded, intended, or submitted), so the operator re-invokes
+the route for the same deposit to read the persisted stream and resume it from
+wherever it stopped. The burn routes hold the wallet lock across signing; no
+route pauses the poller.
 
 Every `burn-excess` route takes the network's RPC endpoint from the service's
 startup-verified chain configuration, never from a request-time environment

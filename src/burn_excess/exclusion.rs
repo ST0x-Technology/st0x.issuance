@@ -16,7 +16,6 @@ use event_sorcery::{EntityList, Never, Reactor, deps};
 use sqlx::{Pool, Sqlite, SqlitePool};
 use tracing::{debug, info};
 
-use super::expectation::clear_funding_expectation;
 use super::{BurnExcess, BurnExcessEvent, FundingTransferId};
 use crate::tokenized_asset::Network;
 
@@ -57,6 +56,7 @@ pub(crate) async fn record_funding_exclusion(
     let deposit = hash_key(deposit_tx_hash);
     let excluded_at = excluded_at.to_rfc3339();
     let log_index = log_index_key(funding.log_index)?;
+    let mut transaction = pool.begin().await?;
 
     sqlx::query(
         "
@@ -76,17 +76,34 @@ pub(crate) async fn record_funding_exclusion(
         ",
     )
     .bind(network)
-    .bind(vault)
-    .bind(tx_hash)
+    .bind(&vault)
+    .bind(&tx_hash)
     .bind(log_index)
     .bind(from_address)
     .bind(to_address)
     .bind(amount)
     .bind(deposit)
     .bind(excluded_at)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
+    sqlx::query(
+        "
+        DELETE FROM burn_excess_held_redemptions
+        WHERE network = ?
+          AND vault = ?
+          AND tx_hash = ?
+          AND log_index = ?
+        ",
+    )
+    .bind(network)
+    .bind(vault)
+    .bind(tx_hash)
+    .bind(log_index)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -123,6 +140,36 @@ pub(crate) async fn is_excluded_funding_log(
     .await?;
 
     Ok(exists)
+}
+
+/// Whether this exact funding log is already excluded for a different deposit
+/// stream. The exclusion insert keeps the first owner on conflict, so a second
+/// stream proving the same log would burn without ever owning its exclusion.
+pub(crate) async fn is_funding_log_excluded_for_another_deposit(
+    pool: &Pool<Sqlite>,
+    funding: &FundingTransferId,
+    deposit_tx_hash: B256,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM burn_excess_funding_exclusions
+            WHERE network = ?
+              AND vault = ?
+              AND tx_hash = ?
+              AND log_index = ?
+              AND deposit_tx_hash <> ?
+        )
+        ",
+    )
+    .bind(funding.network.as_str())
+    .bind(address_key(funding.vault))
+    .bind(hash_key(funding.tx_hash))
+    .bind(log_index_key(funding.log_index)?)
+    .bind(hash_key(deposit_tx_hash))
+    .fetch_one(pool)
+    .await
 }
 
 /// Re-insert every `FundingExclusionRecorded` row from the event store.
@@ -216,10 +263,9 @@ deps!(FundingExclusionReactor, [BurnExcess]);
 
 /// Writes Path B funding identities into the SQL exclusion index when the
 /// aggregate records them, so the transfer poller can skip without scanning
-/// the event store, then drops the stream's funding expectation: the
-/// exclusion now covers the funding log, and the expectation must not go on
-/// holding another Transfer of the same shape. Writing before dropping means
-/// the poller is never left with neither.
+/// the event store. The stream's funding expectation stays: it keeps holding
+/// other Transfers of the same shape until the burn completes or the stream
+/// closes (see [`super::expectation::FundingExpectationReactor`]).
 ///
 /// Live-only: `StoreBuilder` does not catch_up custom reactors for
 /// `Materialized = Nil` entities. Use [`rebuild_funding_exclusion_index`] on
@@ -251,7 +297,6 @@ impl FundingExclusionReactor {
                 *excluded_at,
             )
             .await?;
-            clear_funding_expectation(&self.pool, deposit_tx_hash).await?;
             info!(
                 target: "burn_excess",
                 %deposit_tx_hash,
@@ -392,6 +437,7 @@ mod tests {
                 original_recipient: funding.from,
                 vault: funding.vault,
                 network: funding.network,
+                chain_id: 8453,
                 issuer_wallet: funding.to,
             },
             funding_log_id: funding.clone(),

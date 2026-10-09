@@ -161,7 +161,7 @@ impl TestHarness {
             .await
             .expect("Failed to link account to Alpaca");
 
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let wallet = Address::random();
 
         let whitelist_cmd = AccountCommand::WhitelistWallet { wallet };
 

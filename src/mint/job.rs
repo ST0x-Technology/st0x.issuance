@@ -35,7 +35,6 @@ use super::{
     orchestrator_mint_failure_classification,
 };
 use crate::alpaca::{AlpacaError, AlpacaService, mint_callback_request};
-use crate::burn_excess::has_unresolved_excess_burn_intent;
 use crate::config::VaultMode;
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{
@@ -251,9 +250,8 @@ enum OrchestratorPreSubmitOutcome {
 impl SubmitMintJob {
     /// Refuses while another persisted intent holds this signer's nonce domain.
     ///
-    /// The `active_signer_intents` reservation is network-keyed, so one check
-    /// covers competing mint AND redemption-burn intents on this signer.
-    /// `BurnExcess` holds no reservation row there, so it needs its own check.
+    /// The trigger-maintained reservation is network-keyed and covers mint,
+    /// redemption-burn, and burn-excess intents across processes.
     async fn refuse_behind_wallet_intents(
         &self,
         ctx: &SubmitMintContext,
@@ -266,16 +264,13 @@ impl SubmitMintJob {
             Some(&self.issuer_request_id),
         )
         .await?;
-        let unresolved_excess =
-            has_unresolved_excess_burn_intent(&ctx.pool, None).await?;
-        if !unresolved_intent && !unresolved_excess {
+        if !unresolved_intent {
             return Ok(());
         }
 
         debug!(target: "mint",
             issuer_request_id = %self.issuer_request_id,
             unresolved_intent,
-            unresolved_excess,
             stage,
             "Deferring mint behind another persisted wallet intent"
         );
@@ -2776,7 +2771,6 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::burn_excess::BurnExcessEvent;
     use crate::mint::MintEvent;
     use crate::mint::api::test_utils::TestHarness;
     use crate::mint::recovery::MintRecoveryJob;
@@ -2840,14 +2834,8 @@ mod tests {
         }
     }
 
-    /// Seeds an unresolved `BurnExcess` stream so the wallet intent gate sees a
-    /// competing excess-burn recovery. `BurnExcess` holds no
-    /// `active_signer_intents` row, so the gate reads the event stream directly
-    /// and only `event_type` matters — an empty payload is enough.
-    async fn seed_unresolved_excess_burn(
-        pool: &Pool<Sqlite>,
-        event_type: &str,
-    ) {
+    /// Seeds an unresolved unsigned burn-excess exclusion on Base.
+    async fn seed_unsigned_excess_recovery(pool: &Pool<Sqlite>) {
         sqlx::query(
             "
             INSERT INTO events (
@@ -2863,14 +2851,42 @@ mod tests {
                 'BurnExcess',
                 '0x00000000000000000000000000000000000000000000000000000000000000e1',
                 1,
-                ?,
+                'BurnExcessEvent::FundingExclusionRecorded',
                 '1.0',
-                '{}',
+                '{\"FundingExclusionRecorded\":{\"bind\":{\"network\":\"base\"}}}',
                 '{}'
             )
             ",
         )
-        .bind(event_type)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Seeds an unresolved signed burn-excess recovery on Base.
+    async fn seed_signed_excess_recovery(pool: &Pool<Sqlite>) {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'BurnExcess',
+                '0x00000000000000000000000000000000000000000000000000000000000000e2',
+                1,
+                'BurnExcessEvent::ExcessBurnIntended',
+                '1.0',
+                '{\"ExcessBurnIntended\":{\"bind\":{\"network\":\"base\"}}}',
+                '{}'
+            )
+            ",
+        )
         .execute(pool)
         .await
         .unwrap();
@@ -3282,12 +3298,11 @@ mod tests {
         );
     }
 
-    /// `BurnExcess` holds no `active_signer_intents` reservation, so the
-    /// network-keyed signer-intent query cannot see it. Without the separate
-    /// gate a mint would free-prepare over an excess recovery's nonce.
-    #[traced_test]
+    /// An unsigned burn-excess exclusion arbitrates only another burn-excess
+    /// recovery. Mint preparation may reserve the signer until that recovery
+    /// persists exact signed bytes.
     #[tokio::test]
-    async fn submit_from_minting_defers_to_an_unresolved_excess_burn_intent() {
+    async fn submit_from_minting_proceeds_during_unsigned_excess_recovery() {
         let harness = TestHarness::new().await;
         let issuer_request_id = IssuerMintRequestId::random();
         seed_mint_events(
@@ -3296,35 +3311,25 @@ mod tests {
             events_through_minting(&issuer_request_id),
         )
         .await;
-        // `FundingExcluded` holds no signed transaction yet, and must still
-        // block: its exclusion write is permanent and it will sign against the
-        // same issuer wallet.
-        seed_unresolved_excess_burn(
-            &harness.pool,
-            BurnExcessEvent::FUNDING_EXCLUSION_RECORDED,
-        )
-        .await;
+        // `FundingExcluded` has no signed transaction and therefore holds no
+        // signer nonce reservation.
+        seed_unsigned_excess_recovery(&harness.pool).await;
 
         let vault = Arc::new(MockVaultService::new_success());
         let ctx = submit_ctx(&harness, vault.clone());
 
-        let error = SubmitMintJob {
+        SubmitMintJob {
             issuer_request_id: issuer_request_id.clone(),
             vault: VAULT,
             chain_id: ANVIL_CHAIN_ID,
         }
         .perform(&ctx)
         .await
-        .expect_err("an unresolved excess burn must defer minting");
+        .unwrap();
 
         assert!(
-            matches!(error, MintJobError::UnresolvedWalletIntent { .. }),
-            "expected UnresolvedWalletIntent, got: {error:?}"
-        );
-        assert_eq!(
-            vault.get_call_count(),
-            0,
-            "the blocked job must not prepare a signed transaction"
+            vault.get_call_count() > 0,
+            "the mint must prepare and submit while the exclusion is unsigned"
         );
         let intent_count: i64 = sqlx::query_scalar(
             "
@@ -3339,81 +3344,48 @@ mod tests {
         .fetch_one(&harness.pool)
         .await
         .unwrap();
-        assert_eq!(
-            intent_count, 0,
-            "a blocked mint must persist no signed intent"
-        );
-        assert!(logs_contain_at!(
-            Level::DEBUG,
-            &[
-                "Deferring mint behind another persisted wallet intent",
-                "stage=\"preparation\"",
-                "unresolved_intent=false",
-                "unresolved_excess=true"
-            ]
-        ));
+        assert_eq!(intent_count, 1, "the mint must persist its signed intent");
     }
 
-    /// The rebroadcast path gates too: a persisted mint intent must not go back
-    /// on the wire while an excess recovery is signing against the same wallet.
     #[traced_test]
     #[tokio::test]
-    async fn submit_from_tx_intended_defers_to_an_unresolved_excess_burn_intent()
-     {
+    async fn submit_from_minting_waits_for_signed_excess_recovery() {
         let harness = TestHarness::new().await;
         let issuer_request_id = IssuerMintRequestId::random();
         seed_mint_events(
             &harness.pool,
             &issuer_request_id,
-            events_through_tx_intended(&issuer_request_id),
+            events_through_minting(&issuer_request_id),
         )
         .await;
-        seed_unresolved_excess_burn(
-            &harness.pool,
-            BurnExcessEvent::EXCESS_BURN_INTENDED,
-        )
-        .await;
+        seed_signed_excess_recovery(&harness.pool).await;
 
         let vault = Arc::new(MockVaultService::new_success());
         let ctx = submit_ctx(&harness, vault.clone());
-
-        let error = SubmitMintJob {
+        let result = SubmitMintJob {
             issuer_request_id: issuer_request_id.clone(),
             vault: VAULT,
             chain_id: ANVIL_CHAIN_ID,
         }
         .perform(&ctx)
-        .await
-        .expect_err("an unresolved excess burn must defer submission");
+        .await;
 
-        assert!(
-            matches!(error, MintJobError::UnresolvedWalletIntent { .. }),
-            "expected UnresolvedWalletIntent, got: {error:?}"
-        );
-        let submitted_count: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM events
-            WHERE aggregate_type = 'Mint'
-              AND aggregate_id = ?
-              AND event_type = 'MintEvent::MintTxSubmitted'
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(&harness.pool)
-        .await
-        .unwrap();
+        assert!(matches!(
+            result,
+            Err(MintJobError::UnresolvedWalletIntent {
+                issuer_request_id: blocked_id,
+            }) if blocked_id == issuer_request_id
+        ));
         assert_eq!(
-            submitted_count, 0,
-            "a blocked rebroadcast must record no submission"
+            vault.get_call_count(),
+            0,
+            "a signed burn-excess intent must block mint preparation"
         );
         assert!(logs_contain_at!(
             Level::DEBUG,
             &[
+                "submit_from_minting_waits_for_signed_excess_recovery",
                 "Deferring mint behind another persisted wallet intent",
-                "stage=\"submission\"",
-                "unresolved_intent=false",
-                "unresolved_excess=true"
             ]
         ));
     }

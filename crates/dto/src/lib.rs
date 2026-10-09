@@ -769,6 +769,41 @@ impl<'de> Deserialize<'de> for DecimalShares {
     }
 }
 
+/// Exact issuer-wallet inbound Transfer an operator has reconciled outside the
+/// ordinary redemption/exclusion terminal paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AcknowledgedInboundTransfer {
+    pub tx_hash: B256,
+    pub log_index: u64,
+}
+
+impl std::fmt::Display for AcknowledgedInboundTransfer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.tx_hash, self.log_index)
+    }
+}
+
+impl FromStr for AcknowledgedInboundTransfer {
+    type Err = AcknowledgedInboundTransferError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (tx_hash, log_index) = value
+            .rsplit_once(':')
+            .ok_or(AcknowledgedInboundTransferError::MissingSeparator)?;
+        Ok(Self { tx_hash: tx_hash.parse()?, log_index: log_index.parse()? })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AcknowledgedInboundTransferError {
+    #[error("expected TX_HASH:LOG_INDEX")]
+    MissingSeparator,
+    #[error(transparent)]
+    Hex(#[from] alloy_primitives::hex::FromHexError),
+    #[error(transparent)]
+    ParseInt(#[from] std::num::ParseIntError),
+}
+
 /// Fields shared by every burn-excess request body. `#[serde(flatten)]` folds
 /// these into each, so a field added here changes every route's contract at
 /// once, never just one.
@@ -788,6 +823,10 @@ pub struct BurnExcessCommon {
     /// Optional incident or ticket id for the audit trail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident_id: Option<String>,
+    /// Exact inbound Transfers manually reconciled by an operator. Each
+    /// identity is proven on-chain and persisted with the signed burn intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged_inflows: Vec<AcknowledgedInboundTransfer>,
     pub network: Network,
     /// Validated against the network's configured chain entry.
     pub chain_id: u64,

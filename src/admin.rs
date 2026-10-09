@@ -453,7 +453,16 @@ async fn load_reprocess_context(
                         block_number: *block_number,
                         detected_at: *detected_at,
                         burn_mode: *burn_mode,
+                        account_attribution: None,
                     });
+                }
+            }
+            RedemptionEvent::AccountAttributionAnchored {
+                attribution, ..
+            } => {
+                if let Some(metadata) = &mut metadata {
+                    metadata.account_attribution =
+                        Some(Box::new(attribution.clone()));
                 }
             }
             RedemptionEvent::AlpacaCalled {
@@ -4577,6 +4586,7 @@ mod tests {
         AlpacaCalledData, PostAlpacaRecoveryInput, classify_journal_poll_error,
         load_reprocess_context, recover_post_alpaca,
     };
+    use crate::account::AlpacaAccountNumber;
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -4604,8 +4614,9 @@ mod tests {
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
-        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
+        IssuerRedemptionRequestId, Redemption, RedemptionAccountAttribution,
+        RedemptionCommand, RedemptionError, RedemptionEvent,
+        RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
     use crate::tokenized_asset::schedule::FreezeScheduler;
@@ -5009,6 +5020,7 @@ mod tests {
             ),
             block_number: 12345,
             detected_at: Utc::now(),
+            account_attribution: None,
         }
     }
 
@@ -5273,6 +5285,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    account_attribution: None,
                 },
             )
             .await
@@ -5328,6 +5341,7 @@ mod tests {
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
                     burn_mode: metadata.burn_mode,
+                    account_attribution: None,
                 },
             )
             .await
@@ -5363,6 +5377,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_alpaca_reprocess_restores_historical_account_attribution() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let metadata = test_metadata();
+        let attribution = RedemptionAccountAttribution {
+            client_id: ClientId::new(),
+            alpaca_account: AlpacaAccountNumber("anchored".into()),
+        };
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: metadata.network,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    burn_mode: metadata.burn_mode,
+                    account_attribution: Some(attribution.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "pre-Alpaca failure".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context =
+            load_reprocess_context(&pool, &metadata.issuer_request_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            context.metadata.account_attribution.as_deref(),
+            Some(&attribution)
+        );
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Reprocess {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    metadata: context.metadata,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reprocessed =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        let Redemption::Detected { metadata } = reprocessed else {
+            panic!("expected reprocessed Detected state, got {reprocessed:?}");
+        };
+        assert_eq!(metadata.account_attribution.as_deref(), Some(&attribution));
+    }
+
+    #[tokio::test]
     async fn test_load_reprocess_context_derives_retry_id_from_history() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
@@ -5387,6 +5466,7 @@ mod tests {
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                 },
             )
             .await
@@ -6076,6 +6156,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    account_attribution: None,
                 },
             )
             .await
@@ -6115,6 +6196,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    account_attribution: None,
                 },
             )
             .await
@@ -7545,6 +7627,7 @@ mod tests {
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
                     network: Network::Base,
+                    account_attribution: None,
                 },
             )
             .await
@@ -9253,6 +9336,7 @@ mod tests {
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
                     burn_mode: VaultMode::VaultDirect,
+                    account_attribution: None,
                 },
             )
             .await
@@ -9394,6 +9478,7 @@ mod tests {
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
                     block_number: metadata.block_number,
+                    account_attribution: None,
                 },
             )
             .await
@@ -10286,6 +10371,7 @@ mod tests {
                 called_at: now,
                 alpaca_journal_completed_at: now,
                 external_tx_id: None,
+                account_attribution: None,
                 resumed_at: now,
             },
         ];

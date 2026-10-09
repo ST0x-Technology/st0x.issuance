@@ -99,7 +99,19 @@ impl JournalManager {
             return Ok(());
         };
 
-        let alpaca_account = self.lookup_account_for_recovery(wallet).await?;
+        let alpaca_account = self
+            .load_aggregate(issuer_request_id)
+            .await?
+            .and_then(|aggregate| {
+                aggregate
+                    .metadata()
+                    .and_then(|metadata| metadata.account_attribution.as_ref())
+                    .map(|attribution| attribution.alpaca_account.clone())
+            });
+        let alpaca_account = match alpaca_account {
+            Some(alpaca_account) => alpaca_account,
+            None => self.lookup_account_for_recovery(wallet).await?,
+        };
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering AlpacaCalled redemption - resuming polling"
@@ -673,8 +685,8 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
-        Redemption, RedemptionCommand, RedemptionServices, RedemptionView,
-        UnderlyingSymbol,
+        Redemption, RedemptionAccountAttribution, RedemptionCommand,
+        RedemptionServices, RedemptionView, UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol};
@@ -722,6 +734,21 @@ mod tests {
         issuer_request_id: &IssuerRedemptionRequestId,
         tokenization_request_id: &TokenizationRequestId,
     ) {
+        create_test_redemption_in_alpaca_called_state_with_attribution(
+            store,
+            issuer_request_id,
+            tokenization_request_id,
+            None,
+        )
+        .await;
+    }
+
+    async fn create_test_redemption_in_alpaca_called_state_with_attribution(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tokenization_request_id: &TokenizationRequestId,
+        account_attribution: Option<RedemptionAccountAttribution>,
+    ) {
         store
             .send(
                 issuer_request_id,
@@ -739,6 +766,7 @@ mod tests {
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                     ),
                     block_number: 12345,
+                    account_attribution,
                 },
             )
             .await
@@ -2053,6 +2081,40 @@ mod tests {
             matches!(result, Err(JournalManagerError::AccountNotFound { .. })),
             "Expected AccountNotFound, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn anchored_account_recovers_alpaca_called_after_wallet_unlink() {
+        let (store, pool) = setup_test_store().await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("tok-anchored-account");
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
+            issuer_request_id.clone(),
+        ));
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+        create_test_redemption_in_alpaca_called_state_with_attribution(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+            Some(RedemptionAccountAttribution {
+                client_id: ClientId::new(),
+                alpaca_account: AlpacaAccountNumber("anchored".into()),
+            }),
+        )
+        .await;
+
+        manager.recover_alpaca_called_redemptions().await;
+
+        assert!(matches!(
+            store.load(&issuer_request_id).await.unwrap().unwrap(),
+            Redemption::Burning { .. }
+        ));
     }
 
     #[tokio::test]

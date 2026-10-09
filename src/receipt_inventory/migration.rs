@@ -3590,6 +3590,7 @@ mod tests {
                     &redemption_id,
                     RedemptionCommand::Detect {
                         issuer_request_id: redemption_id.clone(),
+                        account_attribution: None,
                         underlying: underlying.clone(),
                         token,
                         network: Network::Base,
