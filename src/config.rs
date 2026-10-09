@@ -2972,7 +2972,7 @@ mod tests {
     /// Robinhood Chain's approved tokenized-asset listing. Pinning every pair
     /// catches a missing symbol, a substituted symbol, or a wrong address in
     /// either deploy config.
-    const ROBINHOOD_WRAPPERS: [(&str, &str); 57] = [
+    const ROBINHOOD_WRAPPERS: [(&str, &str); 58] = [
         ("AAPL", "0x1B2A2C8c3621642c64cf1245016488fA0f76da78"),
         ("AIR.PA", "0xc3bc6EEf91FfAeBACB13f4c48aC0515C820d2b0c"),
         ("AMAT", "0x44DE27A07B33CD708A49fa79629fAC1df03C56d3"),
@@ -3030,6 +3030,7 @@ mod tests {
         ("TTWO", "0x1D6F0763e58FA6d472d470Eaaef0a4C08080d208"),
         ("VWO", "0x01EE8b582147D1Aa8A8f2Adc2EBB91fA60082AB0"),
         ("WEN", "0x441Eaae749B7BA0C4462F2b19a47fBe8De0DFac2"),
+        ("WMT", "0x23A0944e82766242dA76cb0f77e0b7812e5487EA"),
     ];
 
     /// An EU listing whose underlying contains a dot. TOML bare keys cannot,
