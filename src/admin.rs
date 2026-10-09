@@ -10,9 +10,12 @@ use rocket::http::{ContentType, Status};
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use rocket::{get, post};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::{Pool, Sqlite};
-use st0x_issuance_dto::ScheduleFreezeWindowRequest;
+use st0x_issuance_dto::{
+    CloseMintRequest, CloseRedemptionRequest, ForceCompleteRedemptionRequest,
+    ScheduleFreezeWindowRequest,
+};
 use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -1917,13 +1920,6 @@ const fn map_redemption_error(
     }
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct CloseRedemptionRequest {
-    reason: String,
-    #[schema(value_type = Option<String>)]
-    acknowledged_unresolved_burn_tx_hash: Option<B256>,
-}
-
 /// Admin endpoint to close a redemption that cannot be automatically recovered.
 ///
 /// Valid from `Failed`, `Burning`, or `BurnSubmitted` — the honest terminal
@@ -2044,18 +2040,6 @@ async fn close_redemption_logic(
         message,
         manual_replacement: None,
     }))
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct ForceCompleteRedemptionRequest {
-    /// On-chain transaction hash that burned the redemption's shares. Verified
-    /// against the chain before the redemption is terminalized.
-    #[schema(value_type = String)]
-    burn_tx_hash: B256,
-    /// Operator-supplied audit reason recorded with the terminal event.
-    reason: String,
-    #[schema(value_type = Option<String>)]
-    acknowledged_unresolved_burn_tx_hash: Option<B256>,
 }
 
 /// Admin endpoint to terminalize a redemption stuck in `Burning`/`BurnSubmitted`
@@ -2547,23 +2531,6 @@ impl<'r> Responder<'r, 'static> for ReprocessMintError {
             }
         }
     }
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct CloseMintRequest {
-    reason: String,
-    /// Required when the mint still holds a prepared deposit identity: must
-    /// equal the exact `MintTxIntended` / prepared hash. Omit only when the
-    /// mint has no prepared identity.
-    #[schema(value_type = Option<String>)]
-    acknowledged_unresolved_mint_tx_hash: Option<B256>,
-    /// Required only to close a `NonceReplayUnresolved` mint, and must
-    /// exactly echo that mint's persisted authorization nonce; rejected on
-    /// any other mint. Records that an operator verified the nonce's
-    /// absence against a chain view outside this bot.
-    #[serde(default)]
-    #[schema(value_type = Option<String>)]
-    acknowledged_unresolved_mint_nonce: Option<B256>,
 }
 
 /// Admin endpoint to close a mint that cannot be automatically recovered.

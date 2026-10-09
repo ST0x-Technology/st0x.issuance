@@ -1665,8 +1665,12 @@ path. The offline `issuer burn-excess external` CLI meets this by running with
 the whole issuer service (and poller) stopped, in the same family as the
 `migrate-receipts` sequence, and the Path B plan output states the precondition
 before the confirmation prompt. The `POST /ops/breakglass/burn-excess/external`
-route instead pauses the network's poller for the run and resumes it on every
-exit path, so it needs no service stop.
+route pauses the network's poller only for the run, from when the request
+arrives until it returns. That does not cover the window between the funding
+Transfer being mined and the request arriving, nor the gap between a dry run and
+its `execute`, so until [RAI-2958](https://linear.app/makeitrain/issue/RAI-2958)
+closes that window the offline CLI with the service stopped stays the operating
+path for Path B.
 
 **Non-goals:** Alpaca journal / release of backing; moving the receipt to a
 liquidity wallet; block-range skip or manual checkpoint mutation; general
@@ -4978,14 +4982,21 @@ network's poller (the current tick finished, no new one started) for the run and
 resumes it on every exit path; it returns 422 when the request's `chain_id` does
 not match its network or no poller runs for that network. Two further failures
 follow from the quiescence design and differ in what the operator does next. 503
-when the poller does not confirm it parked within 30 seconds: nothing happened
-(no exclusion written, nothing signed) and the request can simply be retried.
-504 when the run exceeds 120 seconds, where the safe next step depends on the
-mode: a dry-run wrote nothing either — no events, exclusion, or signed intent —
-so it is likewise safe to retry, while an execute leaves the outcome unknown
-(the burn may be excluded, intended, or submitted), so the operator re-invokes
-the route for the same deposit to read the persisted stream and resume it from
-wherever it stopped.
+when the poller cannot be paused within 30 seconds, a window that includes any
+wait for another breakglass operation already holding that network's poller, so
+a second external run is refused rather than queued behind the first: nothing
+happened (no exclusion written, nothing signed). The refusal is logged with the
+request's `issuer_request_id` and one of three causes: another breakglass run
+still holds the poller (including one released too late in the window for the
+poller to re-park), so retry once it finishes; the poller did not park; or the
+poller has exited. The last two mean redemption detection on that network is
+itself broken, so the operator treats that as the incident before retrying. 504
+when the run exceeds 120 seconds, where the safe next step depends on the mode:
+a dry-run wrote nothing either — no events, exclusion, or signed intent — so it
+is likewise safe to retry, while an execute leaves the outcome unknown (the burn
+may be excluded, intended, or submitted), so the operator re-invokes the route
+for the same deposit to read the persisted stream and resume it from wherever it
+stopped.
 
 The internal route holds the wallet lock across signing but pauses no poller, so
 it has no 503; it is bounded the same way, returning 504 when its run exceeds
@@ -5022,18 +5033,19 @@ retained. It also returns 503 when another request holds the refresh slot inside
 that throttle interval and the retained set does not contain the token's key id,
 including during a cold-cache request or key rotation. These failures never
 become a wrong-audience or forged-token acceptance. Every `InternalAuth`
-operator route now has an `/ops` twin; `move-receipts` and `confirm-custody`
-stay offline `issuer` CLI verbs.
+operator route now has an `/ops` twin; `move-receipts`, `confirm-custody`, and
+the `Failed`-redemption `force-complete-redemption` stay offline `issuer` CLI
+verbs.
 
 #### Operator client (`st0x-issuance-client`)
 
-S01 operators reach the `read`, `debug`, and `capital` tiers through the
-`st0x-issuance-client` binary (workspace package `st0x-issuance-ops`,
-`crates/ops-client`), the S01 counterpart of the T0 liquidity client. It is a
-thin typed transport: every verb maps to exactly one `/ops/<tier>/...` route,
-and it holds no production secret and no domain logic, since the bot validates
-and decides everything. Breakglass routes, direct Alpaca account operations, and
-T0 liquidity are out of its scope. The library of the same name
+S01 operators reach all four tiers (`read`, `debug`, `capital`, and
+`breakglass`) through the `st0x-issuance-client` binary (workspace package
+`st0x-issuance-ops`, `crates/ops-client`), the S01 counterpart of the T0
+liquidity client. It is a thin typed transport: every verb maps to exactly one
+`/ops/<tier>/...` route, and it holds no production secret and no domain logic,
+since the bot validates and decides everything. Direct Alpaca account operations
+and T0 liquidity are out of its scope. The library of the same name
 (`crates/client`, package `st0x-issuance-client`) is unrelated: it is the
 liquidity bot's `X-API-KEY` client for the service API.
 
@@ -5076,11 +5088,21 @@ key or secret-file option.
 
 Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
 (`RegisterAccountRequest`, `WhitelistWalletRequest`, `AddTokenizedAssetRequest`,
-`ScheduleFreezeWindowRequest`), so client and bot cannot drift on a body shape.
+`ScheduleFreezeWindowRequest`, `ForceCompleteRedemptionRequest`,
+`CloseRedemptionRequest`, `CloseMintRequest`, `BurnExcessInternalRequest`,
+`BurnExcessExternalRequest`), so client and bot cannot drift on a body shape.
 Every underlying symbol argument is upper-cased at parse time, as the offline
 `issuer` CLI does, because the bot keys a listing or freeze window by the symbol
-exactly as a body carries it. Path segments are percent-encoded and redirects
-are never followed.
+exactly as a body carries it. The burn-excess `shares` amount is a
+`DecimalShares`: its decimal string is parsed to 18-decimal fixed point at
+construction, so the client refuses a zero, negative, or over-precise amount
+before sending, with the same rules the bot and the offline CLI apply. Path
+segments are percent-encoded and redirects are never followed. A request may run
+up to 180 seconds, above the external burn-excess route's own 30-second poller
+pause plus 120-second run bound, so the bot's 503 or 504 reaches the operator
+instead of a client-side timeout. That also requires the load balancer's backend
+timeout for the breakglass tier to exceed those 150 seconds; a shorter one cuts
+the request off first with its own 504.
 
 On success, stdout carries exactly the response body as one compact JSON line
 (the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
@@ -5101,13 +5123,17 @@ outage during sign-in. Failures are explained:
 - **404:** an unknown id or asset, or `/ops` is not mounted on that deployment
   (no `OPS_API_*_AUDIENCE` configured).
 - **503:** the deployment could not serve the request, for example the bot could
-  not fetch Google's IAP keys or the load balancer had no healthy backend. A
-  read can be retried; before retrying a write, the logs show whether it was
-  applied.
+  not fetch Google's IAP keys, a burn-excess transfer poller could not be paused
+  in time (it did not park, or another breakglass run held it), or the load
+  balancer had no healthy backend. A read can be retried; before retrying a
+  write, the logs show whether it was applied.
 - **502 or 504:** a gateway gave up waiting, either the load balancer's backend
-  timeout (an `approve-orchestrator` waiting for its receipt can outlast it) or
-  the bot's own wait on the chain, so the outcome is unknown. A read can be
-  retried; before retrying a write, the logs show whether it was applied.
+  timeout (an `approve-orchestrator` waiting for its receipt, or a long
+  burn-excess run, can outlast it) or the bot's own bound (its wait on the
+  chain, or a burn-excess run's), so the outcome is unknown. A read can be
+  retried. A burn-excess dry-run changed nothing and an `--execute` is resumed
+  by re-running the same command, which reads the persisted burn stream; for any
+  other write, the logs show whether it was applied before a retry.
 - **No response:** a connection that timed out or dropped after the request was
   sent leaves the outcome unknown, and the client says so.
 - **Unwritable output:** the bot answered with success but stdout could not take
@@ -5119,27 +5145,32 @@ carries an S01 Cloud Logging link for the environment's project
 (`s01-issuance-staging` or `s01-issuance`), searching for the command's id or
 symbol when it has one and for warnings otherwise.
 
-| Command                                                            | Route                                                                |
-| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `read stuck`                                                       | `GET /ops/read/stuck`                                                |
-| `read orchestrator-health`                                         | `GET /ops/read/orchestrator-health`                                  |
-| `read network-telemetry`                                           | `GET /ops/read/network-telemetry`                                    |
-| `read wrapped-transfers [--limit] [--before-*]`                    | `GET /ops/read/wrapped-transfers`                                    |
-| `read status <underlying>`                                         | `GET /ops/read/status/<underlying>`                                  |
-| `read orchestrator-preflight <network> [--asset]...`               | `GET /ops/read/orchestrator-preflight/<network>`                     |
-| `debug recover-redemption <id>`                                    | `POST /ops/debug/recover/redemption/<id>`                            |
-| `debug reprocess-mint <id>`                                        | `POST /ops/debug/reprocess/mint/<id>`                                |
-| `debug verify-orchestrator-signing <network> <underlying>`         | `POST /ops/debug/orchestrator-verify-signing/<network>/<underlying>` |
-| `debug register-account --email`                                   | `POST /ops/debug/accounts`                                           |
-| `debug whitelist-wallet <client_id> <wallet>`                      | `POST /ops/debug/accounts/<client_id>/wallets`                       |
-| `debug unwhitelist-wallet <client_id> <wallet>`                    | `DELETE /ops/debug/accounts/<client_id>/wallets/<wallet>`            |
-| `debug tokenized-asset <underlying> --network`                     | `GET /ops/debug/tokenized-assets/<underlying>?network=`              |
-| `debug add-tokenized-asset --underlying --token --network --vault` | `POST /ops/debug/tokenized-assets`                                   |
-| `debug snapshot <aggregate_type> <aggregate_id>`                   | `GET /ops/debug/snapshots/<aggregate_type>/<aggregate_id>`           |
-| `capital freeze <underlying>`                                      | `POST /ops/capital/freeze/<underlying>`                              |
-| `capital unfreeze <underlying>`                                    | `POST /ops/capital/unfreeze/<underlying>`                            |
-| `capital schedule-freeze --underlying --freeze-at --unfreeze-at`   | `POST /ops/capital/freeze-schedules`                                 |
-| `capital approve-orchestrator <network> <underlying>`              | `POST /ops/capital/orchestrator-approve/<network>/<underlying>`      |
+| Command                                                               | Route                                                                |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `read stuck`                                                          | `GET /ops/read/stuck`                                                |
+| `read orchestrator-health`                                            | `GET /ops/read/orchestrator-health`                                  |
+| `read network-telemetry`                                              | `GET /ops/read/network-telemetry`                                    |
+| `read wrapped-transfers [--limit] [--before-*]`                       | `GET /ops/read/wrapped-transfers`                                    |
+| `read status <underlying>`                                            | `GET /ops/read/status/<underlying>`                                  |
+| `read orchestrator-preflight <network> [--asset]...`                  | `GET /ops/read/orchestrator-preflight/<network>`                     |
+| `debug recover-redemption <id>`                                       | `POST /ops/debug/recover/redemption/<id>`                            |
+| `debug reprocess-mint <id>`                                           | `POST /ops/debug/reprocess/mint/<id>`                                |
+| `debug verify-orchestrator-signing <network> <underlying>`            | `POST /ops/debug/orchestrator-verify-signing/<network>/<underlying>` |
+| `debug register-account --email`                                      | `POST /ops/debug/accounts`                                           |
+| `debug whitelist-wallet <client_id> <wallet>`                         | `POST /ops/debug/accounts/<client_id>/wallets`                       |
+| `debug unwhitelist-wallet <client_id> <wallet>`                       | `DELETE /ops/debug/accounts/<client_id>/wallets/<wallet>`            |
+| `debug tokenized-asset <underlying> --network`                        | `GET /ops/debug/tokenized-assets/<underlying>?network=`              |
+| `debug add-tokenized-asset --underlying --token --network --vault`    | `POST /ops/debug/tokenized-assets`                                   |
+| `debug snapshot <aggregate_type> <aggregate_id>`                      | `GET /ops/debug/snapshots/<aggregate_type>/<aggregate_id>`           |
+| `capital freeze <underlying>`                                         | `POST /ops/capital/freeze/<underlying>`                              |
+| `capital unfreeze <underlying>`                                       | `POST /ops/capital/unfreeze/<underlying>`                            |
+| `capital schedule-freeze --underlying --freeze-at --unfreeze-at`      | `POST /ops/capital/freeze-schedules`                                 |
+| `capital approve-orchestrator <network> <underlying>`                 | `POST /ops/capital/orchestrator-approve/<network>/<underlying>`      |
+| `breakglass force-complete-redemption <id> --burn-tx-hash --reason`   | `POST /ops/breakglass/force-complete/redemption/<id>`                |
+| `breakglass close-redemption <id> --reason`                           | `POST /ops/breakglass/close/redemption/<id>`                         |
+| `breakglass close-mint <id> --reason`                                 | `POST /ops/breakglass/close/mint/<id>`                               |
+| `breakglass burn-excess internal --issuer-request-id ... [--execute]` | `POST /ops/breakglass/burn-excess/internal`                          |
+| `breakglass burn-excess external --funding-tx-hash ... [--execute]`   | `POST /ops/breakglass/burn-excess/external`                          |
 
 ### Recover Stuck Aggregates
 

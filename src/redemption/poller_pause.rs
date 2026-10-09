@@ -18,21 +18,45 @@ use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
 use crate::tokenized_asset::Network;
 
-/// How long [`PollerPauseControl::pause`] waits for the poller to confirm it
-/// parked before giving up. The park point is the top of the poll loop, so a
+/// How long [`PollerPauseControl::pause`] waits to pause the poller before
+/// giving up: first for any other pauser's guard to drop, then for the poller
+/// to confirm it parked. The park point is the top of the poll loop, so a
 /// pause waits out at most the current `poll_once` pass (the inter-tick sleeps
 /// yield to a pause at once). In steady state - when a breakglass burn is run -
 /// a pass is one block-number read plus a small `eth_getLogs` per vault, well
 /// under this window. A poller that has not parked within it is stuck or
-/// mid-catch-up, so the pause is refused with `PollerNotParked` rather than
-/// blocking the handler indefinitely.
+/// mid-catch-up, and a poller another breakglass run still holds is busy, so
+/// the pause is refused with a [`PollerPauseRefused`] rather than blocking or
+/// queueing the handler without bound.
 const POLLER_PARK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The poller did not confirm it parked within [`POLLER_PARK_TIMEOUT`], so the
-/// caller must not mutate state the live poller would race.
+/// The least of the window a pause must still have once it holds the poller
+/// before a park timeout is blamed on the poller rather than on the handoff
+/// from another pauser: half the window, far above a healthy pass.
+const MIN_PARK_BUDGET: Duration = Duration::from_secs(15);
+
+/// Why the poller could not be paused within [`POLLER_PARK_TIMEOUT`]; the
+/// caller must not mutate state the live poller would race. The causes differ
+/// in what an operator does next, so they stay distinct in the log.
 #[derive(Debug, thiserror::Error)]
-#[error("the transfer poller did not confirm it parked")]
-pub(crate) struct PollerNotParked;
+pub(crate) enum PollerPauseRefused {
+    /// Another breakglass operation held the poller for all or most of the
+    /// window (released too late for even a healthy pass to re-park): routine
+    /// contention, retry once it finishes.
+    #[error(
+        "another breakglass operation held the transfer poller for (most of) \
+         the window; retry once it finishes"
+    )]
+    Busy,
+    /// The poller did not confirm it parked: it is stuck or mid-catch-up, so
+    /// redemption detection on that network is itself in trouble.
+    #[error("the transfer poller did not confirm it parked; it may be stuck")]
+    NotParked,
+    /// The poller task has exited, so redemptions on that network are not
+    /// being detected at all.
+    #[error("the transfer poller has exited")]
+    Exited,
+}
 
 /// Per-network pause controls, reachable from Rocket state so a handler can
 /// quiesce the poller watching a given network's vaults.
@@ -61,8 +85,10 @@ pub(crate) struct PollerPauseControl {
     parked: watch::Receiver<bool>,
     /// Serializes concurrent pausers so one guard's resume cannot free the
     /// poller while another pauser is still mutating; held for the guard's
-    /// lifetime.
-    serialize: Arc<Mutex<()>>,
+    /// lifetime. Holds whether the last pauser to hold it got the poller to
+    /// park, so a pauser that waited behind it can tell contention from a
+    /// stuck poller.
+    serialize: Arc<Mutex<bool>>,
 }
 
 impl PollerPauseControl {
@@ -71,21 +97,43 @@ impl PollerPauseControl {
     /// resumes the poller when dropped, so a caller cannot forget to resume on
     /// an error or panic path.
     ///
-    /// Pausers are serialized: a second caller waits until the first guard
-    /// drops (and the poller resumes) before it pauses, so overlapping
-    /// breakglass ops cannot resume the poller out from under one another.
+    /// Pausers are serialized: a second caller waits for the first guard to
+    /// drop (and the poller to resume) before it pauses, so overlapping
+    /// breakglass ops cannot resume the poller out from under one another. That
+    /// wait counts against the same window, so a second pauser is refused
+    /// rather than queued without bound behind a long first run.
     ///
-    /// Returns [`PollerNotParked`] when the poller does not confirm it parked
-    /// within [`POLLER_PARK_TIMEOUT`] (including a poller that has exited),
-    /// leaving the poller running rather than blocking the caller forever.
+    /// Returns [`PollerPauseRefused`] when the poller cannot be paused within
+    /// [`POLLER_PARK_TIMEOUT`] (another guard still held, a poller that never
+    /// parks, or one that has exited), leaving the poller as it was rather than
+    /// blocking the caller forever.
     pub(crate) async fn pause(
         &self,
-    ) -> Result<PollerPauseGuard, PollerNotParked> {
-        let permit = Arc::clone(&self.serialize).lock_owned().await;
+    ) -> Result<PollerPauseGuard, PollerPauseRefused> {
+        // One deadline covers the wait for another pauser's guard and the
+        // park itself, timed separately only so a refusal says which it was.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(POLLER_PARK_TIMEOUT)
+            .ok_or(PollerPauseRefused::NotParked)?;
+        let mut permit =
+            if let Ok(permit) = Arc::clone(&self.serialize).try_lock_owned() {
+                permit
+            } else {
+                tokio::time::timeout_at(
+                    deadline,
+                    Arc::clone(&self.serialize).lock_owned(),
+                )
+                .await
+                .map_err(|_| PollerPauseRefused::Busy)?
+            };
+        let previous_holder_parked = *permit;
+        *permit = false;
+        let park_budget =
+            deadline.saturating_duration_since(tokio::time::Instant::now());
 
         let mut parked = self.parked.clone();
         let pause = self.pause.clone();
-        let confirmed = tokio::time::timeout(POLLER_PARK_TIMEOUT, async move {
+        let confirmed = tokio::time::timeout_at(deadline, async move {
             // The previous guard's resume may not have reached the poller
             // yet, so `parked` can still hold that request's stale `true`.
             // Wait for the poller to report itself running before asking
@@ -94,22 +142,38 @@ impl PollerPauseControl {
             // stale one would hand out a guard while the poller goes on to
             // run a tick - the exact race the pause exists to prevent.
             while *parked.borrow_and_update() {
-                parked.changed().await.map_err(|_| ())?;
+                parked
+                    .changed()
+                    .await
+                    .map_err(|_| PollerPauseRefused::Exited)?;
             }
 
-            pause.send(true).map_err(|_| ())?;
-            let guard = PollerPauseGuard { pause, _permit: permit };
+            pause.send(true).map_err(|_| PollerPauseRefused::Exited)?;
+            let mut guard = PollerPauseGuard { pause, permit };
             while !*parked.borrow_and_update() {
-                parked.changed().await.map_err(|_| ())?;
+                parked
+                    .changed()
+                    .await
+                    .map_err(|_| PollerPauseRefused::Exited)?;
             }
-            Ok::<PollerPauseGuard, ()>(guard)
+            *guard.permit = true;
+            Ok(guard)
         })
         .await;
 
-        match confirmed {
-            Ok(Ok(guard)) => Ok(guard),
-            _ => Err(PollerNotParked),
-        }
+        // A pause that got the poller back from another guard with less than
+        // `MIN_PARK_BUDGET` left may not leave even a healthy pass time to
+        // finish and re-park, so that elapse is contention. With at least that
+        // much of the window, or when the pauser it waited behind never got
+        // the poller to park either, a poller that still did not park is
+        // stuck.
+        confirmed.unwrap_or(Err(
+            if park_budget < MIN_PARK_BUDGET && previous_holder_parked {
+                PollerPauseRefused::Busy
+            } else {
+                PollerPauseRefused::NotParked
+            },
+        ))
     }
 
     /// Test hook: a receiver on the poller's parked signal. The poller writes
@@ -127,8 +191,9 @@ impl PollerPauseControl {
 pub(crate) struct PollerPauseGuard {
     pause: watch::Sender<bool>,
     /// Held so the serialize mutex is released (unblocking the next pauser)
-    /// only after this guard drops and the poller resumes.
-    _permit: OwnedMutexGuard<()>,
+    /// only after this guard drops and the poller resumes; set once the
+    /// poller confirmed it parked for this guard.
+    permit: OwnedMutexGuard<bool>,
 }
 
 impl Drop for PollerPauseGuard {
@@ -188,7 +253,7 @@ pub(crate) fn poller_pause() -> (PollerPauseControl, PollerPause) {
         PollerPauseControl {
             pause: pause_tx,
             parked: parked_rx,
-            serialize: Arc::new(Mutex::new(())),
+            serialize: Arc::new(Mutex::new(true)),
         },
         PollerPause { pause: pause_rx, parked: parked_tx },
     )
@@ -251,22 +316,28 @@ mod tests {
     }
 
     /// A poller that has already exited cannot confirm it parked, so pause
-    /// reports `PollerNotParked` promptly instead of hanging.
+    /// reports `Exited` promptly instead of hanging.
     #[tokio::test(start_paused = true)]
-    async fn pause_of_an_exited_poller_reports_not_parked() {
+    async fn pause_of_an_exited_poller_reports_exited() {
         let (control, pause) = poller_pause();
         drop(pause);
-        assert!(control.pause().await.is_err());
+        assert!(matches!(
+            control.pause().await,
+            Err(PollerPauseRefused::Exited)
+        ));
     }
 
     /// A poller that never parks must not stall the caller forever: pause gives
-    /// up after `POLLER_PARK_TIMEOUT` and reports `PollerNotParked`.
+    /// up after `POLLER_PARK_TIMEOUT` and reports `NotParked`.
     #[tokio::test(start_paused = true)]
     async fn pause_times_out_when_the_poller_never_parks() {
         // `_pause` is held but its loop is never run, so it never signals
         // parked; the wait must elapse rather than block forever.
         let (control, _pause) = poller_pause();
-        assert!(control.pause().await.is_err());
+        assert!(matches!(
+            control.pause().await,
+            Err(PollerPauseRefused::NotParked)
+        ));
     }
 
     /// Cancelling a pause after its request is sent must withdraw that request,
@@ -297,11 +368,52 @@ mod tests {
         );
     }
 
-    /// Pausers serialize: while one guard is held a second pause cannot acquire;
-    /// it completes only once the first guard drops and the poller has resumed
-    /// and re-parked.
+    /// Pausers serialize, and waiting for another pauser's guard counts against
+    /// `POLLER_PARK_TIMEOUT`: while one guard is held a second pause is refused
+    /// when the window ends rather than queued without bound, and the refusal
+    /// leaves the poller paused for the first guard.
     #[tokio::test(start_paused = true)]
-    async fn a_second_pause_waits_for_the_first_guard_to_drop() {
+    async fn a_second_pause_is_refused_while_the_first_guard_is_held() {
+        let (control, mut pause) = poller_pause();
+        let ticks = Arc::new(AtomicUsize::new(0));
+
+        let loop_ticks = ticks.clone();
+        let poller = tokio::spawn(async move {
+            loop {
+                pause.wait_while_paused().await;
+                loop_ticks.fetch_add(1, Ordering::SeqCst);
+                pause.interruptible_sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let first = control.pause().await.unwrap();
+        let ticks_under_first = ticks.load(Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+
+        let refused = matches!(
+            tokio::time::timeout(POLLER_PARK_TIMEOUT * 2, control.pause())
+                .await
+                .expect("a second pause must be refused within the window"),
+            Err(PollerPauseRefused::Busy)
+        );
+
+        assert!(refused, "the second pause must be refused as busy");
+        assert_eq!(started.elapsed(), POLLER_PARK_TIMEOUT);
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            ticks_under_first,
+            "the refused pause must not resume the poller under the first guard"
+        );
+
+        drop(first);
+        poller.abort();
+    }
+
+    /// A second pause that arrives while the first guard is held proceeds once
+    /// that guard drops within the window, after the poller has resumed and
+    /// re-parked for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_pause_proceeds_when_the_first_guard_drops_in_time() {
         let (control, mut pause) = poller_pause();
         let control = Arc::new(control);
         let ticks = Arc::new(AtomicUsize::new(0));
@@ -321,12 +433,10 @@ mod tests {
         let second =
             tokio::spawn(async move { second_control.pause().await.is_ok() });
 
-        // No amount of time frees the second pause while the first guard holds
-        // the serialize permit.
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        tokio::time::sleep(POLLER_PARK_TIMEOUT / 2).await;
         assert!(
             !second.is_finished(),
-            "a second pause must block until the first guard drops"
+            "a second pause waits while the first guard is held"
         );
 
         let ticks_before_resume = ticks.load(Ordering::SeqCst);
@@ -334,7 +444,7 @@ mod tests {
 
         assert!(
             second.await.unwrap(),
-            "the second pause proceeds once the first guard drops"
+            "the second pause proceeds once the first guard drops in time"
         );
         assert!(
             ticks.load(Ordering::SeqCst) > ticks_before_resume,
@@ -342,6 +452,105 @@ mod tests {
         );
 
         poller.abort();
+    }
+
+    /// A second pause that had to wait for the first guard, and then ran out
+    /// of window before a healthy poller finished its pass and re-parked, was
+    /// refused by contention, not by a stuck poller: it reports `Busy`, so the
+    /// operator retries rather than treating redemption detection as broken.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_handoff_is_refused_as_busy_not_as_a_stuck_poller() {
+        let (control, mut pause) = poller_pause();
+        let control = Arc::new(control);
+
+        // A healthy poller whose pass takes 10 s.
+        let poller = tokio::spawn(async move {
+            loop {
+                pause.wait_while_paused().await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                pause.interruptible_sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let first = control.pause().await.unwrap();
+
+        let second_control = Arc::clone(&control);
+        let second =
+            tokio::spawn(async move { second_control.pause().await.err() });
+
+        // Release 5 s before the second pause's window ends: the poller resumes
+        // and needs a full 10 s pass before it can park again.
+        tokio::time::sleep(
+            POLLER_PARK_TIMEOUT.checked_sub(Duration::from_secs(5)).unwrap(),
+        )
+        .await;
+        drop(first);
+
+        assert!(matches!(
+            second.await.unwrap(),
+            Some(PollerPauseRefused::Busy)
+        ));
+
+        poller.abort();
+    }
+
+    /// A pause that waited for the first guard only briefly still had most of
+    /// the window to itself, so a poller that then never re-parks is reported
+    /// stuck (`NotParked`), not hidden as routine contention.
+    #[tokio::test(start_paused = true)]
+    async fn an_early_handoff_to_a_stuck_poller_is_refused_as_not_parked() {
+        let (control, mut pause) = poller_pause();
+        let control = Arc::new(control);
+
+        // Parks for the first pause before running any pass, then hangs in
+        // the pass it starts once resumed, so it never parks again.
+        let poller = tokio::spawn(async move {
+            pause.wait_while_paused().await;
+            std::future::pending::<()>().await;
+        });
+
+        let first = control.pause().await.unwrap();
+
+        let second_control = Arc::clone(&control);
+        let second =
+            tokio::spawn(async move { second_control.pause().await.err() });
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(first);
+
+        assert!(matches!(
+            second.await.unwrap(),
+            Some(PollerPauseRefused::NotParked)
+        ));
+
+        poller.abort();
+    }
+
+    /// A second pause that waited behind a first one which itself never got
+    /// the poller to park was not held up by another breakglass run: the
+    /// poller is stuck. It must report `NotParked` even though the handoff
+    /// left it less than `MIN_PARK_BUDGET`, or the operator is told to retry
+    /// instead of treating redemption detection as broken.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_behind_a_pause_that_never_parked_reports_not_parked() {
+        // Held but never polled, so it never parks for either pause.
+        let (control, _pause) = poller_pause();
+        let control = Arc::new(control);
+
+        let first_control = Arc::clone(&control);
+        let first =
+            tokio::spawn(async move { first_control.pause().await.err() });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Queues behind the first, which only releases the permit when its own
+        // window elapses, leaving this one about 5 s.
+        let second = control.pause().await.err();
+
+        assert!(matches!(
+            first.await.unwrap(),
+            Some(PollerPauseRefused::NotParked)
+        ));
+        assert!(matches!(second, Some(PollerPauseRefused::NotParked)));
     }
 
     /// A guard's resume may not have reached the poller when the next pauser

@@ -1353,9 +1353,11 @@ impl BurnManager {
             )?;
 
         let (metadata, planned_burns, alpaca_quantity) = match &redemption {
-            // Burning carries no persisted transaction, so the
-            // `persisted_burn_tx` guard above already rejected it; the arm
-            // exists only to keep the state match exhaustive.
+            // A resumed Burning keeps its earlier burn as `prior_burn_tx`, so
+            // it passes the `persisted_burn_tx` guard above, but it has no
+            // receipt plan: an orchestrator proof is bound by amount below,
+            // while a vault-direct proof cannot match the empty plan and is
+            // refused.
             Redemption::Burning { metadata, alpaca_quantity, .. } => {
                 (metadata, &[][..], alpaca_quantity)
             }

@@ -9,16 +9,24 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::IgnoredAny;
 use st0x_issuance_dto::{
-    AddTokenizedAssetRequest, RegisterAccountRequest,
+    AddTokenizedAssetRequest, BurnExcessExternalRequest,
+    BurnExcessInternalRequest, CloseMintRequest, CloseRedemptionRequest,
+    ForceCompleteRedemptionRequest, RegisterAccountRequest,
     ScheduleFreezeWindowRequest, WhitelistWalletRequest,
 };
 use std::time::Duration;
 use url::Url;
 
-/// Overall per-request bound. An orchestrator approval waits for its on-chain
-/// receipt before answering and can outlast it, which surfaces as
+/// Overall per-request bound, above the slowest route's own bounds: an
+/// external burn-excess waits up to 30 s to pause the transfer poller
+/// (including any wait for another breakglass operation holding it), then the
+/// bot caps the engine run at 120 s and answers 504. Cutting the request
+/// earlier would report a transport failure for a run whose outcome the bot is
+/// about to state. That holds only while the load balancer's backend timeout
+/// for the breakglass tier exceeds those 150 s. An orchestrator approval waits
+/// for its on-chain receipt and can still outlast it, which surfaces as
 /// `NoResponse`: the outcome is unknown and the logs say what happened.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Operator tier; the load balancer routes each prefix to its own IAP backend
@@ -28,6 +36,7 @@ pub(crate) enum Tier {
     Read,
     Debug,
     Capital,
+    Breakglass,
 }
 
 impl Tier {
@@ -36,6 +45,7 @@ impl Tier {
             Self::Read => "/ops/read",
             Self::Debug => "/ops/debug",
             Self::Capital => "/ops/capital",
+            Self::Breakglass => "/ops/breakglass",
         }
     }
 }
@@ -49,6 +59,11 @@ pub(crate) enum RouteBody {
     WhitelistWallet(WhitelistWalletRequest),
     AddTokenizedAsset(AddTokenizedAssetRequest),
     ScheduleFreezeWindow(ScheduleFreezeWindowRequest),
+    ForceCompleteRedemption(ForceCompleteRedemptionRequest),
+    CloseRedemption(CloseRedemptionRequest),
+    CloseMint(CloseMintRequest),
+    BurnExcessInternal(BurnExcessInternalRequest),
+    BurnExcessExternal(BurnExcessExternalRequest),
 }
 
 /// One ops route: exactly what goes on the wire for one command.
@@ -117,20 +132,25 @@ pub(crate) enum TransportError {
     NotFound { body: String },
     #[error(
         "HTTP 503 Service Unavailable: the deployment could not serve the \
-         request (for example the bot could not fetch Google's IAP keys, or \
-         the load balancer had no healthy backend). A read can be retried; \
-         before retrying a write, check the logs for whether it was \
-         applied.{}",
+         request (for example the bot could not fetch Google's IAP keys, a \
+         burn-excess transfer poller could not be paused in time because it \
+         did not park or another breakglass run held it, or the load balancer \
+         had no healthy backend). A read can be retried; before retrying a \
+         write, check the logs for whether it was applied.{}",
         server_said(.body)
     )]
     Unavailable { body: String },
     /// 502 or 504: something between the operator and the bot gave up waiting,
-    /// either the load balancer's backend timeout or the bot's own wait on the
-    /// chain, so a write may still have been applied.
+    /// either the load balancer's backend timeout or the bot's own bound (its
+    /// wait on the chain, or a burn-excess run's), so a write may still have
+    /// been applied.
     #[error(
-        "HTTP {status}: a gateway gave up waiting for the bot, so the outcome \
-         is unknown. A read can be retried; before retrying a write, check the \
-         logs for whether it was applied.{}",
+        "HTTP {status}: a gateway gave up waiting for the bot (the bot's own \
+         bound, or the load balancer in front of it), so the outcome is \
+         unknown. A read can be retried. A burn-excess dry-run changed \
+         nothing, and re-running the same command for a burn-excess --execute \
+         reads its persisted state and resumes it; for any other write, check \
+         the logs before retrying.{}",
         server_said(.body)
     )]
     OutcomeUnknown { status: StatusCode, body: String },
@@ -564,8 +584,9 @@ mod tests {
         assert!(matches!(unavailable, TransportError::Unavailable { .. }));
 
         // A gateway that gave up waiting (the load balancer's backend timeout,
-        // or the bot's own RPC wait) may still see the write land, so these
-        // must not read as a plain failure an operator would retry.
+        // or the bot's own RPC wait or burn-excess bound) may still see the
+        // write land, so these must not read as a plain failure an operator
+        // would retry.
         for response in [
             "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\
              Connection: close\r\n\r\n",
@@ -576,6 +597,10 @@ mod tests {
             let message = gateway.to_string();
             assert!(message.contains("outcome is unknown"), "{message}");
             assert!(message.contains("check the logs"), "{message}");
+            assert!(
+                message.contains("re-running the same command"),
+                "{message}"
+            );
             assert!(gateway.reached_server());
             assert!(!gateway.is_access_denied());
         }

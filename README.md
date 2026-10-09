@@ -208,14 +208,20 @@ endpoints.
 ## Operator Client
 
 `st0x-issuance-client` (`crates/ops-client`) is the S01 operator's typed client
-for the IAP-gated `/ops/{read,debug,capital}` routes. It replaces the offline
-`issuer` CLI and the shared-key `/admin` calls for those tiers, prints each
-response as one JSON line, and exits 0, 2 (setup), 77 (auth/access), or 1.
+for the IAP-gated `/ops/{read,debug,capital,breakglass}` routes, all 24 of them.
+It replaces the shared-key `/admin` calls and the offline `issuer` CLI verbs
+that have an `/ops` route; `move-receipts`, `confirm-custody`, the offline
+`force-complete-redemption` (the legacy path for a `Failed` redemption, unlike
+the client verb of the same name), and `burn-excess external` (until
+[RAI-2958](https://linear.app/makeitrain/issue/RAI-2958)) stay offline. It
+prints each response as one JSON line and exits 0, 2 (setup), 77 (auth/access),
+or 1.
 
 ```bash
 cargo run -p st0x-issuance-ops -- --env staging read stuck
 cargo run -p st0x-issuance-ops -- --env staging capital freeze AAPL
 cargo run -p st0x-issuance-ops -- --env staging debug --help
+cargo run -p st0x-issuance-ops -- --env staging breakglass burn-excess internal --help
 ```
 
 It reads `S01_ISSUANCE_{STAGING,PROD}_URL` plus either the S01 Desktop OAuth
@@ -471,9 +477,9 @@ This repo deploys itself:
 
 The GCP deployments authenticate to Turnkey without a stored key:
 `TURNKEY_KMS_API_KEY` names a Cloud KMS P-256 key whose public half is the
-Turnkey API user, and the bot stamps each request through KMS under the VM's
-own identity (`src/wallet/gcp_kms_stamper.rs`). `TURNKEY_API_PRIVATE_KEY`
-remains for local and droplet use; set exactly one of the two.
+Turnkey API user, and the bot stamps each request through KMS under the VM's own
+identity (`src/wallet/gcp_kms_stamper.rs`). `TURNKEY_API_PRIVATE_KEY` remains
+for local and droplet use; set exactly one of the two.
 
 `nix run .#smoke-test-image -- <image>` runs the same startup check CI does.
 `validate-config` still parses the whole environment, so configs deploy

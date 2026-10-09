@@ -2,12 +2,13 @@
 //! arguments parse into the shared wire types the bot deserializes; the bot
 //! still validates and decides everything.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use st0x_issuance_dto::{
-    Email, Network, UnderlyingSymbol, UnderlyingSymbolError,
+    DecimalShares, Email, Network, UnderlyingSymbol, UnderlyingSymbolError,
 };
+use uuid::Uuid;
 
 use crate::target::Env;
 
@@ -34,6 +35,10 @@ pub(crate) enum Command {
     /// Operations that gate token supply or move funds.
     #[command(subcommand)]
     Capital(CapitalCommand),
+    /// Overrides of normal safety checks: force-complete, close, and excess
+    /// burns.
+    #[command(subcommand)]
+    Breakglass(BreakglassCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,6 +161,105 @@ fn uppercase_symbol(
     UnderlyingSymbol::new(value.to_ascii_uppercase())
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum BreakglassCommand {
+    /// Terminalize a redemption whose burn already landed on-chain but was
+    /// never recorded (a `Burning`, `BurnIntended`, or `BurnSubmitted`
+    /// redemption); the bot verifies the burn before recording it. A `Failed`
+    /// redemption needs the offline `issuer force-complete-redemption` instead.
+    ForceCompleteRedemption {
+        issuer_request_id: String,
+        #[arg(long)]
+        burn_tx_hash: B256,
+        #[arg(long)]
+        reason: String,
+        /// The persisted signed burn's hash, when it differs from
+        /// `--burn-tx-hash`.
+        #[arg(long)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
+    },
+    /// Close a redemption that cannot be recovered automatically.
+    CloseRedemption {
+        issuer_request_id: String,
+        #[arg(long)]
+        reason: String,
+        /// Required when a signed burn is persisted: its exact hash.
+        #[arg(long)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
+    },
+    /// Close a mint that cannot be recovered automatically.
+    CloseMint {
+        issuer_request_id: String,
+        #[arg(long)]
+        reason: String,
+        /// Required when the mint holds a prepared deposit: its exact hash.
+        #[arg(long)]
+        acknowledged_unresolved_mint_tx_hash: Option<B256>,
+        /// Required only for a `NonceReplayUnresolved` mint: its persisted
+        /// authorization nonce.
+        #[arg(long)]
+        acknowledged_unresolved_mint_nonce: Option<B256>,
+    },
+    /// Burn excess shares minted by a duplicate deposit. Dry-run unless
+    /// `--execute`.
+    #[command(subcommand)]
+    BurnExcess(BurnExcessCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BurnExcessCommand {
+    /// The excess shares already sit in the issuer wallet.
+    Internal(BurnExcessArgs),
+    /// The excess shares arrived through an on-chain Transfer into the issuer
+    /// wallet. The bot quiesces that network's redemption poller only once
+    /// this request arrives, so until RAI-2958 use the offline
+    /// `issuer burn-excess external` with the service stopped instead.
+    External {
+        /// Funding Transfer that moved the excess shares into the wallet.
+        #[arg(long)]
+        funding_tx_hash: B256,
+        #[command(flatten)]
+        args: BurnExcessArgs,
+    },
+}
+
+/// Flags shared by both burn-excess paths, named as on the offline
+/// `issuer burn-excess` CLI.
+#[derive(Debug, Args)]
+pub(crate) struct BurnExcessArgs {
+    /// Mint whose deposit produced the excess.
+    #[arg(long)]
+    pub(crate) issuer_request_id: Uuid,
+    /// Deposit transaction that created the excess receipt and shares.
+    #[arg(long)]
+    pub(crate) deposit_tx_hash: B256,
+    /// Excess receipt id from the deposit.
+    #[arg(long)]
+    pub(crate) receipt_id: U256,
+    /// Excess share amount as a decimal (18-decimal fixed point on chain),
+    /// e.g. `0.750`.
+    #[arg(long)]
+    pub(crate) shares: DecimalShares,
+    /// Why this recovery is being run; recorded on events.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Optional incident or ticket id for the audit trail.
+    #[arg(long)]
+    pub(crate) incident_id: Option<String>,
+    #[arg(long)]
+    pub(crate) network: Network,
+    /// Must match the network's chain configured on the bot.
+    #[arg(long)]
+    pub(crate) chain_id: u64,
+    /// Perform the mutation. Without it the bot returns the proven plan and
+    /// changes nothing.
+    #[arg(long)]
+    pub(crate) execute: bool,
+    /// Close a dead intended or submitted burn stream instead of burning.
+    #[arg(long)]
+    pub(crate) close: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -240,9 +344,40 @@ mod tests {
                 "--unfreeze-at",
                 "2026-10-02T00:00:00Z",
             ],
+            &burn_excess(["--shares", "0.0000000000000000001"]),
+            &burn_excess(["--issuer-request-id", "not-a-uuid"]),
         ] {
             let error = parse(args).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation, "{args:?}");
         }
+    }
+
+    /// A complete `breakglass burn-excess internal` invocation with `field`
+    /// overridden, so only that one value can fail parsing.
+    fn burn_excess(field: [&'static str; 2]) -> Vec<&'static str> {
+        let mut args = vec![
+            "--env",
+            "staging",
+            "breakglass",
+            "burn-excess",
+            "internal",
+            "--issuer-request-id",
+            "5f0c6c0e-8a4b-4c9e-9f3a-2b7d1e6a4c10",
+            "--deposit-tx-hash",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "--receipt-id",
+            "1",
+            "--shares",
+            "0.75",
+            "--reason",
+            "duplicate deposit",
+            "--network",
+            "base",
+            "--chain-id",
+            "8453",
+        ];
+        let position = args.iter().position(|arg| *arg == field[0]).unwrap();
+        args[position + 1] = field[1];
+        args
     }
 }

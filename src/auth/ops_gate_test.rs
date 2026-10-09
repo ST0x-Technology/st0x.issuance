@@ -18,7 +18,10 @@ use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
 use st0x_alpaca::issuer::mock::MockIssuerApi;
-use st0x_issuance_dto::{TokenizedAssetDetailResponse, TokenizedAssetStatus};
+use st0x_issuance_dto::{
+    BurnExcessExternalRequest, TokenizedAssetDetailResponse,
+    TokenizedAssetStatus,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +42,6 @@ use crate::account::{
 };
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
-use crate::burn_excess::api::BurnExcessExternalRequest;
 use crate::chain::{ChainConfig, ConfiguredNetworks};
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
@@ -776,7 +778,91 @@ async fn external_burn_validates_chain_id_before_pausing_the_poller() {
         !base_parked.has_changed().expect("Base poller still running"),
         "an invalid chain id must be rejected before parking the poller"
     );
+    // The client's Cloud Logging link searches for the issuer request id, so
+    // the refusal's cause must sit on a line that carries it.
+    logs_assert(|lines: &[&str]| {
+        if lines.iter().any(|line| {
+            line.contains("WARN")
+                && line.contains("admin:")
+                && line.contains("chain_id does not match the configured chain")
+                && line.contains(
+                    "issuer_request_id=00000000-0000-0000-0000-000000000000",
+                )
+        }) {
+            Ok(())
+        } else {
+            Err("no WARN line naming the chain mismatch and the request"
+                .to_owned())
+        }
+    });
     poller.abort();
+}
+
+/// A poller that cannot be paused is a 503 with nothing done, and the log names
+/// the cause, so an operator can tell a dead poller (an incident) from one that
+/// another breakglass run is holding (retry later).
+#[traced_test]
+#[tokio::test]
+async fn external_burn_with_an_exited_poller_is_refused_and_says_so() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+
+    let (control, pause) = poller_pause();
+    drop(pause);
+    let mut controls = HashMap::new();
+    controls.insert(Network::Base, control);
+
+    let mut config = test_config().expect("test config builds");
+    config.chains = vec![ChainConfig {
+        network: Network::Base,
+        chain_id: Network::Base.chain_id(),
+        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
+        backfill_start_block: 0,
+        low_gas_threshold: None,
+    }];
+    let rocket = setup_test_rocket_with_config(config)
+        .await
+        .expect("test rocket builds")
+        .manage(verifiers)
+        .manage(PollerPauses::new(controls))
+        .mount(
+            "/",
+            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let response = client
+        .post("/ops/breakglass/burn-excess/external")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, BREAKGLASS_AUDIENCE),
+        ))
+        .body(external_body(Network::Base))
+        .dispatch()
+        .await;
+
+    assert_eq!(response.status(), Status::ServiceUnavailable);
+    // The handler logs under the `admin` target, which `logs_contain_at!`
+    // (scoped to this module's `auth` target) cannot see.
+    logs_assert(|lines: &[&str]| {
+        if lines.iter().any(|line| {
+            line.contains("WARN")
+                && line.contains("admin:")
+                && line.contains("burn-excess external: poller not quiesced")
+                && line.contains("the transfer poller has exited")
+                && line.contains(
+                    "issuer_request_id=00000000-0000-0000-0000-000000000000",
+                )
+        }) {
+            Ok(())
+        } else {
+            Err("no WARN line naming the exited poller and the request"
+                .to_owned())
+        }
+    });
 }
 
 /// The pause guard resumes the poller on the handler's error paths, not only on
