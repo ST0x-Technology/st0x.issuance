@@ -15,7 +15,10 @@ use super::{
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
-use crate::burn_excess::exclusion::is_excluded_funding_log;
+use crate::burn_excess::FundingTransferId;
+use crate::burn_excess::expectation::{
+    FundingTransferStatus, classify_funding_transfer,
+};
 use crate::config::{MissingOrchestratorAddress, VaultModeConfig};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
@@ -34,6 +37,13 @@ pub(crate) enum TransferOutcome {
     SkippedNoAccount,
     /// Path B burn-excess funding Transfer — not a real AP redemption.
     SkippedAdminRecovery,
+    /// Matches a live burn-excess stream's expected funding Transfer that is
+    /// not yet excluded. Neither redeemed nor skipped: the poller must not
+    /// move this vault's checkpoint past `block_number` until the
+    /// expectation clears.
+    HeldExpectedFunding {
+        block_number: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,16 +145,38 @@ pub(crate) async fn detect_transfer(
     let log_index =
         log.log_index.ok_or(TransferProcessingError::MissingLogIndex)?;
 
-    if is_excluded_funding_log(pool, network, vault, tx_hash, log_index).await?
-    {
-        debug!(
-            target: "redemption",
-            %tx_hash,
-            log_index,
-            %vault,
-            "Skipping admin recovery funding transfer"
-        );
-        return Ok(TransferOutcome::SkippedAdminRecovery);
+    let funding_candidate = FundingTransferId {
+        network,
+        vault,
+        tx_hash,
+        log_index,
+        from: transfer_event.from,
+        to: transfer_event.to,
+        amount: transfer_event.value,
+    };
+    match classify_funding_transfer(pool, &funding_candidate).await? {
+        FundingTransferStatus::Excluded => {
+            debug!(
+                target: "redemption",
+                %tx_hash,
+                log_index,
+                %vault,
+                "Skipping admin recovery funding transfer"
+            );
+            return Ok(TransferOutcome::SkippedAdminRecovery);
+        }
+        FundingTransferStatus::Expected => {
+            debug!(
+                target: "redemption",
+                %tx_hash,
+                log_index,
+                %vault,
+                block_number,
+                "Holding expected admin recovery funding transfer"
+            );
+            return Ok(TransferOutcome::HeldExpectedFunding { block_number });
+        }
+        FundingTransferStatus::Unrelated => {}
     }
 
     let account_view = find_by_wallet(pool, &transfer_event.from).await?;

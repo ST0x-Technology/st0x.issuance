@@ -1,14 +1,15 @@
 //! Breakglass HTTP routes for the internal- and external-path excess-share
 //! burns.
 //!
-//! `internal` never touches the redemption transfer poller. `external` records
-//! a funding-Transfer exclusion the live poller would otherwise read as an AP
-//! redemption, so it quiesces that network's poller for the run and resumes it
-//! on every exit path. Both sign through the running service's vault service,
-//! so the burn shares the wallet lock and nonce manager every live mint and
-//! redemption burn uses, and both self-gate on wallet quiescence under that
-//! lock (an unresolved mint/redemption burn intent on the network refuses with
-//! `Conflict`).
+//! `internal` never touches the redemption transfer poller. `external` burns
+//! shares that arrived through a funding Transfer the live poller would
+//! otherwise read as an AP redemption, so it runs in two steps: `expect-funding`
+//! records the Transfer the stream expects before the operator broadcasts it,
+//! and the poller holds a matching log until `external` excludes it. Both burn
+//! routes sign through the running service's vault service, so the burn shares
+//! the wallet lock and nonce manager every live mint and redemption burn uses,
+//! and both self-gate on wallet quiescence under that lock (an unresolved
+//! mint/redemption burn intent on the network refuses with `Conflict`).
 
 use alloy::primitives::B256;
 use alloy::providers::ProviderBuilder;
@@ -18,13 +19,14 @@ use rocket::{State, post};
 use serde::Serialize;
 use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{
-    BurnExcessCommon, BurnExcessExternalRequest, BurnExcessInternalRequest,
+    BurnExcessCommon, BurnExcessExpectFundingRequest,
+    BurnExcessExternalRequest, BurnExcessInternalRequest,
 };
 use std::time::Duration;
 use tracing::{error, warn};
 
 use super::engine::{
-    BurnExcessEngineError, BurnExcessOutcome, BurnExcessRequest,
+    BurnExcessEngineError, BurnExcessOutcome, BurnExcessRequest, PollerGuard,
     run_burn_excess,
 };
 use super::proof::BurnExcessMode;
@@ -32,22 +34,20 @@ use crate::auth::BreakglassOps;
 use crate::chain::{ChainConfig, rpc_client};
 use crate::config::Config;
 use crate::mint::IssuerMintRequestId;
-use crate::redemption::poller_pause::PollerPauses;
 use crate::vault::NetworkVaultServices;
 
-/// Caps how long either burn-excess route runs the engine. Both hold the
-/// network's wallet lock across signing, and the external route additionally
-/// holds its transfer poller paused; a hung provider or vault call must not
-/// block live signing (or stop redemption detection) until the process
-/// restarts. On elapse the run is abandoned — releasing the wallet lock, and
-/// for the external route dropping the guard so the poller resumes — and the
-/// route returns 504. Chosen above the expected broadcast-and-confirm window.
+/// Caps how long a burn-excess route runs the engine. The burn routes hold the
+/// network's wallet lock across signing; a hung provider or vault call must not
+/// block live signing until the process restarts. On elapse the run is
+/// abandoned, releasing the wallet lock, and the route returns 504. Chosen
+/// above the expected broadcast-and-confirm window.
 const BURN_EXCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Builds the engine request from a route body. The operator-supplied chain
 /// id is validated against the network's configured chain entry by
 /// `resolve_chain`, which can see the config; this function cannot, so it is
-/// infallible.
+/// infallible. Every route runs beside the live poller, so a Path B stream
+/// relies on its funding expectation rather than a stopped service.
 fn into_request(
     common: BurnExcessCommon,
     mode: BurnExcessMode,
@@ -66,6 +66,7 @@ fn into_request(
         chain_id: common.chain_id,
         execute: common.execute,
         close: common.close,
+        poller_guard: PollerGuard::FundingExpected,
     }
 }
 
@@ -79,7 +80,7 @@ pub(crate) struct BurnExcessResponse {
 }
 
 /// Resolves and validates the configured chain before a route performs any
-/// side effect, including pausing the external-path transfer poller.
+/// side effect.
 fn resolve_chain<'config>(
     config: &'config Config,
     request: &BurnExcessRequest,
@@ -156,7 +157,7 @@ async fn run_burn_excess_ops(
     let executed = request.execute;
 
     // Bound the run so a hung provider or vault call cannot hold the wallet
-    // lock (and, for the external route, the paused poller) indefinitely.
+    // lock indefinitely.
     // On elapse the future is dropped, releasing the wallet lock; the burn
     // stream is persisted before broadcast, so a re-invocation resumes it.
     let outcome = tokio::time::timeout(
@@ -231,13 +232,53 @@ pub(crate) async fn burn_excess_internal_ops(
     .await
 }
 
+/// Breakglass-tier first step of the external-path burn, run before the
+/// funding Transfer is broadcast. Proves the deposit bind and, on `execute`,
+/// records the funding Transfer the stream expects, so the live poller holds
+/// it rather than open a Redemption for shares being burned. With `close`, it
+/// closes the stream instead and releases the hold. Signs nothing.
+#[post(
+    "/ops/breakglass/burn-excess/expect-funding",
+    format = "json",
+    data = "<body>"
+)]
+#[tracing::instrument(
+    target = "auth",
+    name = "operator",
+    skip_all,
+    fields(subject = %auth.0)
+)]
+pub(crate) async fn burn_excess_expect_funding_ops(
+    auth: BreakglassOps,
+    pool: &State<Pool<Sqlite>>,
+    config: &State<Config>,
+    vault_services: &State<NetworkVaultServices>,
+    body: Json<BurnExcessExpectFundingRequest>,
+) -> Result<Json<BurnExcessResponse>, Status> {
+    let request = into_request(
+        body.into_inner().common,
+        BurnExcessMode::ExpectFunding,
+        None,
+    );
+    let chain = resolve_chain(config.inner(), &request, "expect-funding")?;
+    run_burn_excess_ops(
+        pool.inner(),
+        config.inner(),
+        chain,
+        vault_services,
+        request,
+        "expect-funding",
+    )
+    .await
+}
+
 /// Breakglass-tier external-path excess-share burn. Unlike `internal`, the
 /// excess shares arrived via an on-chain Transfer into the wallet the
-/// redemption transfer poller watches, so the funding-Transfer exclusion must
-/// land before the poller reads that log or the live poller opens a spurious
-/// `Redemption` for shares being burned. The handler quiesces that network's
-/// poller (confirmed idle, no tick in flight) for the whole run and resumes it
-/// on every exit path via the guard.
+/// redemption transfer poller watches. The stream must already be expecting
+/// that Transfer (`expect-funding`, before it was broadcast), so the poller
+/// has held it; a stream that is not is refused with `Conflict`. The run then
+/// records the exclusion before it releases the expectation, so the poller
+/// skips the funding log rather than redeem it.
 #[post(
     "/ops/breakglass/burn-excess/external",
     format = "json",
@@ -254,12 +295,9 @@ pub(crate) async fn burn_excess_external_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     vault_services: &State<NetworkVaultServices>,
-    poller_pauses: &State<PollerPauses>,
     body: Json<BurnExcessExternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
     let body = body.into_inner();
-    let network = body.common.network;
-    let issuer_request_id = body.common.issuer_request_id;
     let funding_tx_hash = body.funding_tx_hash;
     let request = into_request(
         body.common,
@@ -267,31 +305,6 @@ pub(crate) async fn burn_excess_external_ops(
         Some(funding_tx_hash),
     );
     let chain = resolve_chain(config.inner(), &request, "external")?;
-
-    let Some(control) = poller_pauses.control(network) else {
-        warn!(target: "admin", network = %network,
-            issuer_request_id = %issuer_request_id,
-            "burn-excess external has no transfer poller to quiesce for network"
-        );
-        return Err(Status::UnprocessableEntity);
-    };
-
-    // Quiesce the poller before the exclusion write so it cannot open a
-    // spurious Redemption for the funding Transfer. The guard resumes the
-    // poller on success, error, timeout, and panic paths alike; a poller that
-    // cannot be paused in time (it does not park, or another breakglass run
-    // still holds it) is a 503 rather than an unprotected or queued burn.
-    let _guard = control.pause().await.map_err(|error| {
-        warn!(target: "admin", network = %network,
-            issuer_request_id = %issuer_request_id, %error,
-            "burn-excess external: poller not quiesced; refusing to run"
-        );
-        Status::ServiceUnavailable
-    })?;
-
-    // `run_burn_excess_ops` bounds the run and returns 504 on elapse; the
-    // guard resumes the poller when this handler returns on any path (success,
-    // error, timeout, panic).
     run_burn_excess_ops(
         pool.inner(),
         config.inner(),
@@ -304,23 +317,26 @@ pub(crate) async fn burn_excess_external_ops(
 }
 
 /// Maps a burn-excess failure to an HTTP status. An absent mint is a 404; a
-/// wallet not quiesced is a 409; a bad proof or input is a 422; an on-chain/RPC
-/// fault is a 502; anything else (including a burn that landed but whose
-/// bookkeeping failed) is a 500 for operator intervention.
+/// wallet not quiesced, an external run without its funding expectation, or
+/// another stream's expectation open on the vault is a 409; a bad proof or
+/// input is a 422; an on-chain/RPC fault is a 502; anything else (including a
+/// burn that landed but whose bookkeeping failed) is a 500 for operator
+/// intervention.
 const fn map_burn_excess_error(error: &BurnExcessEngineError) -> Status {
     use BurnExcessEngineError::{
-        AmbiguousDepositTx, AmbiguousShareTransferOut, Contract,
-        DeadBurnIntent, DepositTxInvalid, FundingTxInvalid, MintMissingAsset,
-        MintNetworkMismatch, MintNotFound, Proof, Provider,
-        UnresolvedExcessBurnIntent, UnresolvedSignerIntent, Vault,
-        VaultNotListed,
+        AmbiguousDepositTx, AmbiguousShareTransferOut, AnotherFundingExpected,
+        Contract, DeadBurnIntent, DepositTxInvalid, FundingNotExpected,
+        FundingTxInvalid, MintMissingAsset, MintNetworkMismatch, MintNotFound,
+        Proof, Provider, UnresolvedExcessBurnIntent, UnresolvedSignerIntent,
+        Vault, VaultNotListed,
     };
 
     match error {
         MintNotFound { .. } => Status::NotFound,
-        UnresolvedSignerIntent { .. } | UnresolvedExcessBurnIntent => {
-            Status::Conflict
-        }
+        UnresolvedSignerIntent { .. }
+        | UnresolvedExcessBurnIntent
+        | FundingNotExpected
+        | AnotherFundingExpected { .. } => Status::Conflict,
         Proof(_)
         | MintMissingAsset { .. }
         | MintNetworkMismatch { .. }

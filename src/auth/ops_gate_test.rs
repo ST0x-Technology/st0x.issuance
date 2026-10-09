@@ -22,10 +22,7 @@ use st0x_issuance_dto::{
     BurnExcessExternalRequest, TokenizedAssetDetailResponse,
     TokenizedAssetStatus,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use tracing::Level;
 use tracing_test::traced_test;
 use url::Url;
@@ -51,9 +48,6 @@ use crate::receipt_inventory::{
 };
 use crate::redemption::burn_manager::{
     BurnManagerError, ManualBurnReplacementOutcome, RecoveryOutcome,
-};
-use crate::redemption::poller_pause::{
-    PollerPause, PollerPauses, poller_pause,
 };
 use crate::redemption::{
     IssuerRedemptionRequestId, Redemption, RedemptionServices,
@@ -385,7 +379,6 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
-        .manage(PollerPauses::new(HashMap::new()))
         .mount(
             "/",
             rocket::routes![
@@ -393,6 +386,7 @@ async fn real_ops_routes_require_an_iap_assertion() {
                 crate::admin::reprocess_mint_ops,
                 crate::admin::orchestrator_health_ops,
                 crate::burn_excess::api::burn_excess_internal_ops,
+                crate::burn_excess::api::burn_excess_expect_funding_ops,
                 crate::burn_excess::api::burn_excess_external_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
                 crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
@@ -429,6 +423,14 @@ async fn real_ops_routes_require_an_iap_assertion() {
         .dispatch()
         .await;
     assert_eq!(burn_external.status(), Status::Unauthorized);
+
+    let expect_funding = client
+        .post("/ops/breakglass/burn-excess/expect-funding")
+        .header(rocket::http::ContentType::JSON)
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(expect_funding.status(), Status::Unauthorized);
 
     let preflight =
         client.get("/ops/read/orchestrator-preflight/base").dispatch().await;
@@ -470,11 +472,11 @@ async fn a_debug_token_cannot_burn_excess() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
-        .manage(PollerPauses::new(HashMap::new()))
         .mount(
             "/",
             rocket::routes![
                 crate::burn_excess::api::burn_excess_internal_ops,
+                crate::burn_excess::api::burn_excess_expect_funding_ops,
                 crate::burn_excess::api::burn_excess_external_ops
             ],
         );
@@ -503,6 +505,18 @@ async fn a_debug_token_cannot_burn_excess() {
         .dispatch()
         .await;
     assert_eq!(external.status(), Status::Unauthorized);
+
+    let expect_funding = client
+        .post("/ops/breakglass/burn-excess/expect-funding")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            ASSERTION_HEADER,
+            token(&key, DEBUG_AUDIENCE),
+        ))
+        .body("{}")
+        .dispatch()
+        .await;
+    assert_eq!(expect_funding.status(), Status::Unauthorized);
     assert!(logs_contain_at!(
         Level::WARN,
         &["IAP assertion failed validation"]
@@ -583,7 +597,6 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory)),
         network_telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
         underlying_store,
-        poller_pauses: PollerPauses::new(HashMap::new()),
         background_tasks: crate::BackgroundTasks {
             shutdown,
             handles: Vec::new(),
@@ -629,23 +642,8 @@ async fn role_prefixes_are_absent_without_ops_api_config() {
     }
 }
 
-/// Spawns a poller loop that counts its ticks, so a test can observe whether a
-/// pause quiesced it. Ticks fast so a resume is visible within a short window.
-fn spawn_counting_poller(
-    mut pause: PollerPause,
-    ticks: Arc<AtomicUsize>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            pause.wait_while_paused().await;
-            ticks.fetch_add(1, Ordering::SeqCst);
-            pause.interruptible_sleep(Duration::from_millis(10)).await;
-        }
-    })
-}
-
 /// A well-formed external burn body for `network`; the mint it names does not
-/// exist in an empty store, so the engine errors once the handler runs.
+/// exist in an empty store.
 fn external_body(network: Network) -> String {
     serde_json::json!({
         "issuer_request_id": "00000000-0000-0000-0000-000000000000",
@@ -660,88 +658,15 @@ fn external_body(network: Network) -> String {
     .to_string()
 }
 
-/// A network with no pause control is refused with 422 before any burn, and a
-/// poller running for a different network is left untouched.
-#[tokio::test]
-async fn external_burn_without_a_pause_control_is_refused() {
-    let key = test_key();
-    let jwks = jwks_server(&key);
-    let verifiers =
-        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-
-    let (ethereum_control, ethereum_pause) = poller_pause();
-    let ethereum_parked = ethereum_control.parked_signal();
-    let ticks = Arc::new(AtomicUsize::new(0));
-    let poller = spawn_counting_poller(ethereum_pause, ticks.clone());
-    let mut controls = HashMap::new();
-    controls.insert(Network::Ethereum, ethereum_control);
-
-    let mut config = test_config().expect("test config builds");
-    config.chains = vec![ChainConfig {
-        network: Network::Base,
-        chain_id: Network::Base.chain_id(),
-        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
-        backfill_start_block: 0,
-        low_gas_threshold: None,
-    }];
-    let rocket = setup_test_rocket_with_config(config)
-        .await
-        .expect("test rocket builds")
-        .manage(verifiers)
-        .manage(PollerPauses::new(controls))
-        .mount(
-            "/",
-            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
-        );
-    let client = Client::tracked(rocket).await.unwrap();
-
-    let body = external_body(Network::Base);
-    assert!(
-        serde_json::from_str::<BurnExcessExternalRequest>(&body).is_ok(),
-        "the test body must be well-formed, so the 422 is the handler's \
-         missing-control refusal, not a request-parse rejection"
-    );
-
-    let response = client
-        .post("/ops/breakglass/burn-excess/external")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, BREAKGLASS_AUDIENCE),
-        ))
-        .body(body)
-        .dispatch()
-        .await;
-
-    assert_eq!(response.status(), Status::UnprocessableEntity);
-
-    // The poller writes `parked` only on a real park, so a Base burn that
-    // paused Ethereum even briefly and resumed before this line would have
-    // moved the signal. It must not have.
-    assert!(
-        !ethereum_parked.has_changed().expect("Ethereum poller still running"),
-        "a burn for another network must never park this poller"
-    );
-
-    poller.abort();
-}
-
 /// A request for the wrong configured chain is rejected before the external
-/// route pauses redemption detection.
+/// route runs the engine, on a line the client's log link can find.
 #[traced_test]
 #[tokio::test]
-async fn external_burn_validates_chain_id_before_pausing_the_poller() {
+async fn external_burn_rejects_a_mismatched_chain_id_and_logs_the_request() {
     let key = test_key();
     let jwks = jwks_server(&key);
     let verifiers =
         OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-
-    let (control, pause) = poller_pause();
-    let base_parked = control.parked_signal();
-    let ticks = Arc::new(AtomicUsize::new(0));
-    let poller = spawn_counting_poller(pause, ticks);
-    let mut controls = HashMap::new();
-    controls.insert(Network::Base, control);
 
     let mut config = test_config().expect("test config builds");
     config.chains = vec![ChainConfig {
@@ -755,7 +680,6 @@ async fn external_burn_validates_chain_id_before_pausing_the_poller() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
-        .manage(PollerPauses::new(controls))
         .mount(
             "/",
             rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
@@ -774,10 +698,6 @@ async fn external_burn_validates_chain_id_before_pausing_the_poller() {
         .await;
 
     assert_eq!(response.status(), Status::UnprocessableEntity);
-    assert!(
-        !base_parked.has_changed().expect("Base poller still running"),
-        "an invalid chain id must be rejected before parking the poller"
-    );
     // The client's Cloud Logging link searches for the issuer request id, so
     // the refusal's cause must sit on a line that carries it.
     logs_assert(|lines: &[&str]| {
@@ -795,96 +715,24 @@ async fn external_burn_validates_chain_id_before_pausing_the_poller() {
                 .to_owned())
         }
     });
-    poller.abort();
 }
 
-/// A poller that cannot be paused is a 503 with nothing done, and the log names
-/// the cause, so an operator can tell a dead poller (an incident) from one that
-/// another breakglass run is holding (retry later).
+/// The live external route runs beside the redemption poller, so a stream
+/// that never recorded its funding expectation has nothing keeping the poller
+/// off the funding Transfer: it is refused with 409 before anything is read
+/// from chain, and the log says what to do.
 #[traced_test]
 #[tokio::test]
-async fn external_burn_with_an_exited_poller_is_refused_and_says_so() {
+async fn external_burn_without_a_funding_expectation_is_refused() {
     let key = test_key();
     let jwks = jwks_server(&key);
     let verifiers =
         OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
 
-    let (control, pause) = poller_pause();
-    drop(pause);
-    let mut controls = HashMap::new();
-    controls.insert(Network::Base, control);
-
-    let mut config = test_config().expect("test config builds");
-    config.chains = vec![ChainConfig {
-        network: Network::Base,
-        chain_id: Network::Base.chain_id(),
-        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
-        backfill_start_block: 0,
-        low_gas_threshold: None,
-    }];
-    let rocket = setup_test_rocket_with_config(config)
-        .await
-        .expect("test rocket builds")
-        .manage(verifiers)
-        .manage(PollerPauses::new(controls))
-        .mount(
-            "/",
-            rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
-        );
-    let client = Client::tracked(rocket).await.unwrap();
-
-    let response = client
-        .post("/ops/breakglass/burn-excess/external")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, BREAKGLASS_AUDIENCE),
-        ))
-        .body(external_body(Network::Base))
-        .dispatch()
-        .await;
-
-    assert_eq!(response.status(), Status::ServiceUnavailable);
-    // The handler logs under the `admin` target, which `logs_contain_at!`
-    // (scoped to this module's `auth` target) cannot see.
-    logs_assert(|lines: &[&str]| {
-        if lines.iter().any(|line| {
-            line.contains("WARN")
-                && line.contains("admin:")
-                && line.contains("burn-excess external: poller not quiesced")
-                && line.contains("the transfer poller has exited")
-                && line.contains(
-                    "issuer_request_id=00000000-0000-0000-0000-000000000000",
-                )
-        }) {
-            Ok(())
-        } else {
-            Err("no WARN line naming the exited poller and the request"
-                .to_owned())
-        }
-    });
-}
-
-/// The pause guard resumes the poller on the handler's error paths, not only on
-/// success: an erroring burn leaves the network's poller running.
-#[tokio::test]
-async fn external_burn_resumes_the_poller_after_an_error() {
-    let key = test_key();
-    let jwks = jwks_server(&key);
-    let verifiers =
-        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-
-    let (control, pause) = poller_pause();
-    let base_parked = control.parked_signal();
-    let ticks = Arc::new(AtomicUsize::new(0));
-    let poller = spawn_counting_poller(pause, ticks.clone());
-    let mut controls = HashMap::new();
-    controls.insert(Network::Base, control);
-
-    // A configured Base chain and no CHAIN_BASE_RPC_URL in the environment:
-    // the route must take its endpoint and chain id from here. The default
-    // test signer is the zero key, which signer resolution refuses before the
-    // engine runs; a real (nonzero) key lets the request reach the engine.
+    // The default test signer is the zero key, which signer resolution
+    // refuses before the engine runs; a real (nonzero) key lets the request
+    // reach the engine. No node listens on the RPC, so a 409 also proves the
+    // refusal comes before any chain read.
     let mut config = test_config().expect("test config builds");
     config.chains = vec![ChainConfig {
         network: Network::Base,
@@ -898,7 +746,6 @@ async fn external_burn_resumes_the_poller_after_an_error() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
-        .manage(PollerPauses::new(controls))
         .mount(
             "/",
             rocket::routes![crate::burn_excess::api::burn_excess_external_ops],
@@ -908,8 +755,8 @@ async fn external_burn_resumes_the_poller_after_an_error() {
     let body = external_body(Network::Base);
     assert!(
         serde_json::from_str::<BurnExcessExternalRequest>(&body).is_ok(),
-        "the test body must be well-formed, so the error is the handler's, \
-         not a request-parse rejection"
+        "the test body must be well-formed, so the 409 is the engine's \
+         refusal, not a request-parse rejection"
     );
 
     let response = client
@@ -923,33 +770,23 @@ async fn external_burn_resumes_the_poller_after_an_error() {
         .dispatch()
         .await;
 
-    // The well-formed body ran the handler, which paused the poller then
-    // errored in the engine; the guard must resume the poller on that error
-    // path just as on success. The exact status matters: a broad `>= 400`
-    // would also accept a 503 pause-acquisition failure, where no guard ever
-    // exists. 404 is the engine refusing the absent mint, reachable only once
-    // the pause succeeded and the engine ran - and only because the route
-    // took the RPC and chain id from `config.chains` rather than the
-    // environment (unset here) and dialed nothing first (no node listens).
-    assert_eq!(response.status(), Status::NotFound);
-
-    // The poller writes `parked` only on a real park: the handler must have
-    // actually quiesced the poller before erroring, or "resumes" below proves
-    // nothing.
-    assert!(
-        base_parked.has_changed().expect("Base poller still running"),
-        "the handler must park the poller before the burn runs"
-    );
-
-    // The guard dropped on the error return, so the poller resumes ticking.
-    let resumed_from = ticks.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        ticks.load(Ordering::SeqCst) > resumed_from,
-        "the guard must resume the poller after the handler errors"
-    );
-
-    poller.abort();
+    assert_eq!(response.status(), Status::Conflict);
+    logs_assert(|lines: &[&str]| {
+        if lines.iter().any(|line| {
+            line.contains("ERROR")
+                && line.contains("admin:")
+                && line.contains("burn-excess failed")
+                && line.contains("expect-funding")
+                && line.contains(
+                    "issuer_request_id=00000000-0000-0000-0000-000000000000",
+                )
+        }) {
+            Ok(())
+        } else {
+            Err("no ERROR line naming the missing expectation and the request"
+                .to_owned())
+        }
+    });
 }
 
 /// A legacy flat-Base deployment runs a non-canonical chain id (a local Anvil
@@ -980,7 +817,6 @@ async fn internal_burn_validates_chain_id_against_the_configured_chain() {
         .await
         .expect("test rocket builds")
         .manage(verifiers)
-        .manage(PollerPauses::new(HashMap::new()))
         .mount(
             "/",
             rocket::routes![crate::burn_excess::api::burn_excess_internal_ops],

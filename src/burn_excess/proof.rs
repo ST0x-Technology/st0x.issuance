@@ -11,18 +11,21 @@ use crate::tokenized_asset::Network;
 use crate::vault::ReceiptInformation;
 use crate::vault::rain_meta;
 
-/// Operator-selected CLI mode keyword (`internal` | `external`).
+/// Operator-selected mode keyword: `internal` | `external` on the offline CLI,
+/// plus the live route's `expect-funding` step, which opens a Path B stream
+/// before its funding Transfer is broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BurnExcessMode {
     Internal,
     External,
+    ExpectFunding,
 }
 
 impl BurnExcessMode {
     pub(crate) const fn as_path(self) -> BurnExcessPath {
         match self {
             Self::Internal => BurnExcessPath::Internal,
-            Self::External => BurnExcessPath::External,
+            Self::External | Self::ExpectFunding => BurnExcessPath::External,
         }
     }
 
@@ -30,6 +33,7 @@ impl BurnExcessMode {
         match self {
             Self::Internal => "internal",
             Self::External => "external",
+            Self::ExpectFunding => "expect-funding",
         }
     }
 }
@@ -209,6 +213,14 @@ pub(crate) enum BurnExcessProofError {
         original_recipient: Address,
         issuer_wallet: Address,
     },
+
+    #[error(
+        "the deposit's original recipient is the issuer wallet \
+         ({issuer_wallet:?}), so its excess shares are already there: use \
+         `burn-excess internal`. `expect-funding` is only for shares that \
+         must be sent back to the issuer"
+    )]
+    FundingFromIssuer { issuer_wallet: Address },
 }
 
 /// D0.3–D0.4: resolve path from mode keyword and optional loaded aggregate.
@@ -220,7 +232,10 @@ pub(crate) fn resolve_path(
 
     match state {
         None => Ok(PathResolution::Start(requested)),
-        Some(BurnExcess::FundingExcluded { .. }) => {
+        Some(
+            BurnExcess::AwaitingFunding { .. }
+            | BurnExcess::FundingExcluded { .. },
+        ) => {
             require_path(mode, BurnExcessPath::External)?;
             Ok(PathResolution::Resume(BurnExcessPath::External))
         }

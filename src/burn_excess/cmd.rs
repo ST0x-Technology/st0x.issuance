@@ -6,6 +6,13 @@ use crate::vault::{SendableTxWithHash, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum BurnExcessCommand {
+    /// Path B, live route: record the funding Transfer the stream expects
+    /// before it is broadcast, so the poller holds it rather than redeem it.
+    ExpectFunding {
+        bind: ExcessBurnBind,
+        reason: String,
+        incident_id: Option<String>,
+    },
     /// Path B only: record a verified funding Transfer so the poller skips it.
     RecordFundingExclusion {
         bind: ExcessBurnBind,

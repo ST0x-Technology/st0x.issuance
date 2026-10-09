@@ -210,10 +210,14 @@ pub(crate) enum BreakglassCommand {
 pub(crate) enum BurnExcessCommand {
     /// The excess shares already sit in the issuer wallet.
     Internal(BurnExcessArgs),
+    /// First step when the excess shares must be sent back into the issuer
+    /// wallet: run with `--execute` before that funding Transfer is
+    /// broadcast, so the bot's redemption poller holds it instead of
+    /// redeeming it. `--close` releases the hold if it will not be sent.
+    ExpectFunding(BurnExcessArgs),
     /// The excess shares arrived through an on-chain Transfer into the issuer
-    /// wallet. The bot quiesces that network's redemption poller only once
-    /// this request arrives, so until RAI-2958 use the offline
-    /// `issuer burn-excess external` with the service stopped instead.
+    /// wallet. Needs `expect-funding --execute` recorded before that Transfer
+    /// was broadcast; the bot refuses a stream without it.
     External {
         /// Funding Transfer that moved the excess shares into the wallet.
         #[arg(long)]
@@ -223,7 +227,7 @@ pub(crate) enum BurnExcessCommand {
     },
 }
 
-/// Flags shared by both burn-excess paths, named as on the offline
+/// Flags shared by every burn-excess step, named as on the offline
 /// `issuer burn-excess` CLI.
 #[derive(Debug, Args)]
 pub(crate) struct BurnExcessArgs {
@@ -255,7 +259,8 @@ pub(crate) struct BurnExcessArgs {
     /// changes nothing.
     #[arg(long)]
     pub(crate) execute: bool,
-    /// Close a dead intended or submitted burn stream instead of burning.
+    /// Close the stream instead of burning: a dead intended or submitted
+    /// burn, or an expectation whose funding Transfer will not be sent.
     #[arg(long)]
     pub(crate) close: bool,
 }

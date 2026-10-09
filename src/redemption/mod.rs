@@ -7,7 +7,6 @@ pub(crate) mod force_complete;
 pub(crate) mod job;
 pub(crate) mod journal_manager;
 pub(crate) mod poller;
-pub(crate) mod poller_pause;
 pub(crate) mod redeem_call_manager;
 #[cfg(test)]
 pub(crate) mod test_utils;

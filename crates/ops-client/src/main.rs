@@ -11,10 +11,11 @@ mod transport;
 use clap::Parser;
 use reqwest::Method;
 use st0x_issuance_dto::{
-    AddTokenizedAssetRequest, BurnExcessCommon, BurnExcessExternalRequest,
-    BurnExcessInternalRequest, CloseMintRequest, CloseRedemptionRequest,
-    ForceCompleteRedemptionRequest, RegisterAccountRequest,
-    ScheduleFreezeWindowRequest, TokenSymbol, WhitelistWalletRequest,
+    AddTokenizedAssetRequest, BurnExcessCommon, BurnExcessExpectFundingRequest,
+    BurnExcessExternalRequest, BurnExcessInternalRequest, CloseMintRequest,
+    CloseRedemptionRequest, ForceCompleteRedemptionRequest,
+    RegisterAccountRequest, ScheduleFreezeWindowRequest, TokenSymbol,
+    WhitelistWalletRequest,
 };
 use std::io::Write;
 use std::process::ExitCode;
@@ -388,6 +389,18 @@ fn breakglass_route(command: &BreakglassCommand) -> Route {
                 "/burn-excess/internal".to_owned(),
             )
         },
+        BurnExcess(BurnExcessCommand::ExpectFunding(args)) => Route {
+            body: Some(RouteBody::BurnExcessExpectFunding(
+                BurnExcessExpectFundingRequest {
+                    common: burn_excess_common(args),
+                },
+            )),
+            ..bare(
+                Method::POST,
+                Tier::Breakglass,
+                "/burn-excess/expect-funding".to_owned(),
+            )
+        },
         BurnExcess(BurnExcessCommand::External { funding_tx_hash, args }) => {
             Route {
                 body: Some(RouteBody::BurnExcessExternal(
@@ -462,6 +475,7 @@ fn log_search(command: &Command) -> Option<String> {
         ) => Some(issuer_request_id.clone()),
         Command::Breakglass(BreakglassCommand::BurnExcess(
             BurnExcessCommand::Internal(args)
+            | BurnExcessCommand::ExpectFunding(args)
             | BurnExcessCommand::External { args, .. },
         )) => Some(args.issuer_request_id.to_string()),
         Command::Debug(
@@ -864,6 +878,23 @@ mod tests {
                     "network": "base",
                     "chain_id": 8453,
                     "execute": false,
+                    "close": false
+                }))
+            )
+        );
+        assert_eq!(
+            wire(&burn_excess_flags(&["expect-funding", "--execute"])),
+            (
+                "POST /ops/breakglass/burn-excess/expect-funding".to_owned(),
+                Some(json!({
+                    "issuer_request_id": MINT,
+                    "deposit_tx_hash": HASH_A,
+                    "receipt_id": "0x1",
+                    "shares": "0.750",
+                    "reason": "duplicate deposit",
+                    "network": "base",
+                    "chain_id": 8453,
+                    "execute": true,
                     "close": false
                 }))
             )

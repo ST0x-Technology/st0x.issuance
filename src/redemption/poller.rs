@@ -5,16 +5,18 @@ use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
 use event_sorcery::Store;
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
 
 use super::{
     IssuerRedemptionRequestId, Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
-    poller_pause::PollerPause,
     redeem_call_manager::RedeemCallManager,
     transfer::{
         RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
@@ -52,6 +54,10 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// hidden among routine WARNs. At `RETRY_INTERVAL` (10s) this is ~30s of
 /// continuous failure.
 const MAX_POLL_FAILURES_BEFORE_ALARM: usize = 3;
+
+/// How often a vault held at an expected burn-excess funding Transfer is
+/// reported at WARN while the held set does not change.
+const HELD_VAULT_WARN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Continuously polls `eth_getLogs` for Transfer events across all vaults on
 /// one network.
@@ -94,6 +100,25 @@ pub(crate) struct TransferPoller<P> {
     burn_manager: Arc<BurnManager>,
     vault_mode_config: VaultModeConfig,
     telemetry: Arc<NetworkTelemetry>,
+    held_warning: Mutex<Option<HeldVaultWarning>>,
+    /// Per held vault, how far past the held Transfer a pass has already
+    /// processed. In memory only: after a restart the first pass rescans
+    /// from the checkpoint, which detection's idempotency makes safe.
+    held_scans: Mutex<HashMap<Address, HeldScan>>,
+}
+
+/// A held vault's scan position: the held Transfer's block, and the last
+/// block after it that a pass has processed.
+#[derive(Clone, Copy)]
+struct HeldScan {
+    held_at: u64,
+    scanned_through: u64,
+}
+
+/// The held set last reported at WARN, and when.
+struct HeldVaultWarning {
+    vaults: Vec<(Address, u64)>,
+    at: Instant,
 }
 
 /// Configuration for constructing a [`TransferPoller`].
@@ -125,6 +150,8 @@ impl<P> TransferPoller<P> {
             burn_manager: config.burn_manager,
             vault_mode_config: config.vault_mode_config,
             telemetry: config.telemetry,
+            held_warning: Mutex::new(None),
+            held_scans: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -155,7 +182,7 @@ where
     ///
     /// On error, logs the failure and retries after `RETRY_INTERVAL`. Each
     /// vault's cursor is persisted, so no blocks are re-scanned unnecessarily.
-    pub(crate) async fn run(&self, mut pause: PollerPause) {
+    pub(crate) async fn run(&self) {
         // One-time migration from the legacy global checkpoint to per-vault
         // checkpoints. Non-fatal: without it a vault simply re-scans from
         // `backfill_start_block`, which is safe (redemption detection is
@@ -176,14 +203,12 @@ where
         // outage is indistinguishable from a single blip in the logs.
         let mut consecutive_failures = 0_usize;
         loop {
-            pause.wait_while_paused().await;
-
             match self.poll_once().await {
                 Err(error) => {
                     consecutive_failures += 1;
                     log_poll_failure(&error, consecutive_failures);
                     self.telemetry.record_transfer_poll_failure(self.network);
-                    pause.interruptible_sleep(RETRY_INTERVAL).await;
+                    tokio::time::sleep(RETRY_INTERVAL).await;
                     continue;
                 }
                 Ok(lag_blocks) => {
@@ -193,7 +218,7 @@ where
             }
 
             consecutive_failures = 0;
-            pause.interruptible_sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -277,7 +302,7 @@ where
     /// re-point mid-pass cannot turn an already-fetched log into a
     /// non-transient skip (the vault its log came from is always present in
     /// the snapshot the pass was built from).
-    async fn poll_once(&self) -> Result<u64, TransferPollError> {
+    pub(crate) async fn poll_once(&self) -> Result<u64, TransferPollError> {
         // Re-read the monitored asset set every pass so assets added or
         // re-pointed at runtime are covered without a restart — scoped to
         // this poller's network, so no pass scans (or checkpoints) another
@@ -306,6 +331,7 @@ where
         // in `run()`. (Pass-level failures above — the view read and the head
         // fetch — still propagate, since they block every vault.)
         let mut failed_vaults: Vec<Address> = Vec::new();
+        let mut held_vaults: Vec<(Address, u64)> = Vec::new();
         let total_vaults = vaults.len();
         let mut lag_blocks = 0_u64;
 
@@ -331,19 +357,23 @@ where
             lag_blocks =
                 lag_blocks.max(head.saturating_add(1).saturating_sub(cursor));
 
-            if let Err(error) =
-                self.poll_vault(&assets, vault, head, cursor).await
-            {
-                debug!(
-                    target: "redemption",
-                    %vault,
-                    error = %error,
-                    "Failed to poll vault; will retry next pass from its \
-                     checkpoint"
-                );
-                failed_vaults.push(vault);
+            match self.poll_vault(&assets, vault, head, cursor).await {
+                Ok(Some(held_block)) => held_vaults.push((vault, held_block)),
+                Ok(None) => {}
+                Err(error) => {
+                    debug!(
+                        target: "redemption",
+                        %vault,
+                        error = %error,
+                        "Failed to poll vault; will retry next pass from its \
+                         checkpoint"
+                    );
+                    failed_vaults.push(vault);
+                }
             }
         }
+
+        self.report_held_vaults(&held_vaults).await;
 
         if !failed_vaults.is_empty() {
             warn!(
@@ -363,6 +393,53 @@ where
         }
 
         Ok(lag_blocks)
+    }
+
+    /// A held vault's checkpoint stays before the held Transfer until its
+    /// burn-excess stream excludes it or closes, so the on-call must see it,
+    /// but a hold is meant to last a whole Path B run: WARN when the held set
+    /// changes and again every [`HELD_VAULT_WARN_INTERVAL`] while it lasts,
+    /// DEBUG on the passes in between.
+    async fn report_held_vaults(&self, held_vaults: &[(Address, u64)]) {
+        let warn_now = {
+            let mut last = self.held_warning.lock().await;
+            let due = match last.as_ref() {
+                _ if held_vaults.is_empty() => false,
+                Some(previous) if previous.vaults == held_vaults => {
+                    previous.at.elapsed() >= HELD_VAULT_WARN_INTERVAL
+                }
+                _ => true,
+            };
+            if held_vaults.is_empty() {
+                *last = None;
+            } else if due {
+                *last = Some(HeldVaultWarning {
+                    vaults: held_vaults.to_vec(),
+                    at: Instant::now(),
+                });
+            }
+            due
+        };
+
+        if warn_now {
+            warn!(
+                target: "redemption",
+                network = %self.network,
+                held_vault_count = held_vaults.len(),
+                held_vaults = ?held_vaults,
+                "Transfer poll pass left vaults held at expected burn-excess \
+                 funding transfers; their checkpoints stay before the held \
+                 Transfer until the stream records its exclusion or is closed, \
+                 and non-matching later Transfers on them are still detected"
+            );
+        } else if !held_vaults.is_empty() {
+            debug!(
+                target: "redemption",
+                network = %self.network,
+                held_vaults = ?held_vaults,
+                "Vaults still held at expected burn-excess funding transfers"
+            );
+        }
     }
 
     /// Computes the block a vault's scan starts from: one past its persisted
@@ -389,14 +466,17 @@ where
 
     /// Scans one vault from `cursor` (its start block, from [`Self::start_cursor`])
     /// up to `head`, processing each Transfer and advancing the vault's
-    /// checkpoint per chunk.
+    /// checkpoint per chunk. A held expected-funding Transfer stops the
+    /// checkpoint just before its block, and that block is returned; the
+    /// scan still processes every later non-matching Transfer, so unrelated
+    /// redemptions on the vault are detected while the hold lasts.
     async fn poll_vault(
         &self,
         assets: &[TokenizedAssetView],
         vault: Address,
         head: u64,
         cursor: u64,
-    ) -> Result<(), TransferPollError> {
+    ) -> Result<Option<u64>, TransferPollError> {
         if cursor > head {
             trace!(
                 target: "redemption",
@@ -406,7 +486,19 @@ where
                 head,
                 "Vault caught up; skipping"
             );
-            return Ok(());
+            return Ok(None);
+        }
+
+        let held_scan = self.held_scans.lock().await.get(&vault).copied();
+        if let Some(held_scan) = held_scan {
+            if held_scan.held_at == cursor
+                && let Some(held_at) =
+                    self.poll_held_vault(assets, vault, head, held_scan).await?
+            {
+                return Ok(Some(held_at));
+            }
+
+            self.held_scans.lock().await.remove(&vault);
         }
 
         debug!(
@@ -418,6 +510,7 @@ where
             "Polling vault for transfer events"
         );
 
+        let mut held_at: Option<u64> = None;
         for (chunk_from, chunk_to) in
             block_ranges(cursor, head, BLOCK_CHUNK_SIZE)
         {
@@ -434,17 +527,63 @@ where
                 "Processed block range"
             );
 
-            let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
+            // Later non-matching Transfers are processed too, not deferred
+            // behind the hold: a redemption that only waited would leave its
+            // shares in the issuer wallet, which keeps the burn-excess run
+            // from proving its exact balance and so from ever releasing the
+            // hold. Later passes read only the held block and new blocks (see
+            // `poll_held_vault`); detection is idempotent, so the one rescan
+            // after the hold clears redoes nothing.
+            let held_before_chunk = held_at.is_some();
+            let mut dropped: Vec<(Option<TxHash>, Option<u64>)> = Vec::new();
             for log in &logs {
-                if let ProcessedLog::DroppedNonTransient { tx_hash } =
-                    self.process_log(assets, log).await?
-                {
-                    dropped_tx_hashes.push(tx_hash);
+                match self.process_log(assets, log).await? {
+                    ProcessedLog::Handled => {}
+                    ProcessedLog::DroppedNonTransient { tx_hash } => {
+                        dropped.push((tx_hash, log.block_number));
+                    }
+                    ProcessedLog::HeldExpectedFunding { block_number } => {
+                        let earliest_held_at = held_at
+                            .map_or(block_number, |earlier| {
+                                earlier.min(block_number)
+                            });
+                        if held_at != Some(earliest_held_at) {
+                            held_at = Some(earliest_held_at);
+                            self.held_scans.lock().await.insert(
+                                vault,
+                                HeldScan {
+                                    held_at: earliest_held_at,
+                                    scanned_through: earliest_held_at,
+                                },
+                            );
+                        }
+                    }
                 }
             }
 
-            advance_transfer_poll(&self.pool, self.network, vault, chunk_to)
-                .await?;
+            if let Some(held_at) = held_at {
+                self.held_scans.lock().await.insert(
+                    vault,
+                    HeldScan { held_at, scanned_through: chunk_to },
+                );
+            }
+
+            // Once held, the checkpoint stays before the held Transfer, so it
+            // is read again until its burn-excess stream excludes it (then it
+            // is skipped) or closes (then it is detected).
+            if !held_before_chunk {
+                let processed_through = held_at
+                    .map_or(Some(chunk_to), |block| block.checked_sub(1));
+                if let Some(block) = processed_through {
+                    advance_transfer_poll(
+                        &self.pool,
+                        self.network,
+                        vault,
+                        block,
+                    )
+                    .await?;
+                }
+            }
 
             // The advance above moved the cursor past these transfers, making
             // the skip permanent: real user tokens in the redemption wallet
@@ -453,7 +592,20 @@ where
             // operator's only signal — emitted here, not after the loop, so a
             // transient error in a later chunk cannot swallow it. Any earlier
             // `?` abort leaves this chunk's checkpoint unadvanced, so its
-            // drops are re-detected on the next pass.
+            // drops are re-detected on the next pass, as are drops at or after
+            // a held Transfer's block, which the checkpoint has not passed.
+            let dropped_tx_hashes: Vec<Option<TxHash>> = dropped
+                .into_iter()
+                .filter(|(_, dropped_block)| match (held_at, dropped_block) {
+                    (Some(held_block), Some(dropped_block)) => {
+                        *dropped_block < held_block
+                    }
+                    // Not passed: the checkpoint stops before the hold.
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                })
+                .map(|(tx_hash, _)| tx_hash)
+                .collect();
             if !dropped_tx_hashes.is_empty() {
                 warn!(
                     target: "redemption",
@@ -464,7 +616,82 @@ where
             }
         }
 
-        Ok(())
+        if let Some(block_number) = held_at {
+            debug!(
+                target: "redemption",
+                %vault,
+                network = %self.network,
+                block_number,
+                "Holding vault at expected burn-excess funding transfer"
+            );
+        }
+
+        Ok(held_at)
+    }
+
+    /// A pass over a vault a previous pass left held. Re-reads only the held
+    /// block, to learn whether the hold still stands, and then the blocks
+    /// after `scanned_through` that no pass has read yet: the Transfers after
+    /// the hold were already processed, and reading them again every pass
+    /// would grow RPC and store work with the hold's age. The checkpoint is
+    /// not touched. Returns `None` once the held block no longer holds; the
+    /// caller then rescans from the checkpoint, which reports any drop the
+    /// checkpoint passes and moves it on.
+    async fn poll_held_vault(
+        &self,
+        assets: &[TokenizedAssetView],
+        vault: Address,
+        head: u64,
+        held_scan: HeldScan,
+    ) -> Result<Option<u64>, TransferPollError> {
+        let HeldScan { held_at, mut scanned_through } = held_scan;
+
+        let mut still_held = false;
+        for log in &self.fetch_transfer_logs(vault, held_at, held_at).await? {
+            if let ProcessedLog::HeldExpectedFunding { .. } =
+                self.process_log(assets, log).await?
+            {
+                still_held = true;
+            }
+        }
+        if !still_held {
+            return Ok(None);
+        }
+
+        // Saved before reading on, and again per chunk, so an error in a
+        // later chunk neither drops the hold's position nor makes the next
+        // pass read an already processed chunk again.
+        self.held_scans
+            .lock()
+            .await
+            .insert(vault, HeldScan { held_at, scanned_through });
+        if scanned_through < head {
+            for (chunk_from, chunk_to) in
+                block_ranges(scanned_through + 1, head, BLOCK_CHUNK_SIZE)
+            {
+                for log in &self
+                    .fetch_transfer_logs(vault, chunk_from, chunk_to)
+                    .await?
+                {
+                    self.process_log(assets, log).await?;
+                }
+                scanned_through = chunk_to;
+                self.held_scans
+                    .lock()
+                    .await
+                    .insert(vault, HeldScan { held_at, scanned_through });
+            }
+        }
+
+        debug!(
+            target: "redemption",
+            %vault,
+            network = %self.network,
+            held_at,
+            scanned_through,
+            "Re-read held vault: held block and new blocks only"
+        );
+        Ok(Some(held_at))
     }
 
     /// Fetches Transfer logs for one vault where topic2 (to) == bot_wallet.
@@ -558,18 +785,23 @@ where
             | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedNoAccount
             | TransferOutcome::SkippedAdminRecovery => {}
+            TransferOutcome::HeldExpectedFunding { block_number } => {
+                return Ok(ProcessedLog::HeldExpectedFunding { block_number });
+            }
         }
 
         Ok(ProcessedLog::Handled)
     }
 }
 
-/// Outcome of processing a single Transfer log: either handled (including
-/// benign skips like already-detected) or permanently dropped because of a
-/// non-transient decode/detection failure.
+/// Outcome of processing a single Transfer log: handled (including benign
+/// skips like already-detected), permanently dropped because of a
+/// non-transient decode/detection failure, or held as a live burn-excess
+/// stream's expected funding Transfer.
 enum ProcessedLog {
     Handled,
     DroppedNonTransient { tx_hash: Option<TxHash> },
+    HeldExpectedFunding { block_number: u64 },
 }
 
 /// Watches a spawned redemption-flow task. A dropped `JoinHandle` swallows
@@ -663,63 +895,132 @@ pub(crate) fn block_ranges(
 #[cfg(test)]
 mod tests {
     use alloy::network::EthereumWallet;
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::rpc::client::ClientBuilder;
+    use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
-    use event_sorcery::{Store, StoreBuilder, test_store};
+    use alloy::transports::mock::MockTransport;
+    use alloy::transports::{TransportError, TransportFut};
+    use chrono::Utc;
+    use event_sorcery::StoreBuilder;
+    use parking_lot::Mutex as ParkingMutex;
+    use serde_json::Value;
     use sqlx::SqlitePool;
-    use st0x_alpaca::issuer::mock::MockIssuerApi;
+    use st0x_issuance_dto::AssetKey;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tower::{Layer, Service};
     use tracing_test::traced_test;
 
     use super::{TransferPollError, watch_redemption_flow};
-    use crate::config::VaultModeConfig;
-    use crate::network_telemetry::NetworkTelemetry;
-    use crate::notifications::NoopLifecycleNotifier;
+    use crate::burn_excess::exclusion::record_funding_exclusion;
+    use crate::burn_excess::expectation::{
+        clear_funding_expectation, record_funding_expectation,
+    };
+    use crate::burn_excess::{ExcessBurnBind, FundingTransferId};
+    use crate::mint::IssuerMintRequestId;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
     };
-    use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptInventory, ReceiptService,
-    };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
+        transfer_poller_for_tests,
     };
-    use crate::redemption::{
-        IssuerRedemptionRequestId, Redemption, RedemptionServices,
-    };
-    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
-    use crate::vault::mock::MockVaultService;
-    use st0x_issuance_dto::AssetKey;
 
-    /// `pool` must already have migrations applied — the stores write to the
-    /// `events` table on first command dispatch.
-    fn setup_test_store(
-        pool: &SqlitePool,
-    ) -> (Arc<Store<Redemption>>, Arc<dyn ReceiptService>) {
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-        let vault_service: Arc<dyn crate::vault::VaultService> =
-            Arc::new(MockVaultService::new_success());
-        let store = Arc::new(test_store::<Redemption>(
-            pool.clone(),
-            RedemptionServices::with_single_vault(Network::Base, vault_service),
-        ));
-        let receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(CqrsReceiptService::new(receipt_store));
+    #[derive(Clone, Debug, Default)]
+    struct RequestRecorder(Arc<ParkingMutex<Vec<RequestPacket>>>);
 
-        (store, receipt_service)
+    impl RequestRecorder {
+        fn record(&self, request: &RequestPacket) {
+            self.0.lock().push(request.clone());
+        }
+
+        fn take_get_log_ranges(&self) -> Vec<(u64, u64)> {
+            self.0
+                .lock()
+                .drain(..)
+                .flat_map(|packet| match packet {
+                    RequestPacket::Single(request) => vec![request],
+                    RequestPacket::Batch(requests) => requests,
+                })
+                .filter(|request| request.method() == "eth_getLogs")
+                .map(|request| {
+                    let params: Vec<Value> =
+                        serde_json::from_str(request.params().unwrap().get())
+                            .unwrap();
+                    let filter = params.first().unwrap();
+                    (
+                        filter_block(filter, "fromBlock"),
+                        filter_block(filter, "toBlock"),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn filter_block(filter: &Value, field: &str) -> u64 {
+        let encoded = filter.get(field).and_then(Value::as_str).unwrap();
+        u64::from_str_radix(encoded.strip_prefix("0x").unwrap(), 16).unwrap()
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingLayer {
+        recorder: RequestRecorder,
+    }
+
+    impl<Inner> Layer<Inner> for RecordingLayer {
+        type Service = RecordingTransport<Inner>;
+
+        fn layer(&self, inner: Inner) -> Self::Service {
+            RecordingTransport { inner, recorder: self.recorder.clone() }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingTransport<Inner> {
+        inner: Inner,
+        recorder: RequestRecorder,
+    }
+
+    impl<Inner> Service<RequestPacket> for RecordingTransport<Inner>
+    where
+        Inner: Service<
+                RequestPacket,
+                Response = ResponsePacket,
+                Error = TransportError,
+                Future = TransportFut<'static>,
+            >,
+    {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(context)
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            self.recorder.record(&request);
+            self.inner.call(request)
+        }
     }
 
     struct TestPollerSetup<P: alloy::providers::Provider + Clone> {
         poller: super::TransferPoller<P>,
         pool: SqlitePool,
+        requests: RequestRecorder,
     }
 
     async fn setup_test_poller(
@@ -756,62 +1057,24 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
-        let (store, receipt_service) = setup_test_store(&pool);
-
-        let alpaca_service = Arc::new(MockIssuerApi::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(
-            crate::redemption::redeem_call_manager::RedeemCallManager::new(
-                alpaca_service.clone(),
-                store.clone(),
-                pool.clone(),
-                Arc::new(NoopLifecycleNotifier),
-            ),
-        );
-        let journal_manager =
-            Arc::new(crate::redemption::journal_manager::JournalManager::new(
-                alpaca_service,
-                store.clone(),
-                pool.clone(),
-            ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-
-        let apalis_pool = apalis_sqlite::SqlitePool::connect(":memory:")
-            .await
-            .expect("apalis test pool should connect");
-        let burn_manager = Arc::new(
-            crate::redemption::burn_manager::BurnManager::new_for_tests(
-                vault_service,
-                pool.clone(),
-                store.clone(),
-                receipt_service,
-                bot_wallet,
-                ANVIL_CHAIN_ID,
-                apalis_pool,
-            ),
-        );
-
+        let requests = RequestRecorder::default();
+        let client = ClientBuilder::default()
+            .layer(RecordingLayer { recorder: requests.clone() })
+            .transport(MockTransport::new(asserter.clone()), true);
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
-            .connect_mocked_client(asserter.clone());
+            .connect_client(client);
 
-        let poller = super::TransferPoller::new(super::TransferPollerConfig {
+        let poller = transfer_poller_for_tests(
             network,
             provider,
             bot_wallet,
             backfill_start_block,
-            store,
-            pool: pool.clone(),
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-            vault_mode_config: VaultModeConfig::default(),
-            telemetry: Arc::new(NetworkTelemetry::new([network])),
-        });
+            pool.clone(),
+        )
+        .await;
 
-        TestPollerSetup { poller, pool }
+        TestPollerSetup { poller, pool, requests }
     }
 
     /// Adds a second enabled asset (MSFT/tMSFT) bound to `vault`, alongside
@@ -937,6 +1200,470 @@ mod tests {
             tracing::Level::DEBUG,
             &["Polling vault for transfer events"]
         ));
+    }
+
+    /// A live burn-excess stream expects its funding Transfer before it is
+    /// broadcast. The pass that reads it must neither redeem it nor move the
+    /// checkpoint past it, but a later AP redemption on the same vault must
+    /// still be detected: if it waited, its shares would sit in the issuer
+    /// wallet and the burn-excess run, which needs an exact balance, could
+    /// never record the exclusion that ends the hold. Re-reading it on the
+    /// next held pass detects nothing twice; once the stream excludes the
+    /// funding log, the checkpoint moves past both.
+    #[traced_test]
+    #[tokio::test]
+    async fn poll_holds_the_vault_at_an_expected_funding_transfer() {
+        let vault = address!("0x7777777777777777777777777777777777777777");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let other_amount = U256::from(1_000_000_000_000_000_000u64);
+        let before_tx = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let funding_tx = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let after_tx = b256!(
+            "0x3333333333333333333333333333333333333333333333333333333333333333"
+        );
+        let before = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            other_amount,
+            before_tx,
+            120,
+        );
+        let funding = create_transfer_log(
+            vault, ap_wallet, bot_wallet, shares, funding_tx, 150,
+        );
+        let after = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            other_amount,
+            after_tx,
+            170,
+        );
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![before, funding.clone(), after.clone()]);
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149),
+            "the checkpoint must stop just before the held Transfer's block"
+        );
+        assert!(redemption_exists(&setup, before_tx).await);
+        assert!(!redemption_exists(&setup, funding_tx).await);
+        assert!(
+            redemption_exists(&setup, after_tx).await,
+            "a redemption after the held Transfer must not wait for the hold"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Holding vault at expected burn-excess funding transfer",
+                &vault.to_string(),
+                "150",
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "left vaults held at expected burn-excess funding transfers",
+                "held_vault_count=1",
+                &vault.to_string(),
+            ]
+        ));
+
+        // Still held: the next pass reads only the held block, detects nothing
+        // twice, and leaves the checkpoint where it is.
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone()]);
+        setup.poller.poll_once().await.unwrap();
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149)
+        );
+        assert_eq!(
+            redemption_detected_count(&setup).await,
+            2,
+            "only the Transfers before and after the held one are detected, \
+             each once"
+        );
+
+        let funding_log_id = FundingTransferId {
+            network: Network::Base,
+            vault,
+            tx_hash: funding_tx,
+            log_index: 0,
+            from: ap_wallet,
+            to: bot_wallet,
+            amount: shares,
+        };
+        record_funding_exclusion(
+            &setup.pool,
+            &funding_log_id,
+            bind.deposit_tx_hash,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        clear_funding_expectation(&setup.pool, bind.deposit_tx_hash)
+            .await
+            .unwrap();
+
+        // Released: the held block is read to see the hold is gone, then the
+        // vault is rescanned once from its checkpoint.
+        asserter.push_success(&U256::from(200u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_success(&vec![funding, after]);
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(200)
+        );
+        assert!(!redemption_exists(&setup, funding_tx).await);
+        assert!(redemption_exists(&setup, after_tx).await);
+    }
+
+    /// A hold can last a whole Path B run. A held pass must read only the
+    /// held block (to see whether the hold still stands) and the blocks no
+    /// pass has read yet, not every block after the hold again: that re-read
+    /// grows with the hold's age, one `eth_getLogs` per 2000 blocks every
+    /// pass. The checkpoint stays before the held Transfer throughout.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_held_pass_reads_only_the_held_block_and_new_blocks() {
+        // A vault no other test uses: the log buffer is shared across tests.
+        let vault = address!("0x6767676767676767676767676767676767676767");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            150,
+        );
+        let later_tx = B256::random();
+        let later = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            U256::from(1_000_000_000_000_000_000u64),
+            later_tx,
+            10_020,
+        );
+
+        // First pass: blocks 0..=10_000 in six 2000-block chunks.
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(10_000u64));
+        asserter.push_success(&vec![funding.clone()]);
+        for _ in 0..5 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+        setup.poller.poll_once().await.unwrap();
+        setup.requests.take_get_log_ranges();
+        assert!(asserter.read_q().is_empty());
+
+        // Same head: only the held block is read again.
+        asserter.push_success(&U256::from(10_000u64));
+        asserter.push_success(&vec![funding.clone()]);
+        setup.poller.poll_once().await.unwrap();
+        assert_eq!(
+            setup.requests.take_get_log_ranges(),
+            vec![(150, 150)],
+            "a held pass must re-read exactly the held block"
+        );
+        assert!(
+            asserter.read_q().is_empty(),
+            "a held pass must not re-read the blocks it already processed"
+        );
+
+        // New blocks: the held block, then every block after the last scan.
+        asserter.push_success(&U256::from(10_050u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_success(&vec![later]);
+        setup.poller.poll_once().await.unwrap();
+        assert_eq!(
+            setup.requests.take_get_log_ranges(),
+            vec![(150, 150), (10_001, 10_050)],
+            "the held pass must not skip or re-read blocks after its cursor"
+        );
+        assert!(asserter.read_q().is_empty());
+
+        assert!(
+            redemption_exists(&setup, later_tx).await,
+            "a Transfer in the new blocks is still detected while held"
+        );
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149),
+            "the checkpoint stays before the held Transfer"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Re-read held vault",
+                &vault.to_string(),
+                "held_at=150",
+                "scanned_through=10050",
+            ]
+        ));
+
+        // A transient failure while re-reading the held block must preserve
+        // the in-memory cursor. Recovery still reads the held block, then only
+        // blocks that arrived after the last successful held pass.
+        asserter.push_success(&U256::from(10_050u64));
+        asserter.push_failure_msg("simulated held-block read failure");
+        assert!(matches!(
+            setup.poller.poll_once().await.unwrap_err(),
+            TransferPollError::AllVaultsFailed { total: 1 }
+        ));
+        assert_eq!(setup.requests.take_get_log_ranges(), vec![(150, 150)]);
+
+        asserter.push_success(&U256::from(10_100u64));
+        asserter.push_success(&vec![funding]);
+        asserter.push_success(&Vec::<Log>::new());
+        setup.poller.poll_once().await.unwrap();
+        assert_eq!(
+            setup.requests.take_get_log_ranges(),
+            vec![(150, 150), (10_051, 10_100)],
+            "a failed held-block read must not discard the saved cursor"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Failed to poll vault; will retry next pass", &vault.to_string(),]
+        ));
+    }
+
+    /// Once a full rescan discovers a hold, every completed chunk after it is
+    /// useful progress. A later RPC failure must resume at the held block and
+    /// the first unread chunk rather than restart from the durable checkpoint.
+    #[traced_test]
+    #[tokio::test]
+    async fn full_rescan_preserves_held_progress_across_later_chunk_failure() {
+        let vault = address!("0x6868686868686868686868686868686868686868");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            150,
+        );
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(10_000u64));
+        asserter.push_success(&vec![funding.clone()]);
+        asserter.push_failure_msg("simulated later chunk failure");
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            setup.poller.poll_once().await.unwrap_err(),
+            TransferPollError::AllVaultsFailed { total: 1 }
+        ));
+        assert_eq!(
+            setup.requests.take_get_log_ranges(),
+            vec![(0, 1_999), (2_000, 3_999)]
+        );
+        assert_eq!(
+            load_transfer_poll(&setup.pool, Network::Base, vault)
+                .await
+                .unwrap(),
+            Some(149)
+        );
+
+        asserter.push_success(&U256::from(10_000u64));
+        asserter.push_success(&vec![funding]);
+        for _ in 0..5 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+        setup.poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            setup.requests.take_get_log_ranges(),
+            vec![
+                (150, 150),
+                (2_000, 3_999),
+                (4_000, 5_999),
+                (6_000, 7_999),
+                (8_000, 9_999),
+                (10_000, 10_000),
+            ],
+            "recovery must resume after the last completed chunk"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Re-read held vault", &vault.to_string(), "10000"]
+        ));
+    }
+
+    /// A hold lasts a whole Path B run, so repeated passes over the same held
+    /// vault report it at WARN once, then at DEBUG, rather than every 5 s.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_lasting_hold_warns_once_not_every_pass() {
+        // A vault no other test uses: the log buffer is shared across tests.
+        let vault = address!("0x8888888888888888888888888888888888888888");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let shares = U256::from(750_000_000_000_000_000u64);
+        let funding = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            shares,
+            B256::random(),
+            150,
+        );
+
+        let asserter = Asserter::new();
+        for _ in 0..3 {
+            asserter.push_success(&U256::from(200u64));
+            asserter.push_success(&vec![funding.clone()]);
+        }
+        let setup =
+            setup_test_poller(vault, bot_wallet, Some(ap_wallet), &asserter, 0)
+                .await;
+        let bind = ExcessBurnBind {
+            issuer_request_id: IssuerMintRequestId::random(),
+            deposit_tx_hash: B256::random(),
+            receipt_id: U256::from(7u64),
+            shares,
+            original_recipient: ap_wallet,
+            vault,
+            network: Network::Base,
+            issuer_wallet: bot_wallet,
+        };
+        record_funding_expectation(&setup.pool, &bind, Utc::now())
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            setup.poller.poll_once().await.unwrap();
+        }
+
+        let vault_key = vault.to_string();
+        assert_eq!(
+            log_count_at!(
+                tracing::Level::WARN,
+                &[
+                    "left vaults held at expected burn-excess funding transfers",
+                    &vault_key
+                ]
+            ),
+            1
+        );
+        assert_eq!(
+            log_count_at!(
+                tracing::Level::DEBUG,
+                &[
+                    "Vaults still held at expected burn-excess funding transfers",
+                    &vault_key
+                ]
+            ),
+            2
+        );
+    }
+
+    async fn redemption_exists<P: alloy::providers::Provider + Clone>(
+        setup: &TestPollerSetup<P>,
+        tx_hash: B256,
+    ) -> bool {
+        setup
+            .poller
+            .store
+            .load(&IssuerRedemptionRequestId::new(tx_hash))
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn redemption_detected_count<
+        P: alloy::providers::Provider + Clone,
+    >(
+        setup: &TestPollerSetup<P>,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND event_type = 'RedemptionEvent::Detected'
+            ",
+        )
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap()
     }
 
     /// Each per-network poller must scan only its OWN network's vaults: with

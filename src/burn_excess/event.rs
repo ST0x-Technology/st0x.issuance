@@ -8,6 +8,16 @@ use crate::vault::{SendableTxWithHash, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum BurnExcessEvent {
+    /// Path B, live route: the funding Transfer this stream will burn is
+    /// expected from `bind.original_recipient` to `bind.issuer_wallet` for
+    /// exactly `bind.shares`, so the poller holds a matching log instead of
+    /// opening a Redemption for it.
+    FundingExpected {
+        bind: ExcessBurnBind,
+        reason: String,
+        incident_id: Option<String>,
+        expected_at: DateTime<Utc>,
+    },
     FundingExclusionRecorded {
         bind: ExcessBurnBind,
         funding_log_id: FundingTransferId,
@@ -43,10 +53,11 @@ pub(crate) enum BurnExcessEvent {
 impl BurnExcessEvent {
     /// Stored `event_type` values, shared with the raw SQL that filters on
     /// them: the wallet intent gate (`has_unresolved_excess_burn_intent`) and
-    /// the exclusion index rebuild (`rebuild_funding_exclusion_index`). Bound
-    /// here so a renamed variant is a compile error rather than a query that
-    /// silently matches nothing — a gate that returns zero rows is a gate that
-    /// is off.
+    /// the exclusion and expectation index rebuilds. Bound here so a renamed
+    /// variant is a compile error rather than a query that silently matches
+    /// nothing — a gate that returns zero rows is a gate that is off.
+    pub(crate) const FUNDING_EXPECTED: &'static str =
+        "BurnExcessEvent::FundingExpected";
     pub(crate) const FUNDING_EXCLUSION_RECORDED: &'static str =
         "BurnExcessEvent::FundingExclusionRecorded";
     pub(crate) const EXCESS_BURN_INTENDED: &'static str =
@@ -62,6 +73,7 @@ impl BurnExcessEvent {
 impl DomainEvent for BurnExcessEvent {
     fn event_type(&self) -> String {
         match self {
+            Self::FundingExpected { .. } => Self::FUNDING_EXPECTED.to_string(),
             Self::FundingExclusionRecorded { .. } => {
                 Self::FUNDING_EXCLUSION_RECORDED.to_string()
             }
