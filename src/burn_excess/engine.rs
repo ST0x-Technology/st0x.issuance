@@ -4457,18 +4457,6 @@ mod tests {
             acknowledged_unresolved_burn_tx_hash: None,
             completed_at: Utc::now(),
         };
-        let sequence: i64 = sqlx::query_scalar(
-            "
-            SELECT COALESCE(MAX(sequence), 0) + 1
-            FROM events
-            WHERE aggregate_type = 'Redemption'
-              AND aggregate_id = ?
-            ",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(pool)
-        .await
-        .unwrap();
         sqlx::query(
             "
             INSERT INTO events (
@@ -4480,13 +4468,23 @@ mod tests {
                 payload,
                 metadata
             )
-            VALUES ('Redemption', ?, ?, ?, '2.0', ?, '{}')
+            SELECT
+                'Redemption',
+                ?,
+                COALESCE(MAX(sequence), 0) + 1,
+                ?,
+                '2.0',
+                ?,
+                '{}'
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
             ",
         )
         .bind(issuer_request_id.to_string())
-        .bind(sequence)
         .bind(event.event_type())
         .bind(serde_json::to_string(&event).unwrap())
+        .bind(issuer_request_id.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -5085,18 +5083,7 @@ mod tests {
 
         let redemption_id =
             IssuerRedemptionRequestId::new(redemption_tx).to_string();
-        let next_sequence: i64 = sqlx::query_scalar(
-            "
-            SELECT COALESCE(MAX(sequence), 0) + 1
-            FROM events
-            WHERE aggregate_type = 'Redemption'
-              AND aggregate_id = ?
-            ",
-        )
-        .bind(&redemption_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+
         sqlx::query(
             "
             INSERT INTO events (
@@ -5108,19 +5095,21 @@ mod tests {
                 payload,
                 metadata
             )
-            VALUES (
+            SELECT
                 'Redemption',
                 ?,
-                ?,
+                COALESCE(MAX(sequence), 0) + 1,
                 'RedemptionEvent::BurnIntended',
                 '1.0',
                 '{}',
                 '{}'
-            )
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
             ",
         )
         .bind(&redemption_id)
-        .bind(next_sequence)
+        .bind(&redemption_id)
         .execute(&pool)
         .await
         .unwrap();
