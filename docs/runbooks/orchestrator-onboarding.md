@@ -227,6 +227,14 @@ read. When this step actually submits, the transaction is also live proof that
 the policy's `approve` allowance works; the idempotent no-op path proves nothing
 new — step 4's signing proof covers `approve` in that case.
 
+If it fails with "submitted, unconfirmed", the approval was signed but not
+confirmed within 5 minutes. Look the printed hash up on the explorer before
+doing anything else: once it lands, a re-run sends nothing; if the explorer does
+not know it, nothing was sent and a re-run is safe. If it stays pending without
+mining, it holds the wallet's nonce and later mints and burns on that network
+queue behind it until it mines or that nonce is replaced through Turnkey;
+re-running the approval only adds another transaction behind it.
+
 Record each executed approval in the table below.
 
 ## 6. Final gate: preflight must print READY

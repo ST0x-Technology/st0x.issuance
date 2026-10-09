@@ -10,16 +10,27 @@
 //! read-only, generic over the provider, consumed by the issuer CLI's
 //! preflight subcommand.
 
+use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{
     Ethereum, EthereumWallet, TransactionBuilder, TransactionBuilderError,
 };
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy::providers::Provider;
+use alloy::providers::fillers::{FillProvider, TxFiller};
+use alloy::providers::{Provider, SendableTx};
+use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use alloy::transports::RpcError;
 use std::fmt::{self, Display, Formatter};
-use tracing::{debug, info};
+use std::time::Duration;
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
 
+use super::service::{
+    is_already_known_message, is_definitive_broadcast_rejection,
+    is_nonce_too_low_message,
+};
 use crate::bindings::{
     IST0xOrchestratorV1, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt, ST0xOrchestrator,
@@ -156,7 +167,27 @@ pub(crate) enum ApprovalOutcome {
     /// An `approve(orchestrator, U256::MAX)` landed and the re-read
     /// allowance is unlimited.
     Approved { tx_hash: B256 },
+    /// The approval was signed and broadcast (or its broadcast's answer was
+    /// lost), but its receipt and the allowance re-read did not both come back
+    /// before the deadline, so it may still land. The hash is what the
+    /// operator reconciles on chain instead of sending a second approval.
+    SubmittedUnconfirmed { tx_hash: B256 },
 }
+
+/// The whole approval's budget, from the request's start to its answer. Base
+/// and HyperEVM mine within seconds, and the `/ops` route polls the receipt
+/// every [`APPROVAL_RECEIPT_POLL`], so a healthy approval fits with room to
+/// spare. The route starts it only after the IAP guard, which may spend up to
+/// 10 seconds fetching Google's keys, so 18 seconds keeps the whole request
+/// under a load balancer's default 30-second backend timeout and the bot's
+/// verdict, not a gateway's 504, reaches the operator. Every RPC and signing
+/// step before broadcast is held to it too: one that would overrun it refuses
+/// with nothing sent.
+pub(crate) const APPROVAL_DEADLINE: Duration = Duration::from_secs(18);
+
+/// How often the `/ops` route's provider polls for the approval's receipt,
+/// down from a remote client's default 7 seconds.
+pub(crate) const APPROVAL_RECEIPT_POLL: Duration = Duration::from_secs(1);
 
 /// One transaction shape the Turnkey signing policy must allow. Target and
 /// calldata are fixed at build time, so tests can decode exactly what would
@@ -184,9 +215,20 @@ pub(crate) enum OnboardingError {
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
     #[error(transparent)]
-    PendingTransaction(#[from] alloy::providers::PendingTransactionError),
-    #[error(transparent)]
     Transport(#[from] alloy::transports::TransportError),
+    #[error(
+        "the approval deadline passed before its transaction was broadcast; \
+         nothing was sent"
+    )]
+    DeadlineBeforeBroadcast,
+    #[error("the approval transaction was filled but not signed")]
+    Unsigned,
+    #[error("the node refused approve transaction {tx_hash}: {source}")]
+    BroadcastRejected {
+        tx_hash: B256,
+        #[source]
+        source: alloy::transports::TransportError,
+    },
     #[error("approve transaction {tx_hash} reverted on-chain")]
     ApprovalReverted { tx_hash: B256 },
     #[error(
@@ -302,20 +344,52 @@ pub(crate) async fn check_orchestrator_readiness<P: Provider>(
 /// Success is never inferred from the receipt alone; the allowance the burns
 /// will rely on is re-read from the chain.
 ///
+/// Everything runs against `deadline`. The approval is signed before it is
+/// broadcast, so its hash is known from then on: running out of time before
+/// the broadcast sends nothing, and any later shortfall (no receipt, reads
+/// that kept failing, a broadcast whose answer was lost, cut off, or not
+/// conclusive) reports the hash as [`ApprovalOutcome::SubmittedUnconfirmed`].
+/// Only a broadcast the pool provably refused, and that the node then does
+/// not hold, is an error.
+///
 /// # Errors
 ///
-/// Returns an error if any read or the send fails, if the approve
-/// transaction reverts, or if the re-read allowance is not unlimited.
-pub(crate) async fn ensure_unlimited_approval<P: Provider>(
-    signing_provider: &P,
+/// Returns an error if a read, the fill, or the signing fails, if the
+/// deadline passes before the broadcast, if the node refuses the broadcast,
+/// if the approve transaction reverts, or if the re-read allowance is not
+/// unlimited.
+pub(crate) async fn ensure_unlimited_approval<F, P>(
+    signing_provider: &FillProvider<F, P>,
     vault: Address,
     orchestrator: Address,
     bot: Address,
-) -> Result<ApprovalOutcome, OnboardingError> {
+    deadline: Instant,
+) -> Result<ApprovalOutcome, OnboardingError>
+where
+    F: TxFiller,
+    P: Provider,
+{
     let vault_contract =
         OffchainAssetReceiptVault::new(vault, signing_provider);
-    let current = vault_contract.allowance(bot, orchestrator).call().await?;
-    if current == U256::MAX {
+    let signed = tokio::time::timeout_at(deadline, async {
+        let current =
+            vault_contract.allowance(bot, orchestrator).call().await?;
+        if current == U256::MAX {
+            return Ok(None);
+        }
+
+        let request = vault_contract
+            .approve(orchestrator, U256::MAX)
+            .into_transaction_request();
+        match signing_provider.fill(request).await? {
+            SendableTx::Envelope(envelope) => Ok(Some(envelope)),
+            SendableTx::Builder(_) => Err(OnboardingError::Unsigned),
+        }
+    })
+    .await
+    .map_err(|_| OnboardingError::DeadlineBeforeBroadcast)??;
+
+    let Some(envelope) = signed else {
         info!(
             target: "vault",
             %vault,
@@ -324,20 +398,200 @@ pub(crate) async fn ensure_unlimited_approval<P: Provider>(
             "Orchestrator allowance already unlimited; nothing to send"
         );
         return Ok(ApprovalOutcome::AlreadyUnlimited);
+    };
+    let tx_hash = *envelope.tx_hash();
+    let nonce = envelope.nonce();
+
+    // Signing may have used up the budget; a send started after it could be
+    // cut off before it leaves the socket and still be reported as sent.
+    if Instant::now() >= deadline {
+        return Err(OnboardingError::DeadlineBeforeBroadcast);
     }
 
-    let receipt = vault_contract
-        .approve(orchestrator, U256::MAX)
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
-    let tx_hash = receipt.transaction_hash;
+    broadcast_approval(
+        signing_provider,
+        &envelope,
+        deadline,
+        vault,
+        orchestrator,
+    )
+    .await?;
+
+    let mut last_read_error = None;
+    let confirmed = tokio::time::timeout_at(
+        deadline,
+        confirm_approval(
+            signing_provider,
+            &vault_contract,
+            tx_hash,
+            bot,
+            orchestrator,
+            &mut last_read_error,
+        ),
+    )
+    .await;
+
+    match confirmed {
+        Ok(Ok(())) => {
+            info!(
+                target: "vault",
+                %vault,
+                %orchestrator,
+                bot = %bot,
+                %tx_hash,
+                nonce,
+                "Approved unlimited orchestrator allowance"
+            );
+            Ok(ApprovalOutcome::Approved { tx_hash })
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
+                last_read_error = last_read_error.as_ref().map(display),
+                "Approval signed but not confirmed within the deadline; \
+                 reporting it unconfirmed"
+            );
+            Ok(ApprovalOutcome::SubmittedUnconfirmed { tx_hash })
+        }
+    }
+}
+
+/// Broadcasts the signed approval. An error answer that proves the pool
+/// refused the bytes (insufficient funds, underpriced, nonce too low, or a
+/// malformed request) is [`OnboardingError::BroadcastRejected`] carrying the
+/// node's reason, unless a lookup within the deadline shows the node holds
+/// the transaction anyway. Every other outcome may have left the approval
+/// pending, so it is returned as sent and confirmed by hash: an "already
+/// known" answer, any other server error (a load-balanced provider may have
+/// forwarded the bytes before failing), a lookup that fails or runs out of
+/// time, and a send that fails in transport or runs out of time.
+async fn broadcast_approval<F, P>(
+    signing_provider: &FillProvider<F, P>,
+    envelope: &TxEnvelope,
+    deadline: Instant,
+    vault: Address,
+    orchestrator: Address,
+) -> Result<(), OnboardingError>
+where
+    F: TxFiller,
+    P: Provider,
+{
+    let tx_hash = *envelope.tx_hash();
+    let nonce = envelope.nonce();
+    let sent = tokio::time::timeout_at(
+        deadline,
+        signing_provider.send_raw_transaction(&envelope.encoded_2718()),
+    )
+    .await;
+    let error = match sent {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(error)) => error,
+        Err(_) => {
+            warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
+                "Approval broadcast cut off at the deadline; it may be pending"
+            );
+            return Ok(());
+        }
+    };
+
+    let RpcError::ErrorResp(response) = &error else {
+        warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce, %error,
+            "Approval broadcast failed in transport; it may be pending"
+        );
+        return Ok(());
+    };
+    if is_already_known_message(&response.message) {
+        info!(target: "vault", %vault, %orchestrator, %tx_hash, nonce,
+            "The node already holds the approval; confirming it by hash"
+        );
+        return Ok(());
+    }
+    if !is_pool_refusal(response) {
+        warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce, %error,
+            "Approval broadcast answered with an inconclusive error; it may \
+             be pending"
+        );
+        return Ok(());
+    }
+
+    warn!(target: "vault", %vault, %orchestrator, %tx_hash, nonce, %error,
+        "Approval broadcast refused by the node; checking whether it holds \
+         the transaction anyway"
+    );
+    let lookup = tokio::time::timeout_at(
+        deadline,
+        signing_provider.get_transaction_by_hash(tx_hash),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(None)) => {
+            Err(OnboardingError::BroadcastRejected { tx_hash, source: error })
+        }
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Err(lookup_error)) => {
+            warn!(target: "vault", %tx_hash, %lookup_error,
+                "Lookup after the refusal failed; it may be pending"
+            );
+            Ok(())
+        }
+        Err(_) => {
+            warn!(target: "vault", %tx_hash,
+                "Lookup after the refusal ran out of time; it may be pending"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// An error answer that proves the pool did not accept the bytes: a
+/// malformed request, or a pool rule the transaction failed.
+fn is_pool_refusal(response: &ErrorPayload) -> bool {
+    let message = response.message.to_ascii_lowercase();
+    is_definitive_broadcast_rejection(response.code)
+        || is_nonce_too_low_message(&message)
+        || message.contains("insufficient funds")
+        || message.contains("underpriced")
+}
+
+/// Waits for the sent approval's receipt and re-reads the allowance. A failed
+/// poll or read is retried until the caller's deadline cuts this off, so one
+/// transient error (a 429, a dropped connection) cannot end the wait early;
+/// the last one is kept for the caller's log.
+async fn confirm_approval<F, P>(
+    signing_provider: &FillProvider<F, P>,
+    vault_contract: &OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance<
+        &FillProvider<F, P>,
+    >,
+    tx_hash: B256,
+    bot: Address,
+    orchestrator: Address,
+    last_read_error: &mut Option<OnboardingError>,
+) -> Result<(), OnboardingError>
+where
+    F: TxFiller,
+    P: Provider,
+{
+    let poll_interval = signing_provider.client().poll_interval();
+
+    let receipt = loop {
+        match signing_provider.get_transaction_receipt(tx_hash).await {
+            Ok(Some(receipt)) => break receipt,
+            Ok(None) => {}
+            Err(error) => *last_read_error = Some(error.into()),
+        }
+        tokio::time::sleep(poll_interval).await;
+    };
     if !receipt.status() {
         return Err(OnboardingError::ApprovalReverted { tx_hash });
     }
 
-    let allowance = vault_contract.allowance(bot, orchestrator).call().await?;
+    let allowance = loop {
+        match vault_contract.allowance(bot, orchestrator).call().await {
+            Ok(allowance) => break allowance,
+            Err(error) => *last_read_error = Some(error.into()),
+        }
+        tokio::time::sleep(poll_interval).await;
+    };
     if allowance != U256::MAX {
         return Err(OnboardingError::ApprovalNotEffective {
             tx_hash,
@@ -345,16 +599,7 @@ pub(crate) async fn ensure_unlimited_approval<P: Provider>(
         });
     }
 
-    info!(
-        target: "vault",
-        %vault,
-        %orchestrator,
-        bot = %bot,
-        %tx_hash,
-        "Approved unlimited orchestrator allowance"
-    );
-
-    Ok(ApprovalOutcome::Approved { tx_hash })
+    Ok(())
 }
 
 /// Signs — without ever broadcasting — one transaction per shape the Turnkey
@@ -530,8 +775,18 @@ const fn pass_fail(passed: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use alloy::providers::ProviderBuilder;
+    use alloy::consensus::{SignableTransaction, TxEip1559};
+    use alloy::eips::eip2930::AccessList;
+    use alloy::primitives::TxKind;
+    use alloy::providers::ext::AnvilApi;
+    use alloy::providers::fillers::FillerControlFlow;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{ProviderBuilder, RootProvider};
+    use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::rpc::types::Transaction as RpcTransaction;
+    use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::transports::TransportResult;
     use httpmock::MockServer;
     use tracing::Level;
     use tracing_test::traced_test;
@@ -707,13 +962,19 @@ mod tests {
         assert!(!report.is_ready());
     }
 
-    async fn signing_provider(evm: &LocalEvm) -> impl Provider + use<> {
+    async fn signing_provider(
+        evm: &LocalEvm,
+    ) -> FillProvider<impl TxFiller + use<>, RootProvider> {
         let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
         ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect(&evm.endpoint)
             .await
             .unwrap()
+    }
+
+    fn deadline_after(budget: Duration) -> Instant {
+        Instant::now().checked_add(budget).unwrap()
     }
 
     #[traced_test]
@@ -728,6 +989,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            deadline_after(APPROVAL_DEADLINE),
         )
         .await
         .unwrap();
@@ -753,6 +1015,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            deadline_after(APPROVAL_DEADLINE),
         )
         .await
         .unwrap();
@@ -764,6 +1027,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            deadline_after(APPROVAL_DEADLINE),
         )
         .await
         .unwrap();
@@ -792,6 +1056,7 @@ mod tests {
             evm.vault_address,
             orchestrator,
             evm.wallet_address,
+            deadline_after(APPROVAL_DEADLINE),
         )
         .await
         .unwrap();
@@ -799,6 +1064,351 @@ mod tests {
         assert!(matches!(outcome, ApprovalOutcome::Approved { .. }));
         let report = readiness(&evm, orchestrator, evm.wallet_address).await;
         assert!(report.assets[0].is_unlimited());
+    }
+
+    /// An approval whose receipt never arrives must come back within the
+    /// deadline as submitted-unconfirmed with the signed hash, rather than
+    /// hold the request until a gateway cuts it off with no hash at all.
+    #[traced_test]
+    #[tokio::test]
+    async fn unmined_approval_is_reported_unconfirmed_with_its_hash() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let provider = signing_provider(&evm).await;
+        provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_unlimited_approval(
+                &provider,
+                evm.vault_address,
+                orchestrator,
+                evm.wallet_address,
+                deadline_after(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("the approval must answer once its deadline passes")
+        .unwrap();
+
+        let ApprovalOutcome::SubmittedUnconfirmed { tx_hash } = outcome else {
+            panic!("expected SubmittedUnconfirmed, got {outcome:?}");
+        };
+        assert!(
+            provider.get_transaction_by_hash(tx_hash).await.unwrap().is_some(),
+            "the reported hash must be the approval the node holds as pending"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "not confirmed within the deadline",
+                &tx_hash.to_string(),
+                "nonce"
+            ]
+        ));
+    }
+
+    /// A deadline that passes before the approval is broadcast refuses with
+    /// nothing sent, so the operator can retry without a second approval in
+    /// flight.
+    #[tokio::test]
+    async fn deadline_before_broadcast_sends_nothing() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let provider = signing_provider(&evm).await;
+        let nonce_before =
+            provider.get_transaction_count(evm.wallet_address).await.unwrap();
+
+        let error = ensure_unlimited_approval(
+            &provider,
+            evm.vault_address,
+            orchestrator,
+            evm.wallet_address,
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OnboardingError::DeadlineBeforeBroadcast),
+            "expected DeadlineBeforeBroadcast, got {error:?}"
+        );
+        assert_eq!(
+            provider
+                .get_transaction_count(evm.wallet_address)
+                .pending()
+                .await
+                .unwrap(),
+            nonce_before,
+            "a refusal before broadcast must not have sent a transaction"
+        );
+    }
+
+    /// Stands in for a remote signer whose answer lands just after the
+    /// deadline: it runs once the request is otherwise complete, after the
+    /// wallet has signed, and blocks in the same poll, so the fill future is
+    /// already ready when its timeout is next checked.
+    #[derive(Clone, Debug)]
+    struct SignedLate(Duration);
+
+    impl TxFiller for SignedLate {
+        type Fillable = ();
+
+        fn status(&self, tx: &TransactionRequest) -> FillerControlFlow {
+            if tx.nonce.is_some() && tx.gas.is_some() {
+                FillerControlFlow::Ready
+            } else {
+                FillerControlFlow::Finished
+            }
+        }
+
+        fn fill_sync(&self, _tx: &mut SendableTx<Ethereum>) {}
+
+        async fn prepare<P: Provider>(
+            &self,
+            _provider: &P,
+            _tx: &TransactionRequest,
+        ) -> TransportResult<()> {
+            Ok(())
+        }
+
+        async fn fill(
+            &self,
+            _fillable: (),
+            tx: SendableTx<Ethereum>,
+        ) -> TransportResult<SendableTx<Ethereum>> {
+            std::thread::sleep(self.0);
+            Ok(tx)
+        }
+    }
+
+    /// Signing that finishes after the deadline must not be broadcast: a send
+    /// started then could be cut off before it leaves and still be reported as
+    /// submitted.
+    #[tokio::test]
+    async fn approval_signed_after_its_deadline_is_not_broadcast() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .filler(SignedLate(Duration::from_millis(600)))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let nonce_before =
+            provider.get_transaction_count(evm.wallet_address).await.unwrap();
+
+        let error = ensure_unlimited_approval(
+            &provider,
+            evm.vault_address,
+            orchestrator,
+            evm.wallet_address,
+            deadline_after(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OnboardingError::DeadlineBeforeBroadcast),
+            "expected DeadlineBeforeBroadcast, got {error:?}"
+        );
+        assert_eq!(
+            provider
+                .get_transaction_count(evm.wallet_address)
+                .pending()
+                .await
+                .unwrap(),
+            nonce_before,
+            "an approval signed after its deadline must not have been sent"
+        );
+    }
+
+    /// Signed bytes for a broadcast the mocked node answers; never mined.
+    fn signed_approval() -> TxEnvelope {
+        let signer = PrivateKeySigner::random();
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 60_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        TxEnvelope::from(tx.into_signed(signature))
+    }
+
+    /// What the mocked node answers to the hash lookup after an error answer.
+    enum Lookup {
+        Missing,
+        Fails,
+        NotAsked,
+    }
+
+    /// Only an error that proves the pool refused the bytes, with the node
+    /// then not holding them, is a refusal (422 with nothing pending). An
+    /// "already known" answer, an ambiguous server error, or a lookup that
+    /// fails leaves the approval possibly pending, so it must go on to be
+    /// confirmed by hash (202 with the hash) instead.
+    #[traced_test]
+    #[tokio::test]
+    async fn only_a_known_pool_refusal_the_node_does_not_hold_is_refused() {
+        for (code, message, lookup, refused) in [
+            (
+                -32000,
+                "insufficient funds for gas * price + value",
+                Lookup::Missing,
+                true,
+            ),
+            (
+                -32000,
+                "nonce too low: next nonce 8, tx nonce 7",
+                Lookup::Missing,
+                true,
+            ),
+            (-32000, "already known", Lookup::NotAsked, false),
+            (-32603, "internal error", Lookup::NotAsked, false),
+            (-32000, "transaction underpriced", Lookup::Fails, false),
+        ] {
+            let envelope = signed_approval();
+            let tx_hash = *envelope.tx_hash();
+            let asserter = Asserter::new();
+            asserter.push_failure(ErrorPayload {
+                code,
+                message: message.into(),
+                data: None,
+            });
+            match lookup {
+                Lookup::Missing => {
+                    asserter.push_success(&Option::<RpcTransaction>::None);
+                }
+                Lookup::Fails => {
+                    asserter.push_failure_msg("lookup failed (test)");
+                }
+                Lookup::NotAsked => {}
+            }
+            let provider =
+                ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+            let result = broadcast_approval(
+                &provider,
+                &envelope,
+                deadline_after(Duration::from_secs(5)),
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x11),
+            )
+            .await;
+
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(OnboardingError::BroadcastRejected { .. })
+                ),
+                refused,
+                "{message}: {result:?}"
+            );
+            assert!(asserter.read_q().is_empty(), "{message}: unread answers");
+            if refused {
+                assert!(logs_contain_at!(
+                    Level::WARN,
+                    &["refused by the node", &tx_hash.to_string()]
+                ));
+            }
+        }
+    }
+
+    /// One failed receipt poll or allowance read (a 429, a dropped
+    /// connection) must not end the wait while time is left: the next poll
+    /// can still confirm the approval.
+    #[tokio::test]
+    async fn a_failed_receipt_or_allowance_read_is_retried() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let receipt = OffchainAssetReceiptVault::new(
+            evm.vault_address,
+            signing_provider(&evm).await,
+        )
+        .approve(orchestrator, U256::MAX)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("receipt poll failed (test)");
+        asserter.push_success(&Some(receipt.clone()));
+        asserter.push_failure_msg("allowance read failed (test)");
+        asserter.push_success(&Bytes::from(U256::MAX.to_be_bytes::<32>()));
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let vault_contract =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider);
+
+        let mut last_read_error = None;
+        let confirmed = tokio::time::timeout(
+            Duration::from_secs(10),
+            confirm_approval(
+                &provider,
+                &vault_contract,
+                receipt.transaction_hash,
+                evm.wallet_address,
+                orchestrator,
+                &mut last_read_error,
+            ),
+        )
+        .await
+        .expect("the retried reads must confirm well within the guard");
+
+        assert!(confirmed.is_ok(), "{confirmed:?}");
+    }
+
+    /// A broadcast the node refuses (here a wallet with no gas) is an error
+    /// carrying the hash and the node's reason, answered at once, not a
+    /// 202 for a transaction that will never exist.
+    #[traced_test]
+    #[tokio::test]
+    async fn refused_broadcast_is_an_error_not_an_unconfirmed_approval() {
+        let evm = LocalEvm::new().await.unwrap();
+        let orchestrator = evm.deploy_orchestrator().await.unwrap();
+        let unfunded = PrivateKeySigner::random();
+        let bot = unfunded.address();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(unfunded))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_unlimited_approval(
+                &provider,
+                evm.vault_address,
+                orchestrator,
+                bot,
+                deadline_after(APPROVAL_DEADLINE),
+            ),
+        )
+        .await
+        .expect("a refused broadcast must be answered without waiting out the deadline")
+        .unwrap_err();
+
+        let OnboardingError::BroadcastRejected { tx_hash, .. } = error else {
+            panic!("expected BroadcastRejected, got {error:?}");
+        };
+        assert!(
+            provider.get_transaction_by_hash(tx_hash).await.unwrap().is_none(),
+            "the refused approval must not be held by the node"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["refused by the node", &tx_hash.to_string()]
+        ));
     }
 
     #[test]

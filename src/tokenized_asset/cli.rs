@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 use url::Url;
 
 use super::view::{
@@ -795,11 +796,20 @@ async fn run_orchestrator_preflight(
     Ok(())
 }
 
+/// The offline approval's budget, from its allowance read through the fill,
+/// the Turnkey signature, the broadcast, the receipt, and the allowance
+/// re-read; running out before the broadcast fails with nothing sent. No
+/// gateway sits in front of the CLI, so it outwaits a congested block rather
+/// than matching the `/ops` route's request budget.
+const OFFLINE_APPROVAL_DEADLINE: Duration = Duration::from_secs(300);
+
 /// Executes one asset's one-time unlimited approval through the Turnkey
 /// signer, after an explicit confirmation naming the asset, vault,
 /// orchestrator, and wallet. The mutation itself is idempotent
 /// ([`ensure_unlimited_approval`]), so a re-run after a completed approval
-/// reports "already unlimited" instead of sending again.
+/// reports "already unlimited" instead of sending again. An approval still
+/// unconfirmed at [`OFFLINE_APPROVAL_DEADLINE`] fails with its hash, so a
+/// script never proceeds as if the allowance were in place.
 async fn run_approve_orchestrator(
     args: ApproveOrchestratorArgs,
     confirm: impl Fn(&str) -> io::Result<bool>,
@@ -873,7 +883,17 @@ async fn run_approve_orchestrator(
         );
     }
 
-    match ensure_unlimited_approval(&provider, vault, orchestrator, bot).await?
+    let deadline = Instant::now()
+        .checked_add(OFFLINE_APPROVAL_DEADLINE)
+        .ok_or_else(|| anyhow::anyhow!("approval deadline overflows"))?;
+    match ensure_unlimited_approval(
+        &provider,
+        vault,
+        orchestrator,
+        bot,
+        deadline,
+    )
+    .await?
     {
         ApprovalOutcome::AlreadyUnlimited => println!(
             "Already unlimited: {} vault {vault} needs no approval \
@@ -884,6 +904,17 @@ async fn run_approve_orchestrator(
             "Approved: unlimited allowance for orchestrator {orchestrator} \
              on {} vault {vault} in {tx_hash}.",
             args.underlying
+        ),
+        ApprovalOutcome::SubmittedUnconfirmed { tx_hash } => anyhow::bail!(
+            "submitted, unconfirmed: {tx_hash} was signed for {} vault \
+             {vault} but not confirmed within {}s. Look it up on chain before \
+             re-running: once it lands a re-run sends nothing; if the chain \
+             does not know it, nothing was sent and a re-run is safe; if it \
+             stays pending, later mints and burns on this network queue \
+             behind its nonce until it is replaced through Turnkey, and a \
+             re-run only adds another transaction behind it.",
+            args.underlying,
+            OFFLINE_APPROVAL_DEADLINE.as_secs()
         ),
     }
     println!("Run orchestrator-preflight to verify overall readiness.");

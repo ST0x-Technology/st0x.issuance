@@ -23,9 +23,9 @@ use url::Url;
 /// bot caps the engine run at 120 s and answers 504. Cutting the request
 /// earlier would report a transport failure for a run whose outcome the bot is
 /// about to state. That holds only while the load balancer's backend timeout
-/// for the breakglass tier exceeds those 150 s. An orchestrator approval waits
-/// for its on-chain receipt and can still outlast it, which surfaces as
-/// `NoResponse`: the outcome is unknown and the logs say what happened.
+/// for the breakglass tier exceeds those 150 s. An orchestrator approval
+/// answers within its own 18 s deadline (202 with the transaction hash when
+/// not yet confirmed), well inside this bound.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -134,9 +134,10 @@ pub(crate) enum TransportError {
         "HTTP 503 Service Unavailable: the deployment could not serve the \
          request (for example the bot could not fetch Google's IAP keys, a \
          burn-excess transfer poller could not be paused in time because it \
-         did not park or another breakglass run held it, or the load balancer \
-         had no healthy backend). A read can be retried; before retrying a \
-         write, check the logs for whether it was applied.{}",
+         did not park or another breakglass run held it, an \
+         approve-orchestrator ran out of time before broadcasting anything, \
+         or the load balancer had no healthy backend). A read can be retried; \
+         before retrying a write, check the logs for whether it was applied.{}",
         server_said(.body)
     )]
     Unavailable { body: String },
@@ -147,10 +148,13 @@ pub(crate) enum TransportError {
     #[error(
         "HTTP {status}: a gateway gave up waiting for the bot (the bot's own \
          bound, or the load balancer in front of it), so the outcome is \
-         unknown. A read can be retried. A burn-excess dry-run changed \
-         nothing, and re-running the same command for a burn-excess --execute \
-         reads its persisted state and resumes it; for any other write, check \
-         the logs before retrying.{}",
+         unknown. An approve-orchestrator also answers 502 when an RPC read \
+         or its Turnkey signing failed, or its approval reverted or did not \
+         take effect; its log says which. A read can be \
+         retried. A burn-excess dry-run changed nothing, and re-running the \
+         same command for a burn-excess --execute reads its persisted state \
+         and resumes it; for any other write, check the logs before \
+         retrying.{}",
         server_said(.body)
     )]
     OutcomeUnknown { status: StatusCode, body: String },

@@ -845,7 +845,7 @@ fn classify_burn_broadcast_error(
     }
 }
 
-fn is_nonce_too_low_message(message: &str) -> bool {
+pub(super) fn is_nonce_too_low_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     ["nonce too low", "nonce is too low", "oldnonce", "old nonce"]
         .iter()
@@ -854,11 +854,11 @@ fn is_nonce_too_low_message(message: &str) -> bool {
 
 /// The node's answer when its pool already holds the exact transaction
 /// (geth and op-geth: "already known").
-fn is_already_known_message(message: &str) -> bool {
+pub(super) fn is_already_known_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("already known")
 }
 
-const fn is_definitive_broadcast_rejection(code: i64) -> bool {
+pub(super) const fn is_definitive_broadcast_rejection(code: i64) -> bool {
     matches!(code, -32700 | -32600 | -32601 | -32602)
 }
 
