@@ -12,6 +12,7 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::ScheduleFreezeWindowRequest;
 use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -4246,20 +4247,6 @@ fn mint_history_summary_from_events(
     }
 
     summary
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct ScheduleFreezeWindowRequest {
-    /// Underlying symbol whose supply freezes for the corporate action.
-    underlying: UnderlyingSymbol,
-    /// Instant the `Freeze` fires. May already be in the past for an
-    /// in-progress window (the freeze then applies immediately).
-    #[schema(value_type = String)]
-    freeze_at: DateTime<Utc>,
-    /// Instant the `Unfreeze` fires. Must be after `freeze_at` and in the
-    /// future.
-    #[schema(value_type = String)]
-    unfreeze_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

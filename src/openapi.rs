@@ -48,9 +48,9 @@ expressed as an OpenAPI scheme."
         st0x_issuance_dto::UnderlyingSymbol,
         st0x_issuance_dto::TokenSymbol,
         st0x_issuance_dto::Network,
-        crate::account::api::RegisterAccountRequest,
+        st0x_issuance_dto::RegisterAccountRequest,
         crate::account::api::RegisterAccountResponse,
-        crate::account::api::WhitelistWalletRequest,
+        st0x_issuance_dto::WhitelistWalletRequest,
         crate::account::api::WhitelistWalletResponse,
         st0x_issuance_dto::MintAuthorizationRequest,
         st0x_issuance_dto::MintAuthorizationResponse,
@@ -61,7 +61,7 @@ expressed as an OpenAPI scheme."
         crate::admin::CloseRedemptionRequest,
         crate::admin::ForceCompleteRedemptionRequest,
         crate::admin::CloseMintRequest,
-        crate::admin::ScheduleFreezeWindowRequest,
+        st0x_issuance_dto::ScheduleFreezeWindowRequest,
         crate::admin::ScheduleFreezeWindowResponse,
         crate::admin::AssetVaultMode,
         crate::admin::VaultLogicStatus,
@@ -270,5 +270,24 @@ mod tests {
                 ["$ref"],
             "#/components/schemas/VaultModeTag"
         );
+
+        // The operator request bodies moved into the DTO crate keep their
+        // field-level string overrides: `Email`, alloy's `Address`, and
+        // chrono's `DateTime` all travel as plain strings, so a lost override
+        // would silently republish their internal shapes.
+        assert_eq!(
+            schemas["RegisterAccountRequest"]["properties"]["email"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["WhitelistWalletRequest"]["properties"]["wallet"]["type"],
+            "string"
+        );
+        for field in ["freeze_at", "unfreeze_at"] {
+            assert_eq!(
+                schemas["ScheduleFreezeWindowRequest"]["properties"][field]["type"],
+                "string"
+            );
+        }
     }
 }

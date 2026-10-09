@@ -5025,6 +5025,122 @@ become a wrong-audience or forged-token acceptance. Every `InternalAuth`
 operator route now has an `/ops` twin; `move-receipts` and `confirm-custody`
 stay offline `issuer` CLI verbs.
 
+#### Operator client (`st0x-issuance-client`)
+
+S01 operators reach the `read`, `debug`, and `capital` tiers through the
+`st0x-issuance-client` binary (workspace package `st0x-issuance-ops`,
+`crates/ops-client`), the S01 counterpart of the T0 liquidity client. It is a
+thin typed transport: every verb maps to exactly one `/ops/<tier>/...` route,
+and it holds no production secret and no domain logic, since the bot validates
+and decides everything. Breakglass routes, direct Alpaca account operations, and
+T0 liquidity are out of its scope. The library of the same name
+(`crates/client`, package `st0x-issuance-client`) is unrelated: it is the
+liquidity bot's `X-API-KEY` client for the service API.
+
+Invocation is `st0x-issuance-client --env <staging|production> <group> <verb>`,
+and `--env` has no default. Per environment the client reads
+`S01_ISSUANCE_{STAGING,PROD}_URL`, the bare https origin of the S01 ops load
+balancer (a path, query, or fragment is refused, since every route sets the
+whole path), and obtains a Google ID token one of two ways. Both share one
+transport: the token travels as `Authorization: Bearer`, and IAP (not the
+client) stamps the `x-goog-iap-jwt-assertion` the bot verifies. There is no API
+key or secret-file option.
+
+- **Operator:** the client signs the operator in to the current S01 Google
+  account in the browser through a Desktop OAuth client (loopback redirect with
+  PKCE; `S01_ISSUANCE_*_CLIENT_ID` and `_CLIENT_SECRET`, which Google treats as
+  non-confidential for a Desktop client) and sends the resulting ID token, whose
+  audience is that client id. This requires the client id on the S01 ops
+  backends' IAP programmatic-client allowlist. The refresh token is cached per
+  environment together with the client id it was issued to
+  (`st0x-issuance-client/oauth-<env>.json` under the XDG config directory, mode
+  0600 in a 0700 directory, locked down before every read and write, and never
+  written where unix permissions are unavailable), so later calls do not reopen
+  the browser; a cache from a replaced client id is ignored. Only a cached
+  sign-in Google rejects as `invalid_grant` (revoked or expired) reopens the
+  browser; any other failure (network, rate limit, Google 5xx, a rejected
+  client) is reported instead, so a command never waits on the browser for
+  something a sign-in cannot fix. The browser step is bounded at 5 minutes:
+  Google shows a client id or redirect URI it cannot accept in the browser
+  instead of redirecting back, so that case fails as a setup error rather than
+  hanging. The loopback listener accepts only the redirect carrying the
+  sign-in's own `state`, reading each connection's whole request head within a
+  size and time bound, and its page says whether the sign-in completed. The
+  cache and client ids are separate from the T0 client's, so S01 sign-in never
+  needs the T0 Google account.
+- **CI:** when `S01_ISSUANCE_*_ID_TOKEN` is set, the client sends that token and
+  skips the OAuth flow. The CI job mints it through S01 workload identity by
+  impersonating an S01 service account for an ID token. The minting stays in CI
+  because Google's Rust auth library does not issue ID tokens from
+  external-account (workload identity) credentials.
+
+Request bodies are the shared `st0x-issuance-dto` types the bot deserializes
+(`RegisterAccountRequest`, `WhitelistWalletRequest`, `AddTokenizedAssetRequest`,
+`ScheduleFreezeWindowRequest`), so client and bot cannot drift on a body shape.
+Every underlying symbol argument is upper-cased at parse time, as the offline
+`issuer` CLI does, because the bot keys a listing or freeze window by the symbol
+exactly as a body carries it. Path segments are percent-encoded and redirects
+are never followed.
+
+On success, stdout carries exactly the response body as one compact JSON line
+(the bot's JSON, passed through verbatim) and all diagnostics go to stderr. The
+exit code is 0 on success, 2 for a setup or argument error (including an OAuth
+client or request Google rejects, such as `invalid_client` or
+`unauthorized_client`, and a browser sign-in that never redirects back within
+the time limit), 77 for an authentication or authorization refusal (by IAP, by
+Google rejecting the grant as `invalid_grant`, or by the operator declining at
+the consent screen), and 1 otherwise, including a network failure or Google
+outage during sign-in. Failures are explained:
+
+- **401, or an IAP redirect to sign-in:** the S01 Google identity was missing,
+  expired, or rejected, including a token minted for another tier's audience.
+  Re-running reuses the cached sign-in; deleting the cached refresh token signs
+  in again, for example as another S01 account.
+- **403:** authenticated, but the S01 account is not in the Workspace group IAP
+  requires for this tier. The bot itself never answers 403 on `/ops`.
+- **404:** an unknown id or asset, or `/ops` is not mounted on that deployment
+  (no `OPS_API_*_AUDIENCE` configured).
+- **503:** the deployment could not serve the request, for example the bot could
+  not fetch Google's IAP keys or the load balancer had no healthy backend. A
+  read can be retried; before retrying a write, the logs show whether it was
+  applied.
+- **502 or 504:** a gateway gave up waiting, either the load balancer's backend
+  timeout (an `approve-orchestrator` waiting for its receipt can outlast it) or
+  the bot's own wait on the chain, so the outcome is unknown. A read can be
+  retried; before retrying a write, the logs show whether it was applied.
+- **No response:** a connection that timed out or dropped after the request was
+  sent leaves the outcome unknown, and the client says so.
+- **Unwritable output:** the bot answered with success but stdout could not take
+  the body; the request was completed, so a read can be re-run but a write must
+  not be blindly retried.
+
+After any failure where the request may have reached the server, stderr also
+carries an S01 Cloud Logging link for the environment's project
+(`s01-issuance-staging` or `s01-issuance`), searching for the command's id or
+symbol when it has one and for warnings otherwise.
+
+| Command                                                            | Route                                                                |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `read stuck`                                                       | `GET /ops/read/stuck`                                                |
+| `read orchestrator-health`                                         | `GET /ops/read/orchestrator-health`                                  |
+| `read network-telemetry`                                           | `GET /ops/read/network-telemetry`                                    |
+| `read wrapped-transfers [--limit] [--before-*]`                    | `GET /ops/read/wrapped-transfers`                                    |
+| `read status <underlying>`                                         | `GET /ops/read/status/<underlying>`                                  |
+| `read orchestrator-preflight <network> [--asset]...`               | `GET /ops/read/orchestrator-preflight/<network>`                     |
+| `debug recover-redemption <id>`                                    | `POST /ops/debug/recover/redemption/<id>`                            |
+| `debug reprocess-mint <id>`                                        | `POST /ops/debug/reprocess/mint/<id>`                                |
+| `debug verify-orchestrator-signing <network> <underlying>`         | `POST /ops/debug/orchestrator-verify-signing/<network>/<underlying>` |
+| `debug register-account --email`                                   | `POST /ops/debug/accounts`                                           |
+| `debug whitelist-wallet <client_id> <wallet>`                      | `POST /ops/debug/accounts/<client_id>/wallets`                       |
+| `debug unwhitelist-wallet <client_id> <wallet>`                    | `DELETE /ops/debug/accounts/<client_id>/wallets/<wallet>`            |
+| `debug tokenized-asset <underlying> --network`                     | `GET /ops/debug/tokenized-assets/<underlying>?network=`              |
+| `debug add-tokenized-asset --underlying --token --network --vault` | `POST /ops/debug/tokenized-assets`                                   |
+| `debug snapshot <aggregate_type> <aggregate_id>`                   | `GET /ops/debug/snapshots/<aggregate_type>/<aggregate_id>`           |
+| `capital freeze <underlying>`                                      | `POST /ops/capital/freeze/<underlying>`                              |
+| `capital unfreeze <underlying>`                                    | `POST /ops/capital/unfreeze/<underlying>`                            |
+| `capital schedule-freeze --underlying --freeze-at --unfreeze-at`   | `POST /ops/capital/freeze-schedules`                                 |
+| `capital approve-orchestrator <network> <underlying>`              | `POST /ops/capital/orchestrator-approve/<network>/<underlying>`      |
+
 ### Recover Stuck Aggregates
 
 Recovers a stuck or failed aggregate so existing recovery logic picks it up.
