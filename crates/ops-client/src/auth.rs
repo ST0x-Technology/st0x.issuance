@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use url::Url;
 
-use crate::target::{Env, Identity};
+use crate::target::Identity;
 use crate::transport::{error_chain, server_said};
 
 #[derive(Debug, thiserror::Error)]
@@ -140,19 +140,19 @@ const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// the Desktop client silently refreshes a cached sign-in, or signs the
 /// operator in through the browser once and caches the result.
 pub(crate) async fn id_token(
-    env: Env,
+    cache_slug: &str,
     identity: Identity,
 ) -> Result<String, AuthError> {
     match identity {
         Identity::WorkloadIdentity { id_token } => Ok(id_token),
         Identity::DesktopOauth { client_id, client_secret } => {
-            desktop_id_token(env, &client_id, &client_secret).await
+            desktop_id_token(cache_slug, &client_id, &client_secret).await
         }
     }
 }
 
 async fn desktop_id_token(
-    env: Env,
+    cache_slug: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<String, AuthError> {
@@ -161,7 +161,7 @@ async fn desktop_id_token(
         .connect_timeout(TOKEN_CONNECT_TIMEOUT)
         .build()?;
 
-    if let Some(refresh_token) = load_refresh_token(env, client_id) {
+    if let Some(refresh_token) = load_refresh_token(cache_slug, client_id) {
         match refresh_id_token(
             &http,
             TOKEN_ENDPOINT,
@@ -187,14 +187,14 @@ async fn desktop_id_token(
         }
     }
 
-    interactive_id_token(&http, env, client_id, client_secret).await
+    interactive_id_token(&http, cache_slug, client_id, client_secret).await
 }
 
 /// Runs the browser loopback + PKCE authorization once, exchanges the returned
 /// code for an ID token, and caches the refresh token for silent reuse.
 async fn interactive_id_token(
     http: &reqwest::Client,
-    env: Env,
+    cache_slug: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<String, AuthError> {
@@ -245,7 +245,7 @@ async fn interactive_id_token(
     if let Some(refresh_token) =
         token.get("refresh_token").and_then(serde_json::Value::as_str)
     {
-        store_refresh_token(env, client_id, refresh_token);
+        store_refresh_token(cache_slug, client_id, refresh_token);
     }
 
     extract_id_token(&token)
@@ -466,13 +466,13 @@ fn code_challenge(verifier: &str) -> String {
 /// is separate from the T0 client's, keyed by environment. Per the XDG Base
 /// Directory spec an empty or relative `$XDG_CONFIG_HOME` is ignored, so the
 /// token never lands relative to the working directory.
-fn refresh_token_path(env: Env) -> Option<PathBuf> {
+fn refresh_token_path(cache_slug: &str) -> Option<PathBuf> {
     let base = absolute_dir("XDG_CONFIG_HOME")
         .or_else(|| absolute_dir("HOME").map(|home| home.join(".config")))?;
 
     Some(
         base.join("st0x-issuance-client")
-            .join(format!("oauth-{}.json", env.cache_slug())),
+            .join(format!("oauth-{cache_slug}.json")),
     )
 }
 
@@ -490,8 +490,8 @@ struct CachedSignIn {
     refresh_token: String,
 }
 
-fn load_refresh_token(env: Env, client_id: &str) -> Option<String> {
-    load_refresh_token_at(&refresh_token_path(env)?, client_id)
+fn load_refresh_token(cache_slug: &str, client_id: &str) -> Option<String> {
+    load_refresh_token_at(&refresh_token_path(cache_slug)?, client_id)
 }
 
 /// The cached refresh token, if one was issued to `client_id`; a cache from a
@@ -507,8 +507,8 @@ fn load_refresh_token_at(path: &Path, client_id: &str) -> Option<String> {
 
 /// Best effort: a cache write failure must not fail the command, only cost the
 /// next run a sign-in, so it is reported rather than propagated.
-fn store_refresh_token(env: Env, client_id: &str, refresh_token: &str) {
-    if let Some(path) = refresh_token_path(env)
+fn store_refresh_token(cache_slug: &str, client_id: &str, refresh_token: &str) {
+    if let Some(path) = refresh_token_path(cache_slug)
         && let Err(error) =
             store_refresh_token_at(&path, client_id, refresh_token)
     {

@@ -3,6 +3,7 @@
 //! route, and explains any failure with an exit code and, when the deployment
 //! answered, a link to its Cloud Logging.
 
+mod alpaca;
 mod auth;
 mod cli;
 mod target;
@@ -22,8 +23,9 @@ use std::process::ExitCode;
 
 use crate::auth::AuthError;
 use crate::cli::{
-    BreakglassCommand, BurnExcessArgs, BurnExcessCommand, CapitalCommand, Cli,
-    Command, DebugCommand, ReadCommand, WrappedTransfersArgs,
+    BotCommand, BreakglassCommand, BurnExcessArgs, BurnExcessCommand,
+    CapitalCommand, Cli, Command, DebugCommand, ReadCommand,
+    WrappedTransfersArgs,
 };
 use crate::target::{Env, TargetError};
 use crate::transport::{
@@ -40,16 +42,24 @@ const EXIT_FAILED: u8 = 1;
 #[tokio::main]
 async fn main() -> ExitCode {
     let Cli { env, command } = Cli::parse();
-    let route = route(&command);
+    let search = log_search(&command);
+    let result = match command {
+        Command::Bot(command) => {
+            run(env, &route(&command), |name| std::env::var(name).ok()).await
+        }
+        Command::Alpaca(command) => {
+            run_alpaca(env, command, |name| std::env::var(name).ok()).await
+        }
+    };
 
-    match run(env, &route, |name| std::env::var(name).ok()).await {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             eprintln!("error: {failure}");
             if failure.reached_server() {
                 eprintln!(
                     "\nS01 Cloud Logging: {}",
-                    cloud_logging_url(env, log_search(&command).as_deref())
+                    cloud_logging_url(env, search.as_deref())
                 );
             }
             ExitCode::from(failure.exit_code())
@@ -67,10 +77,14 @@ enum Failure {
     Auth(#[from] AuthError),
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error(transparent)]
+    Alpaca(#[from] alpaca::Failure),
+    #[error(transparent)]
+    AlpacaArgument(#[from] alpaca::ArgumentError),
     #[error(
-        "the S01 ops API answered with success, but the response could not be \
-         written to stdout: {0}\nThe request was completed: a read can simply \
-         be re-run, but do not blindly retry a write."
+        "the selected operation answered with success, but the response could \
+         not be written to stdout: {0}\nThe request was completed: a read can \
+         simply be re-run, but do not blindly retry a write."
     )]
     Output(#[source] std::io::Error),
 }
@@ -78,21 +92,33 @@ enum Failure {
 impl Failure {
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Target(_) | Self::Http(_) => EXIT_SETUP,
+            Self::Target(_) | Self::Http(_) | Self::AlpacaArgument(_) => {
+                EXIT_SETUP
+            }
             Self::Auth(error) if error.is_access_denied() => EXIT_ACCESS_DENIED,
             Self::Auth(error) if error.is_client_misconfigured() => EXIT_SETUP,
             Self::Transport(error) if error.is_access_denied() => {
                 EXIT_ACCESS_DENIED
             }
-            Self::Auth(_) | Self::Transport(_) | Self::Output(_) => EXIT_FAILED,
+            Self::Alpaca(error) if error.is_access_denied() => {
+                EXIT_ACCESS_DENIED
+            }
+            Self::Auth(_)
+            | Self::Transport(_)
+            | Self::Alpaca(_)
+            | Self::Output(_) => EXIT_FAILED,
         }
     }
 
     const fn reached_server(&self) -> bool {
         match self {
             Self::Transport(error) => error.reached_server(),
+            Self::Alpaca(error) => error.reached_server(),
             Self::Output(_) => true,
-            Self::Target(_) | Self::Http(_) | Self::Auth(_) => false,
+            Self::Target(_)
+            | Self::Http(_)
+            | Self::Auth(_)
+            | Self::AlpacaArgument(_) => false,
         }
     }
 }
@@ -103,13 +129,33 @@ async fn run(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(), Failure> {
     let target = target::resolve(env, lookup)?;
-    let token = auth::id_token(env, target.identity).await?;
+    let token = auth::id_token(target.cache_slug, target.identity).await?;
     let client = Client::new(target.base_url, token)?;
     let body = client.send(route).await?;
 
     // A write failure here follows a success the bot already acted on, which
     // is what `Failure::Output` tells the operator.
     print_body(&body).map_err(Failure::Output)
+}
+
+async fn run_alpaca(
+    env: Env,
+    command: alpaca::Command,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), Failure> {
+    // An argument rule clap cannot express is refused before any sign in, as
+    // a usage error.
+    command.validate()?;
+    let target = target::resolve_alpaca(env, lookup)?;
+    let token = auth::id_token(target.cache_slug, target.identity).await?;
+    let value = alpaca::execute(
+        &target.base_url,
+        token,
+        command,
+        &mut std::io::stderr(),
+    )
+    .await?;
+    print_body(&value.to_string()).map_err(Failure::Output)
 }
 
 /// Writes the bot's response body to stdout as one line.
@@ -119,12 +165,12 @@ fn print_body(body: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
-fn route(command: &Command) -> Route {
+fn route(command: &BotCommand) -> Route {
     match command {
-        Command::Read(read) => read_route(read),
-        Command::Debug(debug) => debug_route(debug),
-        Command::Capital(capital) => capital_route(capital),
-        Command::Breakglass(breakglass) => breakglass_route(breakglass),
+        BotCommand::Read(read) => read_route(read),
+        BotCommand::Debug(debug) => debug_route(debug),
+        BotCommand::Capital(capital) => capital_route(capital),
+        BotCommand::Breakglass(breakglass) => breakglass_route(breakglass),
     }
 }
 
@@ -458,16 +504,23 @@ const fn bare(method: Method, tier: Tier, path: String) -> Route {
 /// client id, or its underlying. `None` for commands that name neither.
 fn log_search(command: &Command) -> Option<String> {
     match command {
-        Command::Read(ReadCommand::Status { underlying }) => {
+        Command::Bot(command) => bot_log_search(command),
+        Command::Alpaca(command) => command.log_search(),
+    }
+}
+
+fn bot_log_search(command: &BotCommand) -> Option<String> {
+    match command {
+        BotCommand::Read(ReadCommand::Status { underlying }) => {
             Some(underlying.as_str().to_owned())
         }
-        Command::Read(_)
-        | Command::Debug(DebugCommand::RegisterAccount { .. }) => None,
-        Command::Debug(
+        BotCommand::Read(_)
+        | BotCommand::Debug(DebugCommand::RegisterAccount { .. }) => None,
+        BotCommand::Debug(
             DebugCommand::RecoverRedemption { issuer_request_id }
             | DebugCommand::ReprocessMint { issuer_request_id },
         )
-        | Command::Breakglass(
+        | BotCommand::Breakglass(
             BreakglassCommand::ForceCompleteRedemption {
                 issuer_request_id,
                 ..
@@ -475,24 +528,24 @@ fn log_search(command: &Command) -> Option<String> {
             | BreakglassCommand::CloseRedemption { issuer_request_id, .. }
             | BreakglassCommand::CloseMint { issuer_request_id, .. },
         ) => Some(issuer_request_id.clone()),
-        Command::Breakglass(BreakglassCommand::BurnExcess(
+        BotCommand::Breakglass(BreakglassCommand::BurnExcess(
             BurnExcessCommand::Internal(args)
             | BurnExcessCommand::ExpectFunding(args)
             | BurnExcessCommand::External { args, .. },
         )) => Some(args.issuer_request_id.to_string()),
-        Command::Debug(
+        BotCommand::Debug(
             DebugCommand::WhitelistWallet { client_id, .. }
             | DebugCommand::UnwhitelistWallet { client_id, .. },
         ) => Some(client_id.clone()),
-        Command::Debug(DebugCommand::Snapshot { aggregate_id, .. }) => {
+        BotCommand::Debug(DebugCommand::Snapshot { aggregate_id, .. }) => {
             Some(aggregate_id.clone())
         }
-        Command::Debug(
+        BotCommand::Debug(
             DebugCommand::VerifyOrchestratorSigning { underlying, .. }
             | DebugCommand::TokenizedAsset { underlying, .. }
             | DebugCommand::AddTokenizedAsset { underlying, .. },
         )
-        | Command::Capital(
+        | BotCommand::Capital(
             CapitalCommand::Freeze { underlying }
             | CapitalCommand::Unfreeze { underlying }
             | CapitalCommand::ScheduleFreeze { underlying, .. }
@@ -525,11 +578,11 @@ mod tests {
 
     use super::{Failure, cloud_logging_url, log_search, route};
     use crate::auth::AuthError;
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Command};
     use crate::target::{Env, TargetError};
     use crate::transport::{Client, TransportError};
 
-    fn command(args: &[&str]) -> crate::cli::Command {
+    fn command(args: &[&str]) -> Command {
         Cli::try_parse_from(
             ["st0x-issuance-client", "--env", "staging"]
                 .into_iter()
@@ -542,7 +595,10 @@ mod tests {
     /// Renders a command's route as `METHOD /path?query` plus its JSON body,
     /// through the same URL construction the transport sends.
     fn wire(args: &[&str]) -> (String, Option<Value>) {
-        let route = route(&command(args));
+        let Command::Bot(bot) = command(args) else {
+            panic!("expected a bot command: {args:?}");
+        };
+        let route = route(&bot);
         let client = Client::new(
             Url::parse("https://ops.example").unwrap(),
             "id-token".to_owned(),
@@ -964,6 +1020,12 @@ mod tests {
         });
         assert_eq!(setup.exit_code(), 2);
         assert!(!setup.reached_server());
+
+        let usage = Failure::AlpacaArgument(
+            crate::alpaca::ArgumentError::FinerThanSharePrecision,
+        );
+        assert_eq!(usage.exit_code(), 2, "an alpaca usage error is setup");
+        assert!(!usage.reached_server());
 
         let denied = Failure::Transport(TransportError::Forbidden {
             body: String::new(),

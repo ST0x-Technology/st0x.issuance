@@ -19,12 +19,26 @@ impl Env {
         }
     }
 
+    const fn alpaca_prefix(self) -> &'static str {
+        match self {
+            Self::Staging => "S01_ALPACA_STAGING",
+            Self::Production => "S01_ALPACA_PROD",
+        }
+    }
+
     /// Lowercase environment name that keys the refresh-token cache file, so
     /// each environment's OAuth client keeps its own cached token.
     pub(crate) const fn cache_slug(self) -> &'static str {
         match self {
             Self::Staging => "staging",
             Self::Production => "production",
+        }
+    }
+
+    const fn alpaca_cache_slug(self) -> &'static str {
+        match self {
+            Self::Staging => "alpaca-staging",
+            Self::Production => "alpaca-production",
         }
     }
 
@@ -58,6 +72,7 @@ pub(crate) enum Identity {
 pub(crate) struct Target {
     pub(crate) base_url: Url,
     pub(crate) identity: Identity,
+    pub(crate) cache_slug: &'static str,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,13 +90,15 @@ pub(crate) enum TargetError {
     #[error("{variable} must use https, got {url}")]
     NotHttps { variable: String, url: Url },
     #[error(
-        "{variable} must be the bare https origin of the S01 ops load balancer \
-         (no path, query, or fragment), got {url}"
+        "{variable} must be the bare https origin of the selected S01 load \
+         balancer (no path, query, or fragment), got {url}"
     )]
     NotOrigin { variable: String, url: Url },
 }
 
 const URL_HINT: &str = "the https base URL of the S01 ops load balancer";
+const ALPACA_URL_HINT: &str =
+    "the https base URL of the S01 Alpaca gateway load balancer";
 const ID_TOKEN_HINT: &str =
     "an ID token minted through S01 workload identity, or unset it to sign in";
 const CLIENT_ID_HINT: &str = "the S01 Desktop OAuth client id";
@@ -94,9 +111,31 @@ pub(crate) fn resolve(
     env: Env,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Target, TargetError> {
-    let prefix = env.prefix();
+    resolve_with_prefix(env.prefix(), env.cache_slug(), URL_HINT, lookup)
+}
+
+/// Resolves the S01 Alpaca gateway without consulting issuance target
+/// variables.
+pub(crate) fn resolve_alpaca(
+    env: Env,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Target, TargetError> {
+    resolve_with_prefix(
+        env.alpaca_prefix(),
+        env.alpaca_cache_slug(),
+        ALPACA_URL_HINT,
+        lookup,
+    )
+}
+
+fn resolve_with_prefix(
+    prefix: &str,
+    cache_slug: &'static str,
+    url_hint: &'static str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Target, TargetError> {
     let url_variable = format!("{prefix}_URL");
-    let raw_url = required(&lookup, &url_variable, URL_HINT)?;
+    let raw_url = required(&lookup, &url_variable, url_hint)?;
     let base_url = Url::parse(&raw_url).map_err(|source| {
         TargetError::InvalidUrl { variable: url_variable.clone(), source }
     })?;
@@ -120,7 +159,7 @@ pub(crate) fn resolve(
         });
     }
 
-    Ok(Target { base_url, identity: identity(prefix, &lookup)? })
+    Ok(Target { base_url, identity: identity(prefix, &lookup)?, cache_slug })
 }
 
 fn identity(
@@ -173,7 +212,7 @@ fn required(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{Env, Identity, TargetError, resolve};
+    use super::{Env, Identity, TargetError, resolve, resolve_alpaca};
 
     fn lookup(
         pairs: &[(&str, &str)],
@@ -320,5 +359,25 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, TargetError::InvalidUrl { .. }));
+    }
+
+    #[test]
+    fn alpaca_target_uses_only_s01_alpaca_variables_and_cache() {
+        let target = resolve_alpaca(
+            Env::Staging,
+            lookup(&[
+                ("S01_ISSUANCE_STAGING_URL", "https://issuance.example"),
+                ("S01_ALPACA_STAGING_URL", "https://alpaca.example"),
+                ("S01_ALPACA_STAGING_ID_TOKEN", "alpaca-token"),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(target.base_url.as_str(), "https://alpaca.example/");
+        assert_eq!(target.cache_slug, "alpaca-staging");
+        assert_eq!(
+            target.identity,
+            Identity::WorkloadIdentity { id_token: "alpaca-token".to_owned() }
+        );
     }
 }

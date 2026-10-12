@@ -195,8 +195,14 @@ pub(crate) enum CorporateActionFeedError {
     Auth(#[from] st0x_alpaca::KmsJwtError),
     #[error("corporate-action stream returned HTTP {0}")]
     HttpStatus(reqwest::StatusCode),
-    #[error("corporate-action stream returned content type {0}")]
-    InvalidContentType(String),
+    #[error("corporate-action stream was rate limited")]
+    RateLimited { retry_after: Option<Duration> },
+    #[error(
+        "corporate-action stream returned content type {content_type} with HTTP {status}"
+    )]
+    InvalidContentType { status: reqwest::StatusCode, content_type: String },
+    #[error(transparent)]
+    NotSent(#[from] st0x_alpaca::request_id::GateClosed),
     #[error(
         "corporate-action projection has no cursor or explicit bootstrap boundary"
     )]
@@ -232,10 +238,15 @@ impl From<CorporateActionStreamError> for CorporateActionFeedError {
             CorporateActionStreamError::HttpStatus(status) => {
                 Self::HttpStatus(status)
             }
-            CorporateActionStreamError::InvalidContentType(value) => {
-                Self::InvalidContentType(value)
+            CorporateActionStreamError::RateLimited { retry_after } => {
+                Self::RateLimited { retry_after }
             }
+            CorporateActionStreamError::InvalidContentType {
+                status,
+                content_type,
+            } => Self::InvalidContentType { status, content_type },
             CorporateActionStreamError::Auth(error) => Self::Auth(error),
+            CorporateActionStreamError::NotSent(error) => Self::NotSent(error),
         }
     }
 }
@@ -246,7 +257,9 @@ impl CorporateActionFeedError {
             Self::Http(_) => "transport",
             Self::Auth(_) => "auth",
             Self::HttpStatus(_) => "http_status",
-            Self::InvalidContentType(_) => "content_type",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::InvalidContentType { .. } => "content_type",
+            Self::NotSent(_) => "not_sent",
             Self::BaselineRequired => "baseline_required",
             Self::BoundedReplayEndedMidFrame => "bounded_replay_eof",
             Self::BootstrapSince(_) => "bootstrap_since",
@@ -285,7 +298,9 @@ impl CorporateActionFeedError {
             Self::Auth(_)
             | Self::Http(_)
             | Self::HttpStatus(_)
-            | Self::InvalidContentType(_)
+            | Self::RateLimited { .. }
+            | Self::InvalidContentType { .. }
+            | Self::NotSent(_)
             | Self::Projection(_)
             | Self::BaselineRequired
             | Self::BoundedReplayEndedMidFrame
@@ -565,7 +580,8 @@ impl CorporateActionFeed {
                     | CorporateActionFeedError::Reconciliation(_)
                     | CorporateActionFeedError::Alignment(_)
                     | CorporateActionFeedError::PostProjection { .. }
-                    | CorporateActionFeedError::InvalidContentType(_)
+                    | CorporateActionFeedError::InvalidContentType { .. }
+                    | CorporateActionFeedError::NotSent(_)
                     | CorporateActionFeedError::BaselineRequired
                     | CorporateActionFeedError::BoundedReplayEndedMidFrame),
                 ) => {
@@ -609,6 +625,9 @@ impl CorporateActionFeed {
             let backoff = match &disconnect_error {
                 Some(CorporateActionFeedError::Auth(error)) => {
                     honor_retry_after(backoff, error.retry_after())
+                }
+                Some(CorporateActionFeedError::RateLimited { retry_after }) => {
+                    honor_retry_after(backoff, *retry_after)
                 }
                 _ => backoff,
             };
