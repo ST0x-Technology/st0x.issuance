@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::operations_audit::record_principal;
-use iap::{IapError, OpsPrincipal, OpsTier, authenticate_ops};
-pub(crate) use iap::{OpsApiVerifiers, build_jwks_client};
+use iap::{IapError, OpsPrincipal, authenticate_ops};
+pub(crate) use iap::{OpsApiVerifiers, OpsTier, build_jwks_client};
 pub use ip_whitelist::{InternalIpWhitelist, IpWhitelist};
 pub(crate) use rate_limit::FailedAuthRateLimiter;
 
@@ -131,6 +131,7 @@ impl<'r> FromRequest<'r> for InternalAuth {
             auth.internal_ip_ranges.whitelist()
         }) {
             Ok(client_ip) => {
+                record_principal(request, "internal-api-key".to_string());
                 debug!(target: "auth", ip = %client_ip,
                     endpoint = %request.uri(),
                     "Internal authentication success"
@@ -153,9 +154,7 @@ async fn ops_outcome<Guard>(
 ) -> Outcome<Guard, IapError> {
     match authenticate_ops(request, tier).await {
         Ok(principal) => {
-            if tier != OpsTier::Read {
-                record_principal(request, principal.to_string());
-            }
+            record_principal(request, principal.to_string());
             Outcome::Success(guard(principal))
         }
         Err(error) => Outcome::Error((error.status(), error)),

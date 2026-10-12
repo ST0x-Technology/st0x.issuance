@@ -38,6 +38,7 @@ use crate::mint::{
     },
 };
 use crate::network_telemetry::{NetworkTelemetry, NetworkTelemetrySnapshot};
+use crate::operations_audit::Audited;
 use crate::receipt_inventory::ReceiptService;
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1965,9 +1966,9 @@ pub(crate) async fn close_redemption(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
-    body: Json<CloseRedemptionRequest>,
+    body: Audited<CloseRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
-    close_redemption_logic(store, pool, issuer_request_id, body).await
+    close_redemption_logic(store, pool, issuer_request_id, Json(body.0)).await
 }
 
 /// Breakglass-tier operator route mirroring [`close_redemption`], gated by IAP
@@ -1988,9 +1989,9 @@ pub(crate) async fn close_redemption_ops(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
-    body: Json<CloseRedemptionRequest>,
+    body: Audited<CloseRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
-    close_redemption_logic(store, pool, issuer_request_id, body).await
+    close_redemption_logic(store, pool, issuer_request_id, Json(body.0)).await
 }
 
 /// Closes a redemption after applying the shared safety checks and audit data.
@@ -2089,13 +2090,13 @@ pub(crate) async fn force_complete_redemption(
     pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
-    body: Json<ForceCompleteRedemptionRequest>,
+    body: Audited<ForceCompleteRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
     force_complete_redemption_logic(
         pool,
         burn_recovery,
         issuer_request_id,
-        body,
+        Json(body.0),
     )
     .await
 }
@@ -2118,13 +2119,13 @@ pub(crate) async fn force_complete_redemption_ops(
     pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
-    body: Json<ForceCompleteRedemptionRequest>,
+    body: Audited<ForceCompleteRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
     force_complete_redemption_logic(
         pool,
         burn_recovery,
         issuer_request_id,
-        body,
+        Json(body.0),
     )
     .await
 }
@@ -2576,10 +2577,17 @@ pub(crate) async fn close_mint(
     vault_services: &rocket::State<NetworkVaultServices>,
     receipts: &rocket::State<Arc<dyn ReceiptService>>,
     aggregate_id: &str,
-    body: Json<CloseMintRequest>,
+    body: Audited<CloseMintRequest>,
 ) -> Result<Json<ReprocessResponse>, CloseMintError> {
-    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
-        .await
+    close_mint_logic(
+        store,
+        pool,
+        vault_services,
+        receipts,
+        aggregate_id,
+        Json(body.0),
+    )
+    .await
 }
 
 /// Breakglass-tier operator route mirroring [`close_mint`], gated by IAP
@@ -2602,10 +2610,17 @@ pub(crate) async fn close_mint_ops(
     vault_services: &rocket::State<NetworkVaultServices>,
     receipts: &rocket::State<Arc<dyn ReceiptService>>,
     aggregate_id: &str,
-    body: Json<CloseMintRequest>,
+    body: Audited<CloseMintRequest>,
 ) -> Result<Json<ReprocessResponse>, CloseMintError> {
-    close_mint_logic(store, pool, vault_services, receipts, aggregate_id, body)
-        .await
+    close_mint_logic(
+        store,
+        pool,
+        vault_services,
+        receipts,
+        aggregate_id,
+        Json(body.0),
+    )
+    .await
 }
 
 /// Closes a mint through the safety checks shared by both close routes.
@@ -4260,9 +4275,9 @@ pub(crate) struct ScheduleFreezeWindowResponse {
 pub(crate) async fn schedule_freeze_window(
     _auth: InternalAuth,
     scheduler: &rocket::State<FreezeScheduler>,
-    body: Json<ScheduleFreezeWindowRequest>,
+    body: Audited<ScheduleFreezeWindowRequest>,
 ) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
-    schedule_freeze_window_logic(scheduler, body).await
+    schedule_freeze_window_logic(scheduler, Json(body.0)).await
 }
 
 /// Capital-tier operator route mirroring [`schedule_freeze_window`]: arming a
@@ -4278,9 +4293,9 @@ pub(crate) async fn schedule_freeze_window(
 pub(crate) async fn schedule_freeze_window_ops(
     auth: CapitalOps,
     scheduler: &rocket::State<FreezeScheduler>,
-    body: Json<ScheduleFreezeWindowRequest>,
+    body: Audited<ScheduleFreezeWindowRequest>,
 ) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
-    schedule_freeze_window_logic(scheduler, body).await
+    schedule_freeze_window_logic(scheduler, Json(body.0)).await
 }
 
 /// Validates and schedules the freeze window requested through either route.

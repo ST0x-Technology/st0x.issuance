@@ -35,6 +35,7 @@ use crate::auth::BreakglassOps;
 use crate::chain::{ChainConfig, rpc_client};
 use crate::config::Config;
 use crate::mint::IssuerMintRequestId;
+use crate::operations_audit::Audited;
 use crate::vault::NetworkVaultServices;
 
 /// Caps how long a burn-excess route runs the engine. The burn routes hold the
@@ -218,10 +219,9 @@ pub(crate) async fn burn_excess_internal_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     vault_services: &State<NetworkVaultServices>,
-    body: Json<BurnExcessInternalRequest>,
+    body: Audited<BurnExcessInternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let request =
-        into_request(body.into_inner().common, BurnExcessMode::Internal, None);
+    let request = into_request(body.0.common, BurnExcessMode::Internal, None);
     let chain = resolve_chain(config.inner(), &request, "internal")?;
     run_burn_excess_ops(
         pool.inner(),
@@ -255,13 +255,10 @@ pub(crate) async fn burn_excess_expect_funding_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     vault_services: &State<NetworkVaultServices>,
-    body: Json<BurnExcessExpectFundingRequest>,
+    body: Audited<BurnExcessExpectFundingRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let request = into_request(
-        body.into_inner().common,
-        BurnExcessMode::ExpectFunding,
-        None,
-    );
+    let request =
+        into_request(body.0.common, BurnExcessMode::ExpectFunding, None);
     let chain = resolve_chain(config.inner(), &request, "expect-funding")?;
     run_burn_excess_ops(
         pool.inner(),
@@ -297,9 +294,9 @@ pub(crate) async fn burn_excess_external_ops(
     pool: &State<Pool<Sqlite>>,
     config: &State<Config>,
     vault_services: &State<NetworkVaultServices>,
-    body: Json<BurnExcessExternalRequest>,
+    body: Audited<BurnExcessExternalRequest>,
 ) -> Result<Json<BurnExcessResponse>, Status> {
-    let body = body.into_inner();
+    let body = body.0;
     let funding_tx_hash = body.funding_tx_hash;
     let request = into_request(
         body.common,

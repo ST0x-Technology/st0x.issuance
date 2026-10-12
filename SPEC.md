@@ -5164,34 +5164,49 @@ Tiers and routes:
 
 #### Shared operations audit event
 
-Every request to a mutation-capable operator route emits exactly one structured
-audit event, including denied requests and requests rejected before a handler
-runs. The issuance and liquidity bots use the same versioned event contract so
-Cloud Logging and VictoriaLogs queries do not depend on service-specific log
-messages:
+Every `POST`, `PUT`, `PATCH`, or `DELETE` request to an operator mutation
+surface that reaches the service emits exactly one structured audit event,
+including denied requests and requests rejected before a handler runs. A request
+Google IAP refuses at the load balancer never reaches the service and appears
+only in IAP's own logs. In issuance the surfaces are the IAP tiers `/ops/debug`,
+`/ops/capital`, and `/ops/breakglass`, and their shared-key (`InternalAuth`)
+twins `/admin/*`, `POST /accounts`, `/accounts/<client_id>/wallets`, and
+`POST /tokenized-assets`. Alpaca's and the liquidity bot's integration calls
+(`/inkind/*`, `/accounts/connect`, `/internal/mints/*`) are not operator
+mutations and are not audited. A surface is recognized from the percent-decoded
+path segments Rocket routes on, so no spelling of a mutation path reaches a
+handler unaudited. The issuance and liquidity bots use the same versioned event
+contract so Cloud Logging and VictoriaLogs queries do not depend on
+service-specific log messages:
 
-| Field          | Contract                                                                                                                                 |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                     |
-| `service`      | `issuance` or `liquidity`.                                                                                                               |
-| `principal`    | Verified IAP subject; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no identity was verified. |
-| `role`         | The admitted operator tier (`debug`, `capital`, `breakglass`, or `write`); `local` for loopback-only routes.                             |
-| `route`        | Matched route template, not the raw URI.                                                                                                 |
-| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                               |
-| `target_id`    | Colon-separated dynamic path values and recognized request-body identifiers; `not_identified` only when the request names no entity.     |
-| `reason`       | The request's explicit audit reason; `not_provided` when the route has no reason or the body could not be parsed.                        |
-| `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                         |
-| `timestamp`    | UTC RFC 3339 timestamp generated when the audit event is emitted.                                                                        |
+| Field          | Contract                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                                                                                                                                                                                                                                                                                           |
+| `service`      | `issuance` or `liquidity`.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `principal`    | Verified IAP subject; `internal-api-key` for issuance's shared-key routes; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no guard verified an identity, including an unmatched path.                                                                                                                                                                                |
+| `role`         | Operator surface the request reached (`debug`, `capital`, `breakglass`, `internal`, or `write`; `local` for loopback-only routes). For an accepted request it is also the admitted tier.                                                                                                                                                                                                                       |
+| `route`        | Matched route template, never the raw URI. An unmatched path records its surface's fixed template, for example `/ops/debug/<path..>`.                                                                                                                                                                                                                                                                          |
+| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                                                                                                                                                                                                                                                                                                     |
+| `target_id`    | Colon-separated dynamic path values, then the identifiers the route's typed request body declares; `not_identified` when neither exists, including when the body did not parse. Raw JSON is never inspected, so undeclared fields cannot appear. A value over 256 bytes is recorded as `<oversized: N bytes>`. Burn-excess routes append the mode that ran: `dry-run`, `execute`, `close-dry-run`, or `close`. |
+| `reason`       | The reason field of the route's typed request body; `not_provided` when the route has no reason or the body did not parse. A reason over 1024 bytes is recorded as `<oversized: N bytes>`; the command's own event keeps the full text.                                                                                                                                                                        |
+| `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                                                                                                                                                                                                                                                                                               |
+| `timestamp`    | UTC RFC 3339 timestamp generated when the audit event is emitted.                                                                                                                                                                                                                                                                                                                                              |
 
 The tracing target is `operations_audit`. Success is INFO; every other outcome
-is WARN. A `2xx` response is `success`, `401` or `403` is `denied`, request
-shape and route errors (`400`, `404`, `405`, `413`, `415`, `422`) are
-`validation_failure`, and every other response is `command_failure`. Audit
-delivery is fail-open with respect to the operator command: a recorder failure
-emits an ERROR carrying the same query dimensions and never replaces the
-mutation's response. The production recorder writes to tracing, so the JSON
-stdout collected by Cloud Logging carries these fields; telemetry exporters
-receive the same event without a second schema.
+is WARN. A `2xx` response is `success`, `401`, `403`, or `429` (the
+failed-authentication rate limit) is `denied`, request shape and route errors
+(`400`, `404`, `405`, `413`, `415`, `422`) are `validation_failure`, and every
+other response is `command_failure`. The console layer always admits
+`operations_audit` at INFO, whatever `RUST_LOG` says. Recording never changes
+the mutation's response. The event is one stdout line in the configured
+`LOG_FORMAT`. With `text`, each field is written as a name and a value, and
+every caller-influenced value (`principal`, `route`, `target_id`, `reason`) is
+quoted and escaped, so a newline in it cannot start a forged line. The text
+console colours field names with ANSI escape codes, so a `name=value` phrase
+never appears contiguously in the stored line: search Cloud Logging for bare
+values, for example `"st0x.operations.audit.v1"` or the request UUID. With
+`json`, the fields sit under `fields`. The HyperDX span exporter does not
+receive the event.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
@@ -5417,7 +5432,9 @@ outage during sign-in. Failures are explained:
 After any failure where the request may have reached the server, stderr also
 carries an S01 Cloud Logging link for the environment's project
 (`s01-issuance-staging` or `s01-issuance`), searching for the command's id or
-symbol when it has one and for warnings otherwise.
+symbol when it has one and for warnings otherwise. For a mutation it also
+carries the request's `x-request-id` UUID, which names its audit event when the
+request reached the service.
 
 | Command                                                               | Route                                                                |
 | --------------------------------------------------------------------- | -------------------------------------------------------------------- |

@@ -227,12 +227,15 @@ client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call prints a browser sign-in
 URL for your S01 Google account) or, in CI, a workload-identity ID token
 (`_ID_TOKEN`). See SPEC.md "Operator client" for the full contract.
 
-Every mutation-capable `/ops` request emits the versioned
+Every operator mutation (the `/ops` tiers and their shared-key `/admin`,
+`/accounts`, and `/tokenized-assets` twins) emits the versioned
 `st0x.operations.audit.v1` structured event under tracing target
-`operations_audit`. The event carries the IAP subject, role, matched route,
+`operations_audit`. The event carries the principal, role, matched route,
 request UUID, target, reason, outcome, and timestamp; the response echoes the
-UUID in `x-request-id`. The JSON stdout collected by Cloud Logging preserves
-these stable fields for cross-service audit queries.
+UUID in `x-request-id`, and the client prints it when a mutation fails. With the
+default text log format the event is one stdout line; search Cloud Logging for
+bare values such as `st0x.operations.audit.v1` or the request UUID. See SPEC.md
+"Shared operations audit event".
 
 ## Mint Flow
 

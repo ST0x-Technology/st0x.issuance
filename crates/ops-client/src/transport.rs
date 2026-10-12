@@ -245,13 +245,14 @@ impl Client {
     pub(crate) async fn send(
         &self,
         route: &Route,
+        request_id: Uuid,
     ) -> Result<String, TransportError> {
         let url = self.url(route);
         let request = self
             .http
             .request(route.method.clone(), url.clone())
             .bearer_auth(&self.token)
-            .header("x-request-id", Uuid::new_v4().to_string());
+            .header("x-request-id", request_id.to_string());
 
         // A bodiless write still declares its empty body, since some proxies
         // refuse a POST or DELETE without a length.
@@ -476,7 +477,8 @@ mod tests {
             ("before_network", "a b".to_owned()),
         ];
 
-        let value = client.send(&read).await.unwrap();
+        let request_id = Uuid::new_v4();
+        let value = client.send(&read, request_id).await.unwrap();
         let request = requests.recv().unwrap();
 
         assert_eq!(value, r#"{"b":1,"a":2}"#, "the body is passed through");
@@ -487,10 +489,9 @@ mod tests {
             "{request}"
         );
         assert_eq!(header(&request, "authorization"), Some("Bearer id-token"));
-        assert!(
-            header(&request, "x-request-id")
-                .is_some_and(|value| Uuid::parse_str(value).is_ok()),
-            "{request}"
+        assert_eq!(
+            header(&request, "x-request-id"),
+            Some(request_id.to_string().as_str())
         );
     }
 
@@ -504,7 +505,7 @@ mod tests {
                 email: Email::new("ops@example.com").unwrap(),
             }));
 
-        client.send(&register).await.unwrap();
+        client.send(&register, Uuid::new_v4()).await.unwrap();
         let request = requests.recv().unwrap();
 
         assert!(request.starts_with("POST /ops/debug/accounts "), "{request}");
@@ -523,7 +524,7 @@ mod tests {
             &format!("/accounts/client/wallets/{wallet}"),
         );
 
-        client.send(&unwhitelist).await.unwrap();
+        client.send(&unwhitelist, Uuid::new_v4()).await.unwrap();
         let request = requests.recv().unwrap();
 
         assert!(
@@ -540,7 +541,10 @@ mod tests {
         let client = Client::new(base, "id-token".to_owned()).unwrap();
 
         client
-            .send(&route(Method::POST, Tier::Capital, "/freeze/AAPL"))
+            .send(
+                &route(Method::POST, Tier::Capital, "/freeze/AAPL"),
+                Uuid::new_v4(),
+            )
             .await
             .unwrap_err()
     }
@@ -705,7 +709,7 @@ mod tests {
         .unwrap();
 
         let error = client
-            .send(&route(Method::GET, Tier::Read, "/stuck"))
+            .send(&route(Method::GET, Tier::Read, "/stuck"), Uuid::new_v4())
             .await
             .unwrap_err();
 

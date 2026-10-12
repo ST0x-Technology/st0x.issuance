@@ -74,9 +74,31 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::Level;
 use tracing_subscriber::Registry;
-use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::filter::{FilterExt, LevelFilter, filter_fn};
+use tracing_subscriber::layer::{Filter, Layer, SubscriberExt};
 
 use crate::config::LogFormat;
+
+/// Compose operator-selected diagnostics with the non-negotiable console audit
+/// floor. `RUST_LOG` replaces [`crate::config::default_log_filter`] wholesale,
+/// so the floor lives here rather than in that string: one per-layer filter
+/// emits each audit record once while `RUST_LOG` still refines ordinary logs.
+fn console_filter<S>(
+    env_filter: tracing_subscriber::EnvFilter,
+) -> impl Filter<S>
+where
+    S: tracing::Subscriber
+        + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    // The hint keeps the global level ceiling at the operator's level or
+    // INFO, rather than TRACE, which an unhinted closure filter would force.
+    filter_fn(|metadata| {
+        metadata.target() == "operations_audit"
+            && *metadata.level() <= Level::INFO
+    })
+    .with_max_level_hint(LevelFilter::INFO)
+    .or(env_filter)
+}
 
 /// Build the console fmt layer for `log_format`. The JSON arm is the single
 /// place the console JSON wire shape is defined, so every subscriber emits
@@ -90,12 +112,12 @@ where
         + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     match log_format {
-        LogFormat::Text => {
-            tracing_subscriber::fmt::layer().with_filter(env_filter).boxed()
-        }
+        LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_filter(console_filter::<S>(env_filter))
+            .boxed(),
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_filter(env_filter)
+            .with_filter(console_filter::<S>(env_filter))
             .boxed(),
     }
 }
@@ -270,10 +292,11 @@ const TRACER_NAME: &str = "st0x-tracer";
 mod tests {
     use std::io::Write;
     use tracing::Level;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    use super::{HyperDxApiKey, HyperDxConfig, LogFormat};
+    use super::{HyperDxApiKey, HyperDxConfig, LogFormat, console_filter};
 
     #[test]
     fn hyperdx_config_debug_redacts_api_key() {
@@ -318,6 +341,30 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[test]
+    fn rust_log_cannot_disable_operations_audit_info() {
+        let writer = SharedWriter::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_filter(console_filter::<Registry>(EnvFilter::new(
+                "error,operations_audit[{audit_schema}]=off",
+            )));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "operations_audit",
+                audit_schema = "st0x.operations.audit.v1",
+                "mandatory audit"
+            );
+            tracing::info!(target: "redemption", "ordinary diagnostic");
+        });
+
+        let output = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert_eq!(output.matches("mandatory audit").count(), 1);
+        assert!(!output.contains("ordinary diagnostic"));
     }
 
     /// Pins the JSON console wire shape a log shipper parses: one JSON object
