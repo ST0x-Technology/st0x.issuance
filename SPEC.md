@@ -5190,7 +5190,9 @@ service-specific log messages:
 | `target_id`    | Colon-separated dynamic path values, then the identifiers the route's typed request body declares; `not_identified` when neither exists, including when the body did not parse. Raw JSON is never inspected, so undeclared fields cannot appear. A value over 256 bytes is recorded as `<oversized: N bytes>`. Burn-excess routes append the mode that ran: `dry-run`, `execute`, `close-dry-run`, or `close`. |
 | `reason`       | The reason field of the route's typed request body; `not_provided` when the route has no reason or the body did not parse. A reason over 1024 bytes is recorded as `<oversized: N bytes>`; the command's own event keeps the full text.                                                                                                                                                                        |
 | `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                                                                                                                                                                                                                                                                                               |
-| `timestamp`    | UTC RFC 3339 timestamp generated when the audit event is emitted.                                                                                                                                                                                                                                                                                                                                              |
+
+The log line's own timestamp records when the event was emitted; the event
+carries no separate `timestamp` field.
 
 The tracing target is `operations_audit`. Success is INFO; every other outcome
 is WARN. A `2xx` response is `success`, `401`, `403`, or `429` (the

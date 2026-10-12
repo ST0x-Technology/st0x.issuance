@@ -1,6 +1,5 @@
 //! Shared structured audit records for mutation-capable operator routes.
 
-use chrono::{SecondsFormat, Utc};
 use rocket::data::{self, Data, FromData};
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::{Header, Method, Status};
@@ -55,7 +54,6 @@ struct OperationsAuditEvent {
     target_id: String,
     reason: String,
     outcome: AuditOutcome,
-    timestamp: String,
 }
 
 impl OperationsAuditEvent {
@@ -100,7 +98,6 @@ impl OperationsAuditEvent {
                 |reason| bounded(reason, REASON_LIMIT),
             ),
             outcome: AuditOutcome::from_status(status.code),
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         }
     }
 }
@@ -152,7 +149,6 @@ fn record(event: &OperationsAuditEvent) {
             target_id = event.target_id.as_str(),
             reason = event.reason.as_str(),
             outcome = event.outcome.as_str(),
-            timestamp = %event.timestamp,
             "Operations audit event"
         ),
         AuditOutcome::Denied
@@ -168,7 +164,6 @@ fn record(event: &OperationsAuditEvent) {
             target_id = event.target_id.as_str(),
             reason = event.reason.as_str(),
             outcome = event.outcome.as_str(),
-            timestamp = %event.timestamp,
             "Operations audit event"
         ),
     }
@@ -452,7 +447,6 @@ mod tests {
             target_id: "AAPL".to_string(),
             reason: "incident 42".to_string(),
             outcome,
-            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
         }
     }
 
@@ -855,7 +849,6 @@ mod tests {
                     "target_id=\"AAPL\"",
                     "reason=\"incident 42\"",
                     &format!("outcome=\"{outcome}\""),
-                    "timestamp=2026-01-01T00:00:00.000Z",
                 ]
             ));
         }
