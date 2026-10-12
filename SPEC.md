@@ -5429,13 +5429,92 @@ environment's workload identity ID token. The refresh token cache is separate
 from the issuance bot client and every T0 cache.
 
 The S01 and T0 entry points use the same gateway command and output contract,
-but each resolves its own Google identity and target service. Reads use the
-gateway read tier and mutations use its write tier. Each invocation sends one
-gateway operation, prints one compact JSON value on stdout, and sends
-diagnostics only to stderr. Mutation arguments include a nonblank audit reason
-and expose the gateway key that makes a safe retry possible. Errors retain the
-gateway classification for authentication, authorization, timeout, rate limit,
-unknown outcome, and same key retry decisions.
+but each resolves its own Google identity and target service. The `alpaca` group
+is a thin adapter over `st0x-alpaca-gateway-api`, except for the four whitelist
+verbs (`whitelist`, `whitelist-list`, `whitelist-patch-travel-rule`, and
+`unwhitelist`): `GatewayWallet` has no whitelist methods and
+`GatewayClient::send` is private to that crate at the pinned st0x.alpaca rev, so
+the client builds those exchanges by hand. That code mirrors the crate's request
+building, deadline bound, connect bound, and error reading, and must be removed
+once st0x.alpaca serves the whitelist operations. Reads use the gateway read
+tier and mutations use its write tier. Most verbs send one gateway operation;
+`buy` and `sell` first read the market session and, for a market order, the
+asset, and `convert` polls the conversion until it settles. Each invocation
+prints one compact JSON value on stdout and sends diagnostics only to stderr.
+
+Mutation arguments include a nonblank audit reason. Before a mutation leaves,
+the client prints its key and the operation's same key rule to stderr in one
+line (for example `operationId=<uuid>; retryableWithSameKey=false`), so a run
+cut short still shows them; the JSON result and every error carry the key too.
+Errors retain the gateway classification for authentication, authorization,
+timeout, rate limit, unknown outcome, and same key retry decisions: a failure
+without a gateway answer, or one the gateway classified itself, prints
+`retryable`, `outcomeUnknown`, and `retryableWithSameKey`; an Alpaca answer the
+gateway relays prints Alpaca's status and message; either prints
+`retryAfterSecs` when a wait was asked for. Each gateway call is bounded by its
+operation's deadline plus a 15 second margin, and the Google token exchange by
+fixed 30 second request and 10 second connect bounds.
+
+Exit 77 means the operator was refused: an IAP answer of 401 or 403 that is not
+a gateway error body, an IAP sign in redirect, or the gateway's own
+`401 Unauthenticated`. Google refusing the sign in or the token exchange, before
+any gateway call, also exits 77: the operator declining at the consent screen,
+or Google rejecting the grant as `invalid_grant`. A sign in that fails for a
+misconfigured OAuth client exits 2, and one that fails for any other reason,
+such as a network failure or Google outage, exits 1, as for the bot routes. The
+gateway's 403s refuse the operation, not the operator, and exit 1: `forbidden`
+with reason `destination_not_allowed` for a destination outside the deployment's
+pinned lists, and `capability_disabled` for an operation the deployment switched
+off. An Alpaca status the gateway relays, such as a 403 order rejection, also
+exits 1. An argument refused before sign in exits 2.
+
+`buy` and `sell` apply the session rule of the legacy liquidity `stox buy` and
+`stox sell` before anything is sent: during the overnight session a market order
+is refused, and so is a limit order without `--extended-hours`. A market order
+for an asset Alpaca does not report as fractionable, missing metadata included,
+is refused unless its quantity is whole, since `st0x-alpaca` would floor it to
+whole shares (`prepare_counter_trade_shares`). An exact limit order is placed
+for the quantity typed, so that grid does not apply to it, and a market order is
+never extended hours, so the fractional extended hours attribute never applies.
+Order quantities finer than Alpaca's nine decimal share precision are refused at
+parse time, and a `to-usdc` conversion amount finer than whole cents before sign
+in; neither is truncated. `convert` places the conversion and waits until it
+settles, as the legacy liquidity `alpaca-convert` does: `st0x-alpaca`'s
+conversion loop polls the order to a terminal state and cancels the remainder
+past its 300 second deadline, and the JSON carries the settled order.
+
+Resending a mutation with the same key is safe only for the operations the
+gateway catalog marks resendable (`Operation::resendable_with_same_key`), each
+sent again with its printed key: `buy` and `sell` with `--client-order-id` set
+to the UUID part of the printed `cli-<uuid>`, `cancel` with the same broker
+order ID, `unwhitelist` and `whitelist-patch-travel-rule` with `--operation-id`
+(their end state is idempotent and the ID is for audit only), and `tokenize`
+with `--issuer-request-id`. `withdraw`, `journal`, `convert`, and `whitelist`
+are not resendable: their key is for audit and lookup only (Alpaca does not
+deduplicate a withdrawal by its operation ID, so the same ID sent twice
+withdraws twice), and a conversion's client order ID only finds the order.
+
+An error the gateway call itself returned, from any mutation but `convert`, did
+not apply when it does not show `outcomeUnknown=true`: `outcomeUnknown=false` or
+a relayed Alpaca rejection. A refusal before sending did not apply either. An
+error raised after that call answered, such as a failure to write the JSON to
+stdout, says nothing about the outcome; the mutation applied, so read the key
+from the stderr line and look the result up instead of running it again.
+`convert` can fail while it waits for settlement, after the conversion was
+placed, so check it whatever the error says. After an unknown outcome or an
+interrupted run of a mutation that is not resendable, check the outcome before
+running it again:
+
+- `withdraw`: never run it again on the strength of one empty `transfers` read.
+  Reconcile `transfers` repeatedly over a window longer than the withdrawal's 75
+  second client bound plus Alpaca's processing delay, matching amount,
+  destination, and a creation time no earlier than the run, as the gateway
+  client documents for `initiate_withdrawal`.
+- `journal`: never send it again after an unknown outcome. Confirm the journal
+  in `activities --type JNLS`, and escalate when it is missing.
+- `convert`: find the order with `conversion-find` and the printed client order
+  UUID.
+- `whitelist`: find the entry with `whitelist-list`.
 
 The read surface is `account`, `cash`, `positions`, `position-mark`,
 `activities`, `market-status`, `latest-trade`, `quote`, `asset`, `order-status`,
@@ -5446,13 +5525,15 @@ The read surface is `account`, `cash`, `positions`, `position-mark`,
 `unwhitelist`, `convert`, `journal`, and `tokenize`. `deposit` only returns the
 account bound deposit address, and `redeem` only finds the Alpaca redemption
 created by a separately submitted chain transaction. `journal` accepts a
-configured counterparty name rather than an Alpaca account identifier. The
-gateway deployment supplies the bound Alpaca account, approved destinations,
-Travel Rule beneficiary, journal counterparties, and tokenization recipients.
+configured counterparty name rather than an Alpaca account identifier. `buy` and
+`sell` take no time in force: a market on close order is not available through
+the gateway until st0x.alpaca supports it. The gateway deployment supplies the
+bound Alpaca account, approved destinations, Travel Rule beneficiary, journal
+counterparties, and tokenization recipients.
 
 The client contains no issuance recovery, CQRS decisions, retry loops, chain
-signing, or composite workflow. Those remain in the issuance service and its
-existing operator groups.
+signing, or composite workflow beyond the settlement wait of `convert`. Those
+remain in the issuance service and its existing operator groups.
 
 ### Recover Stuck Aggregates
 

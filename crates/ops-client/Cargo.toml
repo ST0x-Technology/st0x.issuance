@@ -27,9 +27,7 @@ st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "0
   "issuer",
   "tokenization",
 ] }
-st0x-alpaca-gateway-api = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50", features = [
-  "client",
-] }
+st0x-alpaca-gateway-api = { workspace = true, features = ["client"] }
 st0x-issuance-dto = { version = "0.1.0", path = "../dto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -42,3 +40,4 @@ workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 httpmock.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

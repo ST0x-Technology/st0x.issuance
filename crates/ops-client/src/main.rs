@@ -23,8 +23,9 @@ use std::process::ExitCode;
 
 use crate::auth::AuthError;
 use crate::cli::{
-    BreakglassCommand, BurnExcessArgs, BurnExcessCommand, CapitalCommand, Cli,
-    Command, DebugCommand, ReadCommand, WrappedTransfersArgs,
+    BotCommand, BreakglassCommand, BurnExcessArgs, BurnExcessCommand,
+    CapitalCommand, Cli, Command, DebugCommand, ReadCommand,
+    WrappedTransfersArgs,
 };
 use crate::target::{Env, TargetError};
 use crate::transport::{
@@ -43,12 +44,11 @@ async fn main() -> ExitCode {
     let Cli { env, command } = Cli::parse();
     let search = log_search(&command);
     let result = match command {
+        Command::Bot(command) => {
+            run(env, &route(&command), |name| std::env::var(name).ok()).await
+        }
         Command::Alpaca(command) => {
             run_alpaca(env, command, |name| std::env::var(name).ok()).await
-        }
-        command => {
-            let route = route(&command);
-            run(env, &route, |name| std::env::var(name).ok()).await
         }
     };
 
@@ -79,6 +79,8 @@ enum Failure {
     Transport(#[from] TransportError),
     #[error(transparent)]
     Alpaca(#[from] alpaca::Failure),
+    #[error(transparent)]
+    AlpacaArgument(#[from] alpaca::ArgumentError),
     #[error(
         "the selected operation answered with success, but the response could \
          not be written to stdout: {0}\nThe request was completed: a read can \
@@ -90,7 +92,9 @@ enum Failure {
 impl Failure {
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Target(_) | Self::Http(_) => EXIT_SETUP,
+            Self::Target(_) | Self::Http(_) | Self::AlpacaArgument(_) => {
+                EXIT_SETUP
+            }
             Self::Auth(error) if error.is_access_denied() => EXIT_ACCESS_DENIED,
             Self::Auth(error) if error.is_client_misconfigured() => EXIT_SETUP,
             Self::Transport(error) if error.is_access_denied() => {
@@ -111,7 +115,10 @@ impl Failure {
             Self::Transport(error) => error.reached_server(),
             Self::Alpaca(error) => error.reached_server(),
             Self::Output(_) => true,
-            Self::Target(_) | Self::Http(_) | Self::Auth(_) => false,
+            Self::Target(_)
+            | Self::Http(_)
+            | Self::Auth(_)
+            | Self::AlpacaArgument(_) => false,
         }
     }
 }
@@ -136,9 +143,18 @@ async fn run_alpaca(
     command: alpaca::Command,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(), Failure> {
+    // An argument rule clap cannot express is refused before any sign in, as
+    // a usage error.
+    command.validate()?;
     let target = target::resolve_alpaca(env, lookup)?;
     let token = auth::id_token(target.cache_slug, target.identity).await?;
-    let value = alpaca::execute(&target.base_url, token, command).await?;
+    let value = alpaca::execute(
+        &target.base_url,
+        token,
+        command,
+        &mut std::io::stderr(),
+    )
+    .await?;
     print_body(&value.to_string()).map_err(Failure::Output)
 }
 
@@ -149,17 +165,12 @@ fn print_body(body: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
-fn route(command: &Command) -> Route {
+fn route(command: &BotCommand) -> Route {
     match command {
-        Command::Read(read) => read_route(read),
-        Command::Debug(debug) => debug_route(debug),
-        Command::Capital(capital) => capital_route(capital),
-        Command::Breakglass(breakglass) => breakglass_route(breakglass),
-        Command::Alpaca(_) => {
-            unreachable!(
-                "Alpaca commands are dispatched before bot route construction"
-            )
-        }
+        BotCommand::Read(read) => read_route(read),
+        BotCommand::Debug(debug) => debug_route(debug),
+        BotCommand::Capital(capital) => capital_route(capital),
+        BotCommand::Breakglass(breakglass) => breakglass_route(breakglass),
     }
 }
 
@@ -493,16 +504,23 @@ const fn bare(method: Method, tier: Tier, path: String) -> Route {
 /// client id, or its underlying. `None` for commands that name neither.
 fn log_search(command: &Command) -> Option<String> {
     match command {
-        Command::Read(ReadCommand::Status { underlying }) => {
+        Command::Bot(command) => bot_log_search(command),
+        Command::Alpaca(command) => command.log_search(),
+    }
+}
+
+fn bot_log_search(command: &BotCommand) -> Option<String> {
+    match command {
+        BotCommand::Read(ReadCommand::Status { underlying }) => {
             Some(underlying.as_str().to_owned())
         }
-        Command::Read(_)
-        | Command::Debug(DebugCommand::RegisterAccount { .. }) => None,
-        Command::Debug(
+        BotCommand::Read(_)
+        | BotCommand::Debug(DebugCommand::RegisterAccount { .. }) => None,
+        BotCommand::Debug(
             DebugCommand::RecoverRedemption { issuer_request_id }
             | DebugCommand::ReprocessMint { issuer_request_id },
         )
-        | Command::Breakglass(
+        | BotCommand::Breakglass(
             BreakglassCommand::ForceCompleteRedemption {
                 issuer_request_id,
                 ..
@@ -510,30 +528,29 @@ fn log_search(command: &Command) -> Option<String> {
             | BreakglassCommand::CloseRedemption { issuer_request_id, .. }
             | BreakglassCommand::CloseMint { issuer_request_id, .. },
         ) => Some(issuer_request_id.clone()),
-        Command::Breakglass(BreakglassCommand::BurnExcess(
+        BotCommand::Breakglass(BreakglassCommand::BurnExcess(
             BurnExcessCommand::Internal(args)
             | BurnExcessCommand::ExpectFunding(args)
             | BurnExcessCommand::External { args, .. },
         )) => Some(args.issuer_request_id.to_string()),
-        Command::Debug(
+        BotCommand::Debug(
             DebugCommand::WhitelistWallet { client_id, .. }
             | DebugCommand::UnwhitelistWallet { client_id, .. },
         ) => Some(client_id.clone()),
-        Command::Debug(DebugCommand::Snapshot { aggregate_id, .. }) => {
+        BotCommand::Debug(DebugCommand::Snapshot { aggregate_id, .. }) => {
             Some(aggregate_id.clone())
         }
-        Command::Debug(
+        BotCommand::Debug(
             DebugCommand::VerifyOrchestratorSigning { underlying, .. }
             | DebugCommand::TokenizedAsset { underlying, .. }
             | DebugCommand::AddTokenizedAsset { underlying, .. },
         )
-        | Command::Capital(
+        | BotCommand::Capital(
             CapitalCommand::Freeze { underlying }
             | CapitalCommand::Unfreeze { underlying }
             | CapitalCommand::ScheduleFreeze { underlying, .. }
             | CapitalCommand::ApproveOrchestrator { underlying, .. },
         ) => Some(underlying.as_str().to_owned()),
-        Command::Alpaca(command) => command.log_search(),
     }
 }
 
@@ -561,11 +578,11 @@ mod tests {
 
     use super::{Failure, cloud_logging_url, log_search, route};
     use crate::auth::AuthError;
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Command};
     use crate::target::{Env, TargetError};
     use crate::transport::{Client, TransportError};
 
-    fn command(args: &[&str]) -> crate::cli::Command {
+    fn command(args: &[&str]) -> Command {
         Cli::try_parse_from(
             ["st0x-issuance-client", "--env", "staging"]
                 .into_iter()
@@ -578,7 +595,10 @@ mod tests {
     /// Renders a command's route as `METHOD /path?query` plus its JSON body,
     /// through the same URL construction the transport sends.
     fn wire(args: &[&str]) -> (String, Option<Value>) {
-        let route = route(&command(args));
+        let Command::Bot(bot) = command(args) else {
+            panic!("expected a bot command: {args:?}");
+        };
+        let route = route(&bot);
         let client = Client::new(
             Url::parse("https://ops.example").unwrap(),
             "id-token".to_owned(),
@@ -1000,6 +1020,12 @@ mod tests {
         });
         assert_eq!(setup.exit_code(), 2);
         assert!(!setup.reached_server());
+
+        let usage = Failure::AlpacaArgument(
+            crate::alpaca::ArgumentError::FinerThanSharePrecision,
+        );
+        assert_eq!(usage.exit_code(), 2, "an alpaca usage error is setup");
+        assert!(!usage.reached_server());
 
         let denied = Failure::Transport(TransportError::Forbidden {
             body: String::new(),

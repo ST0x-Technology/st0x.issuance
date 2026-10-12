@@ -25,8 +25,21 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
+/// The top level commands: the bot commands, routed to the ops API, and the
+/// `alpaca` group, routed to the S01 Alpaca gateway. Flattening the bot
+/// commands keeps them at the top level of the command line while each
+/// destination stays a type of its own.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    #[command(flatten)]
+    Bot(BotCommand),
+    /// Direct account operations through the S01 Alpaca gateway.
+    #[command(subcommand)]
+    Alpaca(crate::alpaca::Command),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BotCommand {
     /// Read-only diagnostics.
     #[command(subcommand)]
     Read(ReadCommand),
@@ -40,9 +53,6 @@ pub(crate) enum Command {
     /// burns.
     #[command(subcommand)]
     Breakglass(BreakglassCommand),
-    /// Direct account operations through the S01 Alpaca gateway.
-    #[command(subcommand)]
-    Alpaca(crate::alpaca::Command),
 }
 
 #[derive(Debug, Subcommand)]
@@ -279,7 +289,7 @@ mod tests {
     use clap::error::ErrorKind;
     use st0x_issuance_dto::UnderlyingSymbol;
 
-    use super::{Cli, Command, ReadCommand};
+    use super::{BotCommand, Cli, Command, ReadCommand};
     use crate::target::Env;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -311,10 +321,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.env, Env::Production);
-        let Command::Read(ReadCommand::OrchestratorPreflight {
-            network,
-            assets,
-        }) = cli.command
+        let Command::Bot(BotCommand::Read(
+            ReadCommand::OrchestratorPreflight { network, assets },
+        )) = cli.command
         else {
             panic!("expected orchestrator-preflight, got {:?}", cli.command);
         };

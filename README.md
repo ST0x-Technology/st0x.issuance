@@ -225,12 +225,42 @@ cargo run -p st0x-issuance-ops -- --env staging alpaca buy --symbol AAPL --quant
 ```
 
 The bot routes read `S01_ISSUANCE_{STAGING,PROD}_URL`. Alpaca commands read only
-`S01_ALPACA_{STAGING,PROD}_URL` and the matching `_CLIENT_ID`, `_CLIENT_SECRET`,
-`_CONNECT_TIMEOUT_SECS`, and `_REQUEST_TIMEOUT_SECS` values. Both paths use the
-S01 Desktop OAuth client and the S01 Google account, or a workload identity ID
-token in CI, but keep separate sign in caches. Alpaca commands never accept an
-account identifier. See SPEC.md "Operator client" and "Alpaca gateway
-operations" for the full contract.
+`S01_ALPACA_{STAGING,PROD}_URL` and the matching `_ID_TOKEN`, or `_CLIENT_ID`
+and `_CLIENT_SECRET`. Both paths use the S01 Desktop OAuth client and the S01
+Google account, or a workload identity ID token in CI, but keep separate sign in
+caches. Alpaca commands never accept an account identifier, and each gateway
+call is bounded by its operation's deadline plus a 15 second margin.
+
+Every Alpaca mutation prints its key and whether a same key resend is safe to
+stderr in one line before the request leaves, for example
+`operationId=<uuid>; retryableWithSameKey=false`. Only `buy` and `sell` (with
+`--client-order-id` set to the UUID part of the printed `cli-<uuid>`), `cancel`
+(the same broker order ID), `unwhitelist` and `whitelist-patch-travel-rule`
+(`--operation-id`), and `tokenize` (`--issuer-request-id`) are safe to resend
+with the same key. For `withdraw`, `journal`, `convert`, and `whitelist` the key
+is for audit and lookup only. After an unknown outcome or an interrupted run,
+never run a withdrawal again on one empty `transfers` read but reconcile
+`transfers` repeatedly over a window longer than its bound plus Alpaca's
+processing delay, never send a journal again but confirm it in
+`activities --type JNLS` and escalate, and look a whitelist entry up with
+`whitelist-list`. `convert` can fail after the conversion was placed, so after
+any `convert` error, whatever its flags, look the conversion up with
+`conversion-find` and the printed client order UUID before converting again. Any
+other mutation error the gateway call itself returned did not apply unless it
+shows `outcomeUnknown=true`. An error raised after that call answered, such as a
+failure to write the JSON to stdout, says nothing about the outcome; the
+mutation applied, so read the key from the stderr line and look the result up
+instead of running it again.
+
+`buy` and `sell` refuse a market order during the overnight session, a limit
+order without `--extended-hours` then, and a fractional market order for an
+asset Alpaca does not report as fractionable. `convert` waits until the
+conversion settles. An Alpaca command exits 77 when IAP refuses the operator,
+the gateway answers `401 Unauthenticated`, or Google refuses the sign in or
+token exchange before any gateway call (a declined consent or a rejected grant);
+a gateway 403 (`forbidden` or `capability_disabled`) refuses the operation and
+exits 1. See SPEC.md "Operator client" and "Alpaca gateway operations" for the
+full contract.
 
 ## Mint Flow
 
