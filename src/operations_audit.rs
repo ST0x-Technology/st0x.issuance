@@ -302,35 +302,27 @@ impl AuditedBody for BurnExcessCommon {
     }
 }
 
-impl AuditedBody for BurnExcessInternalRequest {
-    fn audit_targets(&self) -> Vec<String> {
-        self.common.audit_targets()
-    }
+/// Each burn-excess request flattens `BurnExcessCommon`, which carries its
+/// whole audit identity.
+macro_rules! audited_through_common {
+    ($($request:ty),+ $(,)?) => {$(
+        impl AuditedBody for $request {
+            fn audit_targets(&self) -> Vec<String> {
+                self.common.audit_targets()
+            }
 
-    fn audit_reason(&self) -> Option<&str> {
-        self.common.audit_reason()
-    }
+            fn audit_reason(&self) -> Option<&str> {
+                self.common.audit_reason()
+            }
+        }
+    )+};
 }
 
-impl AuditedBody for BurnExcessExpectFundingRequest {
-    fn audit_targets(&self) -> Vec<String> {
-        self.common.audit_targets()
-    }
-
-    fn audit_reason(&self) -> Option<&str> {
-        self.common.audit_reason()
-    }
-}
-
-impl AuditedBody for BurnExcessExternalRequest {
-    fn audit_targets(&self) -> Vec<String> {
-        self.common.audit_targets()
-    }
-
-    fn audit_reason(&self) -> Option<&str> {
-        self.common.audit_reason()
-    }
-}
+audited_through_common!(
+    BurnExcessInternalRequest,
+    BurnExcessExpectFundingRequest,
+    BurnExcessExternalRequest,
+);
 
 /// Audits every mutation request to an operator surface after its final
 /// status is known, including guard, routing, and data-validation failures.
@@ -565,70 +557,65 @@ mod tests {
                 "11111111-1111-1111-1111-111111111111",
                 r#"{"issuer_request_id":"op-1","reason":"incident 42"}"#,
                 Status::Ok,
-            ),
-            (
-                "/ops/debug/denied/widget-2",
-                "22222222-2222-2222-2222-222222222222",
-                "",
-                Status::Unauthorized,
-            ),
-            (
-                "/ops/debug/success/widget-3",
-                "33333333-3333-3333-3333-333333333333",
-                "{",
-                Status::BadRequest,
-            ),
-            (
-                "/ops/debug/failure/widget-4",
-                "44444444-4444-4444-4444-444444444444",
-                r#"{"issuer_request_id":"op-4","reason":"incident 42"}"#,
-                Status::InternalServerError,
-            ),
-        ];
-
-        for (path, request_id, body, expected_status) in cases {
-            let response = dispatch_json(&client, path, request_id, body).await;
-            assert_eq!(response.status(), expected_status);
-            assert_eq!(
-                response.headers().get_one("x-request-id"),
-                Some(request_id)
-            );
-        }
-
-        for (level, request_id, principal, target_id, reason, outcome) in [
-            (
                 Level::INFO,
-                "11111111-1111-1111-1111-111111111111",
                 "accounts.google.com:1234",
                 "widget-1:op-1",
                 "incident 42",
                 "success",
             ),
             (
-                Level::WARN,
+                "/ops/debug/denied/widget-2",
                 "22222222-2222-2222-2222-222222222222",
+                "",
+                Status::Unauthorized,
+                Level::WARN,
                 "unauthenticated",
                 "widget-2",
                 "not_provided",
                 "denied",
             ),
             (
-                Level::WARN,
+                "/ops/debug/success/widget-3",
                 "33333333-3333-3333-3333-333333333333",
+                "{",
+                Status::BadRequest,
+                Level::WARN,
                 "accounts.google.com:1234",
                 "widget-3",
                 "not_provided",
                 "validation_failure",
             ),
             (
-                Level::WARN,
+                "/ops/debug/failure/widget-4",
                 "44444444-4444-4444-4444-444444444444",
+                r#"{"issuer_request_id":"op-4","reason":"incident 42"}"#,
+                Status::InternalServerError,
+                Level::WARN,
                 "accounts.google.com:1234",
                 "widget-4:op-4",
                 "incident 42",
                 "command_failure",
             ),
-        ] {
+        ];
+
+        for (
+            path,
+            request_id,
+            body,
+            expected_status,
+            level,
+            principal,
+            target_id,
+            reason,
+            outcome,
+        ) in cases
+        {
+            let response = dispatch_json(&client, path, request_id, body).await;
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response.headers().get_one("x-request-id"),
+                Some(request_id)
+            );
             assert!(
                 logs_contain_at!(
                     level,
