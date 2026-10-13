@@ -19,6 +19,7 @@ use st0x_issuance_dto::{
 };
 use std::io::Write;
 use std::process::ExitCode;
+use uuid::Uuid;
 
 use crate::auth::AuthError;
 use crate::cli::{
@@ -41,14 +42,22 @@ const EXIT_FAILED: u8 = 1;
 async fn main() -> ExitCode {
     let Cli { env, command } = Cli::parse();
     let route = route(&command);
+    // Generated here so a failed mutation can name its own audit event, not
+    // only the identifiers it shares with other commands.
+    let request_id = Uuid::new_v4();
 
-    match run(env, &route, |name| std::env::var(name).ok()).await {
+    match run(env, &route, request_id, |name| std::env::var(name).ok()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             eprintln!("error: {failure}");
             if failure.reached_server() {
+                eprintln!();
+                // Reads emit no audit event, so their id would find nothing.
+                if route.method != Method::GET {
+                    eprintln!("Request id: {request_id}");
+                }
                 eprintln!(
-                    "\nS01 Cloud Logging: {}",
+                    "S01 Cloud Logging: {}",
                     cloud_logging_url(env, log_search(&command).as_deref())
                 );
             }
@@ -100,12 +109,13 @@ impl Failure {
 async fn run(
     env: Env,
     route: &Route,
+    request_id: Uuid,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(), Failure> {
     let target = target::resolve(env, lookup)?;
     let token = auth::id_token(env, target.identity).await?;
     let client = Client::new(target.base_url, token)?;
-    let body = client.send(route).await?;
+    let body = client.send(route, request_id).await?;
 
     // A write failure here follows a success the bot already acted on, which
     // is what `Failure::Output` tells the operator.

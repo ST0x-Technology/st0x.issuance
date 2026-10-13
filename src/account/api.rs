@@ -17,6 +17,7 @@ use super::{
     view::AccountViewError, view::find_by_client_id, view::find_by_email,
 };
 use crate::auth::{DebugOps, InternalAuth, IssuerAuth};
+use crate::operations_audit::Audited;
 
 impl<'a> FromParam<'a> for ClientId {
     type Error = uuid::Error;
@@ -95,9 +96,9 @@ pub(crate) async fn register_account(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
-    request: Json<RegisterAccountRequest>,
+    request: Audited<RegisterAccountRequest>,
 ) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
-    register_account_logic(store, pool, request).await
+    register_account_logic(store, pool, Json(request.0)).await
 }
 
 /// Debug-tier operator route mirroring [`register_account`], gated by IAP
@@ -113,9 +114,9 @@ pub(crate) async fn register_account_ops(
     auth: DebugOps,
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
-    request: Json<RegisterAccountRequest>,
+    request: Audited<RegisterAccountRequest>,
 ) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
-    register_account_logic(store, pool, request).await
+    register_account_logic(store, pool, Json(request.0)).await
 }
 
 #[tracing::instrument(skip(store, pool), fields(email = %request.email))]
@@ -262,9 +263,9 @@ pub(crate) async fn whitelist_wallet(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
-    request: Json<WhitelistWalletRequest>,
+    request: Audited<WhitelistWalletRequest>,
 ) -> Result<Json<WhitelistWalletResponse>, ApiError> {
-    whitelist_wallet_logic(store, pool, client_id, request).await
+    whitelist_wallet_logic(store, pool, client_id, Json(request.0)).await
 }
 
 /// Debug-tier operator route mirroring [`whitelist_wallet`], gated by IAP
@@ -285,9 +286,9 @@ pub(crate) async fn whitelist_wallet_ops(
     store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
-    request: Json<WhitelistWalletRequest>,
+    request: Audited<WhitelistWalletRequest>,
 ) -> Result<Json<WhitelistWalletResponse>, ApiError> {
-    whitelist_wallet_logic(store, pool, client_id, request).await
+    whitelist_wallet_logic(store, pool, client_id, Json(request.0)).await
 }
 
 #[tracing::instrument(skip(store, pool), fields(

@@ -104,6 +104,7 @@ pub(crate) mod jobs;
 pub(crate) mod network_telemetry;
 pub(crate) mod notifications;
 mod openapi;
+pub(crate) mod operations_audit;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
@@ -828,6 +829,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     let mut service_shutdown = state.background_tasks.shutdown.subscribe();
     let background_tasks = state.background_tasks;
     let rocket = rocket::custom(figment)
+        .attach(operations_audit::OperationsAuditFairing)
         .attach(rocket::fairing::AdHoc::on_liftoff(
             "fail closed on poisoned corporate-action source",
             move |rocket| {

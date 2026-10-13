@@ -227,6 +227,16 @@ client (`_CLIENT_ID`, `_CLIENT_SECRET`; the first call prints a browser sign-in
 URL for your S01 Google account) or, in CI, a workload-identity ID token
 (`_ID_TOKEN`). See SPEC.md "Operator client" for the full contract.
 
+Every operator mutation (the `/ops` tiers and their shared-key `/admin`,
+`/accounts`, and `/tokenized-assets` twins) emits the versioned
+`st0x.operations.audit.v1` structured event under tracing target
+`operations_audit`. The event carries the principal, role, matched route,
+request UUID, target, reason, and outcome; the response echoes the UUID in
+`x-request-id`, and the client prints it when a mutation fails. With the default
+text log format the event is one stdout line; search Cloud Logging for bare
+values such as `st0x.operations.audit.v1` or the request UUID. See SPEC.md
+"Shared operations audit event".
+
 ## Mint Flow
 
 1. AP requests mint → Alpaca calls our `/inkind/issuance` endpoint

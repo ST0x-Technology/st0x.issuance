@@ -43,6 +43,7 @@ use crate::chain::{ChainConfig, ConfiguredNetworks};
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
 use crate::network_telemetry::NetworkTelemetry;
+use crate::operations_audit::OperationsAuditFairing;
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptInventory, ReceiptService,
 };
@@ -642,6 +643,100 @@ async fn role_prefixes_are_absent_without_ops_api_config() {
     }
 }
 
+/// Every mutation route the application mounts is audited, which the echoed
+/// `x-request-id` proves, unless it is one of the integration calls Alpaca or
+/// the liquidity bot make as part of the mint and account-link flows. Drives
+/// the real route table, so a new operator mutation mounted outside an
+/// audited surface fails here. An accepted shared-key call proves the real
+/// `InternalAuth` guard attributes its event.
+#[traced_test]
+#[tokio::test]
+async fn every_mounted_operator_mutation_is_audited() {
+    let config = Config {
+        ops_api: Some(ops_config()),
+        ..test_config().expect("test config builds")
+    };
+    let client = Client::tracked(app_rocket(config).await).await.unwrap();
+    let mutations: Vec<(Method, String)> = client
+        .rocket()
+        .routes()
+        .filter(|route| {
+            matches!(
+                route.method,
+                Method::Post | Method::Put | Method::Patch | Method::Delete
+            )
+        })
+        .map(|route| {
+            let concrete = route
+                .uri
+                .path()
+                .split('/')
+                .map(
+                    |segment| {
+                        if segment.starts_with('<') { "x" } else { segment }
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("/");
+            (route.method, concrete)
+        })
+        .collect();
+
+    let mut unaudited = Vec::new();
+    for (method, path) in mutations {
+        let response = client
+            .req(method, path.as_str())
+            .header(ContentType::JSON)
+            .dispatch()
+            .await;
+        if response.headers().get_one("x-request-id").is_none() {
+            unaudited.push(format!("{method} {path}"));
+        }
+    }
+    unaudited.sort();
+
+    assert_eq!(
+        unaudited,
+        [
+            "POST /accounts/connect",
+            "POST /inkind/issuance",
+            "POST /inkind/issuance/confirm",
+            "POST /internal/mints/x/authorization",
+        ]
+    );
+
+    let accepted = client
+        .post("/admin/reprocess/mint/not-a-mint")
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new(
+            "x-request-id",
+            "efefefef-efef-efef-efef-efefefefefef",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .dispatch()
+        .await;
+    assert_ne!(accepted.status(), Status::Unauthorized);
+    assert_ne!(accepted.status(), Status::Forbidden);
+    logs_assert(|lines| {
+        lines
+            .iter()
+            .any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains("efefefef-efef-efef-efef-efefefefefef")
+                    && line.contains("principal=\"internal-api-key\"")
+                    && line.contains("role=\"internal\"")
+                    && line.contains(
+                        "route=\"/admin/reprocess/mint/<aggregate_id>\"",
+                    )
+            })
+            .then_some(())
+            .ok_or_else(|| format!("missing internal audit event: {lines:?}"))
+    });
+}
+
 /// A well-formed external burn body for `network`; the mint it names does not
 /// exist in an empty store.
 fn external_body(network: Network) -> String {
@@ -974,7 +1069,8 @@ async fn capital_freeze_admits_its_token_and_refuses_an_unlisted_underlying() {
 
 /// A mutating route's records name the operator: the freeze log line carries
 /// the assertion's subject id (never the email) via the handler's `operator`
-/// span, so an audit can attribute the action from the service logs alone.
+/// span, and the audit event carries it as its principal, so an audit can
+/// attribute the action from the service logs alone.
 #[traced_test]
 #[tokio::test]
 async fn a_capital_freeze_is_attributed_to_the_assertion_subject() {
@@ -1002,7 +1098,8 @@ async fn a_capital_freeze_is_attributed_to_the_assertion_subject() {
         )
         .await
         .expect("listing seeds");
-    let client = Client::tracked(rocket).await.unwrap();
+    let client =
+        Client::tracked(rocket.attach(OperationsAuditFairing)).await.unwrap();
 
     let response = client
         .post("/ops/capital/freeze/AAPL")
@@ -1033,6 +1130,22 @@ async fn a_capital_freeze_is_attributed_to_the_assertion_subject() {
             if line.contains("operator@rainlang.xyz") {
                 return Err(format!("freeze record carries the email: {line}"));
             }
+        }
+
+        let audited = lines.iter().any(|line| {
+            line.contains("operations_audit: Operations audit event")
+                && line.contains("principal=\"accounts.google.com:1234\"")
+                && line.contains("role=\"capital\"")
+                && line.contains("outcome=\"success\"")
+        });
+        if !audited {
+            return Err(format!("missing attributed audit event: {lines:?}"));
+        }
+        if lines.iter().any(|line| {
+            line.contains("Operations audit event")
+                && line.contains("operator@rainlang.xyz")
+        }) {
+            return Err("audit event carries the email".to_string());
         }
         Ok(())
     });

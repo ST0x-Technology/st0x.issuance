@@ -26,7 +26,7 @@ st0x-issuance-dto = { version = "0.1.0", path = "../dto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 url.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

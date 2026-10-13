@@ -21,6 +21,7 @@ use super::{
 use crate::auth::{DebugOps, InternalAuth, IssuerAuth};
 use crate::chain::ConfiguredNetworks;
 use crate::config::{Config, VaultModeKind};
+use crate::operations_audit::Audited;
 use crate::underlying::load_freeze_status;
 
 /// An operator-supplied underlying symbol in a route path, uppercased and
@@ -288,9 +289,10 @@ pub(crate) async fn add_tokenized_asset(
     store: &rocket::State<Arc<Store<TokenizedAsset>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     configured_networks: &rocket::State<ConfiguredNetworks>,
-    request: Json<AddTokenizedAssetRequest>,
+    request: Audited<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
-    add_tokenized_asset_logic(store, pool, configured_networks, request).await
+    add_tokenized_asset_logic(store, pool, configured_networks, Json(request.0))
+        .await
 }
 
 /// Debug-tier operator route mirroring [`add_tokenized_asset`], gated by IAP
@@ -307,9 +309,10 @@ pub(crate) async fn add_tokenized_asset_ops(
     store: &rocket::State<Arc<Store<TokenizedAsset>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     configured_networks: &rocket::State<ConfiguredNetworks>,
-    request: Json<AddTokenizedAssetRequest>,
+    request: Audited<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
-    add_tokenized_asset_logic(store, pool, configured_networks, request).await
+    add_tokenized_asset_logic(store, pool, configured_networks, Json(request.0))
+        .await
 }
 
 #[tracing::instrument(skip(store, pool, configured_networks), fields(
