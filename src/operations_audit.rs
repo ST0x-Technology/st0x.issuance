@@ -297,8 +297,8 @@ impl AuditedBody for BurnExcessCommon {
     }
 }
 
-/// Each burn-excess request flattens `BurnExcessCommon`, which carries its
-/// whole audit identity.
+/// The internal and expect-funding requests flatten `BurnExcessCommon`, which
+/// carries their whole audit identity.
 macro_rules! audited_through_common {
     ($($request:ty),+ $(,)?) => {$(
         impl AuditedBody for $request {
@@ -316,8 +316,21 @@ macro_rules! audited_through_common {
 audited_through_common!(
     BurnExcessInternalRequest,
     BurnExcessExpectFundingRequest,
-    BurnExcessExternalRequest,
 );
+
+/// The external request also names the funding Transfer the operator
+/// asserted, which sets it apart from an internal burn of the same mint.
+impl AuditedBody for BurnExcessExternalRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        let mut targets = self.common.audit_targets();
+        targets.push(self.funding_tx_hash.to_string());
+        targets
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        self.common.audit_reason()
+    }
+}
 
 /// Audits every mutation request to an operator surface after its final
 /// status is known, including guard, routing, and data-validation failures.
@@ -425,7 +438,8 @@ mod tests {
     use rocket::request::{FromRequest, Outcome};
     use serde::Deserialize;
     use st0x_issuance_dto::{
-        BurnExcessCommon, BurnExcessInternalRequest, Network,
+        BurnExcessCommon, BurnExcessExternalRequest, BurnExcessInternalRequest,
+        Network,
     };
     use tracing::Level;
     use tracing_test::traced_test;
@@ -769,27 +783,38 @@ mod tests {
             (true, false, "close-dry-run"),
             (true, true, "close"),
         ] {
-            let request = BurnExcessInternalRequest {
-                common: BurnExcessCommon {
-                    issuer_request_id: uuid!(
-                        "12345678-1234-1234-1234-123456789abc"
-                    ),
-                    deposit_tx_hash: B256::repeat_byte(1),
-                    receipt_id: U256::from(7),
-                    shares: "1".parse().unwrap(),
-                    reason: "incident 42".to_string(),
-                    incident_id: None,
-                    acknowledged_inflows: Vec::new(),
-                    network: Network::Base,
-                    chain_id: 8453,
-                    execute,
-                    close,
-                },
+            let common = BurnExcessCommon {
+                issuer_request_id: uuid!(
+                    "12345678-1234-1234-1234-123456789abc"
+                ),
+                deposit_tx_hash: B256::repeat_byte(1),
+                receipt_id: U256::from(7),
+                shares: "1".parse().unwrap(),
+                reason: "incident 42".to_string(),
+                incident_id: None,
+                acknowledged_inflows: Vec::new(),
+                network: Network::Base,
+                chain_id: 8453,
+                execute,
+                close,
             };
-
+            let internal = BurnExcessInternalRequest { common: common.clone() };
             assert_eq!(
-                request.audit_targets(),
+                internal.audit_targets(),
                 ["12345678-1234-1234-1234-123456789abc", mode],
+                "close={close} execute={execute}"
+            );
+
+            let funding_tx_hash = B256::repeat_byte(2);
+            let external =
+                BurnExcessExternalRequest { funding_tx_hash, common };
+            assert_eq!(
+                external.audit_targets(),
+                [
+                    "12345678-1234-1234-1234-123456789abc".to_string(),
+                    mode.to_string(),
+                    funding_tx_hash.to_string(),
+                ],
                 "close={close} execute={execute}"
             );
         }
