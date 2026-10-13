@@ -27,10 +27,14 @@ const NOT_PROVIDED: &str = "not_provided";
 const TARGET_VALUE_LIMIT: usize = 256;
 const REASON_LIMIT: usize = 1024;
 
-/// Operator surface an audited request reached.
+/// Operator surface an audited request reached. Only the mutating IAP tiers
+/// and the shared-key twins have one, so a read tier cannot emit a mutation
+/// audit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuditRole {
-    Ops(OpsTier),
+    Debug,
+    Capital,
+    Breakglass,
     /// The shared-key (`InternalAuth`) twins of the operator mutations.
     Internal,
 }
@@ -38,7 +42,9 @@ enum AuditRole {
 impl AuditRole {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Ops(tier) => tier.as_str(),
+            Self::Debug => OpsTier::Debug.as_str(),
+            Self::Capital => OpsTier::Capital.as_str(),
+            Self::Breakglass => OpsTier::Breakglass.as_str(),
             Self::Internal => "internal",
         }
     }
@@ -60,16 +66,11 @@ impl OperationsAuditEvent {
     fn new(
         request: &Request<'_>,
         role: AuditRole,
-        unmatched_route: &'static str,
+        route: &Route,
         status: Status,
     ) -> Self {
         let body = request.local_cache(AuditBody::default);
-        let (route, mut target_parts) = request.route().map_or_else(
-            || (unmatched_route.to_string(), Vec::new()),
-            |matched| {
-                (matched.uri.to_string(), path_parameters(matched, request))
-            },
-        );
+        let mut target_parts = path_parameters(route, request);
         for target in &body.targets {
             if !target_parts.contains(target) {
                 target_parts.push(target.clone());
@@ -82,7 +83,7 @@ impl OperationsAuditEvent {
                 .0
                 .clone(),
             role,
-            route,
+            route: route.uri.to_string(),
             request_id: request_id(request),
             target_id: if target_parts.is_empty() {
                 NOT_IDENTIFIED.to_string()
@@ -332,8 +333,10 @@ impl AuditedBody for BurnExcessExternalRequest {
     }
 }
 
-/// Audits every mutation request to an operator surface after its final
-/// status is known, including guard, routing, and data-validation failures.
+/// Audits every mutation request to an operator surface that matched a route,
+/// after its final status is known, including guard and data-validation
+/// failures. A request that matched no route ran no handler, and its record
+/// could name neither a caller nor a target, so it records nothing.
 pub(crate) struct OperationsAuditFairing;
 
 #[rocket::async_trait]
@@ -347,16 +350,15 @@ impl Fairing for OperationsAuditFairing {
         request: &'request Request<'_>,
         response: &mut Response<'request>,
     ) {
-        let Some((role, unmatched_route)) = audited_surface(request) else {
+        let Some(role) = audited_surface(request) else {
+            return;
+        };
+        let Some(route) = request.route() else {
             return;
         };
 
-        let event = OperationsAuditEvent::new(
-            request,
-            role,
-            unmatched_route,
-            response.status(),
-        );
+        let event =
+            OperationsAuditEvent::new(request, role, route, response.status());
         response.set_header(Header::new(
             REQUEST_ID_HEADER,
             event.request_id.to_string(),
@@ -365,11 +367,10 @@ impl Fairing for OperationsAuditFairing {
     }
 }
 
-/// The audited surface of a mutation request and the fixed route an unmatched
-/// request records instead of its caller-chosen path. Classified from the
+/// The audited surface of a mutation request. Classified from the
 /// percent-decoded, empty-skipping segments Rocket routes on, so no spelling of
 /// a mutation path reaches a handler without an audit event.
-fn audited_surface(request: &Request<'_>) -> Option<(AuditRole, &'static str)> {
+fn audited_surface(request: &Request<'_>) -> Option<AuditRole> {
     if !matches!(
         request.method(),
         Method::Post | Method::Put | Method::Patch | Method::Delete
@@ -379,25 +380,16 @@ fn audited_surface(request: &Request<'_>) -> Option<(AuditRole, &'static str)> {
 
     let segments = request.uri().path().segments();
     match (segments.get(0), segments.get(1), segments.get(2)) {
-        (Some("ops"), Some("debug"), _) => {
-            Some((AuditRole::Ops(OpsTier::Debug), "/ops/debug/<path..>"))
-        }
-        (Some("ops"), Some("capital"), _) => {
-            Some((AuditRole::Ops(OpsTier::Capital), "/ops/capital/<path..>"))
-        }
-        (Some("ops"), Some("breakglass"), _) => Some((
-            AuditRole::Ops(OpsTier::Breakglass),
-            "/ops/breakglass/<path..>",
-        )),
-        (Some("admin"), _, _) => Some((AuditRole::Internal, "/admin/<path..>")),
-        // `/accounts/connect` is Alpaca's account-link call, not an operator
-        // mutation.
-        (Some("accounts"), None, _)
+        (Some("ops"), Some("debug"), _) => Some(AuditRole::Debug),
+        (Some("ops"), Some("capital"), _) => Some(AuditRole::Capital),
+        (Some("ops"), Some("breakglass"), _) => Some(AuditRole::Breakglass),
+        // The shared-key twins. `/accounts/connect` is Alpaca's account-link
+        // call, not an operator mutation, so only the bare `/accounts` and
+        // `/accounts/<client_id>/wallets` count.
+        (Some("admin"), _, _)
+        | (Some("accounts" | "tokenized-assets"), None, _)
         | (Some("accounts"), Some(_), Some("wallets")) => {
-            Some((AuditRole::Internal, "/accounts/<path..>"))
-        }
-        (Some("tokenized-assets"), None, _) => {
-            Some((AuditRole::Internal, "/tokenized-assets/<path..>"))
+            Some(AuditRole::Internal)
         }
         _ => None,
     }
@@ -449,13 +441,12 @@ mod tests {
         AuditOutcome, AuditRole, Audited, AuditedBody, OperationsAuditEvent,
         OperationsAuditFairing, record, record_principal,
     };
-    use crate::auth::OpsTier;
     use crate::test_utils::logs_contain_at;
 
     fn event(outcome: AuditOutcome) -> OperationsAuditEvent {
         OperationsAuditEvent {
             principal: "accounts.google.com:1234".to_string(),
-            role: AuditRole::Ops(OpsTier::Capital),
+            role: AuditRole::Capital,
             route: "/ops/capital/freeze/<underlying>".to_string(),
             request_id: uuid!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             target_id: "AAPL".to_string(),
@@ -730,46 +721,27 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn unmatched_operator_paths_record_a_fixed_route_and_others_are_unaudited()
-     {
+    async fn unmatched_paths_are_unaudited() {
         let client = Client::tracked(audited_rocket()).await.unwrap();
 
-        let unmatched = dispatch_json(
-            &client,
-            "/ops/debug/not-a-command/attacker-chosen",
-            "88888888-8888-8888-8888-888888888888",
-            "{}",
-        )
-        .await;
-        assert_eq!(unmatched.status(), Status::NotFound);
-        assert_eq!(
-            unmatched.headers().get_one("x-request-id"),
-            Some("88888888-8888-8888-8888-888888888888")
-        );
-
-        let unrelated = dispatch_json(
-            &client,
-            "/not-an-operator-route",
-            "99999999-9999-9999-9999-999999999999",
-            "{}",
-        )
-        .await;
-        assert_eq!(unrelated.status(), Status::NotFound);
-        assert_eq!(unrelated.headers().get_one("x-request-id"), None);
-
-        assert!(logs_contain_at!(
-            Level::WARN,
-            &[
-                "Operations audit event",
-                "request_id=88888888-8888-8888-8888-888888888888",
-                "principal=\"unauthenticated\"",
-                "route=\"/ops/debug/<path..>\"",
-                "target_id=\"not_identified\"",
-                "outcome=\"validation_failure\"",
-            ]
-        ));
-        assert!(!logs_contain("attacker-chosen"));
-        assert!(!logs_contain("99999999-9999-9999-9999-999999999999"));
+        for (path, request_id) in [
+            (
+                "/ops/debug/not-a-command/attacker-chosen",
+                "88888888-8888-8888-8888-888888888888",
+            ),
+            ("/admin/not-a-command", "99999999-9999-9999-9999-999999999999"),
+            ("/not-an-operator-route", "66666666-6666-6666-6666-666666666666"),
+        ] {
+            let response = dispatch_json(&client, path, request_id, "{}").await;
+            assert_eq!(response.status(), Status::NotFound, "{path}");
+            assert_eq!(
+                response.headers().get_one("x-request-id"),
+                None,
+                "{path}"
+            );
+            assert!(!logs_contain(request_id), "{path}");
+        }
+        assert!(!logs_contain("Operations audit event"));
     }
 
     /// Every burn-excess call defaults to a dry run, so the record must say

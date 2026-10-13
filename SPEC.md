@@ -5165,10 +5165,12 @@ Tiers and routes:
 #### Shared operations audit event
 
 Every `POST`, `PUT`, `PATCH`, or `DELETE` request to an operator mutation
-surface that reaches the service emits exactly one structured audit event,
-including denied requests and requests rejected before a handler runs. A request
-Google IAP refuses at the load balancer never reaches the service and appears
-only in IAP's own logs. In issuance the surfaces are the IAP tiers `/ops/debug`,
+surface that reaches the service and matches a route emits exactly one
+structured audit event, including denied requests and requests rejected before a
+handler runs. A request that matches no route ran no handler and records no
+event, since it could name neither a caller nor a target. A request Google IAP
+refuses at the load balancer never reaches the service and appears only in IAP's
+own logs. In issuance the surfaces are the IAP tiers `/ops/debug`,
 `/ops/capital`, and `/ops/breakglass`, and their shared-key (`InternalAuth`)
 twins `/admin/*`, `POST /accounts`, `/accounts/<client_id>/wallets`, and
 `POST /tokenized-assets`. Alpaca's and the liquidity bot's integration calls
@@ -5183,10 +5185,10 @@ service-specific log messages:
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `service`      | `issuance` or `liquidity`.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `principal`    | Verified IAP subject; `internal-api-key` for issuance's shared-key routes; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no guard verified an identity, including an unmatched path.                                                                                                                                                                                                                                           |
+| `principal`    | Verified IAP subject; `internal-api-key` for issuance's shared-key routes; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no guard verified an identity.                                                                                                                                                                                                                                                                        |
 | `role`         | Operator surface the request reached (`debug`, `capital`, `breakglass`, `internal`, or `write`; `local` for loopback-only routes). For an accepted request it is also the admitted tier.                                                                                                                                                                                                                                                                                  |
-| `route`        | Matched route template, never the raw URI. An unmatched path records its surface's fixed template, for example `/ops/debug/<path..>`.                                                                                                                                                                                                                                                                                                                                     |
-| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                                                                                                                                                                                                                                                                                                                                                                |
+| `route`        | Matched route template, never the raw URI.                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID when none is supplied; either one is returned in the `x-request-id` response header.                                                                                                                                                                                                                                                                                                                 |
 | `target_id`    | Colon-separated dynamic path values, then the identifiers the route's typed request body declares; `not_identified` when neither exists, including when the body did not parse. Raw JSON is never inspected, so undeclared fields cannot appear. A value over 256 bytes is recorded as `<oversized: N bytes>`. Burn-excess routes append the mode that ran: `dry-run`, `execute`, `close-dry-run`, or `close`; the external route then appends the funding Transfer hash. |
 | `reason`       | The reason field of the route's typed request body; `not_provided` when the route has no reason or the body did not parse. A reason over 1024 bytes is recorded as `<oversized: N bytes>`; the command's own event keeps the full text.                                                                                                                                                                                                                                   |
 | `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`. `success` means the service accepted the request and answered `2xx`; it does not mean an on-chain effect is confirmed. A route that answers at broadcast, such as a `202` `submitted_unconfirmed` orchestrator approval, records `success` while its transaction may still land or never land; the response body says which.                                                                             |
@@ -5200,15 +5202,15 @@ failed-authentication rate limit) is `denied`, request shape and route errors
 (`400`, `404`, `405`, `413`, `415`, `422`) are `validation_failure`, and every
 other response is `command_failure`. The console layer always admits
 `operations_audit` at INFO, whatever `RUST_LOG` says. Recording never changes
-the mutation's response. The event is one stdout line in the configured
-`LOG_FORMAT`. With `text`, each field is written as a name and a value, and
-every caller-influenced value (`principal`, `route`, `target_id`, `reason`) is
-quoted and escaped, so a newline in it cannot start a forged line. The text
-console colours field names with ANSI escape codes, so a `name=value` phrase
-never appears contiguously in the stored line: search Cloud Logging for bare
-values, for example `"st0x.operations.audit.v1"` or the request UUID. With
-`json`, the fields sit under `fields`. The HyperDX span exporter does not
-receive the event.
+the mutation's status or body; it only adds the `x-request-id` header. The event
+is one stdout line in the configured `LOG_FORMAT`. With `text`, each field is
+written as a name and a value, and every caller-influenced value (`principal`,
+`route`, `target_id`, `reason`) is quoted and escaped, so a newline in it cannot
+start a forged line. The text console colours field names with ANSI escape
+codes, so a `name=value` phrase never appears contiguously in the stored line:
+search Cloud Logging for bare values, for example `"st0x.operations.audit.v1"`
+or the request UUID. With `json`, the fields sit under `fields`. The HyperDX
+span exporter does not receive the event.
 
 Freezing gates token supply, so freeze/unfreeze are **capital**, not debug: a
 debug identity cannot freeze, burn excess, force-complete, or close.
