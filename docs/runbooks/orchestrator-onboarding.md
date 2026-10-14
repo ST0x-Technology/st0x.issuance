@@ -191,7 +191,25 @@ vault-direct path already signs under Turnkey (Fireblocks stays retired). During
 the per-asset rollout BOTH mint/burn paths run in production simultaneously,
 until RAI-1223 retires vault-direct mode.
 
-Record the policy name(s) in the table below.
+The allowances above are P68, P69 and P70 in turnkey-policy-spec. Each allows a
+request only from a Turnkey user that holds the `s01-orchestrator` tag. So grant
+that tag to the issuance bot's signing user before step 4. The liquidity bot's
+MintAuth signing (P67) is gated by the `orchestrator-mint-auth` tag. Grant that
+tag to the liquidity bot's production signing user before the step 7 MintAuth
+checks, both the allow side and the deny side. Never put both tags on one user:
+the orchestrator needs two separate keys for a mint.
+
+Each grant is a root-quorum change in turnkey-policy-spec. A reviewed PR first
+adds the tag to that user's `tags` in `constants/identities.json`, then a root
+user applies it. That private file holds the exact user names and IDs, so this
+runbook names the users by role only. On the droplet, the issuance bot signs as
+the droplet's Turnkey user. The GCP issuance user needs `s01-orchestrator` too,
+before any asset in orchestrator mode runs on GCP. After each grant, run
+`npm run audit-identities` from a turnkey-policy-spec checkout. It must report
+no difference from `constants/identities.json`, and no user may hold both tags.
+
+Record the policy names and the granted tags in the table below. Their Turnkey
+IDs stay in turnkey-policy-spec and on RAI-1221.
 
 ## 4. Prove the policy by signing (nothing broadcast)
 
@@ -205,7 +223,7 @@ Signs one transaction per shape in the table above — never broadcasting — an
 fails naming the refused shape if the policy denies one. Run it per asset as
 each asset approaches cutover (the approve/transfer shapes are token-scoped). A
 policy gap surfaces here as a named refusal instead of during the pilot's first
-live mint.
+live mint. It can pass only after the `s01-orchestrator` grant in step 3.
 
 ## 5. Execute the approval (per asset, staged with the rollout)
 
@@ -558,7 +576,10 @@ it runs on, so they run per chain too (see the policy bullet):
     default-deny and the `eth.eip_712` conditions are unset for a bare-digest
     (hexadecimal-encoded) request, this grant does NOT permit raw digest
     signing: anything that is not an EIP-712 payload with exactly our domain and
-    struct is refused. Two checks, one per side of that claim:
+    struct is refused. Two checks, one per side of that claim. Run both while
+    the liquidity bot's production signing user holds `orchestrator-mint-auth`
+    (step 3): P67 allows only a holder of that tag, so without it Turnkey
+    refuses the allow side too, and the deny side proves nothing:
     - **Allow side** — the scoped grant admits our exact payload; executable
       proof against prod Turnkey, run **once per chain in the set** with that
       chain's id in the payload's `chainId`:
@@ -603,6 +624,13 @@ it runs on, so they run per chain too (see the policy bullet):
              derived set — proves the `chain_id` condition exists and is bounded
              to the set. (A chain inside the set must be admitted, so probing
              with one of them proves nothing.)
+
+         If a probe signs, remove `orchestrator-mint-auth` from that user before
+         any other step: run `npm run remove-tag <tag ID>` from a
+         turnkey-policy-spec checkout. It removes only this tag and keeps the
+         user's other tags; a root approves it. Then find the policy that
+         allowed the probe. If a probe waits in `CONSENSUS_NEEDED`, another
+         policy matched it: reject that activity at once, then find that policy.
 
 ## 8. Freeze and drain
 
@@ -1110,6 +1138,7 @@ criteria ask for.
 | `DEPOSIT`/`WITHDRAW` grants (orchestrator on each vault authorizer) |       |      | `orchestrator-preflight`       |
 | `EMERGENCY_ROLE` holder, per chain (rollback, escalation)           |       |      | step 7 `hasRole` read          |
 | Turnkey policy name(s)                                              |       |      | `verify-orchestrator-signing`  |
+| Turnkey tags granted (both orchestrator tags)                       |       |      | `npm run audit-identities`     |
 | Issuance release tag (`$RELEASE_TAG`, `vX.Y.Z`)                     |       |      | `git ls-remote --tags …`       |
 | Orchestrator `eip712Domain()` (one row per chain)                   |       |      | `cast call`                    |
 | Orchestrator beacon, beacon owner, implementation hash (per chain)  |       |      | `cast storage` / `cast keccak` |
