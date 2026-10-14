@@ -143,9 +143,9 @@ jobs:
     # Same group as preflight and release-tag.yml: a config-only run must
     # not capture the live digest before a tag deployment and write it back
     # stale. queue: max keeps every queued run (the default keeps one and
-    # cancels it when another arrives); a queued run still fails at the PAM
-    # step while the previous release's grant is ACTIVE, so revoke it in the
-    # console and re-run.
+    # cancels it when another arrives); a queued run reuses the previous
+    # release's open grant, or rolls inside an approved deploy window, and
+    # otherwise asks for its own approval.
     concurrency:
       group: production-release
       cancel-in-progress: false
@@ -153,7 +153,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@54f9987aa80b22fd443124219bfa9ed13b84188a  # app-release @ .github #7; #9 on main reuses any open PAM grant
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5 # app-release @ .github main
     with:
       environment: production
       runtime: bot-vm
