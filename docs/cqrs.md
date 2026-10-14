@@ -235,7 +235,11 @@ For aggregates that don't need services, use `type Services = ()`.
    history through a reactor) and read-side event-history inspection where
    `event_sorcery::Store` exposes no event-log read — the admin
    reprocess/history endpoints in `src/admin.rs` and `BurnManager`'s retry
-   externalTxId derivation in `src/redemption/burn_manager.rs`.
+   externalTxId derivation and legacy failed-burn transaction-identity check
+   (`is_failed_burn_current`) in `src/redemption/burn_manager.rs`. The latter
+   reads the latest `BurningFailed` only when the failed aggregate retains no
+   signed transaction, binding recovery's result to that legacy transaction
+   before any terminal write or receipt effect.
 2. **Never query view tables with raw SQL** - use `GenericQuery::load()`
 3. **Never modify or delete events** - they're immutable historical facts
 4. **Never worry about changing aggregates/views** - they're just
