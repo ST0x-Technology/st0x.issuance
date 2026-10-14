@@ -2573,7 +2573,7 @@ impl BurnManager {
                 tx_hash = %sendable_tx.hash,
                 nonce = sendable_tx.nonce,
                 error = %error,
-                "Failed to rebroadcast submitted burn; the next recovery pass will retry"
+                "Failed to rebroadcast submitted burn; recovery retries while budget remains"
             ),
         }
     }
@@ -14120,7 +14120,7 @@ mod tests {
                 1
             );
             let expected_log = if resend_fails {
-                "Failed to rebroadcast submitted burn"
+                "Failed to rebroadcast submitted burn; recovery retries while budget remains"
             } else {
                 "Rebroadcast submitted burn"
             };
