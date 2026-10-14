@@ -475,8 +475,9 @@ This repo deploys itself:
   only label; deploy them with the rollback dispatch. A production release
   revokes its PAM grant once the roll succeeds (the releaser holds
   `grants.revoke` on `app-deploy` since 2026-10-13); a grant belongs to the run
-  that asked for it, so the next release closes any grant a failed or timed-out
-  run left open and asks with its own text. After a PAM timeout,
+  that asked for it, so the next release that asks for its own approval closes
+  any grant a failed or timed-out run left open first (a release inside an
+  approved deploy window asks nobody and leaves it). After a PAM timeout,
   start a fresh run rather than re-running the failed job: a re-run skips the
   preflight that checks the config is still current. Setting
   `PRODUCTION_RELEASES_ENABLED` also retires the droplet path:
