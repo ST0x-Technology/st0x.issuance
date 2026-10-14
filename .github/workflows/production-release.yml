@@ -142,7 +142,7 @@ jobs:
     if: needs.preflight.outputs.release == 'true'
     # Same group as preflight and release-tag.yml: a config-only run must
     # not capture the live digest before a tag deployment and write it back
-    # stale. queue: max keeps every queued run (the default keeps one and
+    # stale. queue: max keeps up to 100 queued runs (GitHub cancels the rest) (the default keeps one and
     # cancels it when another arrives); a queued run reuses the previous
     # release's open grant, or rolls inside an approved deploy window, and
     # otherwise asks for its own approval.

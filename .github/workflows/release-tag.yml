@@ -39,7 +39,7 @@ jobs:
   # label and the GitHub release never wait behind a production run: the
   # two production entrypoints serialize, so a config-only run cannot
   # capture the live digest before a tag deployment and write it back
-  # stale. queue: max keeps every queued run; a queued run reuses the previous
+  # stale. queue: max keeps up to 100 queued runs (GitHub cancels the rest); a queued run reuses the previous
   # release's open grant, or rolls inside an approved deploy window, and
   # otherwise asks for its own approval.
   deploy-production:
