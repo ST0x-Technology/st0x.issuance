@@ -4920,7 +4920,7 @@ pub(crate) enum BurnManagerError {
 mod tests {
     use alloy::primitives::{Address, B256, Bytes, U256, address, b256, uint};
     use alloy::sol_types::SolCall;
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use cqrs_es::AggregateError;
     use event_sorcery::{LifecycleError, Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
@@ -12377,6 +12377,146 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
             &["Retained burn can still land", &issuer_request_id.to_string()]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn legacy_failed_recovery_rejects_a_different_transaction() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let vault_mock = Arc::new(MockVaultService::new_confirm_revert());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+        harness
+            .receipt_service
+            .reserve_burn(
+                ANVIL_CHAIN_ID,
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: uint!(99_U256),
+                    shares_burned: uint!(100_000000000000000000_U256),
+                }],
+            )
+            .await
+            .unwrap();
+        let current_tx_id = TxId::random();
+        seed_pre_guard_burn_failure(
+            &harness.pool,
+            &issuer_request_id,
+            Some(current_tx_id),
+        )
+        .await;
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { unresolved_burn_tx: None, .. }
+        ));
+        let manager = BurnManager::new_for_tests(
+            vault_mock,
+            harness.pool.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        );
+        let stale_tx_id = TxId::random();
+        manager
+            .recover_burn_failed_with_existing_tx(
+                &issuer_request_id,
+                &Network::Base,
+                vault,
+                &stale_tx_id,
+                &Quantity::new(Decimal::ZERO),
+                super::FailedBurnConfirmationLock::Acquire,
+            )
+            .await
+            .expect(
+                "legacy stale confirmation must not mutate the current failure",
+            );
+        assert_eq!(
+            count_redemption_events(
+                &harness.pool,
+                &issuer_request_id,
+                "RedemptionEvent::RedemptionFailed"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            harness
+                .receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap(),
+            vec![issuer_request_id.clone()]
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Skipping stale failed burn recovery result",
+                &issuer_request_id.to_string(),
+                &stale_tx_id.to_string()
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn failed_recovery_rejects_a_stale_failure_timestamp() {
+        let signed_burn = cafe_burn();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone()),
+        );
+        let (harness, manager, issuer_request_id) =
+            failed_over_a_retained_burn(vault_mock.clone(), &signed_burn, None)
+                .await;
+        let (_, mut stale_view) = find_burn_failed(&harness.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let RedemptionView::BurnFailed { failed_at, .. } = &mut stale_view
+        else {
+            panic!("failed view expected")
+        };
+        *failed_at -= ChronoDuration::seconds(1);
+        manager
+            .recover_single_burn_failed(&issuer_request_id, &stale_view)
+            .await
+            .unwrap();
+        assert_eq!(vault_mock.burn_classification_call_count(), 0);
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
+        assert!(vault_mock.submitted_burn_txs().is_empty());
+        assert_eq!(
+            count_redemption_events(
+                &harness.pool,
+                &issuer_request_id,
+                "RedemptionEvent::BurnResumed"
+            )
+            .await,
+            0
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Skipping stale failed burn recovery view",
+                &issuer_request_id.to_string()
+            ]
         ));
     }
 

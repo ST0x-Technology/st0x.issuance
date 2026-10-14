@@ -4602,7 +4602,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio::sync::{Notify, OwnedMutexGuard};
+    use tokio::time::timeout;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -6695,7 +6697,9 @@ mod tests {
             response = &mut resume => panic!("operator must pause during replacement readiness, got {}", response.status()),
         }
         rebuild_redemption_view(&harness.pool).await.unwrap();
-        manager.recover_unresolved_burns().await;
+        timeout(Duration::from_secs(5), manager.recover_unresolved_burns())
+            .await
+            .expect("periodic recovery must skip the busy operator gate");
         assert!(matches!(
             store.load(&metadata.issuer_request_id).await.unwrap(),
             Some(Redemption::Burning { .. })
@@ -6756,7 +6760,23 @@ mod tests {
                 ))
                 .remote("127.0.0.1:8000".parse().unwrap())
         };
+        let held_gate = recovery
+            .recovery_gates
+            .gate(&metadata.issuer_request_id)
+            .await
+            .lock_owned()
+            .await;
         let mut first = Box::pin(make_request().dispatch());
+        assert!(
+            timeout(Duration::from_millis(100), &mut first).await.is_err(),
+            "admin recovery must wait on the held gate"
+        );
+        assert_eq!(recovery.calls(), 0);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Failed { .. })
+        ));
+        drop(held_gate);
         let MockBurnResult::Blocked { started, release } = &recovery.result
         else {
             unreachable!()
