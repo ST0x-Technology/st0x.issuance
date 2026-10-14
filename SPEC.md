@@ -1530,11 +1530,11 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
 (cross-checked against the RPC-reported chain); its RPC endpoint is **not** a
 CLI flag — it uses the service environment for that network, resolved exactly as
 the service resolves it (`CHAIN_<NETWORK>_RPC_URL`, then legacy `RPC_URL` for
-Base, then the endpoint derived from `ALCHEMY_API_KEY`), the same secrets the
-long-running bot loads. The other on-chain operator commands
-(`force-complete-redemption`, `orchestrator-preflight`, `approve-orchestrator`,
-`verify-orchestrator-signing`, `move-receipts`, `confirm-custody`) resolve the
-same way unless `--rpc-url` overrides it.
+Base, with the same Alchemy JWT settings), the same secrets the long-running bot
+loads. The other on-chain operator commands (`force-complete-redemption`,
+`orchestrator-preflight`, `approve-orchestrator`, `verify-orchestrator-signing`,
+`move-receipts`, `confirm-custody`) resolve the same way unless `--rpc-url`
+overrides it.
 
 ### Burn excess shares
 
@@ -5999,25 +5999,29 @@ Alpaca calls a single issuer URL; payload `network` selects the runtime.
 `CHAIN_<NETWORK>_CHAIN_ID` and `CHAIN_<NETWORK>_BACKFILL_START_BLOCK`, plus an
 RPC endpoint. Supplying any field of a group requires both ids, so partial chain
 configuration fails at startup. An absent additional-network group keeps that
-chain disabled. The RPC endpoint is, in order: `CHAIN_<NETWORK>_RPC_URL` when
-set; for Base only, the legacy flat `RPC_URL`; otherwise the Alchemy endpoint
-derived from `ALCHEMY_API_KEY`
-(`https://{eth,base,hyperliquid,robinhood}-mainnet.g.alchemy.com/v2`, with the
-key sent as an `Authorization: Bearer` header so no URL carries it). BNB Smart
-Chain is not derived and always needs `CHAIN_BINANCE_RPC_URL`. A group with
-neither an explicit URL nor the key fails at startup naming both. Every chain
-client strips the URL from transport errors, so a logged RPC failure never
-quotes an endpoint that embeds a key. `CHAIN_<NETWORK>_CHAIN_ID` must be the
-network's canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`, Robinhood
-Chain `4663`, BNB Smart Chain `56`); a mismatch fails at startup, because the
-receipt inventory is keyed by chain id and a mislabeled network orphans every
-existing aggregate. The legacy flat `CHAIN_ID` is exempt so local development
-can point Base at Anvil. The grouped `CHAIN_BASE_*` ids override the legacy flat
+chain disabled. The RPC endpoint is `CHAIN_<NETWORK>_RPC_URL`, or for Base only
+the legacy flat `RPC_URL`; a group with neither fails at startup naming its
+variable. A bare Alchemy URL (`https://<network>.g.alchemy.com/v2`) is called
+with `Authorization: Bearer <JWT>`: an ES256 JWT signed by the Cloud KMS key
+version in `ALCHEMY_JWT_KMS_KEY_VERSION`, with `ALCHEMY_JWT_KID` as its key id,
+minted by the `st0x-rpc` crate. A bare Alchemy URL without both settings fails
+at startup naming the missing one, and each JWT endpoint makes one signed
+`eth_chainId` call before the client is used. Any other Alchemy URL must be
+`https` with a `/v2/<key>` path: one over `http://` or `ws://`, which would send
+its key in cleartext, or with another port, a query or no key fails at startup;
+any other URL is called as written. Every chain client follows no redirect and
+keeps the URL out of transport errors, so a logged RPC failure never quotes an
+endpoint that embeds a key. `CHAIN_<NETWORK>_CHAIN_ID` must be the network's
+canonical id (Base `8453`, Ethereum `1`, HyperEVM `999`, Robinhood Chain `4663`,
+BNB Smart Chain `56`); a mismatch fails at startup, because the receipt
+inventory is keyed by chain id and a mislabeled network orphans every existing
+aggregate. The legacy flat `CHAIN_ID` is exempt so local development can point
+Base at Anvil. The grouped `CHAIN_BASE_*` ids override the legacy flat
 `CHAIN_ID` and `BACKFILL_START_BLOCK` (its URL follows the precedence above);
 when they are absent, `RPC_URL`, `CHAIN_ID`, and `BACKFILL_START_BLOCK` continue
-to produce the single Base entry unchanged, with no key derivation. This lets
-one deployed artifact start Base-only and later activate another chain through a
-config update and restart.
+to produce the single Base entry unchanged. This lets one deployed artifact
+start Base-only and later activate another chain through a config update and
+restart.
 
 Checkpoints are keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under

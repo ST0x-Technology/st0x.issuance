@@ -28,9 +28,7 @@ use crate::wallet::{
     turnkey::resolve_turnkey_signer,
 };
 pub(crate) use rpc::rpc_client;
-pub use rpc::{
-    AlchemyApiKey, InvalidAlchemyApiKey, RpcClientError, RpcEndpoint,
-};
+pub use rpc::{InvalidRpcEndpoint, RpcClientError, RpcEndpoint};
 
 mod rpc;
 
@@ -133,8 +131,8 @@ pub enum ChainRegistryError {
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-    #[error(transparent)]
-    RpcClient(#[from] RpcClientError),
+    #[error("{network} RPC client: {source}")]
+    RpcClient { network: Network, source: RpcClientError },
     #[error("Failed to resolve signer: {0}")]
     SignerResolve(#[from] SignerResolveError),
     #[error(
@@ -288,8 +286,10 @@ async fn build_chain_runtime(
         low_gas_threshold,
     } = config;
 
-    let http_provider =
-        ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+    let client = rpc_client(&rpc)
+        .await
+        .map_err(|source| ChainRegistryError::RpcClient { network, source })?;
+    let http_provider = ProviderBuilder::new().connect_client(client.clone());
 
     let rpc_chain_id = http_provider.get_chain_id().await?;
     if rpc_chain_id != chain_id {
@@ -320,7 +320,7 @@ async fn build_chain_runtime(
         .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_client(rpc_client(&rpc)?);
+        .connect_client(client);
 
     let vault_service: Arc<dyn VaultService> =
         Arc::new(RealBlockchainService::new(signing_provider, nonce_manager));
@@ -337,7 +337,7 @@ async fn build_chain_runtime(
         chain_id,
         rpc_scheme = rpc_url.scheme(),
         rpc_host = rpc_url.host_str().unwrap_or("(none)"),
-        rpc_bearer_auth = rpc.uses_bearer_auth(),
+        rpc_alchemy_jwt = rpc.uses_alchemy_jwt(),
         "RPC endpoint for on-chain mint and redemption transactions"
     );
 
@@ -353,9 +353,10 @@ async fn build_chain_runtime(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{B256, address};
     use event_sorcery::StoreBuilder;
     use sqlx::sqlite::SqlitePoolOptions;
+    use st0x_rpc::JwtEnv;
     use tracing::Level;
     use tracing_test::traced_test;
     use url::Url;
@@ -372,10 +373,47 @@ mod tests {
         ChainConfig {
             network: Network::Base,
             chain_id,
-            rpc: Url::parse("wss://localhost:8545").unwrap().into(),
+            rpc: RpcEndpoint::new(
+                Url::parse("wss://localhost:8545").unwrap(),
+                &JwtEnv::Unset,
+            )
+            .unwrap(),
             backfill_start_block: 1,
             low_gas_threshold: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_rpc_client_names_its_network() {
+        let config = ChainConfig {
+            network: Network::Ethereum,
+            chain_id: 1,
+            rpc: RpcEndpoint::new(
+                Url::parse("ftp://localhost:8545").unwrap(),
+                &JwtEnv::Unset,
+            )
+            .unwrap(),
+            backfill_start_block: 1,
+            low_gas_threshold: None,
+        };
+
+        let Err(error) =
+            build_chain_runtime(config, &SignerConfig::Local(B256::ZERO)).await
+        else {
+            panic!("an ftp RPC URL cannot get a client");
+        };
+
+        assert!(
+            matches!(
+                error,
+                ChainRegistryError::RpcClient {
+                    network: Network::Ethereum,
+                    source: RpcClientError::InvalidRpcScheme(_),
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("ethereum"), "{error}");
     }
 
     #[traced_test]
@@ -386,7 +424,11 @@ mod tests {
             ChainConfig {
                 network: Network::Ethereum,
                 chain_id: 8453,
-                rpc: Url::parse("wss://localhost:8546").unwrap().into(),
+                rpc: RpcEndpoint::new(
+                    Url::parse("wss://localhost:8546").unwrap(),
+                    &JwtEnv::Unset,
+                )
+                .unwrap(),
                 backfill_start_block: 1,
                 low_gas_threshold: None,
             },
@@ -408,7 +450,11 @@ mod tests {
             ChainConfig {
                 network: Network::Ethereum,
                 chain_id: 1,
-                rpc: Url::parse("wss://localhost:8546").unwrap().into(),
+                rpc: RpcEndpoint::new(
+                    Url::parse("wss://localhost:8546").unwrap(),
+                    &JwtEnv::Unset,
+                )
+                .unwrap(),
                 backfill_start_block: 1,
                 low_gas_threshold: None,
             },

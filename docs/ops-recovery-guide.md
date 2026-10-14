@@ -480,7 +480,9 @@ test -f "$DB_PATH"
 REDEMPTION=<issuer_request_id>
 OLD_TX_HASH=<old_tx_hash from the 422>
 # The redemption's network: CHAIN_<NETWORK>_RPC_URL. For Base, the service
-# falls back to RPC_URL when CHAIN_BASE_RPC_URL is not set.
+# falls back to RPC_URL when CHAIN_BASE_RPC_URL is not set. cast sends no JWT,
+# so if that URL is bare Alchemy (https://<network>.g.alchemy.com/v2), set RPC
+# to a URL for the same chain that needs no JWT.
 RPC="${CHAIN_BASE_RPC_URL:-$RPC_URL}"
 test -n "$RPC"
 RAW_TX=$(sqlite3 -readonly "$DB_PATH" "
@@ -509,6 +511,9 @@ fi
 
 Read the node's answer:
 
+- HTTP 401: `$RPC` is a bare Alchemy URL, which only takes the bot's JWT. Set
+  `RPC` to a URL for the same chain that needs no JWT, and run the `if` block
+  again.
 - A transaction hash, or "already known": the node holds the burn. Wait for it
   to mine, then call `/admin/recover` again.
 - "nonce too low": the nonce is already used, by this burn or by another

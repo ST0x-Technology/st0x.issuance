@@ -64,8 +64,8 @@ group:
 
 - `CHAIN_ETHEREUM_CHAIN_ID=1`
 - `CHAIN_ETHEREUM_BACKFILL_START_BLOCK`
-- `CHAIN_ETHEREUM_RPC_URL`, optional when `ALCHEMY_API_KEY` is set (an explicit
-  URL wins over the derived Alchemy endpoint)
+- `CHAIN_ETHEREUM_RPC_URL` (a bare `https://eth-mainnet.g.alchemy.com/v2` also
+  needs `ALCHEMY_JWT_KMS_KEY_VERSION` and `ALCHEMY_JWT_KID`)
 
 Supplying only part of the group fails startup. The grouped Base form
 (`CHAIN_BASE_*`) overrides the legacy flat Base variables when both are present;

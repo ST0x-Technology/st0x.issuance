@@ -5,6 +5,7 @@ use alloy::primitives::{
 use alloy::providers::Provider;
 use clap::{Args, Parser};
 use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
+use st0x_rpc::{JwtEnv, KEY_VERSION_VAR, KID_VAR};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,8 +17,8 @@ use url::Url;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::chain::{
-    AlchemyApiKey, ChainConfig, ChainRegistry, ChainRegistryError,
-    InvalidAlchemyApiKey, RpcEndpoint, build_chain_registry,
+    ChainConfig, ChainRegistry, ChainRegistryError, InvalidRpcEndpoint,
+    RpcEndpoint, build_chain_registry,
 };
 use crate::notifications::{
     LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
@@ -513,20 +514,39 @@ struct Env {
         env = "RPC_URL",
         help = "Legacy flat Base RPC endpoint URL; required unless \
                 CHAIN_BASE_CHAIN_ID and CHAIN_BASE_BACKFILL_START_BLOCK \
-                configure Base, whose URL then comes from CHAIN_BASE_RPC_URL, \
-                this variable, or ALCHEMY_API_KEY"
+                configure Base, whose URL then comes from CHAIN_BASE_RPC_URL \
+                or this variable"
     )]
     rpc_url: Option<String>,
 
     #[arg(
         long,
-        env = "ALCHEMY_API_KEY",
-        hide_env_values = true,
-        help = "Alchemy API key; gives every chain group without an explicit \
-                CHAIN_<NETWORK>_RPC_URL its Alchemy endpoint (not \
-                CHAIN_BINANCE_*), sent as an Authorization header"
+        env = "ALCHEMY_JWT_KMS_KEY_VERSION",
+        help = "Cloud KMS key version (projects/.../cryptoKeyVersions/N) that \
+                signs the JWT for every bare \
+                https://<network>.g.alchemy.com/v2 RPC URL; required with \
+                ALCHEMY_JWT_KID when any RPC URL is bare Alchemy"
     )]
-    alchemy_api_key: Option<String>,
+    alchemy_jwt_kms_key_version: Option<String>,
+
+    #[arg(
+        long,
+        env = "ALCHEMY_JWT_KID",
+        help = "Key id Alchemy assigned to the KMS key's public half; \
+                required with ALCHEMY_JWT_KMS_KEY_VERSION when any RPC URL is \
+                bare Alchemy"
+    )]
+    alchemy_jwt_kid: Option<String>,
+
+    /// Read only to explain a group that relied on the endpoint this key used
+    /// to derive.
+    #[arg(
+        long = "alchemy-api-key",
+        env = "ALCHEMY_API_KEY",
+        hide = true,
+        hide_env_values = true
+    )]
+    retired_alchemy_api_key: Option<String>,
 
     #[arg(
         long,
@@ -614,8 +634,7 @@ struct Env {
             "chain_base_backfill_start_block"
         ],
         help = "Base RPC endpoint; setting it requires the full CHAIN_BASE_* \
-                group. Optional: without it the group uses RPC_URL, then \
-                ALCHEMY_API_KEY"
+                group. Optional: without it the group uses RPC_URL"
     )]
     chain_base_rpc_url: Option<Url>,
 
@@ -652,7 +671,7 @@ struct Env {
             "chain_ethereum_backfill_start_block"
         ],
         help = "Ethereum RPC endpoint; setting it requires the full \
-                CHAIN_ETHEREUM_* group. Optional when ALCHEMY_API_KEY is set"
+                CHAIN_ETHEREUM_* group"
     )]
     chain_ethereum_rpc_url: Option<Url>,
 
@@ -689,7 +708,7 @@ struct Env {
             "chain_hyperevm_backfill_start_block"
         ],
         help = "HyperEVM RPC endpoint; setting it requires the full \
-                CHAIN_HYPEREVM_* group. Optional when ALCHEMY_API_KEY is set"
+                CHAIN_HYPEREVM_* group"
     )]
     chain_hyperevm_rpc_url: Option<Url>,
 
@@ -727,7 +746,7 @@ struct Env {
             "chain_robinhood_backfill_start_block"
         ],
         help = "Robinhood Chain RPC endpoint; setting it requires the full \
-                CHAIN_ROBINHOOD_* group. Optional when ALCHEMY_API_KEY is set"
+                CHAIN_ROBINHOOD_* group"
     )]
     chain_robinhood_rpc_url: Option<Url>,
 
@@ -909,16 +928,21 @@ impl Env {
     fn chain_configs(
         &self,
     ) -> Result<(ChainConfig, Vec<ChainConfig>), ConfigError> {
-        // Empty counts as unset: a templated `ALCHEMY_API_KEY=${...}` with
-        // nothing behind it must not fail a deployment whose URLs are all
-        // explicit.
-        let alchemy = self
-            .alchemy_api_key
-            .clone()
-            .filter(|key| !key.is_empty())
-            .map(AlchemyApiKey::new)
-            .transpose()?;
-        let alchemy = alchemy.as_ref();
+        self.resolve_chain_configs().map_err(|error| {
+            explain_retired_alchemy_api_key(
+                error,
+                self.retired_alchemy_api_key.as_deref(),
+            )
+        })
+    }
+
+    fn resolve_chain_configs(
+        &self,
+    ) -> Result<(ChainConfig, Vec<ChainConfig>), ConfigError> {
+        let jwt = &JwtEnv::from_values(
+            self.alchemy_jwt_kms_key_version.clone(),
+            self.alchemy_jwt_kid.clone(),
+        );
         // Empty counts as unset here too: rollout removes RPC_URL, and a
         // templated `RPC_URL=${...}` left behind must not stop the service.
         let legacy_rpc_url = self
@@ -937,7 +961,7 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_base_rpc_url.as_ref(),
                 legacy_rpc_url: legacy_rpc_url.as_ref(),
-                alchemy,
+                jwt,
                 chain_id: self.chain_base_chain_id,
                 backfill_start_block: self.chain_base_backfill_start_block,
                 low_gas_threshold: self.chain_base_low_gas_threshold.as_deref(),
@@ -974,15 +998,14 @@ impl Env {
             }
             base
         } else {
-            // The flat form stays explicit: it is how local development
-            // points Base at Anvil, where a derived mainnet URL would be
-            // wrong. Without the grouped CHAIN_BASE_* ids it needs RPC_URL.
+            // The flat form is how local development points Base at Anvil.
+            // Without the grouped CHAIN_BASE_* ids it needs RPC_URL.
             let rpc_url = legacy_rpc_url
                 .ok_or(ConfigError::MissingBaseChainConfiguration)?;
             ChainConfig {
                 network: Network::Base,
                 chain_id: self.chain_id,
-                rpc: rpc_url.into(),
+                rpc: rpc_endpoint(Network::Base, rpc_url, jwt)?,
                 backfill_start_block: self.backfill_start_block,
                 low_gas_threshold: parse_low_gas_threshold(
                     Network::Base,
@@ -995,7 +1018,7 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_ethereum_rpc_url.as_ref(),
                 legacy_rpc_url: None,
-                alchemy,
+                jwt,
                 chain_id: self.chain_ethereum_chain_id,
                 backfill_start_block: self.chain_ethereum_backfill_start_block,
                 low_gas_threshold: self
@@ -1008,7 +1031,7 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_hyperevm_rpc_url.as_ref(),
                 legacy_rpc_url: None,
-                alchemy,
+                jwt,
                 chain_id: self.chain_hyperevm_chain_id,
                 backfill_start_block: self.chain_hyperevm_backfill_start_block,
                 low_gas_threshold: self
@@ -1021,7 +1044,7 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_robinhood_rpc_url.as_ref(),
                 legacy_rpc_url: None,
-                alchemy,
+                jwt,
                 chain_id: self.chain_robinhood_chain_id,
                 backfill_start_block: self.chain_robinhood_backfill_start_block,
                 low_gas_threshold: self
@@ -1034,7 +1057,7 @@ impl Env {
             &ChainGroupEnv {
                 rpc_url: self.chain_binance_rpc_url.as_ref(),
                 legacy_rpc_url: None,
-                alchemy,
+                jwt,
                 chain_id: self.chain_binance_chain_id,
                 backfill_start_block: self.chain_binance_backfill_start_block,
                 low_gas_threshold: self
@@ -1048,6 +1071,26 @@ impl Env {
         chains.extend(robinhood);
         chains.extend(binance);
 
+        // A bare Alchemy URL with incomplete settings has already failed.
+        match jwt {
+            JwtEnv::Partial { missing } => warn!(
+                target: "startup",
+                missing,
+                "Alchemy JWT settings are incomplete and no RPC URL is bare \
+                 Alchemy; they are unused"
+            ),
+            JwtEnv::Both(_)
+                if !chains.iter().any(|chain| chain.rpc.uses_alchemy_jwt()) =>
+            {
+                warn!(
+                    target: "startup",
+                    "Alchemy JWT settings are set, but no RPC URL is bare \
+                     Alchemy; they are unused"
+                );
+            }
+            JwtEnv::Both(_) | JwtEnv::Unset => {}
+        }
+
         Ok((base, chains))
     }
 
@@ -1058,7 +1101,7 @@ impl Env {
         let &ChainGroupEnv {
             rpc_url,
             legacy_rpc_url,
-            alchemy,
+            jwt,
             chain_id,
             backfill_start_block,
             low_gas_threshold,
@@ -1105,7 +1148,7 @@ impl Env {
                         network,
                         rpc_url.cloned(),
                         legacy_rpc_url.cloned(),
-                        alchemy,
+                        jwt,
                     )?,
                     backfill_start_block,
                     low_gas_threshold: parse_low_gas_threshold(
@@ -1131,7 +1174,7 @@ struct ChainGroupEnv<'env> {
     /// The legacy flat `RPC_URL`, ranked after the group's own URL. `None`
     /// for every network but Base.
     legacy_rpc_url: Option<&'env Url>,
-    alchemy: Option<&'env AlchemyApiKey>,
+    jwt: &'env JwtEnv,
     chain_id: Option<u64>,
     backfill_start_block: Option<u64>,
     low_gas_threshold: Option<&'env str>,
@@ -1316,12 +1359,9 @@ pub enum ConfigError {
     #[error(
         "Base chain configuration is required: set CHAIN_BASE_CHAIN_ID and \
          CHAIN_BASE_BACKFILL_START_BLOCK (the URL comes from \
-         CHAIN_BASE_RPC_URL, RPC_URL or ALCHEMY_API_KEY), or the legacy flat \
-         RPC_URL"
+         CHAIN_BASE_RPC_URL or RPC_URL), or the legacy flat RPC_URL"
     )]
     MissingBaseChainConfiguration,
-    #[error(transparent)]
-    InvalidAlchemyApiKey(#[from] InvalidAlchemyApiKey),
     #[error(
         "CHAIN_{}_CHAIN_ID is {configured} but {network} is chain {expected}; \
          a network bound to the wrong chain would re-key the receipt inventory",
@@ -1358,6 +1398,24 @@ pub enum ConfigError {
          environment (deployment secrets / .env)"
     )]
     NetworkRpcNotConfigured { network: Network, hint: &'static str },
+    #[error(
+        "the {network} RPC URL is a bare Alchemy URL, which needs {missing}"
+    )]
+    AlchemyJwtNotConfigured { network: Network, missing: &'static str },
+    #[error(
+        "no RPC URL configured for {network}; ALCHEMY_API_KEY no longer \
+         supplies one, so set {hint}"
+    )]
+    AlchemyApiKeyRetired { network: Network, hint: &'static str },
+    #[error(
+        "the {network} RPC URL points at Alchemy, so it must be the bare \
+         https://<network>.g.alchemy.com/v2 form or an https /v2/<key> URL"
+    )]
+    MalformedAlchemyUrl { network: Network },
+    #[error(
+        "the {network} RPC URL is an Alchemy URL, so it must use https or wss"
+    )]
+    InsecureAlchemyUrl { network: Network },
     #[error("configured RPC URL for {network} is not a valid URL: {source}")]
     InvalidConfiguredRpcUrl {
         network: Network,
@@ -1694,34 +1752,91 @@ pub(crate) fn wss_to_http(url: &Url) -> Result<Url, InvalidRpcScheme> {
 
 /// Picks one network's RPC endpoint, the same way for the service and the
 /// operator CLIs: the group's own `CHAIN_<NETWORK>_RPC_URL`, then (Base only)
-/// the legacy flat `RPC_URL`, then the endpoint `ALCHEMY_API_KEY` derives.
+/// the legacy flat `RPC_URL`.
 fn resolve_rpc_endpoint(
     network: Network,
     explicit: Option<Url>,
     legacy_base: Option<Url>,
-    alchemy: Option<&AlchemyApiKey>,
+    jwt: &JwtEnv,
 ) -> Result<RpcEndpoint, ConfigError> {
     let legacy_base = legacy_base.filter(|_| network == Network::Base);
-
-    if let Some(url) = explicit.or(legacy_base) {
-        return Ok(url.into());
-    }
-
-    alchemy.and_then(|key| key.endpoint(network)).ok_or(
+    let url = explicit.or(legacy_base).ok_or(
         ConfigError::NetworkRpcNotConfigured {
             network,
             hint: rpc_settings_hint(network),
         },
-    )
+    )?;
+
+    rpc_endpoint(network, url, jwt)
+}
+
+/// An operator's `--rpc-url` for `network`, authenticated like the service's
+/// own endpoint: a bare Alchemy URL takes the JWT settings from the process
+/// environment.
+pub(crate) fn cli_rpc_endpoint(
+    network: Network,
+    url: Url,
+) -> Result<RpcEndpoint, ConfigError> {
+    resolve_cli_rpc_endpoint(network, url, process_env)
+}
+
+fn resolve_cli_rpc_endpoint(
+    network: Network,
+    url: Url,
+    env_get: impl Fn(&str) -> Option<String>,
+) -> Result<RpcEndpoint, ConfigError> {
+    rpc_endpoint(network, url, &jwt_env(env_get))
+}
+
+fn rpc_endpoint(
+    network: Network,
+    url: Url,
+    jwt: &JwtEnv,
+) -> Result<RpcEndpoint, ConfigError> {
+    RpcEndpoint::new(url, jwt).map_err(|error| match error {
+        InvalidRpcEndpoint::AlchemyJwtNotConfigured { missing } => {
+            ConfigError::AlchemyJwtNotConfigured { network, missing }
+        }
+        InvalidRpcEndpoint::MalformedAlchemyUrl => {
+            ConfigError::MalformedAlchemyUrl { network }
+        }
+        InvalidRpcEndpoint::InsecureAlchemyUrl => {
+            ConfigError::InsecureAlchemyUrl { network }
+        }
+    })
+}
+
+fn jwt_env(env_get: impl Fn(&str) -> Option<String>) -> JwtEnv {
+    JwtEnv::from_values(env_get(KEY_VERSION_VAR), env_get(KID_VAR))
+}
+
+/// A deployment upgraded from a release that derived a group's URL from
+/// `ALCHEMY_API_KEY` still has the key set; name it as the cause.
+fn explain_retired_alchemy_api_key(
+    error: ConfigError,
+    retired_key: Option<&str>,
+) -> ConfigError {
+    match error {
+        ConfigError::NetworkRpcNotConfigured { network, hint }
+            if retired_key.is_some_and(|key| !key.is_empty()) =>
+        {
+            ConfigError::AlchemyApiKeyRetired { network, hint }
+        }
+        other => other,
+    }
+}
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// The variables that would give `network` an RPC endpoint.
 const fn rpc_settings_hint(network: Network) -> &'static str {
     match network {
-        Network::Base => "CHAIN_BASE_RPC_URL, RPC_URL or ALCHEMY_API_KEY",
-        Network::Ethereum => "CHAIN_ETHEREUM_RPC_URL or ALCHEMY_API_KEY",
-        Network::HyperEvm => "CHAIN_HYPEREVM_RPC_URL or ALCHEMY_API_KEY",
-        Network::Robinhood => "CHAIN_ROBINHOOD_RPC_URL or ALCHEMY_API_KEY",
+        Network::Base => "CHAIN_BASE_RPC_URL or RPC_URL",
+        Network::Ethereum => "CHAIN_ETHEREUM_RPC_URL",
+        Network::HyperEvm => "CHAIN_HYPEREVM_RPC_URL",
+        Network::Robinhood => "CHAIN_ROBINHOOD_RPC_URL",
         Network::BnbSmartChain => "CHAIN_BINANCE_RPC_URL",
     }
 }
@@ -1734,9 +1849,7 @@ const fn rpc_settings_hint(network: Network) -> &'static str {
 pub(crate) fn configured_rpc_endpoint(
     network: Network,
 ) -> Result<RpcEndpoint, ConfigError> {
-    resolve_configured_rpc_endpoint(network, |name| {
-        std::env::var(name).ok().filter(|value| !value.is_empty())
-    })
+    resolve_configured_rpc_endpoint(network, process_env)
 }
 
 fn resolve_configured_rpc_endpoint(
@@ -1756,12 +1869,14 @@ fn resolve_configured_rpc_endpoint(
     } else {
         None
     };
-    let alchemy = env_get("ALCHEMY_API_KEY")
-        .filter(|key| !key.is_empty())
-        .map(AlchemyApiKey::new)
-        .transpose()?;
 
-    resolve_rpc_endpoint(network, explicit, legacy_base, alchemy.as_ref())
+    resolve_rpc_endpoint(network, explicit, legacy_base, &jwt_env(&env_get))
+        .map_err(|error| {
+            explain_retired_alchemy_api_key(
+                error,
+                env_get("ALCHEMY_API_KEY").as_deref(),
+            )
+        })
 }
 
 /// Domain target categories used in `target:` on all tracing macros.
@@ -1785,7 +1900,8 @@ const DOMAIN_TARGETS: &[&str] = &[
 /// Builds a default `EnvFilter` string that includes both the crate module
 /// path and all custom domain targets at the given level.
 pub(crate) fn default_log_filter(level: Level) -> String {
-    let mut parts = vec![format!("st0x_issuance={level}")];
+    let mut parts =
+        vec![format!("st0x_issuance={level}"), format!("st0x_rpc={level}")];
 
     for target in DOMAIN_TARGETS {
         parts.push(format!("{target}={level}"));
@@ -1817,7 +1933,7 @@ mod tests {
 
     use super::*;
     use crate::auth::IpWhitelist;
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{log_count_at, logs_contain_at};
 
     #[test]
     fn parse_flag_accepts_the_common_boolean_spellings() {
@@ -2006,6 +2122,16 @@ mod tests {
     }
 
     #[test]
+    fn default_filter_includes_the_rpc_crate() {
+        let filter =
+            tracing_subscriber::EnvFilter::new(default_log_filter(Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "st0x_rpc", Level::INFO));
+        });
+    }
+
+    #[test]
     fn into_config_populates_base_chain_entry_from_legacy_env_vars() {
         let env = Env::try_parse_from(minimal_args()).unwrap();
         let config = env.into_config().unwrap();
@@ -2018,7 +2144,7 @@ mod tests {
             chain.rpc.url(),
             &Url::parse("wss://localhost:8545").unwrap()
         );
-        assert!(!chain.rpc.uses_bearer_auth());
+        assert!(!chain.rpc.uses_alchemy_jwt());
         assert_eq!(chain.backfill_start_block, config.backfill_start_block);
     }
 
@@ -2124,7 +2250,7 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://ethereum.example").unwrap()),
                 legacy_rpc_url: None,
-                alchemy: None,
+                jwt: &JwtEnv::Unset,
                 chain_id: Some(8453),
                 backfill_start_block: Some(22_000_000),
                 low_gas_threshold: None,
@@ -2270,7 +2396,7 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: None,
                 legacy_rpc_url: None,
-                alchemy: None,
+                jwt: &JwtEnv::Unset,
                 chain_id: None,
                 backfill_start_block: None,
                 low_gas_threshold: Some("0.05"),
@@ -2361,7 +2487,7 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: Some(&Url::parse("wss://hyperevm.example").unwrap()),
                 legacy_rpc_url: None,
-                alchemy: None,
+                jwt: &JwtEnv::Unset,
                 chain_id: Some(998),
                 backfill_start_block: Some(9_000_000),
                 low_gas_threshold: None,
@@ -2636,63 +2762,51 @@ mod tests {
         ));
     }
 
-    const ALCHEMY_KEY: &str = "alchemyTestKey_123";
-
-    fn alchemy_key() -> AlchemyApiKey {
-        AlchemyApiKey::new(ALCHEMY_KEY.to_string()).unwrap()
-    }
+    const BARE_BASE: &str = "https://base-mainnet.g.alchemy.com/v2";
+    const BARE_ETHEREUM: &str = "https://eth-mainnet.g.alchemy.com/v2";
+    const KEY_VERSION: &str =
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1";
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).unwrap()
     }
 
-    #[test]
-    fn rpc_endpoint_derives_from_the_key_when_no_url_is_set() {
-        for (network, host) in [
-            (Network::Base, "base-mainnet.g.alchemy.com"),
-            (Network::Ethereum, "eth-mainnet.g.alchemy.com"),
-            (Network::HyperEvm, "hyperliquid-mainnet.g.alchemy.com"),
-            (Network::Robinhood, "robinhood-mainnet.g.alchemy.com"),
-        ] {
-            let rpc =
-                resolve_rpc_endpoint(network, None, None, Some(&alchemy_key()))
-                    .unwrap();
+    fn both() -> JwtEnv {
+        JwtEnv::from_values(Some(KEY_VERSION.into()), Some("kid".into()))
+    }
 
-            assert_eq!(rpc.url(), &url(&format!("https://{host}/v2")));
-            assert!(rpc.uses_bearer_auth(), "{network}");
+    #[test]
+    fn a_group_without_a_url_names_only_its_url_variables() {
+        for (network, hint) in [
+            (Network::Base, "CHAIN_BASE_RPC_URL or RPC_URL"),
+            (Network::Ethereum, "CHAIN_ETHEREUM_RPC_URL"),
+            (Network::HyperEvm, "CHAIN_HYPEREVM_RPC_URL"),
+            (Network::Robinhood, "CHAIN_ROBINHOOD_RPC_URL"),
+            (Network::BnbSmartChain, "CHAIN_BINANCE_RPC_URL"),
+        ] {
+            let error =
+                resolve_rpc_endpoint(network, None, None, &both()).unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::NetworkRpcNotConfigured { network: got, hint: got_hint }
+                        if got == network && got_hint == hint
+                ),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("ALCHEMY"), "{error}");
         }
     }
 
     #[test]
-    fn explicit_rpc_url_wins_over_the_key() {
-        for network in [
-            Network::Base,
-            Network::Ethereum,
-            Network::HyperEvm,
-            Network::Robinhood,
-        ] {
-            let rpc = resolve_rpc_endpoint(
-                network,
-                Some(url("wss://explicit.example")),
-                None,
-                Some(&alchemy_key()),
-            )
-            .unwrap();
-
-            assert_eq!(rpc.url(), &url("wss://explicit.example"));
-            assert!(!rpc.uses_bearer_auth(), "{network}");
-        }
-    }
-
-    #[test]
-    fn base_rpc_precedence_is_grouped_then_legacy_then_key() {
-        let key = alchemy_key();
+    fn base_rpc_precedence_is_grouped_then_legacy() {
         let resolve = |explicit: Option<&str>, legacy: Option<&str>| {
             resolve_rpc_endpoint(
                 Network::Base,
                 explicit.map(url),
                 legacy.map(url),
-                Some(&key),
+                &JwtEnv::Unset,
             )
             .unwrap()
         };
@@ -2705,111 +2819,211 @@ mod tests {
 
         let legacy = resolve(None, Some("wss://legacy.example"));
         assert_eq!(legacy.url(), &url("wss://legacy.example"));
-        assert!(!legacy.uses_bearer_auth());
-
-        let derived = resolve(None, None);
-        assert_eq!(
-            derived.url(),
-            &url("https://base-mainnet.g.alchemy.com/v2")
-        );
     }
 
     #[test]
     fn legacy_rpc_url_never_reaches_another_network() {
-        let rpc = resolve_rpc_endpoint(
+        let error = resolve_rpc_endpoint(
             Network::Ethereum,
             None,
             Some(url("wss://legacy.example")),
-            Some(&alchemy_key()),
-        )
-        .unwrap();
-
-        assert_eq!(rpc.url(), &url("https://eth-mainnet.g.alchemy.com/v2"));
-    }
-
-    #[test]
-    fn bnb_smart_chain_needs_an_explicit_url_even_with_the_key() {
-        let error = resolve_rpc_endpoint(
-            Network::BnbSmartChain,
-            None,
-            None,
-            Some(&alchemy_key()),
+            &JwtEnv::Unset,
         )
         .unwrap_err();
 
         assert!(matches!(
             error,
             ConfigError::NetworkRpcNotConfigured {
-                network: Network::BnbSmartChain,
-                hint: "CHAIN_BINANCE_RPC_URL",
+                network: Network::Ethereum,
+                ..
             }
         ));
     }
 
     #[test]
-    fn missing_url_and_key_names_every_way_to_configure_the_rpc() {
-        let error = resolve_rpc_endpoint(Network::Robinhood, None, None, None)
-            .unwrap_err();
+    fn a_bare_alchemy_url_with_both_settings_uses_the_jwt() {
+        let rpc = resolve_rpc_endpoint(
+            Network::Ethereum,
+            Some(url(BARE_ETHEREUM)),
+            None,
+            &both(),
+        )
+        .unwrap();
 
-        let message = error.to_string();
-        assert!(message.contains("CHAIN_ROBINHOOD_RPC_URL"), "{message}");
-        assert!(message.contains("ALCHEMY_API_KEY"), "{message}");
+        assert_eq!(rpc.url(), &url(BARE_ETHEREUM));
+        assert!(rpc.uses_alchemy_jwt());
     }
 
     #[test]
-    fn configured_rpc_endpoint_derives_from_the_key() {
+    fn a_bare_alchemy_url_missing_a_setting_is_refused() {
+        for (jwt, missing) in [
+            (JwtEnv::from_values(Some(KEY_VERSION.into()), None), KID_VAR),
+            (
+                JwtEnv::from_values(Some(String::new()), Some("kid".into())),
+                KEY_VERSION_VAR,
+            ),
+            (
+                JwtEnv::from_values(None, None),
+                "ALCHEMY_JWT_KMS_KEY_VERSION and ALCHEMY_JWT_KID",
+            ),
+        ] {
+            let error = resolve_rpc_endpoint(
+                Network::Ethereum,
+                Some(url(BARE_ETHEREUM)),
+                None,
+                &jwt,
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::AlchemyJwtNotConfigured {
+                        network: Network::Ethereum,
+                        missing: got,
+                    } if got == missing
+                ),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("ethereum"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_keyed_alchemy_url_stays_plain() {
+        let rpc = resolve_rpc_endpoint(
+            Network::Base,
+            Some(url("https://base-mainnet.g.alchemy.com/v2/someKey")),
+            None,
+            &JwtEnv::Unset,
+        )
+        .unwrap();
+
+        assert!(!rpc.uses_alchemy_jwt());
+    }
+
+    #[test]
+    fn configured_rpc_endpoint_reads_the_jwt_settings() {
         let lookup = |name: &str| match name {
-            "ALCHEMY_API_KEY" => Some(ALCHEMY_KEY.into()),
+            "CHAIN_ROBINHOOD_RPC_URL" => {
+                Some("https://robinhood-mainnet.g.alchemy.com/v2".into())
+            }
+            "ALCHEMY_JWT_KMS_KEY_VERSION" => Some(KEY_VERSION.into()),
+            "ALCHEMY_JWT_KID" => Some("kid".into()),
             _ => None,
         };
 
         let rpc = resolve_configured_rpc_endpoint(Network::Robinhood, lookup)
             .unwrap();
-        assert_eq!(
-            rpc.url(),
-            &url("https://robinhood-mainnet.g.alchemy.com/v2")
-        );
-        assert!(rpc.uses_bearer_auth());
+
+        assert!(rpc.uses_alchemy_jwt());
     }
 
     #[test]
-    fn configured_rpc_endpoint_treats_an_empty_key_as_unset() {
+    fn configured_rpc_endpoint_refuses_a_bare_url_without_the_settings() {
         let lookup = |name: &str| match name {
-            "CHAIN_ETHEREUM_RPC_URL" => Some("wss://ethereum.example".into()),
-            "ALCHEMY_API_KEY" => Some(String::new()),
+            "RPC_URL" => Some(BARE_BASE.into()),
+            "ALCHEMY_JWT_KID" => Some("kid".into()),
             _ => None,
         };
 
-        let rpc =
-            resolve_configured_rpc_endpoint(Network::Ethereum, lookup).unwrap();
-        assert_eq!(rpc.url(), &url("wss://ethereum.example"));
+        let error =
+            resolve_configured_rpc_endpoint(Network::Base, lookup).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyJwtNotConfigured {
+                network: Network::Base,
+                missing: KEY_VERSION_VAR,
+            }
+        ));
     }
 
     #[test]
-    fn configured_rpc_endpoint_rejects_a_malformed_key_without_echoing_it() {
-        let lookup = |name: &str| match name {
-            "ALCHEMY_API_KEY" => Some("leaked/key".into()),
+    fn an_operator_rpc_url_takes_the_jwt_settings_from_the_environment() {
+        let both = |name: &str| match name {
+            "ALCHEMY_JWT_KMS_KEY_VERSION" => Some(KEY_VERSION.into()),
+            "ALCHEMY_JWT_KID" => Some("kid".into()),
             _ => None,
         };
 
-        let error = resolve_configured_rpc_endpoint(Network::Ethereum, lookup)
-            .unwrap_err();
+        let rpc = resolve_cli_rpc_endpoint(
+            Network::Ethereum,
+            url(BARE_ETHEREUM),
+            both,
+        )
+        .unwrap();
+        assert!(rpc.uses_alchemy_jwt());
 
-        assert!(matches!(error, ConfigError::InvalidAlchemyApiKey(_)));
-        assert!(!error.to_string().contains("leaked"));
+        let error = resolve_cli_rpc_endpoint(
+            Network::Ethereum,
+            url(BARE_ETHEREUM),
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyJwtNotConfigured {
+                network: Network::Ethereum,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn grouped_ids_and_the_key_enable_a_chain_without_any_url() {
+    fn a_keyed_alchemy_url_over_http_is_refused_for_its_network() {
+        let error = resolve_rpc_endpoint(
+            Network::Ethereum,
+            Some(url("http://eth-mainnet.g.alchemy.com/v2/abc123")),
+            None,
+            &JwtEnv::Unset,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InsecureAlchemyUrl { network: Network::Ethereum }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("ethereum"), "{message}");
+        assert!(!message.contains("abc123"), "{message}");
+    }
+
+    #[test]
+    fn a_keyless_alchemy_url_that_is_not_bare_is_refused_for_its_network() {
+        let error = resolve_rpc_endpoint(
+            Network::Robinhood,
+            Some(url("http://robinhood-mainnet.g.alchemy.com/v2")),
+            None,
+            &both(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::MalformedAlchemyUrl { network: Network::Robinhood }
+        ));
+        assert!(error.to_string().contains("robinhood"), "{error}");
+    }
+
+    #[traced_test]
+    #[test]
+    fn grouped_bare_alchemy_urls_with_both_settings_use_the_jwt() {
         let mut args = minimal_args();
         remove_argument(&mut args, "--rpc-url");
         args.extend_from_slice(&[
-            "--alchemy-api-key",
-            ALCHEMY_KEY,
+            "--alchemy-jwt-kms-key-version",
+            KEY_VERSION,
+            "--alchemy-jwt-kid",
+            "kid",
+            "--chain-base-rpc-url",
+            BARE_BASE,
             "--chain-base-chain-id",
             "8453",
             "--chain-base-backfill-start-block",
             "42000000",
+            "--chain-ethereum-rpc-url",
+            "https://ethereum.example",
             "--chain-ethereum-chain-id",
             "1",
             "--chain-ethereum-backfill-start-block",
@@ -2819,52 +3033,178 @@ mod tests {
         let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
 
         assert_eq!(config.chains.len(), 2);
-        let base = &config.chains[0];
-        assert_eq!(base.network, Network::Base);
+        assert!(config.chains[0].rpc.uses_alchemy_jwt());
+        assert!(!config.chains[1].rpc.uses_alchemy_jwt());
         assert_eq!(
-            base.rpc.url(),
-            &url("https://base-mainnet.g.alchemy.com/v2")
+            log_count_at!(Level::WARN, &["Alchemy JWT settings are"]),
+            0
         );
-        assert!(base.rpc.uses_bearer_auth());
-        let ethereum = &config.chains[1];
-        assert_eq!(ethereum.network, Network::Ethereum);
-        assert_eq!(
-            ethereum.rpc.url(),
-            &url("https://eth-mainnet.g.alchemy.com/v2")
-        );
-        assert!(!format!("{:?}", config.chains).contains(ALCHEMY_KEY));
     }
 
     #[test]
-    fn an_empty_key_counts_as_unset() {
+    fn a_bare_grouped_url_with_one_setting_fails_startup() {
         let mut args = minimal_args();
-        args.extend_from_slice(&["--alchemy-api-key", ""]);
-
-        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
-
-        assert_eq!(config.chains.len(), 1);
-        assert!(!config.chains[0].rpc.uses_bearer_auth());
-    }
-
-    #[test]
-    fn a_malformed_key_fails_startup_without_echoing_it() {
-        let mut args = minimal_args();
-        args.extend_from_slice(&["--alchemy-api-key", "leaked key"]);
+        remove_argument(&mut args, "--rpc-url");
+        args.extend_from_slice(&[
+            "--alchemy-jwt-kms-key-version",
+            KEY_VERSION,
+            "--chain-base-rpc-url",
+            BARE_BASE,
+            "--chain-base-chain-id",
+            "8453",
+            "--chain-base-backfill-start-block",
+            "42000000",
+        ]);
 
         let Err(error) = Env::try_parse_from(args).unwrap().into_config()
         else {
-            panic!("a malformed ALCHEMY_API_KEY must fail startup");
+            panic!("a bare Alchemy URL without ALCHEMY_JWT_KID must fail");
         };
 
-        assert!(matches!(error, ConfigError::InvalidAlchemyApiKey(_)));
-        assert!(!error.to_string().contains("leaked"));
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyJwtNotConfigured {
+                network: Network::Base,
+                missing: KID_VAR,
+            }
+        ));
     }
 
     #[test]
-    fn the_key_alone_does_not_configure_base() {
+    fn a_bare_legacy_rpc_url_without_the_settings_fails_startup() {
         let mut args = minimal_args();
         remove_argument(&mut args, "--rpc-url");
-        args.extend_from_slice(&["--alchemy-api-key", ALCHEMY_KEY]);
+        args.extend_from_slice(&["--rpc-url", BARE_BASE]);
+
+        let Err(error) = Env::try_parse_from(args).unwrap().into_config()
+        else {
+            panic!("a bare legacy RPC_URL without the JWT settings must fail");
+        };
+
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyJwtNotConfigured { network: Network::Base, .. }
+        ));
+    }
+
+    #[test]
+    fn empty_jwt_settings_count_as_unset() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--alchemy-jwt-kms-key-version",
+            "",
+            "--alchemy-jwt-kid",
+            "",
+        ]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert!(!config.chains[0].rpc.uses_alchemy_jwt());
+    }
+
+    #[test]
+    fn a_group_left_on_the_retired_alchemy_api_key_names_it() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--chain-ethereum-chain-id",
+            "1",
+            "--chain-ethereum-backfill-start-block",
+            "22000000",
+            "--alchemy-api-key",
+            "someKey",
+        ]);
+
+        let Err(error) = Env::try_parse_from(args).unwrap().into_config()
+        else {
+            panic!("Ethereum has no RPC URL");
+        };
+
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyApiKeyRetired {
+                network: Network::Ethereum,
+                hint: "CHAIN_ETHEREUM_RPC_URL",
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("ALCHEMY_API_KEY"), "{message}");
+        assert!(!message.contains("someKey"), "{message}");
+    }
+
+    #[test]
+    fn the_retired_alchemy_api_key_flag_still_parses() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--alchemy-api-key", "someKey"]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert!(!config.chains[0].rpc.uses_alchemy_jwt());
+    }
+
+    #[test]
+    fn configured_rpc_endpoint_names_the_retired_alchemy_api_key() {
+        let lookup = |name: &str| match name {
+            "ALCHEMY_API_KEY" => Some("someKey".into()),
+            _ => None,
+        };
+
+        let error = resolve_configured_rpc_endpoint(Network::Robinhood, lookup)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::AlchemyApiKeyRetired {
+                network: Network::Robinhood,
+                ..
+            }
+        ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn jwt_settings_with_no_bare_url_warn_once() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&[
+            "--alchemy-jwt-kms-key-version",
+            KEY_VERSION,
+            "--alchemy-jwt-kid",
+            "kid",
+        ]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert!(!config.chains[0].rpc.uses_alchemy_jwt());
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &["Alchemy JWT settings are set, but no RPC URL is bare"]
+            ),
+            1
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn incomplete_jwt_settings_with_no_bare_url_warn_once() {
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--alchemy-jwt-kid", "kid"]);
+
+        let config = Env::try_parse_from(args).unwrap().into_config().unwrap();
+
+        assert!(!config.chains[0].rpc.uses_alchemy_jwt());
+        assert_eq!(
+            log_count_at!(
+                Level::WARN,
+                &["Alchemy JWT settings are incomplete", KEY_VERSION_VAR]
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn base_without_ids_or_rpc_url_is_not_configured() {
+        let mut args = minimal_args();
+        remove_argument(&mut args, "--rpc-url");
 
         let Err(error) = Env::try_parse_from(args).unwrap().into_config()
         else {
@@ -2875,6 +3215,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("CHAIN_BASE_CHAIN_ID"), "{message}");
         assert!(message.contains("RPC_URL"), "{message}");
+        assert!(!message.contains("ALCHEMY"), "{message}");
     }
 
     #[test]
@@ -2884,7 +3225,7 @@ mod tests {
             &ChainGroupEnv {
                 rpc_url: None,
                 legacy_rpc_url: None,
-                alchemy: None,
+                jwt: &JwtEnv::Unset,
                 chain_id: Some(46630),
                 backfill_start_block: Some(1),
                 low_gas_threshold: None,

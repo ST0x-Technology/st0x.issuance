@@ -5,6 +5,8 @@
     "sha256-ozmSgVRQoPT9VTO2y1JWawxd7zZ91viBXWcbr1ezdKE=";
   "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736" =
     "sha256-DN/5I45GOMobUSAvBwJPGCWD1LuEQdIWJnNZQ/D6GKk=";
+  "git+https://github.com/ST0x-Technology/st0x.rpc?tag=v0.1.0#03f2aeb9a0c7322f466622dc3f3d4e432cc6f681" =
+    "sha256-DwT0msA2VCLqPJcMGCQPssKxh1eZyvk6bEEYJqYS1oY=";
   "git+https://github.com/rainlanguage/rain.math.float?rev=e226e5a27125e75208e3e709e1c5eee128bd8b3b#e226e5a27125e75208e3e709e1c5eee128bd8b3b" =
     "sha256-LALVrtIfJDLDo7HSK8eSPF5AqwpK9TWjTxT6rpYbWzs=";
 }

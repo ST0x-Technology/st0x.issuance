@@ -12,6 +12,7 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use st0x_rpc::JwtEnv;
 use std::time::Duration;
 use url::Url;
 
@@ -20,8 +21,8 @@ use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig,
-    receipt_inventory_aggregate_id,
+    IpWhitelist, LogFormat, LogLevel, Network, RpcEndpoint, SignerConfig,
+    VaultModeConfig, receipt_inventory_aggregate_id,
 };
 
 use crate::harness::{create_provider, initialize_rocket};
@@ -328,7 +329,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
-            rpc: rpc_url.into(),
+            rpc: RpcEndpoint::new(rpc_url, &JwtEnv::Unset).unwrap(),
             low_gas_threshold: None,
             backfill_start_block: 0,
         }],
