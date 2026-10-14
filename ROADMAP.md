@@ -300,6 +300,10 @@ Bug fixes and improvements that don't fit into the original phases.
 
 #### Bug Fixes
 
+- [ ] [RAI-2833](https://linear.app/makeitrain/issue/RAI-2833) - Serialize
+      periodic and operator burn recovery per redemption, preserving replacement
+      transaction state and receipt reservations when an old result arrives.
+
 - [x] [#108](https://github.com/ST0x-Technology/st0x.issuance/issues/108) -
       IssuerRequestId conflates mint and redemption ID formats
 - [x] [#87](https://github.com/ST0x-Technology/st0x.issuance/issues/87) - Fix
