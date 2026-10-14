@@ -6088,19 +6088,32 @@ carrying the shared field `event = "fill_accepted"`, so a single query counts
 both kinds:
 
 - **Mint:** logged by `POST /inkind/issuance` (`target: "mint"`) once the
-  `Initiated` event is persisted, with `issuer_request_id` and `underlying`.
-  Requests refused before that (invalid quantity, unknown asset, ineligible
-  client, frozen underlying, command failure) log no fill.
+  `Initiated` event is persisted, with `issuer_request_id`, `underlying` and
+  `network`. Requests refused before that (invalid quantity, unknown asset,
+  ineligible client, frozen underlying, command failure) log no fill.
 - **Redemption:** logged by transfer detection (`target: "redemption"`, message
   "Redemption transfer detected") once the `Detected` event is persisted, with
-  `issuer_request_id`. A transfer that was already detected returns before the
-  log, so a rescan never counts a redemption twice.
+  `issuer_request_id`, `underlying` and `network`. The log follows the persisted
+  event, not the cleanup of a held redemption record that may come after it: a
+  failed cleanup must not lose the fill, because the next scan reports the
+  transfer as already detected and never logs it. A transfer that was already
+  detected returns before the log, so a rescan never counts a redemption twice.
 
-The two kinds are told apart by `target`, so the alert rule can count them
-together or separately. Counting at intake rather than completion is deliberate:
-intake is what stops when Alpaca cannot reach the issuer. The alert rule, its
-mute timings (US extended-hours session, NYSE holidays), and the separate "no
-issuer logs at all" rule are configured in the Grafana repository, not here.
+Both kinds carry `underlying` and `network`, so a rule can count per chain or
+per asset. The two kinds are told apart by `target`, so the alert rule can count
+them together or separately.
+
+The fill lines reach the console only through the default log filter, which sets
+the `mint` and `redemption` targets to the configured level. A `RUST_LOG`
+override replaces that filter wholesale, and `LOG_LEVEL=warn` raises its level
+above INFO. Either one silences the fill lines while intake is healthy, so the
+rule would count zero. Any `RUST_LOG` in production must keep `mint` and
+`redemption` at INFO, and the "no issuer logs at all" rule does not cover this
+because the bot still logs other lines. Counting at intake rather than
+completion is deliberate: intake is what stops when Alpaca cannot reach the
+issuer. The alert rule, its mute timings (US extended-hours session, NYSE
+holidays), and the separate "no issuer logs at all" rule are configured in the
+Grafana repository, not here.
 
 ## Per network monitoring
 

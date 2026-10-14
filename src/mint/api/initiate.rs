@@ -81,6 +81,7 @@ pub(crate) async fn initiate_mint(
             config.vault_mode_for(&request.underlying, request.network)?;
 
         let underlying = request.underlying.clone();
+        let network = request.network;
 
         let command = MintCommand::Initiate {
             issuer_request_id: issuer_request_id.clone(),
@@ -107,7 +108,7 @@ pub(crate) async fn initiate_mint(
         // one) by `event`, so it is emitted exactly once per accepted mint and
         // only after the `Initiated` event is persisted.
         info!(target: "mint", event = "fill_accepted", %issuer_request_id,
-            underlying = %underlying.as_str(),
+            underlying = %underlying.as_str(), %network,
             "Mint request accepted"
         );
 
@@ -774,12 +775,14 @@ mod tests {
         )
         .expect("valid JSON response");
         let issuer_request_id = mint_response.issuer_request_id.to_string();
+        let network_field = format!("network={network}");
 
         let snippets = [
             r#"event="fill_accepted""#,
             "Mint request accepted",
             issuer_request_id.as_str(),
             underlying.as_str(),
+            network_field.as_str(),
         ];
         assert!(
             logs_contain_at!(tracing::Level::INFO, &snippets),
