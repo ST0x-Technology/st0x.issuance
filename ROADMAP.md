@@ -177,6 +177,7 @@ Complete redemption flow - detect transfer through burn.
 - [x] [RAI-2926](https://linear.app/makeitrain/issue/RAI-2926) - Rebroadcast
       dropped submitted burns using the persisted bytes and bounded recovery
       budget
+  - **PR:** [#471](https://github.com/ST0x-Technology/st0x.issuance/pull/471)
 
 ---
 
