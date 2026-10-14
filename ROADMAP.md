@@ -174,6 +174,9 @@ Complete redemption flow - detect transfer through burn.
 - [x] [#26](https://github.com/ST0x-Technology/st0x.issuance/issues/26) -
       End-to-end redemption flow tests
   - **PR:** [#58](https://github.com/ST0x-Technology/st0x.issuance/pull/58)
+- [x] [RAI-2926](https://linear.app/makeitrain/issue/RAI-2926) - Rebroadcast
+      dropped submitted burns using the persisted bytes and bounded recovery
+      budget
 
 ---
 
