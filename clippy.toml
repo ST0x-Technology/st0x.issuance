@@ -1,10 +1,13 @@
 allow-unwrap-in-tests = true
 too-many-lines-threshold = 200
 
-# Production chain clients go through `chain::rpc_client`, which sends a
-# derived endpoint's key as a header and strips the URL from transport
-# errors. Building a provider straight from a URL bypasses both.
+# Production chain clients go through `chain::rpc_client`, which signs a
+# bare Alchemy URL's requests with the configured JWT, follows no redirect
+# and keeps the URL out of transport errors. Building a provider straight
+# from a URL bypasses all three; `st0x_rpc::connect` also reads the JWT
+# settings from the environment instead of the parsed config.
 disallowed-methods = [
+  { path = "st0x_rpc::connect", reason = "build chain clients with chain::rpc_client and connect_client" },
   { path = "alloy::providers::ProviderBuilder::connect", reason = "build chain clients with chain::rpc_client and connect_client" },
   { path = "alloy::providers::ProviderBuilder::connect_with", reason = "build chain clients with chain::rpc_client and connect_client" },
   { path = "alloy::providers::ProviderBuilder::connect_with_config", reason = "build chain clients with chain::rpc_client and connect_client" },

@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::client::RpcClient;
 use clap::{Args, Parser, Subcommand};
 use event_sorcery::{
     AggregateError, LifecycleError, ReconcileError, Store, StoreBuilder,
@@ -26,7 +27,7 @@ use crate::burn_excess::cli::{
 use crate::chain::{RpcEndpoint, rpc_client};
 use crate::config::{
     ConfigError, DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL,
-    LogFormat, LogLevel, VaultModeConfig, VaultModeKind,
+    LogFormat, LogLevel, VaultModeConfig, VaultModeKind, cli_rpc_endpoint,
     configured_rpc_endpoint, load_config_file, setup_tracing,
 };
 use crate::prepare_event_sourced_startup;
@@ -184,9 +185,10 @@ struct ForceCompleteRedemptionArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -256,9 +258,10 @@ struct OrchestratorPreflightArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -305,9 +308,10 @@ struct ApproveOrchestratorArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -356,9 +360,10 @@ struct VerifyOrchestratorSigningArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -426,9 +431,10 @@ struct MoveReceiptsArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -469,9 +475,10 @@ struct ConfirmCustodyArgs {
 
     /// RPC endpoint for the network. Defaults to the service's own endpoint
     /// for `--network`, resolved from the environment the way the service
-    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, the legacy `RPC_URL` for Base,
-    /// then `ALCHEMY_API_KEY`). Like the service, the command sends a
-    /// `ws`/`wss` URL over HTTP(S) to the same host, port and path.
+    /// resolves it (`CHAIN_<NETWORK>_RPC_URL`, then the legacy `RPC_URL` for
+    /// Base, with the same Alchemy JWT settings). Like the service, the
+    /// command sends a `ws`/`wss` URL over HTTP(S) to the same host, port and
+    /// path.
     #[arg(long)]
     rpc_url: Option<Url>,
 
@@ -677,8 +684,8 @@ async fn run_force_complete_redemption(
                 underlying: evidence.underlying.clone(),
             })?;
 
-    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
-    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+    let (client, chain_id) = verified_client(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(client);
 
     let landed = verify_landed_burn(
         &provider,
@@ -781,8 +788,8 @@ async fn run_orchestrator_preflight(
         preflight_assets(&admin.pool, args.network, &args.assets, &vault_modes)
             .await?;
 
-    verified_chain_id(&rpc, args.chain_id).await?;
-    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+    let (client, _) = verified_client(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(client);
     let report =
         check_orchestrator_readiness(&provider, orchestrator, bot, &assets)
             .await?;
@@ -853,12 +860,12 @@ async fn run_approve_orchestrator(
         anyhow::bail!("aborted by operator");
     }
 
-    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
+    let (client, chain_id) = verified_client(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_client(rpc_client(&rpc)?);
+        .connect_client(client);
 
     // The spender is about to receive an UNLIMITED allowance from the
     // production bot wallet, so prove the configured address actually IS an
@@ -963,9 +970,9 @@ async fn run_verify_orchestrator_signing(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
+    let (client, chain_id) = verified_client(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
-    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+    let provider = ProviderBuilder::new().connect_client(client);
 
     let proofs = prove_signing_shapes(
         &provider,
@@ -1049,12 +1056,12 @@ async fn run_move_receipts(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
+    let (client, chain_id) = verified_client(&rpc, args.chain_id).await?;
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_client(rpc_client(&rpc)?);
+        .connect_client(client);
 
     verify_gas_readiness(&provider, bot).await?;
 
@@ -1272,8 +1279,8 @@ async fn run_confirm_custody(
             underlying: args.underlying.clone(),
         })?;
 
-    let chain_id = verified_chain_id(&rpc, args.chain_id).await?;
-    let provider = ProviderBuilder::new().connect_client(rpc_client(&rpc)?);
+    let (client, chain_id) = verified_client(&rpc, args.chain_id).await?;
+    let provider = ProviderBuilder::new().connect_client(client);
 
     let identity = VaultIdentity::verify(
         &admin.pool,
@@ -1434,12 +1441,12 @@ fn rpc_endpoint(
 ) -> Result<RpcEndpoint, ConfigError> {
     rpc_url.map_or_else(
         || configured_rpc_endpoint(network),
-        |url| Ok(url.clone().into()),
+        |url| cli_rpc_endpoint(network, url.clone()),
     )
 }
 
-/// Connects to the RPC and cross-checks the chain it reports against
-/// `--chain-id`.
+/// Connects to the RPC, cross-checks the chain it reports against
+/// `--chain-id`, and returns the client for the command's providers.
 ///
 /// Reached only once the operator has confirmed intent, so an `--rpc-url` typo
 /// cannot surface before they have decided. The RPC is the authority on which
@@ -1447,12 +1454,13 @@ fn rpc_endpoint(
 /// meant; disagreement means the vault address, the inventory key, or the
 /// endpoint is wrong — and a deterministic deployment can put the same vault
 /// address on both chains, so reaching the contract proves nothing.
-async fn verified_chain_id(
+async fn verified_client(
     rpc: &RpcEndpoint,
     expected_chain_id: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(RpcClient, u64)> {
+    let client = rpc_client(rpc).await?;
     let chain_id = ProviderBuilder::new()
-        .connect_client(rpc_client(rpc)?)
+        .connect_client(client.clone())
         .get_chain_id()
         .await?;
 
@@ -1465,7 +1473,7 @@ async fn verified_chain_id(
         );
     }
 
-    Ok(chain_id)
+    Ok((client, chain_id))
 }
 
 enum AssetAction {
@@ -2663,7 +2671,7 @@ mod tests {
         let args = parse(&["--rpc-url", "http://127.0.0.1:1"]);
         let rpc = rpc_endpoint(args.rpc_url.as_ref(), args.network).unwrap();
         assert_eq!(rpc.url(), &Url::parse("http://127.0.0.1:1").unwrap());
-        assert!(!rpc.uses_bearer_auth());
+        assert!(!rpc.uses_alchemy_jwt());
     }
 
     #[test]

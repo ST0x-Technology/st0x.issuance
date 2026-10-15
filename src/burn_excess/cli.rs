@@ -3,6 +3,7 @@
 use alloy::primitives::{B256, U256};
 use alloy::providers::fillers::{BlobGasFiller, NonceFiller};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::client::RpcClient;
 use clap::{Args, Subcommand};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
@@ -71,8 +72,8 @@ pub(crate) struct BurnExcessSharedArgs {
     /// Network of the vault listing (cross-checked with mint + chain-id).
     /// RPC is taken from the service environment for this network, in the
     /// service's order: `CHAIN_<NETWORK>_RPC_URL`, then legacy `RPC_URL` for
-    /// Base, then the endpoint derived from `ALCHEMY_API_KEY` — same secrets
-    /// as the long-running bot; not a CLI flag.
+    /// Base, with the same Alchemy JWT settings — same secrets as the
+    /// long-running bot; not a CLI flag.
     #[arg(long, value_parser = Network::from_str)]
     network: Network,
 
@@ -163,12 +164,12 @@ pub(crate) async fn run_burn_excess_cli(
     // from the environment and proves the chain id against it, since nothing
     // verified that endpoint at startup.
     let rpc = configured_rpc_endpoint(shared.network)?;
-    let chain_id = verified_chain_id(&rpc, shared.chain_id).await?;
+    let (client, chain_id) = verified_client(&rpc, shared.chain_id).await?;
 
     let outcome = run_burn_excess_request(
         &pool,
         &signer_config,
-        &rpc,
+        client,
         chain_id,
         request,
         confirm,
@@ -178,15 +179,15 @@ pub(crate) async fn run_burn_excess_cli(
     Ok(())
 }
 
-/// Builds the signing and read providers for `rpc` from the signer, then
+/// Builds the signing and read providers on `client` from the signer, then
 /// runs the dual-path orchestration. The offline CLI has no running service to
-/// borrow a vault service from, so it builds its own here, with `rpc` and
+/// borrow a vault service from, so it builds its own here, with `client` and
 /// the verified `chain_id` resolved by the caller; the breakglass HTTP routes
 /// sign through the service's shared vault service instead.
 async fn run_burn_excess_request(
     pool: &Pool<Sqlite>,
     signer_config: &SignerConfig,
-    rpc: &RpcEndpoint,
+    client: RpcClient,
     chain_id: u64,
     request: BurnExcessRequest,
     confirm: impl Fn(&str) -> io::Result<bool> + Send + Sync,
@@ -208,12 +209,12 @@ async fn run_burn_excess_request(
         .filler(NonceFiller::new(nonce_manager.clone()))
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
-        .connect_client(rpc_client(rpc)?);
+        .connect_client(client.clone());
 
     let vault_service =
         RealBlockchainService::new(signing_provider, nonce_manager);
 
-    let read_provider = ProviderBuilder::new().connect_client(rpc_client(rpc)?);
+    let read_provider = ProviderBuilder::new().connect_client(client);
 
     run_burn_excess(
         pool,
@@ -264,12 +265,13 @@ async fn connect_pool(
         })
 }
 
-async fn verified_chain_id(
+async fn verified_client(
     rpc: &RpcEndpoint,
     expected_chain_id: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(RpcClient, u64)> {
+    let client = rpc_client(rpc).await?;
     let chain_id = ProviderBuilder::new()
-        .connect_client(rpc_client(rpc)?)
+        .connect_client(client.clone())
         .get_chain_id()
         .await?;
 
@@ -280,7 +282,7 @@ async fn verified_chain_id(
         );
     }
 
-    Ok(chain_id)
+    Ok((client, chain_id))
 }
 
 #[cfg(test)]

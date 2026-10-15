@@ -22,6 +22,7 @@ use st0x_issuance_dto::{
     BurnExcessExternalRequest, TokenizedAssetDetailResponse,
     TokenizedAssetStatus,
 };
+use st0x_rpc::JwtEnv;
 use std::sync::Arc;
 use tracing::Level;
 use tracing_test::traced_test;
@@ -39,7 +40,7 @@ use crate::account::{
 };
 use crate::admin::RedemptionBurnRecovery;
 use crate::alpaca::AlpacaService;
-use crate::chain::{ChainConfig, ConfiguredNetworks};
+use crate::chain::{ChainConfig, ConfiguredNetworks, RpcEndpoint};
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
 use crate::network_telemetry::NetworkTelemetry;
@@ -767,7 +768,11 @@ async fn external_burn_rejects_a_mismatched_chain_id_and_logs_the_request() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: 31337,
-        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
+        rpc: RpcEndpoint::new(
+            Url::parse("wss://localhost:8545").expect("valid url"),
+            &JwtEnv::Unset,
+        )
+        .expect("plain url"),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];
@@ -832,7 +837,11 @@ async fn external_burn_without_a_funding_expectation_is_refused() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: Network::Base.chain_id(),
-        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
+        rpc: RpcEndpoint::new(
+            Url::parse("wss://localhost:8545").expect("valid url"),
+            &JwtEnv::Unset,
+        )
+        .expect("plain url"),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];
@@ -903,7 +912,11 @@ async fn internal_burn_validates_chain_id_against_the_configured_chain() {
     config.chains = vec![ChainConfig {
         network: Network::Base,
         chain_id: anvil_chain_id,
-        rpc: Url::parse("wss://localhost:8545").expect("valid url").into(),
+        rpc: RpcEndpoint::new(
+            Url::parse("wss://localhost:8545").expect("valid url"),
+            &JwtEnv::Unset,
+        )
+        .expect("plain url"),
         backfill_start_block: 0,
         low_gas_threshold: None,
     }];

@@ -10,13 +10,15 @@ use alloy::primitives::{U256, b256};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
+use st0x_rpc::JwtEnv;
 use url::Url;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig,
+    IpWhitelist, LogFormat, LogLevel, Network, RpcEndpoint, SignerConfig,
+    VaultModeConfig,
 };
 
 use crate::harness::{create_provider, initialize_rocket};
@@ -102,7 +104,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
-            rpc: rpc_url.into(),
+            rpc: RpcEndpoint::new(rpc_url, &JwtEnv::Unset).unwrap(),
             low_gas_threshold: None,
             backfill_start_block: 0,
         }],

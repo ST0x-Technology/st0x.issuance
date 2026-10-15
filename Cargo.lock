@@ -5144,6 +5144,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-core",
+ "h2 0.4.19",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -6779,6 +6780,7 @@ dependencies = [
  "st0x-finance",
  "st0x-issuance-client",
  "st0x-issuance-dto",
+ "st0x-rpc",
  "subtle",
  "tempfile",
  "thiserror",
@@ -6847,6 +6849,27 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "st0x-rpc"
+version = "0.1.0"
+source = "git+https://github.com/ST0x-Technology/st0x.rpc?tag=v0.1.0#03f2aeb9a0c7322f466622dc3f3d4e432cc6f681"
+dependencies = [
+ "alloy-json-rpc",
+ "alloy-rpc-client",
+ "alloy-transport",
+ "base64 0.22.1",
+ "p256",
+ "percent-encoding",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

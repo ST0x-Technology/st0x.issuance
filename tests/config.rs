@@ -311,12 +311,14 @@ fn deploy_configs_are_rejected_without_the_robinhood_chain_group() {
     }
 }
 
-const ALCHEMY_KEY: &str = "alchemyIntegrationKey_42";
+const BARE_BASE: &str = "https://base-mainnet.g.alchemy.com/v2";
+const KEY_VERSION: &str =
+    "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1";
 
-fn alchemy_base_command() -> Command {
+fn grouped_base_command(rpc_url: &str) -> Command {
     let mut command = validate_config_command();
     command
-        .env("ALCHEMY_API_KEY", ALCHEMY_KEY)
+        .env("CHAIN_BASE_RPC_URL", rpc_url)
         .env("CHAIN_BASE_CHAIN_ID", "8453")
         .env("CHAIN_BASE_BACKFILL_START_BLOCK", "42000000");
 
@@ -324,14 +326,10 @@ fn alchemy_base_command() -> Command {
 }
 
 #[test]
-fn alchemy_key_with_grouped_ids_is_valid_without_any_rpc_url() {
-    let output = alchemy_base_command()
-        .env("CHAIN_ETHEREUM_CHAIN_ID", "1")
-        .env("CHAIN_ETHEREUM_BACKFILL_START_BLOCK", "100")
-        .env("CHAIN_HYPEREVM_CHAIN_ID", "999")
-        .env("CHAIN_HYPEREVM_BACKFILL_START_BLOCK", "9000000")
-        .env("CHAIN_ROBINHOOD_CHAIN_ID", "4663")
-        .env("CHAIN_ROBINHOOD_BACKFILL_START_BLOCK", "0")
+fn a_bare_alchemy_url_with_both_jwt_settings_is_valid() {
+    let output = grouped_base_command(BARE_BASE)
+        .env("ALCHEMY_JWT_KMS_KEY_VERSION", KEY_VERSION)
+        .env("ALCHEMY_JWT_KID", "kid")
         .output()
         .unwrap();
 
@@ -339,7 +337,60 @@ fn alchemy_key_with_grouped_ids_is_valid_without_any_rpc_url() {
 }
 
 #[test]
-fn a_group_without_url_or_key_names_both_ways_to_configure_it() {
+fn a_bare_alchemy_url_without_the_jwt_settings_fails() {
+    let output = grouped_base_command(BARE_BASE).output().unwrap();
+
+    assert!(!output.status.success(), "a bare URL has no other auth");
+    let stderr = command_stderr(&output);
+    assert!(
+        stderr.contains("ALCHEMY_JWT_KMS_KEY_VERSION")
+            && stderr.contains("ALCHEMY_JWT_KID"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_keyed_alchemy_url_needs_no_jwt_settings() {
+    let output =
+        grouped_base_command("https://base-mainnet.g.alchemy.com/v2/someKey")
+            .output()
+            .unwrap();
+
+    assert!(output.status.success(), "{}", command_stderr(&output));
+}
+
+/// The image rolls before the secret drops `ALCHEMY_API_KEY`.
+#[test]
+fn a_leftover_alchemy_api_key_is_ignored() {
+    let output = legacy_base_command()
+        .env("ALCHEMY_API_KEY", "someKey")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", command_stderr(&output));
+}
+
+#[test]
+fn a_group_left_on_the_retired_alchemy_api_key_names_it() {
+    let output = legacy_base_command()
+        .env("ALCHEMY_API_KEY", "someKey")
+        .env("CHAIN_ETHEREUM_CHAIN_ID", "1")
+        .env("CHAIN_ETHEREUM_BACKFILL_START_BLOCK", "100")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "Ethereum has no RPC URL");
+    let stderr = command_stderr(&output);
+    assert!(
+        stderr.contains("ALCHEMY_API_KEY no longer supplies one")
+            && stderr.contains("CHAIN_ETHEREUM_RPC_URL"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("someKey"), "{stderr}");
+}
+
+#[test]
+fn a_group_without_url_names_its_url_variable() {
     let output = legacy_base_command()
         .env("CHAIN_ETHEREUM_CHAIN_ID", "1")
         .env("CHAIN_ETHEREUM_BACKFILL_START_BLOCK", "100")
@@ -348,46 +399,26 @@ fn a_group_without_url_or_key_names_both_ways_to_configure_it() {
 
     assert!(!output.status.success(), "Ethereum has no RPC endpoint");
     let stderr = command_stderr(&output);
-    assert!(
-        stderr.contains("CHAIN_ETHEREUM_RPC_URL")
-            && stderr.contains("ALCHEMY_API_KEY"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("CHAIN_ETHEREUM_RPC_URL"), "{stderr}");
+    assert!(!stderr.contains("ALCHEMY"), "{stderr}");
 }
 
 #[test]
-fn the_alchemy_key_alone_does_not_configure_base() {
-    let output = validate_config_command()
-        .env("ALCHEMY_API_KEY", ALCHEMY_KEY)
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success(), "Base needs its grouped ids");
-    let stderr = command_stderr(&output);
-    assert!(
-        stderr.contains("CHAIN_BASE_CHAIN_ID") && stderr.contains("RPC_URL"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(ALCHEMY_KEY), "{stderr}");
-}
-
-#[test]
-fn bnb_smart_chain_still_needs_an_explicit_url() {
-    let output = alchemy_base_command()
+fn bnb_smart_chain_needs_its_url() {
+    let output = legacy_base_command()
         .env("CHAIN_BINANCE_CHAIN_ID", "56")
         .env("CHAIN_BINANCE_BACKFILL_START_BLOCK", "0")
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "Binance is not derived");
+    assert!(!output.status.success(), "Binance has no RPC endpoint");
     let stderr = command_stderr(&output);
     assert!(stderr.contains("--chain-binance-rpc-url"), "{stderr}");
-    assert!(!stderr.contains(ALCHEMY_KEY), "{stderr}");
 }
 
 #[test]
 fn a_chain_id_without_its_backfill_block_fails_closed() {
-    let output = alchemy_base_command()
+    let output = legacy_base_command()
         .env("CHAIN_ETHEREUM_CHAIN_ID", "1")
         .output()
         .unwrap();
@@ -398,49 +429,23 @@ fn a_chain_id_without_its_backfill_block_fails_closed() {
         stderr.contains("--chain-ethereum-backfill-start-block"),
         "{stderr}"
     );
-    assert!(!stderr.contains(ALCHEMY_KEY), "{stderr}");
-}
-
-#[test]
-fn a_malformed_alchemy_key_fails_without_echoing_it() {
-    let output = alchemy_base_command()
-        .env("ALCHEMY_API_KEY", "leaked/key")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success(), "a malformed key must fail");
-    let stderr = command_stderr(&output);
-    assert!(stderr.contains("ALCHEMY_API_KEY is invalid"), "{stderr}");
-    assert!(!stderr.contains("leaked"), "{stderr}");
-}
-
-#[test]
-fn help_never_prints_the_alchemy_key() {
-    let output = alchemy_base_command().arg("--help").output().unwrap();
-
-    // `Config::parse` surfaces clap's help as an error, so it may land on
-    // either stream.
-    let printed = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        command_stderr(&output)
-    );
-    assert!(printed.contains("ALCHEMY_API_KEY"), "{printed}");
-    assert!(!printed.contains(ALCHEMY_KEY), "{printed}");
 }
 
 /// Rollout removes `RPC_URL`, so a secret map rendered from a template that
 /// still lists it hands the service an empty value.
 #[test]
 fn an_empty_rpc_url_counts_as_unset() {
-    let output = alchemy_base_command().env("RPC_URL", "").output().unwrap();
+    let output = grouped_base_command("https://base.example")
+        .env("RPC_URL", "")
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "{}", command_stderr(&output));
 }
 
 #[test]
 fn a_malformed_rpc_url_fails_without_echoing_it() {
-    let output = alchemy_base_command()
+    let output = grouped_base_command("https://base.example")
         .env("RPC_URL", "not a url SECRETPATH")
         .output()
         .unwrap();

@@ -25,6 +25,7 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use st0x_rpc::JwtEnv;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use url::Url;
@@ -39,7 +40,8 @@ use st0x_issuance::test_utils::{
 };
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, ChainConfig, Config, Environment, IpWhitelist,
-    LogFormat, LogLevel, Network, SignerConfig, VaultModeConfig, VaultModeKind,
+    LogFormat, LogLevel, Network, RpcEndpoint, SignerConfig, VaultModeConfig,
+    VaultModeKind,
 };
 
 /// The internal API key every harness-built config and request header share:
@@ -637,7 +639,7 @@ pub fn create_config_with_db(
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: evm.chain_id,
-            rpc: rpc_url.into(),
+            rpc: RpcEndpoint::new(rpc_url, &JwtEnv::Unset)?,
             backfill_start_block: 0,
             low_gas_threshold: None,
         }],
@@ -659,14 +661,20 @@ pub fn create_multichain_config_with_db(
         ChainConfig {
             network: Network::Base,
             chain_id: base_evm.chain_id,
-            rpc: Url::parse(&base_evm.endpoint)?.into(),
+            rpc: RpcEndpoint::new(
+                Url::parse(&base_evm.endpoint)?,
+                &JwtEnv::Unset,
+            )?,
             backfill_start_block: 0,
             low_gas_threshold: None,
         },
         ChainConfig {
             network: Network::Ethereum,
             chain_id: eth_evm.chain_id,
-            rpc: Url::parse(&eth_evm.endpoint)?.into(),
+            rpc: RpcEndpoint::new(
+                Url::parse(&eth_evm.endpoint)?,
+                &JwtEnv::Unset,
+            )?,
             backfill_start_block: 0,
             low_gas_threshold: None,
         },

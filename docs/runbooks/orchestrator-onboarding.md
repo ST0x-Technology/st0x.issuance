@@ -122,14 +122,12 @@ unit's file at that moment, and an older file lacks the newer entries. The
 `issuer` commands find each chain's RPC the way the service does, so they take
 no `--rpc-url`. The `cast` reads take a URL: Base's is `$RPC_URL` (or
 `$CHAIN_BASE_RPC_URL`, where the grouped form is set), and every other chain's
-is its `$CHAIN_<NETWORK>_RPC_URL`. A chain that reaches its RPC only through
-`ALCHEMY_API_KEY` has no such variable. For that chain, set its own variable in
-this shell to `https://<host>.g.alchemy.com/v2/$ALCHEMY_API_KEY`, where `<host>`
-is `base-mainnet`, `eth-mainnet`, `hyperliquid-mainnet` or `robinhood-mainnet`.
-Never set one chain's URL under another chain's name, and never echo it: the URL
-holds the key. The bot wallet is `$TURNKEY_ADDRESS`. The `git`, `gh` and
-`nix run .#…Deploy…` commands run on your workstation, in a checkout of this
-repo.
+is its `$CHAIN_<NETWORK>_RPC_URL`. Never echo one: a keyed URL holds the key.
+`cast` sends no JWT, so a bare Alchemy URL
+(`https://<network>.g.alchemy.com/v2`) answers its reads with HTTP 401; give
+`cast` a URL that needs no JWT. The bot wallet is `$TURNKEY_ADDRESS`. The `git`,
+`gh` and `nix run .#…Deploy…` commands run on your workstation, in a checkout of
+this repo.
 
 ## 1. Ship the orchestrator addresses in the config (stays dark)
 

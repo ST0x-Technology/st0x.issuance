@@ -121,8 +121,8 @@ fn resolve_chain<'config>(
 /// The read provider's RPC endpoint comes from the service's startup-verified
 /// chain configuration, never from a request-time environment read, so a
 /// deployment that supplies its RPC as a flag rather than an env var serves
-/// these routes too. That configuration was RPC-verified when the service
-/// started, so no per-request chain-id round trip is needed either.
+/// these routes too. Each request builds its own client, so a JWT endpoint
+/// signs one `eth_chainId` call before the read provider is used.
 async fn run_burn_excess_ops(
     pool: &Pool<Sqlite>,
     config: &Config,
@@ -149,8 +149,8 @@ async fn run_burn_excess_ops(
         );
         Status::InternalServerError
     })?;
-    let rpc = rpc_client(&chain.rpc).map_err(|error| {
-        error!(target: "admin", %error, path,
+    let rpc = rpc_client(&chain.rpc).await.map_err(|error| {
+        error!(target: "admin", ?error, path,
             issuer_request_id = %issuer_request_id,
             "burn-excess RPC unavailable"
         );

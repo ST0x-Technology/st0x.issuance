@@ -63,8 +63,8 @@ pub(crate) async fn orchestrator_preflight_ops(
     })?;
 
     let provider = ProviderBuilder::new().connect_client(
-        rpc_client(&rpc).map_err(|error| {
-            error!(target: "asset", %network, %error,
+        rpc_client(&rpc).await.map_err(|error| {
+            error!(target: "asset", %network, ?error,
                 "Orchestrator preflight could not connect to RPC"
             );
             Status::BadGateway
@@ -124,8 +124,8 @@ pub(crate) async fn orchestrator_verify_signing_ops(
         })?;
 
     let provider = ProviderBuilder::new().connect_client(
-        rpc_client(&rpc).map_err(|error| {
-            error!(target: "asset", %error,
+        rpc_client(&rpc).await.map_err(|error| {
+            error!(target: "asset", ?error,
                 "verify-signing could not connect to RPC"
             );
             Status::BadGateway
@@ -221,10 +221,14 @@ pub(crate) async fn orchestrator_approve_ops(
     // A remote RPC client polls receipts every 7 s by default, which would
     // spend most of the approval's deadline between two looks at a receipt
     // that landed in the first block or two.
-    let rpc_client = rpc_client(&rpc).map_err(|error| {
-        error!(target: "asset", %error, "approve could not connect to RPC");
-        Status::BadGateway
-    })?;
+    let rpc_client = before_deadline(deadline, "rpc connect", rpc_client(&rpc))
+        .await?
+        .map_err(|error| {
+            error!(target: "asset", ?error,
+                "approve could not connect to RPC"
+            );
+            Status::BadGateway
+        })?;
     let provider = ProviderBuilder::new()
         .with_chain_id(chain_id)
         .wallet(resolved.wallet)
