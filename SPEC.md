@@ -1492,9 +1492,9 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   must state it through the config flag, so a hand-typed orchestrator address
   never enters the flow. Either way the stated address only becomes reachable as
   a transfer destination through the corroboration witness described under
-  "Receipt custody". Before anything is signed the command verifies the
-  deployment hold is armed (the hold file present and the readiness marker
-  absent — the engine's projection rebuilds must not race a running service),
+  "Receipt custody". Before anything is signed the command takes the store lock
+  for the whole command (see "Store lock"; it refuses while the service runs,
+  because the engine's projection rebuilds must not race a running service),
   verifies the bot wallet's native balance covers a fixed transfer-gas ceiling
   at the current gas price (no per-transaction estimate — estimating a transfer
   of receipts the destination does not hold yet would revert), corroborates the
@@ -1522,9 +1522,10 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   records custody away from the bot wallet, so its rollback does not need this
   command. The holder is always the Turnkey wallet (`TURNKEY_ADDRESS`) — never
   typed — and it cannot be recorded wrongly: a wallet that does not hold every
-  tracked balance is refused with the first mismatch. Requires the deployment
-  hold armed (the engine's quiescence gates and projection rebuilds must not
-  race a running service); signs nothing and submits nothing on-chain.
+  tracked balance is refused with the first mismatch. Takes the store lock for
+  the whole command (see "Store lock"; it refuses while the service runs,
+  because the engine's quiescence gates and projection rebuilds must not race a
+  running service); signs nothing and submits nothing on-chain.
 
 `burn-excess` is listing/network-scoped and takes `--network` / `--chain-id`
 (cross-checked against the RPC-reported chain); its RPC endpoint is **not** a
@@ -1995,8 +1996,7 @@ between chunks resumes via a plain re-run: completed chunks have left the source
 on-chain, so reconciliation re-derives exactly the remaining identifiers and can
 never re-select a moved one — no resume bookkeeping is persisted anywhere. The
 `move-receipts` driver performs the outside-the-engine checks before the generic
-engine is invoked: it verifies the deployment hold is armed (hold file present,
-readiness marker absent — see `docs/runbooks/deploy-hold.md`), binds the signing
+engine is invoked: it takes the store lock (see "Store lock"), binds the signing
 provider to the Turnkey bot wallet (which the engine then independently
 corroborates against recorded aggregate custody as the stated holder), verifies
 the wallet's native balance covers a fixed transfer-gas ceiling at the current
@@ -4849,6 +4849,19 @@ corrupt view state.
 The database uses **SQLite** with an event sourcing architecture. The event
 store is the single source of truth, and all other tables are read-optimized
 views derived from events.
+
+### Store lock
+
+The service and the receipt custody commands never use a store at the same time.
+The service takes an exclusive OS file lock on `<database file>.lock` before it
+opens the store, and holds it while it runs. `issuer move-receipts` and
+`issuer confirm-custody` take the same lock for the whole command. A process
+that cannot take the lock refuses: the service does not start while one of these
+commands runs, and the commands refuse while the service runs. Other `issuer`
+commands take no lock. The kernel releases the lock when its holder exits, so no
+stale lock stays behind. An in-memory store takes no lock. The lock needs the
+database as a file path in `DATABASE_URL` (for example
+`sqlite:///mnt/data/issuance.db`), so a SQLite `file:` URI there is refused.
 
 ### Event Store Tables
 

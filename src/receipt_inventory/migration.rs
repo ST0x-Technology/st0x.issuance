@@ -9,7 +9,7 @@
 //! The vendor-neutral engine's operator driver is `issuer move-receipts`
 //! (`src/tokenized_asset/cli.rs`), which supplies the Turnkey signing
 //! provider and the kind-corroborated destination, and performs the
-//! outside-the-engine checks (deploy hold, gas readiness, confirmation).
+//! outside-the-engine checks (store lock, gas readiness, confirmation).
 //!
 //! **The issuer service must be stopped before this runs.** Startup
 //! reconciliation reads `balanceOf(bot_wallet)` for every tracked receipt

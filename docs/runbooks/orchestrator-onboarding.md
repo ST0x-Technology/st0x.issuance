@@ -648,9 +648,11 @@ quiescence gate of `move-receipts` in step 10 proves it.
 Have the step 12 deploy checkout ready first: the reviewed flip cherry-picked
 onto what production runs, and pushed (step 12 says how). A cherry-pick conflict
 must not fall inside the window. Then arm the deployment hold and stop the
-service per `docs/runbooks/deploy-hold.md` — `move-receipts` refuses without it,
-because the engine's projection rebuilds and quiescence reads must not race a
-running service. Then snapshot: record this token's per-receipt on-chain
+service per `docs/runbooks/deploy-hold.md`. `move-receipts` refuses while the
+service runs (both take the store lock), because the engine's projection
+rebuilds and quiescence reads must not race a running service. The lock ends
+with the command, so only the hold keeps the service stopped from the move to
+the flip in step 12. Then snapshot: record this token's per-receipt on-chain
 balances of BOTH wallets (run the "Zero-supply chains" loop once as written and
 once with the orchestrator address in place of `<bot wallet>`, and keep both
 outputs) — the bot wallet and the orchestrator's pre-move balances for the same

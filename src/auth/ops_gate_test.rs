@@ -432,6 +432,7 @@ async fn app_rocket_with_verifiers(
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory)),
         network_telemetry: Arc::new(NetworkTelemetry::new([Network::Base])),
         underlying_store,
+        store_guard: None,
         background_tasks: crate::BackgroundTasks {
             shutdown,
             handles: Vec::new(),

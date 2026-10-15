@@ -75,6 +75,7 @@ use crate::redemption::{
     redeem_call_manager::RedeemCallManager,
     view::{RedemptionViewReactor, rebuild_redemption_view},
 };
+use crate::store_lock::StoreLock;
 use crate::tokenized_asset::{
     CorporateActionFeed, TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
     spawn_corporate_action_feed, validate_one_underlying_per_network_vault,
@@ -107,6 +108,7 @@ mod openapi;
 pub(crate) mod operations_audit;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
+pub(crate) mod store_lock;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 pub(crate) mod wallet;
@@ -293,6 +295,7 @@ pub(crate) enum QuantityConversionError {
 ///
 /// Returns an error if:
 /// - Lifecycle-notification client construction fails
+/// - Another process holds the store lock, or the lock file cannot be opened
 /// - Database connection or migration fails
 /// - Blockchain service configuration is invalid
 /// - Alpaca service configuration is invalid
@@ -305,6 +308,22 @@ pub async fn initialize_rocket(
         "Operator lifecycle notification delivery configured"
     );
     let lifecycle_notifier = config.lifecycle_notifications.build_notifier()?;
+
+    // Taken before any pool opens and held for the life of the service, so
+    // `issuer move-receipts` and `issuer confirm-custody` refuse while the
+    // service runs, and the service refuses to start during one of them.
+    let store_guard =
+        store_lock::acquire(&config.database_url).inspect_err(|error| {
+            error!(target: "startup", %error,
+                "Refusing to start: cannot take the store lock"
+            );
+        })?;
+    if let Some(lock) = &store_guard {
+        info!(target: "startup", path = %lock.path.display(),
+            "Holding the store lock while the service runs"
+        );
+    }
+
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -481,6 +500,7 @@ pub async fn initialize_rocket(
         configured_networks,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
         network_telemetry,
+        store_guard,
         background_tasks: BackgroundTasks {
             shutdown: shutdown_tx,
             handles: background_task_handles,
@@ -662,6 +682,9 @@ struct RocketState {
     /// The Underlying aggregate store backing the capital-tier freeze/unfreeze
     /// and read-tier status ops routes.
     underlying_store: Arc<Store<Underlying>>,
+    /// The store lock, kept as managed state so it is held as long as the
+    /// Rocket lives. `None` for an in-memory store.
+    store_guard: Option<StoreLock>,
     background_tasks: BackgroundTasks,
 }
 
@@ -874,6 +897,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.receipts)
         .manage(state.network_telemetry)
         .manage(state.underlying_store)
+        .manage(state.store_guard)
         .mount(
             "/",
             routes![
