@@ -981,13 +981,35 @@ async fn serve_behind_iap(
     (base_url, server)
 }
 
+/// Query keys of `request` that the route answering it does not declare.
+/// Rocket ignores such a key, so the handler runs with that parameter unset.
+fn undeclared_query_keys(request: &rocket::Request<'_>) -> Vec<String> {
+    let declared: BTreeSet<&str> = request
+        .route()
+        .and_then(|route| route.uri.query())
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .map(|parameter| {
+            parameter.trim_start_matches('<').trim_end_matches('>')
+        })
+        .collect();
+    request
+        .uri()
+        .query()
+        .into_iter()
+        .flat_map(|query| query.segments())
+        .filter(|(key, _)| !declared.contains(key))
+        .map(|(key, _)| key.to_owned())
+        .collect()
+}
+
 /// Drives every `st0x-issuance-client` command through the real router over
 /// HTTP. With its own tier's token each command is answered by a route under
-/// its own `/ops/<tier>/` prefix, refused by no guard and forwarded by no path
-/// or query value, and with each other tier's token it is refused. Together
-/// the commands cover every `/ops` route exactly once, so a client path or
-/// parameter the server does not serve, or a route no command calls, fails
-/// here.
+/// its own `/ops/<tier>/` prefix that declares every query key it sends,
+/// refused by no guard and forwarded by no path or query value, and with each
+/// other tier's token it is refused. Together the commands cover every `/ops`
+/// route exactly once, so a client path or parameter the server does not
+/// serve, or a route no command calls, fails here.
 #[tokio::test]
 async fn every_client_command_reaches_a_route_of_its_own_tier() {
     let key = test_key();
@@ -997,6 +1019,18 @@ async fn every_client_command_reaches_a_route_of_its_own_tier() {
         instrument(gated_app_rocket(&jwks).await, &answered, |route| {
             ops_tier_segment(route.uri.path()).is_some()
         });
+    let undeclared = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&undeclared);
+    let rocket = rocket.attach(AdHoc::on_response(
+        "undeclared query key recorder",
+        move |request, _| {
+            recorder
+                .lock()
+                .expect("query key recorder is not poisoned")
+                .extend(undeclared_query_keys(request));
+            Box::pin(async {})
+        },
+    ));
     let (base_url, server) = serve_behind_iap(rocket).await;
     let client = |audience: &str| {
         OpsClient::new(base_url.clone(), token(&key, audience))
@@ -1009,6 +1043,7 @@ async fn every_client_command_reaches_a_route_of_its_own_tier() {
         let own = tier_audience(case.tier)
             .unwrap_or_else(|| panic!("{case:?}: unknown tier"));
         answered.lock().expect("route recorder is not poisoned").clear();
+        undeclared.lock().expect("query key recorder is not poisoned").clear();
 
         match dispatch_args(&client(own), &case.args).await {
             Ok(_)
@@ -1029,6 +1064,15 @@ async fn every_client_command_reaches_a_route_of_its_own_tier() {
                 "{case:?} must send one request to a route, sent {requests:?}"
             );
         };
+        let ignored = std::mem::take(
+            &mut *undeclared
+                .lock()
+                .expect("query key recorder is not poisoned"),
+        );
+        assert!(
+            ignored.is_empty(),
+            "{case:?} sent query keys {identity} does not declare: {ignored:?}"
+        );
         let Some(route) =
             routes.iter().find(|route| route.identity == *identity)
         else {
