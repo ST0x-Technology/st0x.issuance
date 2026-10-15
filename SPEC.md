@@ -5162,6 +5162,20 @@ Tiers and routes:
   `close/redemption/<id>`, `close/mint/<id>`, `burn-excess/internal`,
   `burn-excess/expect-funding`, `burn-excess/external`.
 
+A route's tier is the one its path prefix names: every route under `/ops` sits
+under one of the four tier prefixes, and its guard admits only an assertion for
+that tier's audience, refusing a missing, expired, or other tier assertion
+with 401. Every mutation mounted outside `/ops` is guarded by the shared API
+key: `InternalAuth` (an internal address), except Alpaca's
+`POST /accounts/connect`, `POST /inkind/issuance`, and
+`POST /inkind/issuance/confirm`, which are `IssuerAuth` (Alpaca's address).
+Tests hold this over the real mounted route table rather than a hand picked
+list, so a new route is checked without being named, and they drive every
+`st0x-issuance-client` command through the real router over HTTP: with its own
+tier's token a command reaches a route under its own prefix, with any other
+tier's it is refused, and the commands together cover every `/ops` route exactly
+once.
+
 #### Shared operations audit event
 
 Every `POST`, `PUT`, `PATCH`, or `DELETE` request to an operator mutation

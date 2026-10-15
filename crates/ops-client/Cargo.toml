@@ -11,6 +11,11 @@ name = "st0x-issuance-client"
 path = "src/main.rs"
 doc = false
 
+[features]
+# Exposes the command cases and dispatch entry point the bot's route tests
+# drive through its real router.
+test-support = []
+
 [dependencies]
 alloy-primitives.workspace = true
 base64.workspace = true
