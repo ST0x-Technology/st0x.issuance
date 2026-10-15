@@ -24,6 +24,7 @@ use st0x_issuance_dto::{
 };
 use st0x_rpc::JwtEnv;
 use std::sync::Arc;
+use tokio::sync::OwnedMutexGuard;
 use tracing::Level;
 use tracing_test::traced_test;
 use url::Url;
@@ -1171,6 +1172,13 @@ struct UnreachableBurnRecovery;
 
 #[async_trait]
 impl RedemptionBurnRecovery for UnreachableBurnRecovery {
+    async fn lock_recovery(
+        &self,
+        _issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> OwnedMutexGuard<()> {
+        unreachable!("unauthorized request must not acquire recovery lock")
+    }
+
     async fn replace_exhausted_dead_burn(
         &self,
         _: &IssuerRedemptionRequestId,

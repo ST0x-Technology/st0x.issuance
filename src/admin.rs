@@ -18,6 +18,7 @@ use st0x_issuance_dto::{
 };
 use std::io::Cursor;
 use std::sync::Arc;
+use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, error, info, warn};
 
 use crate::Quantity;
@@ -75,6 +76,11 @@ use crate::wrapped_transfer::{
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
+    async fn lock_recovery(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> OwnedMutexGuard<()>;
+
     async fn replace_exhausted_dead_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -99,6 +105,13 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
 
 #[async_trait]
 impl RedemptionBurnRecovery for BurnManager {
+    async fn lock_recovery(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> OwnedMutexGuard<()> {
+        self.lock_recovery(issuer_request_id).await
+    }
+
     async fn replace_exhausted_dead_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -646,6 +659,7 @@ async fn recover_redemption_logic(
 ) -> Result<Json<RecoverRedemptionResponseBody>, RecoverRedemptionError> {
     let aggregate_id = issuer_request_id.to_string();
 
+    let _recovery_guard = burn_recovery.lock_recovery(&issuer_request_id).await;
     let context =
         load_reprocess_context(pool.inner(), &issuer_request_id).await?;
 
@@ -4588,6 +4602,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{Notify, OwnedMutexGuard};
+    use tokio::time::timeout;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -4624,8 +4641,9 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
-    use crate::redemption::burn_manager::BurnManager;
+    use crate::redemption::burn_manager::{BurnManager, BurnRecoveryGates};
     use crate::redemption::job::SubmitBurnJob;
+    use crate::redemption::view::rebuild_redemption_view;
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
         BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
@@ -4644,8 +4662,8 @@ mod tests {
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnRange, BurnTxStatus, MultiBurnEntry, NetworkVaultServices,
-        OrchestratorBurnResult, PreparedMintTx, SendableTxWithHash, TxId,
-        VaultError, VaultService,
+        OrchestratorBurnResult, OrchestratorRevertReason, PreparedMintTx,
+        SendableTxWithHash, TxId, VaultError, VaultService,
     };
     use crate::vault::{MintAuthorization, OrchestratorMintedLog};
     use crate::wrapped_transfer::{
@@ -4709,10 +4727,10 @@ mod tests {
     /// Configurable result for `MockBurnRecovery`. `Fails` exercises the
     /// endpoint's error path; the concrete `BurnManagerError` is irrelevant
     /// since every error maps to `502`.
-    #[derive(Clone, Copy)]
     enum MockBurnResult {
         Succeeds(super::RecoveryOutcome),
         Fails,
+        Blocked { started: Notify, release: Notify },
     }
 
     /// Configurable result for `MockBurnRecovery::force_complete_burn`.
@@ -4738,6 +4756,8 @@ mod tests {
     }
 
     struct MockBurnRecovery {
+        lock_attempted: Notify,
+        recovery_gates: BurnRecoveryGates,
         calls: AtomicUsize,
         manual_calls: AtomicUsize,
         result: MockBurnResult,
@@ -4749,6 +4769,8 @@ mod tests {
     impl Default for MockBurnRecovery {
         fn default() -> Self {
             Self {
+                lock_attempted: Notify::new(),
+                recovery_gates: BurnRecoveryGates::default(),
                 calls: AtomicUsize::new(0),
                 manual_calls: AtomicUsize::new(0),
                 result: MockBurnResult::Succeeds(
@@ -4776,6 +4798,7 @@ mod tests {
     }
 
     struct ReservationTrackingBurnRecovery {
+        recovery_gates: BurnRecoveryGates,
         calls: AtomicUsize,
         receipt_inventory_store: Arc<Store<ReceiptInventory>>,
         vault: Address,
@@ -4789,6 +4812,13 @@ mod tests {
 
     #[async_trait]
     impl super::RedemptionBurnRecovery for ReservationTrackingBurnRecovery {
+        async fn lock_recovery(
+            &self,
+            issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> OwnedMutexGuard<()> {
+            self.recovery_gates.gate(issuer_request_id).await.lock_owned().await
+        }
+
         async fn replace_exhausted_dead_burn(
             &self,
             _issuer_request_id: &IssuerRedemptionRequestId,
@@ -4832,6 +4862,14 @@ mod tests {
 
     #[async_trait]
     impl super::RedemptionBurnRecovery for MockBurnRecovery {
+        async fn lock_recovery(
+            &self,
+            issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> OwnedMutexGuard<()> {
+            self.lock_attempted.notify_one();
+            self.recovery_gates.gate(issuer_request_id).await.lock_owned().await
+        }
+
         async fn replace_exhausted_dead_burn(
             &self,
             _issuer_request_id: &IssuerRedemptionRequestId,
@@ -4910,8 +4948,13 @@ mod tests {
             _issuer_request_id: &IssuerRedemptionRequestId,
         ) -> Result<super::RecoveryOutcome, super::BurnManagerError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            match self.result {
-                MockBurnResult::Succeeds(outcome) => Ok(outcome),
+            match &self.result {
+                MockBurnResult::Succeeds(outcome) => Ok(*outcome),
+                MockBurnResult::Blocked { started, release } => {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(super::RecoveryOutcome::Executed)
+                }
                 MockBurnResult::Fails => {
                     Err(super::BurnManagerError::SharesOverflow)
                 }
@@ -6580,6 +6623,199 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn periodic_recovery_skips_operator_resume_in_progress() {
+        let harness = TestHarness::new().await;
+        let vault_mock = Arc::new(
+            MockVaultService::new_readiness_blocked()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_orchestrator_confirm_revert(
+                    OrchestratorRevertReason::VaultLogicMismatch,
+                ),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store =
+            setup_store_with_vault(&harness.pool, vault_service.clone());
+        let (metadata, alpaca_data) =
+            setup_orchestrator_burn_failure(&store, TxId::random()).await;
+        let token = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness
+            .asset_store
+            .send(
+                &AssetKey::new(metadata.underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Add {
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: Network::Base,
+                    vault: token,
+                },
+            )
+            .await
+            .unwrap();
+        let receipt_inventory_store =
+            Arc::new(test_store::<ReceiptInventory>(harness.pool.clone(), ()));
+        let manager = Arc::new(BurnManager::new_for_tests(
+            vault_service.clone(),
+            harness.pool.clone(),
+            store.clone(),
+            Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+            Address::ZERO,
+            ANVIL_CHAIN_ID,
+            harness.apalis_pool.clone(),
+        ));
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let client =
+            rocket::local::asynchronous::Client::tracked(post_alpaca_rocket(
+                store.clone(),
+                harness.pool.clone(),
+                alpaca,
+                vault_service,
+                manager.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut resume = Box::pin(
+            client
+                .post(format!(
+                    "/admin/recover/redemption/{}",
+                    metadata.issuer_request_id
+                ))
+                .header(rocket::http::Header::new(
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
+                ))
+                .remote("127.0.0.1:8000".parse().unwrap())
+                .dispatch(),
+        );
+        tokio::select! {
+            () = vault_mock.wait_for_readiness_read() => {},
+            response = &mut resume => panic!("operator must pause during replacement readiness, got {}", response.status()),
+        }
+        rebuild_redemption_view(&harness.pool).await.unwrap();
+        timeout(Duration::from_secs(5), manager.recover_unresolved_burns())
+            .await
+            .expect("periodic recovery must skip the busy operator gate");
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Burning { .. })
+        ));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Redemption recovered from Failed to Burning",
+                &metadata.issuer_request_id.to_string()
+            ]
+        ));
+        vault_mock.release_readiness_read();
+        assert_eq!(resume.await.status(), Status::Ok);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn concurrent_admin_recoveries_serialize_through_burn_dispatch() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&store).await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let recovery = Arc::new(MockBurnRecovery {
+            result: MockBurnResult::Blocked {
+                started: Notify::new(),
+                release: Notify::new(),
+            },
+            ..Default::default()
+        });
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool,
+            alpaca,
+            mock_vault_service(),
+            recovery.clone(),
+        );
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let make_request = || {
+            client
+                .post(format!(
+                    "/admin/recover/redemption/{}",
+                    metadata.issuer_request_id
+                ))
+                .header(rocket::http::Header::new(
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
+                ))
+                .remote("127.0.0.1:8000".parse().unwrap())
+        };
+        let held_gate = recovery
+            .recovery_gates
+            .gate(&metadata.issuer_request_id)
+            .await
+            .lock_owned()
+            .await;
+        let mut first = Box::pin(make_request().dispatch());
+        assert!(
+            timeout(Duration::from_millis(100), &mut first).await.is_err(),
+            "admin recovery must wait on the held gate"
+        );
+        assert_eq!(recovery.calls(), 0);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Failed { .. })
+        ));
+        drop(held_gate);
+        let MockBurnResult::Blocked { started, release } = &recovery.result
+        else {
+            unreachable!()
+        };
+        tokio::select! {
+            () = started.notified() => {},
+            _ = &mut first => panic!("first recovery must wait at burn dispatch"),
+        }
+        recovery.lock_attempted.notified().await;
+        let mut second = Box::pin(make_request().dispatch());
+        tokio::select! {
+            () = recovery.lock_attempted.notified() => {},
+            _ = &mut second => panic!("second recovery must wait for the first"),
+        }
+        assert_eq!(recovery.calls(), 1);
+        release.notify_one();
+        let (first_response, second_response) = tokio::join!(first, second);
+        assert_eq!(first_response.status(), Status::Ok);
+        assert_eq!(second_response.status(), Status::UnprocessableEntity);
+        assert_eq!(
+            recovery.calls(),
+            1,
+            "a concurrent admin must not dispatch a second burn"
+        );
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Burning { .. })
+        ));
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Redemption recovered from Failed to Burning",
+                &metadata.issuer_request_id.to_string()
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn endpoint_rejects_burn_receipt_without_block_number() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
@@ -8210,6 +8446,7 @@ mod tests {
             });
             let vault_service: Arc<dyn VaultService> = Arc::new(vault_service);
             let burn_recovery = Arc::new(ReservationTrackingBurnRecovery {
+                recovery_gates: BurnRecoveryGates::default(),
                 calls: AtomicUsize::new(0),
                 receipt_inventory_store: receipt_inventory_store.clone(),
                 vault,

@@ -5501,6 +5501,22 @@ Auto-detects the right recovery path from the event history:
   fails, the response identifies the partial success, and recovery re-enqueues
   the same bytes without signing.
 
+Periodic burn recovery and operator recovery share a per-redemption gate for an
+entire recovery action, from reading its state through recording the outcome and
+dispatching the next job. Operators wait for the gate; periodic passes skip busy
+redemptions at DEBUG and continue with other redemptions. Recovery takes this
+gate before any network wallet lock. Queued workers retain their own wallet lock
+and exact-transaction guards, without acquiring the recovery gate.
+
+After confirming a failed burn, recovery re-reads the aggregate under the
+network wallet lock before any terminal write or receipt settlement/release. It
+acts only while the redemption is still failed and retains the exact inspected
+transaction (or, for a legacy burn without signed bytes, names that transaction
+in its latest failed-burn event). A superseded result is skipped at DEBUG with
+the redemption id, transaction id, and current state. Vault-direct recovery
+preserves a replacement's receipt reservation; orchestrator recovery has no
+receipt reservation and preserves its replacement state.
+
 **Mint:** `POST /admin/reprocess/mint/<aggregate_id>`
 
 Enqueues the same `MintRecoveryJob` / `drive_one_step` path used by automatic
