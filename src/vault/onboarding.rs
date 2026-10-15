@@ -614,6 +614,11 @@ where
 /// The receipt contract is resolved on-chain from the vault, mirroring the
 /// migration tooling — never typed.
 ///
+/// `mint_to` is the recipient of the `orchestrator.mint` shape. A policy that
+/// pins the mint recipient refuses any other address, so the caller passes
+/// the pinned recipient here (the operator commands default to the bot's own
+/// wallet).
+///
 /// # Errors
 ///
 /// Returns an error if an on-chain read fails or a shape fails to sign;
@@ -625,6 +630,7 @@ pub(crate) async fn prove_signing_shapes<P: Provider>(
     orchestrator: Address,
     vault: Address,
     bot: Address,
+    mint_to: Address,
 ) -> Result<Vec<SigningShapeProof>, OnboardingError> {
     let receipt_contract = Address::from(
         OffchainAssetReceiptVault::new(vault, provider)
@@ -642,8 +648,13 @@ pub(crate) async fn prove_signing_shapes<P: Provider>(
     // would instead produce immediately broadcastable transactions.
     let mut nonce = u64::MAX;
 
-    let shapes =
-        build_signing_shapes(orchestrator, vault, receipt_contract, bot);
+    let shapes = build_signing_shapes(
+        orchestrator,
+        vault,
+        receipt_contract,
+        bot,
+        mint_to,
+    );
     let mut proofs = Vec::with_capacity(shapes.len());
     for shape in shapes {
         let request = TransactionRequest::default()
@@ -684,6 +695,7 @@ pub(crate) async fn prove_signing_shapes<P: Provider>(
         target: "vault",
         %orchestrator,
         %vault,
+        %mint_to,
         shapes = proofs.len(),
         "Signed every policy-proof shape without broadcasting"
     );
@@ -701,6 +713,7 @@ fn build_signing_shapes(
     vault: Address,
     receipt_contract: Address,
     bot: Address,
+    mint_to: Address,
 ) -> Vec<SigningShape> {
     vec![
         SigningShape {
@@ -708,7 +721,7 @@ fn build_signing_shapes(
             to: orchestrator,
             calldata: IST0xOrchestratorV1::mintCall {
                 token: vault,
-                to: bot,
+                to: mint_to,
                 amount: U256::ONE,
                 auth: IST0xOrchestratorV1::MintAuthV1 {
                     nonce: B256::ZERO,
@@ -1417,9 +1430,15 @@ mod tests {
         let vault = Address::repeat_byte(0x22);
         let receipt_contract = Address::repeat_byte(0x33);
         let bot = Address::repeat_byte(0x44);
+        let mint_to = Address::repeat_byte(0x55);
 
-        let shapes =
-            build_signing_shapes(orchestrator, vault, receipt_contract, bot);
+        let shapes = build_signing_shapes(
+            orchestrator,
+            vault,
+            receipt_contract,
+            bot,
+            mint_to,
+        );
         let labels: Vec<&str> =
             shapes.iter().map(|shape| shape.label).collect();
         assert_eq!(
@@ -1437,7 +1456,10 @@ mod tests {
                 .unwrap();
         assert_eq!(shapes[0].to, orchestrator);
         assert_eq!(mint.token, vault);
-        assert_eq!(mint.to, bot);
+        assert_eq!(
+            mint.to, mint_to,
+            "the mint shape names the given recipient"
+        );
         assert!(
             mint.auth.signature.is_empty(),
             "the placeholder auth must stay opaque and empty"
@@ -1482,12 +1504,14 @@ mod tests {
         let nonce_before =
             provider.get_transaction_count(evm.wallet_address).await.unwrap();
 
+        let mint_to = Address::repeat_byte(0x5a);
         let proofs = prove_signing_shapes(
             &provider,
             &wallet,
             orchestrator,
             evm.vault_address,
             evm.wallet_address,
+            mint_to,
         )
         .await
         .unwrap();
@@ -1514,7 +1538,11 @@ mod tests {
         );
         assert!(logs_contain_at!(
             Level::INFO,
-            &["Signed every policy-proof shape", "shapes=4"]
+            &[
+                "Signed every policy-proof shape",
+                "shapes=4",
+                &format!("mint_to={mint_to}")
+            ]
         ));
         assert!(logs_contain_at!(
             Level::DEBUG,
@@ -1552,6 +1580,7 @@ mod tests {
             &wallet,
             orchestrator,
             evm.vault_address,
+            evm.wallet_address,
             evm.wallet_address,
         )
         .await

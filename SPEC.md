@@ -1480,7 +1480,11 @@ against the local SQLite store, and is where future issuer actions (e.g. `mint`,
   broadcasting, one transaction per shape the Turnkey signing policy must allow
   before cutover (`orchestrator.mint`, `orchestrator.burn`, `vault.approve`,
   `receipt.safeBatchTransferFrom`), so a policy gap surfaces as a named signing
-  refusal instead of during the pilot's first live mint.
+  refusal instead of during the pilot's first live mint. The optional
+  `--mint-to <ADDRESS>` sets the recipient `to` of the `orchestrator.mint`
+  shape; without it, the shape names the bot's own wallet. A signing policy that
+  pins the mint recipient needs that pinned address here, so that the proof
+  signs the shape a real mint sends.
 - `issuer move-receipts <UNDERLYING>` — moves one vault's tracked deposit
   receipts to a corroborated destination through the Turnkey signer, driving the
   receipt-moving engine (see "Receipt custody"). The destination is stated by
@@ -5164,9 +5168,9 @@ Tiers and routes:
   `network-telemetry`, `wrapped-transfers`.
 - **debug** (`/ops/debug/*`): `POST recover/redemption/<id>`,
   `POST reprocess/mint/<id>`,
-  `POST orchestrator-verify-signing/<network>/<underlying>`, `POST accounts`,
-  `accounts/<client_id>/wallets` (`POST` and `DELETE .../<wallet>`),
-  `GET tokenized-assets/<underlying>?network=<network>`,
+  `POST orchestrator-verify-signing/<network>/<underlying>[?mint_to=<address>]`,
+  `POST accounts`, `accounts/<client_id>/wallets` (`POST` and
+  `DELETE .../<wallet>`), `GET tokenized-assets/<underlying>?network=<network>`,
   `POST tokenized-assets`, `snapshots/<aggregate_type>/<aggregate_id>`.
 - **capital** (`/ops/capital/*`): `freeze/<underlying>`,
   `unfreeze/<underlying>`, `freeze-schedules`,
@@ -5495,6 +5499,11 @@ request reached the service.
 | `breakglass burn-excess internal --issuer-request-id ... [--execute]` | `POST /ops/breakglass/burn-excess/internal`                          |
 | `breakglass burn-excess expect-funding --issuer-request-id ...`       | `POST /ops/breakglass/burn-excess/expect-funding`                    |
 | `breakglass burn-excess external --funding-tx-hash ... [--execute]`   | `POST /ops/breakglass/burn-excess/external`                          |
+
+`debug verify-orchestrator-signing` also takes an optional
+`--mint-to <address>`, which it sends as `?mint_to=`. The bot answers 422 for a
+malformed value or for more than one value, and the response names the mint
+recipient as `mint_to`.
 
 ### Recover Stuck Aggregates
 

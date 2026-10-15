@@ -225,15 +225,21 @@ fn debug_route(command: &DebugCommand) -> Route {
             Tier::Debug,
             format!("/reprocess/mint/{}", encode_segment(issuer_request_id)),
         ),
-        VerifyOrchestratorSigning { network, underlying } => bare(
-            Method::POST,
-            Tier::Debug,
-            format!(
-                "/orchestrator-verify-signing/{}/{}",
-                network.as_str(),
-                encode_segment(underlying.as_str())
-            ),
-        ),
+        VerifyOrchestratorSigning { network, underlying, mint_to } => Route {
+            query: mint_to
+                .iter()
+                .map(|address| ("mint_to", address.to_string()))
+                .collect(),
+            ..bare(
+                Method::POST,
+                Tier::Debug,
+                format!(
+                    "/orchestrator-verify-signing/{}/{}",
+                    network.as_str(),
+                    encode_segment(underlying.as_str())
+                ),
+            )
+        },
         RegisterAccount { email } => Route {
             body: Some(RouteBody::RegisterAccount(RegisterAccountRequest {
                 email: email.clone(),
@@ -642,6 +648,20 @@ mod tests {
         assert_eq!(
             wire(&["debug", "verify-orchestrator-signing", "base", "AAPL"]),
             bodiless("POST /ops/debug/orchestrator-verify-signing/base/AAPL")
+        );
+        assert_eq!(
+            wire(&[
+                "debug",
+                "verify-orchestrator-signing",
+                "base",
+                "AAPL",
+                "--mint-to",
+                "0xa9c16673f65ae808688cb18952afe3d9658c808f",
+            ]),
+            bodiless(
+                "POST /ops/debug/orchestrator-verify-signing/base/AAPL\
+                 ?mint_to=0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+            )
         );
         assert_eq!(
             wire(&[

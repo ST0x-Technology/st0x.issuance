@@ -223,6 +223,12 @@ each asset approaches cutover (the approve/transfer shapes are token-scoped). A
 policy gap surfaces here as a named refusal instead of during the pilot's first
 live mint. It can pass only after the `s01-orchestrator` grant in step 3.
 
+The optional `--mint-to <ADDRESS>` sets the recipient of the signed mint shape,
+and the output names it as the mint shape recipient. Without it, the shape names
+the bot wallet. P68 does not pin the mint recipient today, so leave it out. If a
+later P68 pins the recipient, pass that pinned address here and in step 7, or
+the proof fails.
+
 ## 5. Execute the approval (per asset, staged with the rollout)
 
 ```

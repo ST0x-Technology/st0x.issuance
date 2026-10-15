@@ -91,6 +91,10 @@ pub(crate) enum DebugCommand {
         network: Network,
         #[arg(value_parser = uppercase_symbol)]
         underlying: UnderlyingSymbol,
+        /// Recipient of the signed mint shape; the bot's own wallet when
+        /// omitted.
+        #[arg(long)]
+        mint_to: Option<Address>,
     },
     /// Register an account for an email address.
     RegisterAccount {
