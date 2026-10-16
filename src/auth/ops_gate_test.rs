@@ -12,7 +12,8 @@ use httpmock::prelude::*;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
-use rocket::http::{ContentType, Method, Status};
+use rocket::fairing::AdHoc;
+use rocket::http::{Accept, ContentType, MediaType, Method, Status};
 use rocket::local::asynchronous::Client;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -22,8 +23,14 @@ use st0x_issuance_dto::{
     BurnExcessExternalRequest, TokenizedAssetDetailResponse,
     TokenizedAssetStatus,
 };
+use st0x_issuance_ops::test_support::{
+    Client as OpsClient, CommandError, TransportError as OpsTransportError,
+    command_cases, dispatch_args,
+};
 use st0x_rpc::JwtEnv;
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex as StdMutex};
 use tracing::Level;
 use tracing_test::traced_test;
 use url::Url;
@@ -39,15 +46,12 @@ use crate::account::{
     RegisterAccountResponse, WhitelistWalletResponse,
 };
 use crate::admin::RedemptionBurnRecovery;
-use crate::alpaca::AlpacaService;
 use crate::chain::{ChainConfig, ConfiguredNetworks, RpcEndpoint};
 use crate::config::{Config, OpsApiConfig};
 use crate::mint::Mint;
 use crate::network_telemetry::NetworkTelemetry;
 use crate::operations_audit::OperationsAuditFairing;
-use crate::receipt_inventory::{
-    CqrsReceiptService, ReceiptInventory, ReceiptService,
-};
+use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::redemption::burn_manager::{
     BurnManagerError, ManualBurnReplacementOutcome, RecoveryOutcome,
 };
@@ -153,11 +157,29 @@ fn test_key() -> TestKey {
 }
 
 fn token(key: &TestKey, audience: &str) -> String {
-    let now = std::time::SystemTime::now()
+    let now = unix_now();
+    signed_token(key, audience, now, now + 300)
+}
+
+/// A token whose lifetime ended five minutes ago, past the verifier's leeway.
+fn expired_token(key: &TestKey, audience: &str) -> String {
+    let now = unix_now();
+    signed_token(key, audience, now - 600, now - 300)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after epoch")
-        .as_secs();
+        .as_secs()
+}
 
+fn signed_token(
+    key: &TestKey,
+    audience: &str,
+    issued_at: u64,
+    expires_at: u64,
+) -> String {
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(TEST_KID.to_string());
 
@@ -168,8 +190,8 @@ fn token(key: &TestKey, audience: &str) -> String {
             email: "operator@rainlang.xyz".to_string(),
             aud: audience.to_string(),
             iss: IAP_ISSUER.to_string(),
-            iat: now,
-            exp: now + 300,
+            iat: issued_at,
+            exp: expires_at,
         },
         &EncodingKey::from_ec_pem(&key.signing_pem).expect("PEM parses"),
     )
@@ -325,209 +347,9 @@ async fn a_read_tier_assertion_cannot_reach_the_debug_tier() {
     assert_eq!(response.status(), Status::Unauthorized);
 }
 
-/// Aggregate snapshots can contain prepared transaction bytes and
-/// authorization nonces, so the diagnostic is debug-tier rather than a
-/// general read-tier route.
-#[traced_test]
-#[tokio::test]
-async fn aggregate_snapshots_require_the_debug_tier() {
-    let key = test_key();
-    let jwks = jwks_server(&key);
-    let verifiers =
-        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-    let rocket = setup_test_rocket()
-        .await
-        .expect("test rocket builds")
-        .manage(verifiers)
-        .mount("/", rocket::routes![crate::admin::aggregate_snapshot_ops]);
-    let client = Client::tracked(rocket).await.unwrap();
-
-    let read = client
-        .get("/ops/debug/snapshots/Mint/some-id")
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, READ_AUDIENCE),
-        ))
-        .dispatch()
-        .await;
-    assert_eq!(read.status(), Status::Unauthorized);
-
-    let debug = client
-        .get("/ops/debug/snapshots/Mint/some-id")
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, DEBUG_AUDIENCE),
-        ))
-        .dispatch()
-        .await;
-    assert_eq!(debug.status(), Status::NotFound);
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["IAP assertion failed validation"]
-    ));
-    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
-}
-
-/// The real read- and debug-tier handlers, mounted on the full app state, are
-/// refused without an IAP assertion: the gate is on the production routes, not
-/// only on the probes.
-#[traced_test]
-#[tokio::test]
-async fn real_ops_routes_require_an_iap_assertion() {
-    let verifiers =
-        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
-    let rocket = setup_test_rocket()
-        .await
-        .expect("test rocket builds")
-        .manage(verifiers)
-        .mount(
-            "/",
-            rocket::routes![
-                crate::admin::list_stuck_ops,
-                crate::admin::reprocess_mint_ops,
-                crate::admin::orchestrator_health_ops,
-                crate::burn_excess::api::burn_excess_internal_ops,
-                crate::burn_excess::api::burn_excess_expect_funding_ops,
-                crate::burn_excess::api::burn_excess_external_ops,
-                crate::tokenized_asset::orchestrator_ops::orchestrator_preflight_ops,
-                crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops,
-                crate::tokenized_asset::orchestrator_ops::orchestrator_approve_ops,
-                crate::admin::aggregate_snapshot_ops
-            ],
-        );
-    let client = Client::tracked(rocket).await.unwrap();
-
-    let read = client.get("/ops/read/stuck").dispatch().await;
-    assert_eq!(read.status(), Status::Unauthorized);
-
-    let debug = client
-        .post("/ops/debug/reprocess/mint/00000000-0000-0000-0000-000000000000")
-        .dispatch()
-        .await;
-    assert_eq!(debug.status(), Status::Unauthorized);
-
-    let health = client.get("/ops/read/orchestrator-health").dispatch().await;
-    assert_eq!(health.status(), Status::Unauthorized);
-
-    let burn = client
-        .post("/ops/breakglass/burn-excess/internal")
-        .header(rocket::http::ContentType::JSON)
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(burn.status(), Status::Unauthorized);
-
-    let burn_external = client
-        .post("/ops/breakglass/burn-excess/external")
-        .header(rocket::http::ContentType::JSON)
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(burn_external.status(), Status::Unauthorized);
-
-    let expect_funding = client
-        .post("/ops/breakglass/burn-excess/expect-funding")
-        .header(rocket::http::ContentType::JSON)
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(expect_funding.status(), Status::Unauthorized);
-
-    let preflight =
-        client.get("/ops/read/orchestrator-preflight/base").dispatch().await;
-    assert_eq!(preflight.status(), Status::Unauthorized);
-
-    let verify = client
-        .post("/ops/debug/orchestrator-verify-signing/base/AAPL")
-        .dispatch()
-        .await;
-    assert_eq!(verify.status(), Status::Unauthorized);
-
-    let approve = client
-        .post("/ops/capital/orchestrator-approve/base/AAPL")
-        .dispatch()
-        .await;
-    assert_eq!(approve.status(), Status::Unauthorized);
-
-    let snapshot =
-        client.get("/ops/debug/snapshots/Mint/some-id").dispatch().await;
-    assert_eq!(snapshot.status(), Status::Unauthorized);
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["Request carries no IAP assertion"]
-    ));
-}
-
-/// The headline breakglass property: a debug-tier operator cannot burn excess.
-/// A debug token is refused on the breakglass burn-excess route before the
-/// handler (and the signer) is ever reached.
-#[traced_test]
-#[tokio::test]
-async fn a_debug_token_cannot_burn_excess() {
-    let key = test_key();
-    let jwks = jwks_server(&key);
-    let verifiers =
-        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-    let rocket = setup_test_rocket()
-        .await
-        .expect("test rocket builds")
-        .manage(verifiers)
-        .mount(
-            "/",
-            rocket::routes![
-                crate::burn_excess::api::burn_excess_internal_ops,
-                crate::burn_excess::api::burn_excess_expect_funding_ops,
-                crate::burn_excess::api::burn_excess_external_ops
-            ],
-        );
-    let client = Client::tracked(rocket).await.unwrap();
-
-    let internal = client
-        .post("/ops/breakglass/burn-excess/internal")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, DEBUG_AUDIENCE),
-        ))
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(internal.status(), Status::Unauthorized);
-
-    let external = client
-        .post("/ops/breakglass/burn-excess/external")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, DEBUG_AUDIENCE),
-        ))
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(external.status(), Status::Unauthorized);
-
-    let expect_funding = client
-        .post("/ops/breakglass/burn-excess/expect-funding")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, DEBUG_AUDIENCE),
-        ))
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(expect_funding.status(), Status::Unauthorized);
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["IAP assertion failed validation"]
-    ));
-}
-
-/// One representative route per tier. Each request matches its route's method
-/// and format but carries no assertion, so 401 versus 404 is decided by
-/// whether the tier is mounted and gated, nothing else.
+/// One representative route per tier, which a deployment without ops API
+/// audiences must not serve. Each request matches its route's method and
+/// format, so a 404 means the tier is absent, not that the request missed.
 const TIER_ROUTES: [(Method, &str); 4] = [
     (Method::Get, "/ops/read/stuck"),
     (Method::Post, "/ops/debug/recover/redemption/some-id"),
@@ -544,11 +366,23 @@ async fn probe_tier_route(
 }
 
 /// The application rocket built by the same `build_rocket` production uses,
-/// with `config` deciding whether the `/ops/*` routes are mounted. Every
-/// managed state the ops routes declare is supplied (Rocket refuses to ignite
-/// a route whose `State` is unmanaged); the gate refuses before any handler
-/// runs, so none of it is exercised.
+/// with `config` deciding whether the `/ops/*` routes are mounted.
 async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
+    let ops_verifiers =
+        crate::build_ops_verifiers(&config).expect("JWKS client builds");
+    app_rocket_with_verifiers(config, ops_verifiers).await
+}
+
+/// [`app_rocket`] with the ops verifiers supplied, so a test can point them at
+/// a mocked key set. Every managed state the ops routes declare is supplied
+/// (Rocket refuses to ignite a route whose `State` is unmanaged): the stores
+/// `setup_test_rocket` manages, whose tokenized asset store lists AAPL and
+/// TSLA on Base, and empty redemption, receipt inventory, and underlying
+/// stores.
+async fn app_rocket_with_verifiers(
+    config: Config,
+    ops_verifiers: Option<OpsApiVerifiers>,
+) -> rocket::Rocket<rocket::Build> {
     let base = setup_test_rocket().await.expect("test rocket builds");
     let pool = base.state::<Pool<Sqlite>>().expect("pool managed").clone();
     let apalis_pool =
@@ -581,8 +415,7 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
     let (shutdown, _) = tokio::sync::watch::channel(false);
 
     crate::build_rocket(crate::RocketState {
-        ops_verifiers: crate::build_ops_verifiers(&config)
-            .expect("JWKS client builds"),
+        ops_verifiers,
         freeze_scheduler: FreezeScheduler::new(&apalis_pool, pool.clone()),
         rate_limiter: FailedAuthRateLimiter::new().expect("rate limiter"),
         config,
@@ -593,7 +426,7 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
         mint_store,
         redemption_store,
         alpaca_service: Arc::new(MockIssuerApi::new_success()),
-        burn_recovery: Arc::new(UnreachableBurnRecovery),
+        burn_recovery: Arc::new(AbsentRedemptionBurnRecovery),
         vault_services,
         configured_networks: ConfiguredNetworks::from_iter([Network::Base]),
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory)),
@@ -606,34 +439,21 @@ async fn app_rocket(config: Config) -> rocket::Rocket<rocket::Build> {
     })
 }
 
-/// With audiences configured the application mounts every tier under its
-/// role prefix and gates it: a bare request reaches the guard and is refused
-/// with 401, not 404. This drives the real mounting branch in `build_rocket`,
-/// so a tier dropped from the route table or moved off its prefix fails here.
-#[tokio::test]
-async fn role_prefixes_are_mounted_and_gated_with_ops_api_config() {
-    let config = Config {
-        ops_api: Some(ops_config()),
-        ..test_config().expect("test config builds")
-    };
-    let client = Client::tracked(app_rocket(config).await).await.unwrap();
-
-    for (method, path) in TIER_ROUTES {
-        assert_eq!(
-            probe_tier_route(&client, method, path).await,
-            Status::Unauthorized,
-            "{path} must be mounted and gated"
-        );
-    }
-}
-
 /// Without configured audiences the `/ops/*` routes are not mounted at all: a
 /// deployment with no load balancer serves 404, never a 401 that suggests the
-/// path exists and wants credentials.
+/// path exists and wants credentials. Checked over the whole route table, so a
+/// route moved out of the configured mount fails here.
 #[tokio::test]
 async fn role_prefixes_are_absent_without_ops_api_config() {
     let config = test_config().expect("test config builds");
-    let client = Client::tracked(app_rocket(config).await).await.unwrap();
+    let rocket = app_rocket(config).await;
+    let exposed: Vec<String> = rocket
+        .routes()
+        .filter(|route| ops_tier_segment(route.uri.path()).is_some())
+        .map(route_identity)
+        .collect();
+    assert!(exposed.is_empty(), "mounted without ops API config: {exposed:#?}");
+    let client = Client::tracked(rocket).await.unwrap();
 
     for (method, path) in TIER_ROUTES {
         assert_eq!(
@@ -667,20 +487,7 @@ async fn every_mounted_operator_mutation_is_audited() {
                 Method::Post | Method::Put | Method::Patch | Method::Delete
             )
         })
-        .map(|route| {
-            let concrete = route
-                .uri
-                .path()
-                .split('/')
-                .map(
-                    |segment| {
-                        if segment.starts_with('<') { "x" } else { segment }
-                    },
-                )
-                .collect::<Vec<_>>()
-                .join("/");
-            (route.method, concrete)
-        })
+        .map(|route| (route.method, concrete_target(route)))
         .collect();
 
     let mut unaudited = Vec::new();
@@ -702,16 +509,13 @@ async fn every_mounted_operator_mutation_is_audited() {
             "POST /accounts/connect",
             "POST /inkind/issuance",
             "POST /inkind/issuance/confirm",
-            "POST /internal/mints/x/authorization",
+            "POST /internal/mints/00000000-0000-0000-0000-000000000000/authorization",
         ]
     );
 
     let accepted = client
         .post("/admin/reprocess/mint/not-a-mint")
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
+        .header(rocket::http::Header::new("X-API-KEY", API_KEY))
         .header(rocket::http::Header::new(
             "x-request-id",
             "efefefef-efef-efef-efef-efefefefefef",
@@ -736,6 +540,606 @@ async fn every_mounted_operator_mutation_is_audited() {
             .then_some(())
             .ok_or_else(|| format!("missing internal audit event: {lines:?}"))
     });
+}
+
+/// With audiences configured the application mounts every tier under its
+/// role prefix and gates it: a bare request reaches the guard and is refused
+/// with 401, not 404. This drives the production chain from `Config` through
+/// `build_ops_verifiers` to the mounting branch in `build_rocket`, which the
+/// route walks below bypass to read a mocked key set.
+#[tokio::test]
+async fn role_prefixes_are_mounted_and_gated_with_ops_api_config() {
+    let config = Config {
+        ops_api: Some(ops_config()),
+        ..test_config().expect("test config builds")
+    };
+    let client = Client::tracked(app_rocket(config).await).await.unwrap();
+
+    for (method, path) in TIER_ROUTES {
+        assert_eq!(
+            probe_tier_route(&client, method, path).await,
+            Status::Unauthorized,
+            "{path} must be mounted and gated"
+        );
+    }
+}
+
+/// Audience each tier's IAP backend stamps, keyed by the tier segment of its
+/// `/ops/<tier>/` prefix.
+const TIER_AUDIENCES: [(&str, &str); 4] = [
+    ("read", READ_AUDIENCE),
+    ("debug", DEBUG_AUDIENCE),
+    ("capital", CAPITAL_AUDIENCE),
+    ("breakglass", BREAKGLASS_AUDIENCE),
+];
+
+fn tier_audience(tier: &str) -> Option<&'static str> {
+    TIER_AUDIENCES
+        .iter()
+        .find(|(name, _)| *name == tier)
+        .map(|(_, audience)| *audience)
+}
+
+/// The segment after `/ops` in a route path, or `None` for a route outside
+/// `/ops`.
+fn ops_tier_segment(path: &str) -> Option<&str> {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    (segments.next() == Some("ops"))
+        .then(|| segments.next().unwrap_or_default())
+}
+
+/// An `IssuerRedemptionRequestId`: the transaction hash that started the
+/// redemption.
+const REDEMPTION_ID: &str =
+    "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A value each path or query parameter of the mounted routes parses as.
+/// Rocket runs a route's request guards before its path and query guards, so
+/// a value the route cannot parse still meets the auth guard but then
+/// forwards instead of entering the handler, which the walks report. A new
+/// parameter name fails here until it has a sample.
+fn sample_parameter(name: &str) -> &str {
+    match name {
+        "aggregate_id" | "client_id" | "tokenization_request_id" => REQUEST_ID,
+        "issuer_request_id" => REDEMPTION_ID,
+        "underlying" | "asset" => "AAPL",
+        "network" | "before_network" => "base",
+        "wallet" => WALLET,
+        "aggregate_type" => "Mint",
+        "limit" | "before_block" | "before_log_index" => "1",
+        // The swagger UI's catch all tail.
+        "_.." => "index.html",
+        other => panic!("no sample value for route parameter {other}"),
+    }
+}
+
+/// The route's path and query with every parameter replaced by its sample.
+fn concrete_target(route: &rocket::Route) -> String {
+    let path = route
+        .uri
+        .path()
+        .split('/')
+        .map(|segment| {
+            segment
+                .strip_prefix('<')
+                .and_then(|name| name.strip_suffix('>'))
+                .map_or(segment, sample_parameter)
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let Some(query) = route.uri.query() else {
+        return path;
+    };
+    let query = query
+        .split('&')
+        .map(|parameter| {
+            let name = parameter.trim_start_matches('<').trim_end_matches('>');
+            format!("{name}={}", sample_parameter(name))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{query}")
+}
+
+/// Names a route uniquely among the mounted ones: Rocket lets two routes share
+/// a method and path when their formats or ranks differ.
+fn route_identity(route: &rocket::Route) -> String {
+    let format = route
+        .format
+        .as_ref()
+        .map_or_else(|| "any".to_owned(), ToString::to_string);
+    format!(
+        "{} {} rank {} format {format}",
+        route.method, route.uri, route.rank
+    )
+}
+
+/// A mounted route a walk probes, with a request target its path and query
+/// guards accept and the media type its format matches.
+struct WalkedRoute {
+    identity: String,
+    method: Method,
+    path: String,
+    target: String,
+    format: MediaType,
+}
+
+/// Answers a request a walked route forwarded because a path or query value
+/// did not parse. Mounted below each walked route, so a forwarded probe is
+/// answered here and records this route instead of the walked one.
+#[derive(Clone)]
+struct ForwardSentinel;
+
+#[rocket::async_trait]
+impl rocket::route::Handler for ForwardSentinel {
+    async fn handle<'r>(
+        &self,
+        request: &'r rocket::Request<'_>,
+        _: rocket::Data<'r>,
+    ) -> rocket::route::Outcome<'r> {
+        rocket::route::Outcome::from(request, Status::ImATeapot)
+    }
+}
+
+/// Identity of the route that answered each request, `None` when the request
+/// matched no route.
+type AnsweredRoutes = Arc<StdMutex<Vec<Option<String>>>>;
+
+/// Prepares `rocket` for a route walk over the routes `walk` selects: lists
+/// them, mounts a [`ForwardSentinel`] below each, and records into `answered`
+/// which route answered every request.
+fn instrument(
+    rocket: rocket::Rocket<rocket::Build>,
+    answered: &AnsweredRoutes,
+    walk: impl Fn(&rocket::Route) -> bool,
+) -> (rocket::Rocket<rocket::Build>, Vec<WalkedRoute>) {
+    let selected: Vec<rocket::Route> =
+        rocket.routes().filter(|route| walk(route)).cloned().collect();
+    let mut sentinels: Vec<rocket::Route> = Vec::new();
+    for route in &selected {
+        let duplicate = sentinels.iter().any(|sentinel| {
+            sentinel.method == route.method
+                && sentinel.uri.as_str() == route.uri.as_str()
+                && sentinel.format == route.format
+        });
+        if !duplicate {
+            let mut sentinel = rocket::Route::ranked(
+                100,
+                route.method,
+                route.uri.as_str(),
+                ForwardSentinel,
+            );
+            sentinel.format.clone_from(&route.format);
+            sentinels.push(sentinel);
+        }
+    }
+    let walked = selected
+        .iter()
+        .map(|route| WalkedRoute {
+            identity: route_identity(route),
+            method: route.method,
+            path: route.uri.path().to_owned(),
+            target: concrete_target(route),
+            format: route.format.clone().unwrap_or(MediaType::JSON),
+        })
+        .collect();
+
+    let recorder = Arc::clone(answered);
+    let rocket = rocket.mount("/", sentinels).attach(AdHoc::on_response(
+        "answering route recorder",
+        move |request, _| {
+            recorder
+                .lock()
+                .expect("route recorder is not poisoned")
+                .push(request.route().map(route_identity));
+            Box::pin(async {})
+        },
+    ));
+    (rocket, walked)
+}
+
+/// The application rocket with every tier mounted, its verifiers reading the
+/// key set `jwks` serves.
+async fn gated_app_rocket(jwks: &MockServer) -> rocket::Rocket<rocket::Build> {
+    let config = Config {
+        ops_api: Some(ops_config()),
+        ..test_config().expect("test config builds")
+    };
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    app_rocket_with_verifiers(config, Some(verifiers)).await
+}
+
+/// Sends `route` its sample request from `remote` with `headers` added, in the
+/// media type its format matches and with a `{}` body on a mutation. Returns
+/// the status and the identity of the route that answered.
+async fn probe(
+    client: &Client,
+    answered: &AnsweredRoutes,
+    route: &WalkedRoute,
+    remote: SocketAddr,
+    headers: Vec<rocket::http::Header<'static>>,
+) -> (Status, Option<String>) {
+    let mut request = client
+        .req(route.method, route.target.as_str())
+        .remote(remote)
+        .header(ContentType(route.format.clone()))
+        .header(Accept::from(route.format.clone()));
+    for header in headers {
+        request = request.header(header);
+    }
+    if route.method != Method::Get {
+        request = request.body("{}");
+    }
+    let status = request.dispatch().await.status();
+    let answered_by = answered
+        .lock()
+        .expect("route recorder is not poisoned")
+        .pop()
+        .flatten();
+    (status, answered_by)
+}
+
+fn assertion(token: String) -> Vec<rocket::http::Header<'static>> {
+    vec![rocket::http::Header::new(ASSERTION_HEADER, token)]
+}
+
+/// The shared key `test_config` sets for `InternalAuth` and `IssuerAuth`.
+const API_KEY: &str = "test-key-12345678901234567890123456";
+
+const LOOPBACK: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
+
+/// Walks the real route table: every route mounted under `/ops` sits under one
+/// of the four tier prefixes, and its guard is that tier's. The tier's own
+/// assertion passes the tier guard (only a guard answers 401), while a missing
+/// assertion, an expired one, and each other tier's are refused with 401. A
+/// handler taking another tier's guard than its prefix names fails here.
+#[traced_test]
+#[tokio::test]
+async fn every_ops_route_admits_only_its_own_tier() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let answered = AnsweredRoutes::default();
+    let (rocket, routes) =
+        instrument(gated_app_rocket(&jwks).await, &answered, |route| {
+            ops_tier_segment(route.uri.path()).is_some()
+        });
+    let client = Client::tracked(rocket).await.unwrap();
+
+    for (tier, _) in TIER_AUDIENCES {
+        assert!(
+            routes
+                .iter()
+                .any(|route| ops_tier_segment(&route.path) == Some(tier)),
+            "no route mounted under /ops/{tier}"
+        );
+    }
+
+    let mut failures = Vec::new();
+    for route in &routes {
+        let identity = &route.identity;
+        let Some(own) = ops_tier_segment(&route.path).and_then(tier_audience)
+        else {
+            failures.push(format!("{identity}: outside the tiers"));
+            continue;
+        };
+
+        let mut probes = vec![
+            ("its own assertion".to_owned(), assertion(token(&key, own)), true),
+            ("no assertion".to_owned(), Vec::new(), false),
+            (
+                "an expired assertion".to_owned(),
+                assertion(expired_token(&key, own)),
+                false,
+            ),
+        ];
+        probes.extend(
+            TIER_AUDIENCES.iter().filter(|(_, audience)| *audience != own).map(
+                |(other, audience)| {
+                    (
+                        format!("a {other} assertion"),
+                        assertion(token(&key, audience)),
+                        false,
+                    )
+                },
+            ),
+        );
+        for (label, headers, admitted) in probes {
+            let (status, answered_by) =
+                probe(&client, &answered, route, LOOPBACK, headers).await;
+            if answered_by.as_ref() != Some(identity) {
+                failures.push(format!(
+                    "{identity}: {label} was answered by {answered_by:?}"
+                ));
+            } else if admitted == (status == Status::Unauthorized) {
+                failures.push(format!("{identity}: {label} got {status}"));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["Request carries no IAP assertion"]
+    ));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
+}
+
+/// Walks the real route table: every route mounted outside `/ops`, read or
+/// mutation, is guarded by the shared API key and an address check. Each is
+/// `InternalAuth` except Alpaca's four calls, which are `IssuerAuth`, and the
+/// API docs, which a development build serves to anyone (production does not
+/// mount them). A route mounted with neither guard fails here.
+#[traced_test]
+#[tokio::test]
+async fn every_route_outside_ops_is_internal_an_alpaca_call_or_the_api_docs() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let answered = AnsweredRoutes::default();
+    let (rocket, routes) =
+        instrument(gated_app_rocket(&jwks).await, &answered, |route| {
+            ops_tier_segment(route.uri.path()).is_none()
+        });
+    let client = Client::tracked(rocket).await.unwrap();
+    let api_key = || vec![rocket::http::Header::new("X-API-KEY", API_KEY)];
+    // Inside the test config's internal range but outside its Alpaca range.
+    let internal = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1);
+    assert!(!routes.is_empty());
+
+    let mut issuer = Vec::new();
+    let mut unguarded = Vec::new();
+    let mut other = Vec::new();
+    for (index, route) in (1u8..).zip(&routes) {
+        // A distinct public address per route, so the failed authentication
+        // rate limit never answers in place of the guard.
+        let public =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, index)), 1);
+        let mut statuses = [0; 4];
+        for (slot, (remote, headers)) in statuses.iter_mut().zip([
+            (LOOPBACK, Vec::new()),
+            (internal, api_key()),
+            (public, api_key()),
+            (LOOPBACK, api_key()),
+        ]) {
+            let (status, answered_by) =
+                probe(&client, &answered, route, remote, headers).await;
+            if answered_by.as_ref() != Some(&route.identity) {
+                other.push(format!(
+                    "{}: from {remote} was answered by {answered_by:?}",
+                    route.identity
+                ));
+            }
+            *slot = status.code;
+        }
+
+        // 401 and 403 are the guards' refusals, 429 their rate limit.
+        let passed = |status: u16| !matches!(status, 401 | 403 | 429);
+        match statuses {
+            // `InternalAuth`: the key passes from an internal address and is
+            // refused from a public one.
+            [401, internal, 403, _] if passed(internal) => {}
+            // `IssuerAuth`: the key passes only from Alpaca's address.
+            [401, 403, 403, alpaca] if passed(alpaca) => {
+                issuer.push(format!("{} {}", route.method, route.target));
+            }
+            statuses if statuses.into_iter().all(passed) => {
+                unguarded.push(format!("{} {}", route.method, route.target));
+            }
+            statuses => other.push(format!(
+                "{}: without a key, from an internal, a public, and Alpaca's \
+                 address: {statuses:?}",
+                route.identity
+            )),
+        }
+    }
+
+    assert!(other.is_empty(), "{other:#?}");
+    issuer.sort();
+    assert_eq!(
+        issuer,
+        [
+            "GET /tokenized-assets",
+            "POST /accounts/connect",
+            "POST /inkind/issuance",
+            "POST /inkind/issuance/confirm",
+        ]
+    );
+    unguarded.sort();
+    assert_eq!(
+        unguarded,
+        ["GET /api-docs/openapi.json", "GET /swagger-ui/index.html"]
+    );
+    assert!(logs_contain_at!(Level::WARN, &["Missing X-API-KEY header"]));
+    assert!(logs_contain_at!(Level::WARN, &["IP not whitelisted"]));
+}
+
+/// Serves `rocket` on an ephemeral loopback port behind a stand in for the
+/// load balancer, which turns the client's bearer token into the IAP assertion
+/// header as IAP does.
+async fn serve_behind_iap(
+    rocket: rocket::Rocket<rocket::Build>,
+) -> (Url, tokio::task::JoinHandle<()>) {
+    let (port_sender, port) = tokio::sync::oneshot::channel();
+    let figment = rocket
+        .figment()
+        .clone()
+        .merge((rocket::Config::ADDRESS, Ipv4Addr::LOCALHOST))
+        .merge((rocket::Config::PORT, 0));
+    let rocket = rocket
+        .configure(figment)
+        .attach(AdHoc::on_request("IAP stand in", |request, _| {
+            let bearer = request
+                .headers()
+                .get_one("Authorization")
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_owned);
+            if let Some(token) = bearer {
+                request.add_header(rocket::http::Header::new(
+                    ASSERTION_HEADER,
+                    token,
+                ));
+            }
+            Box::pin(async {})
+        }))
+        .attach(AdHoc::on_liftoff("report port", move |rocket| {
+            // The server binds port 0 and records the port it got before
+            // liftoff.
+            port_sender.send(rocket.config().port).expect("test awaits port");
+            Box::pin(async {})
+        }));
+
+    let server = tokio::spawn(async move {
+        if let Err(error) = rocket.launch().await {
+            panic!("test server failed: {error}");
+        }
+    });
+    let port = port.await.expect("server lifts off");
+    let base_url =
+        Url::parse(&format!("http://127.0.0.1:{port}")).expect("valid URL");
+    (base_url, server)
+}
+
+/// Query keys of `request` that the route answering it does not declare.
+/// Rocket ignores such a key, so the handler runs with that parameter unset.
+fn undeclared_query_keys(request: &rocket::Request<'_>) -> Vec<String> {
+    let declared: BTreeSet<&str> = request
+        .route()
+        .and_then(|route| route.uri.query())
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .map(|parameter| {
+            parameter.trim_start_matches('<').trim_end_matches('>')
+        })
+        .collect();
+    request
+        .uri()
+        .query()
+        .into_iter()
+        .flat_map(|query| query.segments())
+        .filter(|(key, _)| !declared.contains(key))
+        .map(|(key, _)| key.to_owned())
+        .collect()
+}
+
+/// Drives every `st0x-issuance-client` command through the real router over
+/// HTTP. With its own tier's token each command is answered by a route under
+/// its own `/ops/<tier>/` prefix that declares every query key it sends,
+/// refused by no guard and forwarded by no path or query value, and with each
+/// other tier's token it is refused. Together the commands cover every `/ops`
+/// route exactly once, so a client path or parameter the server does not
+/// serve, or a route no command calls, fails here.
+#[traced_test]
+#[tokio::test]
+async fn every_client_command_reaches_a_route_of_its_own_tier() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let answered = AnsweredRoutes::default();
+    let (rocket, routes) =
+        instrument(gated_app_rocket(&jwks).await, &answered, |route| {
+            ops_tier_segment(route.uri.path()).is_some()
+        });
+    let undeclared = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&undeclared);
+    let rocket = rocket.attach(AdHoc::on_response(
+        "undeclared query key recorder",
+        move |request, _| {
+            recorder
+                .lock()
+                .expect("query key recorder is not poisoned")
+                .extend(undeclared_query_keys(request));
+            Box::pin(async {})
+        },
+    ));
+    let (base_url, server) = serve_behind_iap(rocket).await;
+    let client = |audience: &str| {
+        OpsClient::new(base_url.clone(), token(&key, audience))
+            .expect("client builds")
+    };
+    let cases = command_cases();
+    let mut covered = BTreeSet::new();
+
+    for case in &cases {
+        let own = tier_audience(case.tier)
+            .unwrap_or_else(|| panic!("{case:?}: unknown tier"));
+        answered.lock().expect("route recorder is not poisoned").clear();
+        undeclared.lock().expect("query key recorder is not poisoned").clear();
+
+        match dispatch_args(&client(own), &case.args).await {
+            Ok(_)
+            | Err(CommandError::Transport(
+                OpsTransportError::NotFound { .. }
+                | OpsTransportError::Unavailable { .. }
+                | OpsTransportError::OutcomeUnknown { .. }
+                | OpsTransportError::Http { .. }
+                | OpsTransportError::Decode { .. },
+            )) => {}
+            Err(error) => panic!("{case:?} did not reach its handler: {error}"),
+        }
+        let requests = std::mem::take(
+            &mut *answered.lock().expect("route recorder is not poisoned"),
+        );
+        let [Some(identity)] = requests.as_slice() else {
+            panic!(
+                "{case:?} must send one request to a route, sent {requests:?}"
+            );
+        };
+        let ignored = std::mem::take(
+            &mut *undeclared
+                .lock()
+                .expect("query key recorder is not poisoned"),
+        );
+        assert!(
+            ignored.is_empty(),
+            "{case:?} sent query keys {identity} does not declare: {ignored:?}"
+        );
+        let Some(route) =
+            routes.iter().find(|route| route.identity == *identity)
+        else {
+            panic!("{case:?} was answered by {identity}, not an /ops handler");
+        };
+        assert_eq!(
+            ops_tier_segment(&route.path),
+            Some(case.tier),
+            "{case:?} called {identity}"
+        );
+        assert!(
+            covered.insert(identity.clone()),
+            "{case:?} called {identity}, which another command calls"
+        );
+
+        for (other, audience) in TIER_AUDIENCES {
+            if audience == own {
+                continue;
+            }
+            match dispatch_args(&client(audience), &case.args).await {
+                Err(CommandError::Transport(
+                    OpsTransportError::Unauthorized { .. },
+                )) => {}
+                result => {
+                    panic!(
+                        "{case:?} must refuse a {other} token, got {result:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        covered,
+        routes.iter().map(|route| route.identity.clone()).collect(),
+        "commands must cover every /ops route"
+    );
+    server.abort();
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
 }
 
 /// A well-formed external burn body for `network`; the mint it names does not
@@ -1007,31 +1411,6 @@ async fn underlying_ops_rocket(
     )
 }
 
-/// The freeze/unfreeze (capital) and status (read) routes are gated: without an
-/// IAP assertion every one is refused inside the app.
-#[traced_test]
-#[tokio::test]
-async fn underlying_ops_routes_require_an_iap_assertion() {
-    let verifiers =
-        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
-    let client =
-        Client::tracked(underlying_ops_rocket(verifiers).await).await.unwrap();
-
-    let status = client.get("/ops/read/status/AAPL").dispatch().await;
-    assert_eq!(status.status(), Status::Unauthorized);
-
-    let freeze = client.post("/ops/capital/freeze/AAPL").dispatch().await;
-    assert_eq!(freeze.status(), Status::Unauthorized);
-
-    let unfreeze = client.post("/ops/capital/unfreeze/AAPL").dispatch().await;
-    assert_eq!(unfreeze.status(), Status::Unauthorized);
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["Request carries no IAP assertion"]
-    ));
-}
-
 /// A read token admits the status route and the handler runs: an unlisted
 /// underlying is a 404, proving the guard passed and the handler executed.
 #[traced_test]
@@ -1164,25 +1543,33 @@ async fn a_capital_freeze_is_attributed_to_the_assertion_subject() {
     });
 }
 
-/// Burn recovery that must never be reached: the IAP gate refuses every
-/// request in these tests before a handler runs, so any call here is a gate
-/// failure, not a recovery scenario.
-struct UnreachableBurnRecovery;
+/// Burn recovery over the empty redemption store. Only `force_complete_burn`
+/// is reached for an unknown redemption, since the recover route answers 404
+/// from the event store first; it refuses as `BurnManager::force_complete_burn`
+/// does for a redemption that was never initialized, and the other two methods
+/// return the same error.
+struct AbsentRedemptionBurnRecovery;
+
+fn uninitialized() -> BurnManagerError {
+    BurnManagerError::InvalidAggregateState {
+        current_state: "Uninitialized".to_string(),
+    }
+}
 
 #[async_trait]
-impl RedemptionBurnRecovery for UnreachableBurnRecovery {
+impl RedemptionBurnRecovery for AbsentRedemptionBurnRecovery {
     async fn replace_exhausted_dead_burn(
         &self,
         _: &IssuerRedemptionRequestId,
     ) -> Result<ManualBurnReplacementOutcome, BurnManagerError> {
-        unreachable!("the IAP gate refuses before the handler runs")
+        Err(uninitialized())
     }
 
     async fn execute_recovered_burn(
         &self,
         _: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        unreachable!("the IAP gate refuses before the handler runs")
+        Err(uninitialized())
     }
 
     async fn force_complete_burn(
@@ -1192,147 +1579,11 @@ impl RedemptionBurnRecovery for UnreachableBurnRecovery {
         _: String,
         _: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError> {
-        unreachable!("the IAP gate refuses before the handler runs")
+        Err(uninitialized())
     }
-}
-
-/// The full app rocket plus every piece of state the recovery, close,
-/// force-complete, and freeze-schedule handlers declare, so all of them can be
-/// mounted (Rocket refuses to ignite a route whose `State` is unmanaged). The
-/// gate refuses before any handler runs, so none of this state is exercised.
-async fn recovery_ops_rocket(
-    verifiers: OpsApiVerifiers,
-) -> rocket::Rocket<rocket::Build> {
-    let rocket = setup_test_rocket().await.expect("test rocket builds");
-    let pool = rocket.state::<Pool<Sqlite>>().expect("pool managed").clone();
-    let vaults = rocket
-        .state::<NetworkVaultServices>()
-        .expect("vault services managed")
-        .clone();
-    let freeze_scheduler = FreezeScheduler::new(
-        rocket.state::<ApalisSqlitePool>().expect("apalis pool managed"),
-        pool.clone(),
-    );
-
-    let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
-        .build(RedemptionServices::new(vaults))
-        .await
-        .expect("redemption store builds");
-    let receipt_inventory = StoreBuilder::<ReceiptInventory>::new(pool)
-        .build(())
-        .await
-        .expect("receipt inventory store builds");
-    let receipts: Arc<dyn ReceiptService> =
-        Arc::new(CqrsReceiptService::new(receipt_inventory));
-    let burn_recovery: Arc<dyn RedemptionBurnRecovery> =
-        Arc::new(UnreachableBurnRecovery);
-    let alpaca: Arc<dyn AlpacaService> = Arc::new(MockIssuerApi::new_success());
-
-    rocket
-        .manage(verifiers)
-        .manage(redemption_store)
-        .manage(receipts)
-        .manage(burn_recovery)
-        .manage(alpaca)
-        .manage(freeze_scheduler)
-        .mount(
-            "/",
-            rocket::routes![
-                crate::admin::recover_redemption_ops,
-                crate::admin::close_redemption_ops,
-                crate::admin::force_complete_redemption_ops,
-                crate::admin::close_mint_ops,
-                crate::admin::schedule_freeze_window_ops
-            ],
-        )
 }
 
 const REQUEST_ID: &str = "00000000-0000-0000-0000-000000000000";
-
-/// The recovery, close, force-complete, and freeze-schedule handlers, mounted
-/// on the full app state, are refused without an IAP assertion.
-#[traced_test]
-#[tokio::test]
-async fn recovery_ops_routes_require_an_iap_assertion() {
-    let verifiers =
-        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
-    let client =
-        Client::tracked(recovery_ops_rocket(verifiers).await).await.unwrap();
-
-    let recover = client
-        .post(format!("/ops/debug/recover/redemption/{REQUEST_ID}"))
-        .dispatch()
-        .await;
-    assert_eq!(recover.status(), Status::Unauthorized);
-
-    for path in [
-        format!("/ops/breakglass/close/redemption/{REQUEST_ID}"),
-        format!("/ops/breakglass/force-complete/redemption/{REQUEST_ID}"),
-        format!("/ops/breakglass/close/mint/{REQUEST_ID}"),
-        "/ops/capital/freeze-schedules".to_string(),
-    ] {
-        let response = client
-            .post(&path)
-            .header(rocket::http::ContentType::JSON)
-            .body("{}")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Unauthorized, "{path}");
-    }
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["Request carries no IAP assertion"]
-    ));
-}
-
-/// The done-when tier boundaries on the real handlers: a debug token cannot
-/// force-complete, close, or schedule a freeze, and a read token cannot
-/// recover. Each is refused before the handler runs.
-#[traced_test]
-#[tokio::test]
-async fn lower_tier_tokens_cannot_recover_close_force_complete_or_freeze() {
-    let key = test_key();
-    let jwks = jwks_server(&key);
-    let verifiers =
-        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
-    let client =
-        Client::tracked(recovery_ops_rocket(verifiers).await).await.unwrap();
-
-    let recover = client
-        .post(format!("/ops/debug/recover/redemption/{REQUEST_ID}"))
-        .header(rocket::http::Header::new(
-            ASSERTION_HEADER,
-            token(&key, READ_AUDIENCE),
-        ))
-        .dispatch()
-        .await;
-    assert_eq!(recover.status(), Status::Unauthorized);
-
-    for path in [
-        format!("/ops/breakglass/close/redemption/{REQUEST_ID}"),
-        format!("/ops/breakglass/force-complete/redemption/{REQUEST_ID}"),
-        format!("/ops/breakglass/close/mint/{REQUEST_ID}"),
-        "/ops/capital/freeze-schedules".to_string(),
-    ] {
-        let response = client
-            .post(&path)
-            .header(rocket::http::ContentType::JSON)
-            .header(rocket::http::Header::new(
-                ASSERTION_HEADER,
-                token(&key, DEBUG_AUDIENCE),
-            ))
-            .body("{}")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Unauthorized, "{path}");
-    }
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["IAP assertion failed validation"]
-    ));
-}
 
 /// The full app rocket plus the state the account, tokenized-asset, and
 /// network-diagnostic twins declare beyond what [`setup_test_rocket`]
@@ -1361,55 +1612,6 @@ async fn onboarding_ops_rocket(
 }
 
 const WALLET: &str = "0x0000000000000000000000000000000000000001";
-
-/// The account, tokenized-asset, and network-diagnostic twins, mounted on the
-/// full app state, are refused without an IAP assertion.
-#[traced_test]
-#[tokio::test]
-async fn onboarding_ops_routes_require_an_iap_assertion() {
-    let verifiers =
-        OpsApiVerifiers::new(&ops_config(), &reqwest::Client::new());
-    let client =
-        Client::tracked(onboarding_ops_rocket(verifiers).await).await.unwrap();
-
-    for path in ["/ops/debug/accounts", "/ops/debug/tokenized-assets"] {
-        let response = client
-            .post(path)
-            .header(rocket::http::ContentType::JSON)
-            .body("{}")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Unauthorized, "{path}");
-    }
-
-    let whitelist = client
-        .post(format!("/ops/debug/accounts/{REQUEST_ID}/wallets"))
-        .header(rocket::http::ContentType::JSON)
-        .body("{}")
-        .dispatch()
-        .await;
-    assert_eq!(whitelist.status(), Status::Unauthorized);
-
-    let unwhitelist = client
-        .delete(format!("/ops/debug/accounts/{REQUEST_ID}/wallets/{WALLET}"))
-        .dispatch()
-        .await;
-    assert_eq!(unwhitelist.status(), Status::Unauthorized);
-
-    for path in [
-        "/ops/debug/tokenized-assets/AAPL?network=base",
-        "/ops/read/network-telemetry",
-        "/ops/read/wrapped-transfers",
-    ] {
-        let response = client.get(path).dispatch().await;
-        assert_eq!(response.status(), Status::Unauthorized, "{path}");
-    }
-
-    assert!(logs_contain_at!(
-        Level::WARN,
-        &["Request carries no IAP assertion"]
-    ));
-}
 
 /// A read token is refused on every debug-tier onboarding route (account
 /// registration, wallet whitelisting, asset listing all change what the bot

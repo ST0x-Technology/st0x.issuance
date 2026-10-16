@@ -85,7 +85,7 @@ const SIGN_IN_AGAIN: &str = "Re-running alone reuses the cached S01 sign-in. \
      and re-run; in CI, mint a fresh ID token for this environment.";
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TransportError {
+pub enum TransportError {
     #[error(
         "the request to the S01 ops API at {url} was not sent: {}",
         error_chain(.source)
@@ -222,17 +222,20 @@ pub(crate) fn server_said(body: &str) -> String {
 }
 
 /// Sends routes to one environment's ops API with one ID token.
-pub(crate) struct Client {
+pub struct Client {
     http: reqwest::Client,
     base_url: Url,
     token: String,
 }
 
 impl Client {
-    pub(crate) fn new(
-        base_url: Url,
-        token: String,
-    ) -> Result<Self, reqwest::Error> {
+    /// Builds a client that sends every route to `base_url` with `token` as
+    /// its bearer ID token.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reqwest gives when its HTTP client cannot be built.
+    pub fn new(base_url: Url, token: String) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .redirect(Policy::none())
             .timeout(REQUEST_TIMEOUT)

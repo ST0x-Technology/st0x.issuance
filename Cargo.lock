@@ -6780,6 +6780,7 @@ dependencies = [
  "st0x-finance",
  "st0x-issuance-client",
  "st0x-issuance-dto",
+ "st0x-issuance-ops",
  "st0x-rpc",
  "subtle",
  "tempfile",

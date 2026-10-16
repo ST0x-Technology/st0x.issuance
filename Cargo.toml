@@ -116,6 +116,7 @@ st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "e
   "corporate-actions",
 ] }
 st0x-issuance-client = { path = "crates/client" }
+st0x-issuance-ops = { path = "crates/ops-client", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "test-util"] }
 tower = { version = "0.5", default-features = false }
