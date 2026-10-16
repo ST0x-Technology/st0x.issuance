@@ -142,10 +142,10 @@ jobs:
     if: needs.preflight.outputs.release == 'true'
     # Same group as preflight and release-tag.yml: a config-only run must
     # not capture the live digest before a tag deployment and write it back
-    # stale. queue: max keeps every queued run (the default keeps one and
-    # cancels it when another arrives); a queued run still fails at the PAM
-    # step while the previous release's grant is ACTIVE, so revoke it in the
-    # console and re-run.
+    # stale. queue: max keeps up to 100 queued runs and GitHub cancels the
+    # rest (the default keeps one and cancels it when another arrives). A
+    # queued run rolls inside an approved deploy window, or asks for its own
+    # approval after closing any grant the previous release left open.
     concurrency:
       group: production-release
       cancel-in-progress: false
@@ -153,7 +153,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@54f9987aa80b22fd443124219bfa9ed13b84188a  # app-release @ .github #7; #9 on main reuses any open PAM grant
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7 # app-release @ .github main
     with:
       environment: production
       runtime: bot-vm

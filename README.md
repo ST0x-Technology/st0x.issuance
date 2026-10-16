@@ -472,12 +472,12 @@ This repo deploys itself:
   config. `production-release.yml`'s dispatch with a version is a rollback. All
   of these wait for the `PRODUCTION_RELEASES_ENABLED` repository variable.
 - Tags on commits older than this release path run the old `release-tag.yml` and
-  only label; deploy them with the rollback dispatch. Every production release
-  leaves its PAM grant ACTIVE for up to an hour: the releaser has no right to
-  revoke it, so the revoke step only warns. The next release inside that hour (a
-  queued run included) fails at "Await PAM approval" until someone revokes the
-  grant in the GCP console; that is the normal case, not an error, until devops
-  grants the releaser `grants.revoke` on `app-deploy`. After a PAM timeout,
+  only label; deploy them with the rollback dispatch. A production release
+  revokes its PAM grant once the roll succeeds (the releaser holds
+  `grants.revoke` on `app-deploy` since 2026-10-13); a grant belongs to the run
+  that asked for it, so the next release that asks for its own approval closes
+  any grant a failed or timed-out run left open first (a release inside an
+  approved deploy window asks nobody and leaves it). After a PAM timeout,
   start a fresh run rather than re-running the failed job: a re-run skips the
   preflight that checks the config is still current. Setting
   `PRODUCTION_RELEASES_ENABLED` also retires the droplet path:
