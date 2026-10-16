@@ -5619,17 +5619,21 @@ broadcasts it out of band the same way.
   (`ResyncNonceManager`) only moves forward: the next burn or mint signs the
   following nonce and cannot mine behind the gap. The redemption stays
   `BurnSubmitted`: a missing receipt fails nothing, and no operator route sends
-  `MarkFailed`. So neither resend above reaches it. Each periodic pass spends
-  one budget attempt on it and does not send it again (five attempts, one pass
-  every five minutes). `/admin/recover` resumes only a `Failed` redemption, so
-  it does not send the burn either, and after the budget runs out it refuses the
-  burn as above. The operator broadcasts the burn's signed bytes from the
-  redemption's event stream out of band, or restarts the service: the next
-  signer then takes the dropped nonce. An unchanged broadcast closes the gap
-  only when a node takes the bytes. It cannot raise the fee, so a burn dropped
-  for its fee can be refused or dropped again. A service resend of another
-  failed burn after the restart does not move the counter, so the next signer
-  still takes the lowest missing nonce.
+  `MarkFailed`. Each periodic recovery pass classifying it as `StillMineable`
+  reserves one budget attempt, broadcasts the exact persisted signed bytes again
+  under the network wallet lock, and queues a submit job to hand off to
+  confirmation (five attempts, one pass every five minutes). Ordinary submit-job
+  reruns remain idempotent and do not resend a `BurnSubmitted` transaction. A
+  failed resend logs at WARN and still queues confirmation; the next recovery
+  pass tries again while budget remains. No fresh transaction is signed.
+  `/admin/recover` resumes only a `Failed` redemption, so it does not send the
+  burn either, and after the budget runs out it refuses the burn as above. The
+  operator broadcasts the burn's signed bytes from the redemption's event stream
+  out of band, or restarts the service: the next signer then takes the dropped
+  nonce. An unchanged broadcast closes the gap only when a node takes the bytes.
+  It cannot raise the fee, so a burn dropped for its fee can be refused or
+  dropped again. A service resend of another failed burn after the restart does
+  not move the counter, so the next signer still takes the lowest missing nonce.
 - **Intended, never broadcast.** The redemption keeps its signer intent
   (`BurnIntended`, `BurningFailed` and `RedemptionFailed` do not release it), so
   no other burn or mint signs on that network. After the rebroadcast, the next

@@ -2498,6 +2498,14 @@ impl BurnManager {
 
         match status {
             BurnTxStatus::StillMineable => {
+                if has_submitted {
+                    Self::rebroadcast_submitted_burn(
+                        issuer_request_id,
+                        vault_service.as_ref(),
+                        sendable_tx,
+                    )
+                    .await;
+                }
                 let params = self.recovery_burn_params(
                     metadata.burn_mode,
                     vault,
@@ -2546,6 +2554,28 @@ impl BurnManager {
             "Automatic burn recovery action accepted"
         );
         Ok(RecoveryOutcome::EnqueuedBurnJob)
+    }
+
+    async fn rebroadcast_submitted_burn(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault_service: &dyn VaultService,
+        sendable_tx: &SendableTxWithHash,
+    ) {
+        match vault_service.rebroadcast_burn(sendable_tx).await {
+            Ok(()) => debug!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                "Rebroadcast submitted burn"
+            ),
+            Err(error) => warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                error = %error,
+                "Failed to rebroadcast submitted burn; recovery retries while budget remains"
+            ),
+        }
     }
 
     /// Broadcasts the replacement transaction `ReplaceDeadBurn` just
@@ -13949,6 +13979,172 @@ mod tests {
         );
 
         (harness, manager, issuer_request_id)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn submitted_burn_recovery_rebroadcasts_with_a_bounded_budget() {
+        for resend_fails in [false, true] {
+            let signed_burn = cafe_burn();
+            let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+            let owner = signed_burn.signer_for_test();
+            let mock = MockVaultService::new_success()
+                .with_prepared_tx(signed_burn.clone())
+                .with_burn_tx_status(BurnTxStatus::StillMineable);
+            let vault_mock = Arc::new(if resend_fails {
+                mock.with_rebroadcast_burn_failure()
+            } else {
+                mock
+            });
+            let harness =
+                TestHarness::with_vault_mock(vault_mock.clone()).await;
+            harness
+                .add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault)
+                .await;
+            let manager = Arc::new(BurnManager::new_for_tests(
+                vault_mock.clone(),
+                harness.pool.clone(),
+                harness.store.clone(),
+                harness.receipt_service.clone(),
+                owner,
+                ANVIL_CHAIN_ID,
+                harness.apalis_pool.clone(),
+            ));
+            let issuer_request_id = IssuerRedemptionRequestId::random();
+            seed_burn_intended(
+                &harness,
+                &vault_mock,
+                vault,
+                &issuer_request_id,
+                owner,
+            )
+            .await;
+            let execution =
+                intended_execution(&harness.store, &issuer_request_id, vault)
+                    .await;
+            manager
+                .submit_intended_burn(&issuer_request_id, &execution)
+                .await
+                .unwrap();
+            let preparations = vault_mock.burn_preparation_call_count();
+
+            for attempt in 1..=MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS {
+                let locks_before = vault_mock.get_wallet_lock_call_count();
+                assert!(matches!(
+                    manager
+                        .recover_single_burning(&issuer_request_id)
+                        .await
+                        .unwrap(),
+                    RecoveryOutcome::EnqueuedBurnJob
+                ));
+                assert_eq!(
+                    vault_mock.get_wallet_lock_call_count(),
+                    locks_before + 1
+                );
+                assert_eq!(
+                    vault_mock.rebroadcast_burn_txs(),
+                    vec![signed_burn.clone(); attempt as usize]
+                );
+                assert_eq!(
+                    manager
+                        .burn_recovery_budget(&issuer_request_id)
+                        .await
+                        .unwrap()
+                        .attempts,
+                    attempt
+                );
+                assert_eq!(
+                    submit_burn_job_count(&harness).await,
+                    1,
+                    "recovery must queue the transaction-bound submit job"
+                );
+                SubmitBurnJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: signed_burn.hash,
+                    execution: execution.clone(),
+                }
+                .perform(&SubmitBurnContext { burn_manager: manager.clone() })
+                .await
+                .unwrap();
+                assert_eq!(
+                    vault_mock.rebroadcast_burn_txs().len(),
+                    attempt as usize,
+                    "ordinary submit reruns must not resend"
+                );
+                let confirms: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM Jobs WHERE job_type = ?",
+                )
+                .bind(job_type::<ConfirmBurnJob>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    confirms, 1,
+                    "the submit job must queue confirmation even after resend failure"
+                );
+                assert!(
+                    matches!(load_aggregate(&harness.store, &issuer_request_id).await,
+                    Redemption::BurnSubmitted { sendable_tx, .. } if sendable_tx == signed_burn)
+                );
+            }
+            for _pass in 0..2 {
+                assert!(matches!(
+                    manager
+                        .recover_single_burning(&issuer_request_id)
+                        .await
+                        .unwrap(),
+                    RecoveryOutcome::SkippedManualIntervention
+                ));
+            }
+            assert_eq!(
+                vault_mock.rebroadcast_burn_txs().len(),
+                MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS as usize
+            );
+            assert_eq!(
+                vault_mock.burn_preparation_call_count(),
+                preparations,
+                "recovery must never sign a fresh burn"
+            );
+            assert_eq!(vault_mock.replacement_preparation_call_count(), 0);
+            assert_eq!(
+                vault_mock.submitted_burn_txs(),
+                vec![signed_burn.clone()]
+            );
+            assert_eq!(
+                count_redemption_events(
+                    &harness.pool,
+                    &issuer_request_id,
+                    "RedemptionEvent::BurnRecoveryExhausted"
+                )
+                .await,
+                1
+            );
+            let expected_log = if resend_fails {
+                "Failed to rebroadcast submitted burn; recovery retries while budget remains"
+            } else {
+                "Rebroadcast submitted burn"
+            };
+            let level = if resend_fails {
+                tracing::Level::WARN
+            } else {
+                tracing::Level::DEBUG
+            };
+            assert!(logs_contain_at!(
+                level,
+                &[
+                    expected_log,
+                    &issuer_request_id.to_string(),
+                    &signed_burn.hash.to_string()
+                ]
+            ));
+            assert!(logs_contain_at!(
+                tracing::Level::ERROR,
+                &[
+                    "Automatic burn recovery exhausted",
+                    &issuer_request_id.to_string()
+                ]
+            ));
+        }
     }
 
     fn cafe_burn() -> SendableTxWithHash {
