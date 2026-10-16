@@ -7,6 +7,7 @@
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use rocket::http::Status;
+use rocket::http::uri::Origin;
 use rocket::request::FromParam;
 use rocket::serde::json::Json;
 use rocket::{State, get, post};
@@ -89,7 +90,10 @@ pub(crate) async fn orchestrator_preflight_ops(
 
 /// Debug-tier proof that the Turnkey policy signs every orchestrator shape.
 /// Signs (never broadcasts) one transaction per required shape; a policy
-/// denial surfaces here rather than during the first live mint.
+/// denial surfaces here rather than during the first live mint. The optional
+/// `?mint_to=` names the mint shape's recipient; without it the shape names
+/// the bot's own wallet. The route declares no query and reads `mint_to` from
+/// the request URI, so its audited route template does not change with it.
 #[post("/ops/debug/orchestrator-verify-signing/<network>/<underlying>")]
 #[tracing::instrument(
     target = "auth",
@@ -103,11 +107,21 @@ pub(crate) async fn orchestrator_verify_signing_ops(
     config: &State<Config>,
     network: &str,
     underlying: UnderlyingParam,
+    uri: &Origin<'_>,
 ) -> Result<Json<VerifySigningResponse>, Status> {
     let network = parse_network(network)?;
+    let mint_to_values: Vec<&str> = uri
+        .query()
+        .into_iter()
+        .flat_map(|query| query.segments())
+        .filter(|(key, _)| *key == "mint_to")
+        .map(|(_, value)| value)
+        .collect();
+    let mint_to = parse_mint_to(&mint_to_values)?;
     let UnderlyingParam(symbol) = underlying;
     let OrchestratorContext { orchestrator, bot, rpc, chain_id, turnkey } =
         resolve_orchestrator_context(config.inner(), network)?;
+    let mint_to = mint_to.unwrap_or(bot);
 
     let vault = find_vault(pool.inner(), &symbol, &network)
         .await
@@ -138,21 +152,23 @@ pub(crate) async fn orchestrator_verify_signing_ops(
         orchestrator,
         vault,
         bot,
+        mint_to,
     )
     .await
     .map_err(|error| {
-        error!(target: "asset", %orchestrator, %error,
+        error!(target: "asset", %orchestrator, %mint_to, %error,
             "Orchestrator signing proof failed"
         );
         map_onboarding_error(&error)
     })?;
 
-    info!(target: "asset", %orchestrator, shapes = proofs.len(),
+    info!(target: "asset", %orchestrator, %mint_to, shapes = proofs.len(),
         "Orchestrator signing verified"
     );
     Ok(Json(VerifySigningResponse {
         orchestrator: orchestrator.to_string(),
         bot: bot.to_string(),
+        mint_to: mint_to.to_string(),
         shapes: proofs
             .iter()
             .map(|proof| SigningShapeResponse {
@@ -463,6 +479,7 @@ pub(crate) struct SigningShapeResponse {
 pub(crate) struct VerifySigningResponse {
     orchestrator: String,
     bot: String,
+    mint_to: String,
     shapes: Vec<SigningShapeResponse>,
 }
 
@@ -530,6 +547,27 @@ fn parse_network(network: &str) -> Result<Network, Status> {
     })
 }
 
+/// The `?mint_to=` value is an operator-supplied address; a malformed value,
+/// or more than one value, is a 422, never a silent fallback to the bot's own
+/// wallet.
+fn parse_mint_to(mint_to: &[&str]) -> Result<Option<Address>, Status> {
+    match mint_to {
+        [] => Ok(None),
+        [value] => Address::from_str(value).map(Some).map_err(|error| {
+            warn!(target: "asset", mint_to = *value, %error,
+                "Invalid mint_to address"
+            );
+            Status::UnprocessableEntity
+        }),
+        values => {
+            warn!(target: "asset", count = values.len(), ?values,
+                "Repeated mint_to address"
+            );
+            Err(Status::UnprocessableEntity)
+        }
+    }
+}
+
 /// The `?asset=` filter values are operator-supplied symbols like the path
 /// segment, so they take the same normalisation; a malformed one is a 422.
 fn parse_assets(assets: &[String]) -> Result<Vec<UnderlyingSymbol>, Status> {
@@ -589,7 +627,7 @@ mod tests {
 
     use super::{
         approve_reply, approve_under_wallet_lock, log_approval_failure,
-        map_onboarding_error,
+        map_onboarding_error, parse_mint_to,
     };
     use crate::account::ClientId;
     use crate::mint::{IssuerMintRequestId, MintEvent, TokenizationRequestId};
@@ -865,6 +903,47 @@ mod tests {
         assert_eq!(status, Status::Ok);
         assert_eq!(body.outcome, "already_unlimited");
         assert_eq!(body.tx_hash, None);
+    }
+
+    #[traced_test]
+    #[test]
+    fn mint_to_parses_one_address_and_refuses_a_malformed_or_repeated_one() {
+        let recipient = "0xa9c16673f65ae808688cb18952afe3d9658c808f";
+
+        assert_eq!(parse_mint_to(&[]).unwrap(), None);
+        assert_eq!(
+            parse_mint_to(&[recipient]).unwrap(),
+            Some(address!("0xa9c16673f65ae808688cb18952afe3d9658c808f"))
+        );
+
+        assert_eq!(
+            parse_mint_to(&["not-an-address"]).unwrap_err(),
+            Status::UnprocessableEntity,
+            "a malformed recipient must refuse, never fall back to the bot"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Invalid mint_to address", "not-an-address"]
+        ));
+
+        parse_mint_to(&["bad\nforged"]).unwrap_err();
+        assert!(
+            logs_contain_at!(
+                Level::WARN,
+                &["Invalid mint_to address", "bad\\nforged"]
+            ),
+            "the operator's value must be logged escaped, not as a new line"
+        );
+
+        assert_eq!(
+            parse_mint_to(&[recipient, recipient]).unwrap_err(),
+            Status::UnprocessableEntity,
+            "a repeated recipient must refuse, never fall back to the bot"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Repeated mint_to address", "count=2"]
+        ));
     }
 
     /// A broadcast the node refused is definitive, nothing is pending, so it

@@ -374,6 +374,12 @@ struct VerifyOrchestratorSigningArgs {
     #[arg(long)]
     chain_id: u64,
 
+    /// Recipient `to` of the `orchestrator.mint` shape. Defaults to the
+    /// bot's own wallet. A signing policy that pins the mint recipient
+    /// refuses any other address, so pass the pinned recipient then.
+    #[arg(long)]
+    mint_to: Option<Address>,
+
     #[clap(flatten)]
     signer: SignerEnv,
 
@@ -966,12 +972,14 @@ async fn run_verify_orchestrator_signing(
     let resolved = resolve_turnkey_signer(&turnkey_config, chain_id).await?;
     let provider = ProviderBuilder::new().connect_client(client);
 
+    let mint_to = args.mint_to.unwrap_or(bot);
     let proofs = prove_signing_shapes(
         &provider,
         &resolved.wallet,
         orchestrator,
         vault,
         bot,
+        mint_to,
     )
     .await?;
 
@@ -982,7 +990,8 @@ async fn run_verify_orchestrator_signing(
         );
     }
     println!(
-        "Turnkey policy allows all {} orchestrator shapes for {} from {bot}.",
+        "Turnkey policy allows all {} orchestrator shapes for {} from {bot} \
+         (mint shape recipient {mint_to}).",
         proofs.len(),
         args.underlying
     );
@@ -3535,6 +3544,25 @@ mod tests {
         assert_eq!(args.underlying, UnderlyingSymbol::new("RKLB").unwrap());
         assert_eq!(args.network, Network::Base);
         assert_eq!(args.config, PathBuf::from("issuance-config.toml"));
+        assert_eq!(
+            args.mint_to, None,
+            "without --mint-to the bot is the default"
+        );
+    }
+
+    #[test]
+    fn verify_orchestrator_signing_parses_the_mint_recipient() {
+        let mut flags = TURNKEY_FLAGS.to_vec();
+        flags.extend_from_slice(&[
+            "--mint-to",
+            "0xa9c16673f65ae808688cb18952afe3d9658c808f",
+        ]);
+        let args = verify_signing_args("issuance-config.toml", &flags);
+
+        assert_eq!(
+            args.mint_to,
+            Some(address!("0xa9c16673f65ae808688cb18952afe3d9658c808f"))
+        );
     }
 
     /// Signing with a local key would trivially succeed and prove nothing

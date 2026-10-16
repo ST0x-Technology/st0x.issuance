@@ -347,6 +347,63 @@ async fn a_read_tier_assertion_cannot_reach_the_debug_tier() {
     assert_eq!(response.status(), Status::Unauthorized);
 }
 
+/// A debug-tier assertion reaches the signing-proof handler, which refuses a
+/// malformed or repeated `?mint_to=` with a 422 before it resolves the
+/// orchestrator: the proof never falls back to the bot's own wallet. The audit
+/// event names the route without a query, as before `mint_to` existed.
+#[traced_test]
+#[tokio::test]
+async fn verify_signing_refuses_a_malformed_or_repeated_mint_to() {
+    let key = test_key();
+    let jwks = jwks_server(&key);
+    let verifiers =
+        OpsApiVerifiers::with_jwks_url(&ops_config(), &jwks.url("/keys"));
+    let rocket = setup_test_rocket()
+        .await
+        .expect("test rocket builds")
+        .attach(OperationsAuditFairing)
+        .manage(verifiers)
+        .mount(
+            "/",
+            rocket::routes![
+                crate::tokenized_asset::orchestrator_ops::orchestrator_verify_signing_ops
+            ],
+        );
+    let client = Client::tracked(rocket).await.unwrap();
+
+    let recipient = "0xa9c16673f65ae808688cb18952afe3d9658c808f";
+    for query in [
+        "mint_to=not-an-address".to_owned(),
+        format!("mint_to={recipient}&mint_to={recipient}"),
+    ] {
+        let response = client
+            .post(format!(
+                "/ops/debug/orchestrator-verify-signing/base/AAPL?{query}"
+            ))
+            .header(rocket::http::Header::new(
+                ASSERTION_HEADER,
+                token(&key, DEBUG_AUDIENCE),
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::UnprocessableEntity, "{query}");
+    }
+
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+    assert!(logs_contain("Invalid mint_to address"));
+    assert!(logs_contain("Repeated mint_to address"));
+    assert!(
+        !logs_contain("No orchestrator address configured"),
+        "the handler must refuse before it resolves the orchestrator"
+    );
+    assert!(
+        logs_contain(
+            "route=\"/ops/debug/orchestrator-verify-signing/<network>/<underlying>\""
+        ),
+        "the audited route must not carry a query"
+    );
+}
+
 /// One representative route per tier, which a deployment without ops API
 /// audiences must not serve. Each request matches its route's method and
 /// format, so a 404 means the tier is absent, not that the request missed.
