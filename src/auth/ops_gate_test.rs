@@ -607,6 +607,8 @@ fn sample_parameter(name: &str) -> &str {
         "wallet" => WALLET,
         "aggregate_type" => "Mint",
         "limit" | "before_block" | "before_log_index" => "1",
+        // The swagger UI's catch all tail.
+        "_.." => "index.html",
         other => panic!("no sample value for route parameter {other}"),
     }
 }
@@ -793,6 +795,7 @@ const LOOPBACK: SocketAddr =
 /// assertion passes the tier guard (only a guard answers 401), while a missing
 /// assertion, an expired one, and each other tier's are refused with 401. A
 /// handler taking another tier's guard than its prefix names fails here.
+#[traced_test]
 #[tokio::test]
 async fn every_ops_route_admits_only_its_own_tier() {
     let key = test_key();
@@ -856,33 +859,42 @@ async fn every_ops_route_admits_only_its_own_tier() {
     }
 
     assert!(failures.is_empty(), "{failures:#?}");
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["Request carries no IAP assertion"]
+    ));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
 }
 
-/// Walks the real route table: every mutation mounted outside `/ops` is
-/// guarded by the shared API key and an address check. Each is `InternalAuth`
-/// except Alpaca's three calls, which are `IssuerAuth`. A mutation mounted
-/// with neither guard fails here.
+/// Walks the real route table: every route mounted outside `/ops`, read or
+/// mutation, is guarded by the shared API key and an address check. Each is
+/// `InternalAuth` except Alpaca's four calls, which are `IssuerAuth`, and the
+/// API docs, which a development build serves to anyone (production does not
+/// mount them). A route mounted with neither guard fails here.
+#[traced_test]
 #[tokio::test]
-async fn every_mutation_outside_ops_is_internal_or_an_alpaca_call() {
+async fn every_route_outside_ops_is_internal_an_alpaca_call_or_the_api_docs() {
     let key = test_key();
     let jwks = jwks_server(&key);
     let answered = AnsweredRoutes::default();
-    let (rocket, mutations) =
+    let (rocket, routes) =
         instrument(gated_app_rocket(&jwks).await, &answered, |route| {
-            matches!(
-                route.method,
-                Method::Post | Method::Put | Method::Patch | Method::Delete
-            ) && ops_tier_segment(route.uri.path()).is_none()
+            ops_tier_segment(route.uri.path()).is_none()
         });
     let client = Client::tracked(rocket).await.unwrap();
     let api_key = || vec![rocket::http::Header::new("X-API-KEY", API_KEY)];
     // Inside the test config's internal range but outside its Alpaca range.
     let internal = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1);
-    assert!(!mutations.is_empty());
+    assert!(!routes.is_empty());
 
     let mut issuer = Vec::new();
+    let mut unguarded = Vec::new();
     let mut other = Vec::new();
-    for (index, route) in (1u8..).zip(&mutations) {
+    for (index, route) in (1u8..).zip(&routes) {
         // A distinct public address per route, so the failed authentication
         // rate limit never answers in place of the guard.
         let public =
@@ -915,6 +927,9 @@ async fn every_mutation_outside_ops_is_internal_or_an_alpaca_call() {
             [401, 403, 403, alpaca] if passed(alpaca) => {
                 issuer.push(format!("{} {}", route.method, route.target));
             }
+            statuses if statuses.into_iter().all(passed) => {
+                unguarded.push(format!("{} {}", route.method, route.target));
+            }
             statuses => other.push(format!(
                 "{}: without a key, from an internal, a public, and Alpaca's \
                  address: {statuses:?}",
@@ -928,11 +943,19 @@ async fn every_mutation_outside_ops_is_internal_or_an_alpaca_call() {
     assert_eq!(
         issuer,
         [
+            "GET /tokenized-assets",
             "POST /accounts/connect",
             "POST /inkind/issuance",
             "POST /inkind/issuance/confirm",
         ]
     );
+    unguarded.sort();
+    assert_eq!(
+        unguarded,
+        ["GET /api-docs/openapi.json", "GET /swagger-ui/index.html"]
+    );
+    assert!(logs_contain_at!(Level::WARN, &["Missing X-API-KEY header"]));
+    assert!(logs_contain_at!(Level::WARN, &["IP not whitelisted"]));
 }
 
 /// Serves `rocket` on an ephemeral loopback port behind a stand in for the
@@ -1010,6 +1033,7 @@ fn undeclared_query_keys(request: &rocket::Request<'_>) -> Vec<String> {
 /// other tier's token it is refused. Together the commands cover every `/ops`
 /// route exactly once, so a client path or parameter the server does not
 /// serve, or a route no command calls, fails here.
+#[traced_test]
 #[tokio::test]
 async fn every_client_command_reaches_a_route_of_its_own_tier() {
     let key = test_key();
@@ -1111,6 +1135,11 @@ async fn every_client_command_reaches_a_route_of_its_own_tier() {
         "commands must cover every /ops route"
     );
     server.abort();
+    assert!(logs_contain_at!(Level::INFO, &["IAP assertion accepted"]));
+    assert!(logs_contain_at!(
+        Level::WARN,
+        &["IAP assertion failed validation"]
+    ));
 }
 
 /// A well-formed external burn body for `network`; the mint it names does not
