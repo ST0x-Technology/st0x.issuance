@@ -1895,6 +1895,7 @@ const DOMAIN_TARGETS: &[&str] = &[
     "vault",
     "notifications",
     "operational_alert",
+    "store",
 ];
 
 /// Builds a default `EnvFilter` string that includes both the crate module
@@ -2118,6 +2119,16 @@ mod tests {
             assert!(
                 tracing::enabled!(target: "operational_alert", Level::ERROR)
             );
+        });
+    }
+
+    #[test]
+    fn default_filter_includes_the_store_lock() {
+        let filter =
+            tracing_subscriber::EnvFilter::new(default_log_filter(Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "store", Level::WARN));
         });
     }
 

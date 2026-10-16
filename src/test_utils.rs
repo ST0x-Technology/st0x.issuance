@@ -1132,6 +1132,9 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
     if module.contains("::burn_excess") {
         return "burn_excess";
     }
+    if module.contains("::store_lock") {
+        return "store";
+    }
 
     if module.contains("::mint") {
         "mint"

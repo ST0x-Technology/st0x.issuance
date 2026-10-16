@@ -41,6 +41,7 @@ use crate::redemption::force_complete::{
     VerifiedCompletion, ensure_burn_unclaimed, landed_burn_evidence,
     terminalize_and_settle, verify_landed_burn,
 };
+use crate::store_lock;
 use crate::underlying::{
     AssetStatus, Underlying, UnderlyingCommand, UnderlyingViewError,
     load_freeze_status, with_freeze_admission,
@@ -147,9 +148,10 @@ enum IssuerCommand {
     /// never typed — the cutover path) or --to <ADDRESS> (the
     /// wallet-rotation path); either way it only becomes reachable through
     /// the kind-aware corroboration witness (EOA: on-chain history;
-    /// contract: proven ERC-1155 receiver support). Requires the deployment
-    /// hold armed and the service stopped (docs/runbooks/deploy-hold.md),
-    /// and the bot wallet funded for the transfer gas.
+    /// contract: proven ERC-1155 receiver support). Requires the service
+    /// stopped (the command holds the store lock until it returns, so it
+    /// refuses while the service runs) and the bot wallet funded for the
+    /// transfer gas.
     MoveReceipts(Box<MoveReceiptsArgs>),
     /// Verifies on-chain that the Turnkey bot wallet holds exactly every
     /// tracked receipt balance for the asset's vault, then records it as
@@ -161,9 +163,9 @@ enum IssuerCommand {
     /// records no custody, so its rollback does not need this command. The
     /// holder is always the Turnkey wallet — never typed — and cannot be
     /// recorded wrongly: a wallet that does not hold every tracked balance
-    /// is refused with the first mismatch. Requires the deployment hold
-    /// armed and the service stopped (docs/runbooks/deploy-hold.md); signs
-    /// nothing and submits nothing on-chain.
+    /// is refused with the first mismatch. Requires the service stopped (the
+    /// command holds the store lock until it returns, so it refuses while
+    /// the service runs); signs nothing and submits nothing on-chain.
     ConfirmCustody(Box<ConfirmCustodyArgs>),
 }
 
@@ -567,20 +569,10 @@ impl IssuerCli {
                 run_verify_orchestrator_signing(*args).await
             }
             IssuerCommand::MoveReceipts(args) => {
-                run_move_receipts(
-                    *args,
-                    Path::new(DEPLOY_RUNTIME_DIR),
-                    prompt_confirm,
-                )
-                .await
+                run_move_receipts(*args, prompt_confirm).await
             }
             IssuerCommand::ConfirmCustody(args) => {
-                run_confirm_custody(
-                    *args,
-                    Path::new(DEPLOY_RUNTIME_DIR),
-                    prompt_confirm,
-                )
-                .await
+                run_confirm_custody(*args, prompt_confirm).await
             }
         }
     }
@@ -998,13 +990,6 @@ async fn run_verify_orchestrator_signing(
     Ok(())
 }
 
-/// The runtime directory of the deploy-hold protocol
-/// (docs/runbooks/deploy-hold.md); [`run_move_receipts`] verifies the hold
-/// there before an irreversible custody move.
-const DEPLOY_RUNTIME_DIR: &str = "/run/st0x";
-const DEPLOY_HOLD_FILE: &str = "st0x-issuance.hold";
-const DEPLOY_READY_FILE: &str = "st0x-issuance.ready";
-
 /// Gas ceiling for one receipt-batch transfer, used only to fail the move
 /// actionably BEFORE corroboration and prompting when the bot wallet cannot
 /// pay for it. Deliberately a generous upper bound for the engine's
@@ -1015,13 +1000,12 @@ const MOVE_RECEIPTS_GAS_CEILING: u64 = 3_000_000;
 /// Moves one vault's tracked receipts to a corroborated destination through
 /// the Turnkey signer. Everything outside the engine happens here, in order:
 /// destination resolution (config-read or stated, never a typed orchestrator
-/// address), the Turnkey-only signer requirement, the deploy-hold check, gas
+/// address), the Turnkey-only signer requirement, the store lock, gas
 /// readiness, kind-aware destination corroboration, and the confirmation
 /// prompt stating what was proven. The engine then re-verifies identity,
 /// custody, quiescence, and balances before anything is submitted.
 async fn run_move_receipts(
     args: MoveReceiptsArgs,
-    runtime_dir: &Path,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     if args.chain_id != args.network.chain_id() {
@@ -1044,7 +1028,9 @@ async fn run_move_receipts(
     };
     let bot = turnkey_config.settings.address;
 
-    verify_deploy_hold(runtime_dir)?;
+    // Held until the command returns, so the service cannot run or start while
+    // the engine rebuilds projections and reads quiescence from the store.
+    let _store_lock = store_lock::acquire(&args.database_url)?;
 
     println!("Using database: {}", args.database_url);
     let admin =
@@ -1207,46 +1193,15 @@ fn refuse_empty_inventory(
     }
 }
 
-/// Verifies the deploy hold is armed: hold file present, readiness marker
-/// absent. The engine rebuilds projections and reads quiescence from the
-/// same store the service writes, so a running service — or a deploy that
-/// could restart one mid-move — must be excluded before an irreversible
-/// custody move. The file checks are the machine-checkable half of the
-/// protocol; stopping the unit is the runbook's job.
-fn verify_deploy_hold(runtime_dir: &Path) -> anyhow::Result<()> {
-    let hold = runtime_dir.join(DEPLOY_HOLD_FILE);
-    if !hold.exists() {
-        anyhow::bail!(
-            "deployment hold is not armed: {} does not exist; arm the hold \
-             and stop the service (docs/runbooks/deploy-hold.md) before \
-             moving receipts",
-            hold.display()
-        );
-    }
-
-    let ready = runtime_dir.join(DEPLOY_READY_FILE);
-    if ready.exists() {
-        anyhow::bail!(
-            "readiness marker {} still exists, so a deploy could restart the \
-             service mid-move; remove it when arming the hold \
-             (docs/runbooks/deploy-hold.md)",
-            ready.display()
-        );
-    }
-
-    Ok(())
-}
-
 /// Re-records the Turnkey bot wallet as a vault's custody holder after its
 /// receipts returned there (the `move-receipts` rollback path). Purely
 /// verify-and-record: the engine refuses unless the wallet holds exactly
 /// every tracked balance on-chain, and requires the same quiescence as a
 /// migration, so the checks here are only the ones outside the engine — the
-/// Turnkey-only holder source and the deploy hold. Nothing is signed, so no
+/// Turnkey-only holder source and the store lock. Nothing is signed, so no
 /// signing provider is built.
 async fn run_confirm_custody(
     args: ConfirmCustodyArgs,
-    runtime_dir: &Path,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     if args.chain_id != args.network.chain_id() {
@@ -1267,7 +1222,9 @@ async fn run_confirm_custody(
     };
     let bot = turnkey_config.settings.address;
 
-    verify_deploy_hold(runtime_dir)?;
+    // Held until the command returns, so the service cannot run or start while
+    // the engine rebuilds projections and reads quiescence from the store.
+    let _store_lock = store_lock::acquire(&args.database_url)?;
 
     println!("Using database: {}", args.database_url);
     let admin =
@@ -1825,6 +1782,7 @@ mod tests {
     use crate::redemption::{
         BurnFailureClassification, BurnRecord, RedemptionEvent,
     };
+    use crate::store_lock::StoreLockError;
     use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -3138,7 +3096,7 @@ mod tests {
 
     /// A typed orchestrator address must be refused with the config-flag
     /// alternative named, keeping the never-typed convention: the check runs
-    /// before the signer, hold, database, or network are touched — the
+    /// before the signer, store lock, database, or network are touched — the
     /// panicking confirm and unreachable RPC prove it.
     #[tokio::test]
     async fn move_receipts_refuses_a_typed_orchestrator_destination() {
@@ -3151,7 +3109,7 @@ mod tests {
             &TURNKEY_FLAGS,
         );
 
-        let error = run_move_receipts(args, directory.path(), |_| {
+        let error = run_move_receipts(args, |_| {
             panic!("must refuse the typed orchestrator before prompting")
         })
         .await
@@ -3177,7 +3135,7 @@ mod tests {
             &TURNKEY_FLAGS,
         );
 
-        let error = run_move_receipts(args, directory.path(), |_| {
+        let error = run_move_receipts(args, |_| {
             panic!("must refuse the missing section before prompting")
         })
         .await
@@ -3202,7 +3160,7 @@ mod tests {
             &["--evm-private-key", TEST_SIGNER_KEY],
         );
 
-        let error = run_move_receipts(args, directory.path(), |_| {
+        let error = run_move_receipts(args, |_| {
             panic!("must refuse the signer before prompting")
         })
         .await
@@ -3214,57 +3172,35 @@ mod tests {
         );
     }
 
-    /// An un-armed hold means the service may be running (or a deploy may
-    /// restart it), racing the engine's projection rebuilds — refused before
-    /// the database or network are touched.
+    /// A running service holds the store lock, and the engine's projection
+    /// rebuilds must not race it, so the command refuses before it prompts
+    /// or opens the store.
     #[tokio::test]
-    async fn move_receipts_refuses_when_the_hold_is_not_armed() {
+    async fn move_receipts_refuses_while_the_store_lock_is_held() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = write_orchestrator_config(directory.path());
+        let database = directory.path().join("issuance.db");
+        let database_url = format!("sqlite:{}?mode=rwc", database.display());
+        let _service_lock = store_lock::acquire(&database_url).unwrap();
 
-        let args = move_receipts_args(
+        let mut args = move_receipts_args(
             config_path.to_str().unwrap(),
             &["--to", "0x00000000000000000000000000000000000000aa"],
             &TURNKEY_FLAGS,
         );
+        args.database_url = database_url;
 
-        let error = run_move_receipts(args, directory.path(), |_| {
-            panic!("must refuse the un-armed hold before prompting")
+        let error = run_move_receipts(args, |_| {
+            panic!("must refuse the held store lock before prompting")
         })
         .await
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("deployment hold is not armed"),
-            "the refusal must say how to arm the hold, got {error}"
+            error.to_string().contains("another process holds the store lock"),
+            "the refusal must name the store lock, got {error}"
         );
-    }
-
-    /// A lingering readiness marker lets a concurrent deploy restart the
-    /// service mid-move; armed means hold present AND marker absent.
-    #[tokio::test]
-    async fn move_receipts_refuses_when_the_readiness_marker_remains() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = write_orchestrator_config(directory.path());
-        std::fs::write(directory.path().join(DEPLOY_HOLD_FILE), "").unwrap();
-        std::fs::write(directory.path().join(DEPLOY_READY_FILE), "").unwrap();
-
-        let args = move_receipts_args(
-            config_path.to_str().unwrap(),
-            &["--to", "0x00000000000000000000000000000000000000aa"],
-            &TURNKEY_FLAGS,
-        );
-
-        let error = run_move_receipts(args, directory.path(), |_| {
-            panic!("must refuse the readiness marker before prompting")
-        })
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("readiness marker"),
-            "the refusal must name the marker, got {error}"
-        );
+        assert!(!database.exists(), "the store must not be opened");
     }
 
     /// The chain-id/network redundancy check runs first, as in every other
@@ -3293,7 +3229,7 @@ mod tests {
             panic!("expected the move-receipts subcommand")
         };
 
-        let error = run_move_receipts(*args, directory.path(), |_| {
+        let error = run_move_receipts(*args, |_| {
             panic!("must refuse the mismatch before prompting")
         })
         .await
@@ -3333,12 +3269,10 @@ mod tests {
     /// never a local key — so a local signer is refused outright.
     #[tokio::test]
     async fn confirm_custody_refuses_a_non_turnkey_signer() {
-        let directory = tempfile::tempdir().unwrap();
-
         let args =
             confirm_custody_args(&["--evm-private-key", TEST_SIGNER_KEY]);
 
-        let error = run_confirm_custody(args, directory.path(), |_| {
+        let error = run_confirm_custody(args, |_| {
             panic!("must refuse the signer before prompting")
         })
         .await
@@ -3351,22 +3285,66 @@ mod tests {
     }
 
     /// Confirmation records custody the quiescence gates depend on, so a
-    /// running service (un-armed hold) must be excluded first.
+    /// running service (it holds the store lock) must be excluded first.
     #[tokio::test]
-    async fn confirm_custody_refuses_when_the_hold_is_not_armed() {
+    async fn confirm_custody_refuses_while_the_store_lock_is_held() {
         let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("issuance.db");
+        let database_url = format!("sqlite:{}?mode=rwc", database.display());
+        let _service_lock = store_lock::acquire(&database_url).unwrap();
 
-        let args = confirm_custody_args(&TURNKEY_FLAGS);
+        let mut args = confirm_custody_args(&TURNKEY_FLAGS);
+        args.database_url = database_url;
 
-        let error = run_confirm_custody(args, directory.path(), |_| {
-            panic!("must refuse the un-armed hold before prompting")
+        let error = run_confirm_custody(args, |_| {
+            panic!("must refuse the held store lock before prompting")
         })
         .await
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("deployment hold is not armed"),
-            "the refusal must say how to arm the hold, got {error}"
+            error.to_string().contains("another process holds the store lock"),
+            "the refusal must name the store lock, got {error}"
+        );
+        assert!(!database.exists(), "the store must not be opened");
+    }
+
+    /// The command keeps the store lock until it returns, not only at its
+    /// start: at the prompt a service still cannot take the lock, and after
+    /// the command returns the lock is free.
+    #[tokio::test]
+    async fn confirm_custody_holds_the_store_lock_until_it_returns() {
+        let evm = LocalEvm::with_chain_id(8453).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("custody.db").display()
+        );
+        seed_listing_at_vault(&database_url, "RKLB", evm.vault_address).await;
+
+        let mut args = confirm_custody_args(&TURNKEY_FLAGS);
+        args.rpc_url = Some(Url::parse(&evm.endpoint).unwrap());
+        args.database_url = database_url.clone();
+
+        let error = run_confirm_custody(args, |_| {
+            let refusal = store_lock::acquire(&database_url).unwrap_err();
+            assert!(
+                matches!(refusal, StoreLockError::Held { .. }),
+                "the command must hold the store lock at its prompt, got \
+                 {refusal:?}"
+            );
+            Ok(false)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("aborted by operator"),
+            "the command must reach its prompt, got {error}"
+        );
+        assert!(
+            store_lock::acquire(&database_url).unwrap().is_some(),
+            "the command must release the store lock when it returns"
         );
     }
 
@@ -3374,8 +3352,6 @@ mod tests {
     /// network-scoped subcommand.
     #[tokio::test]
     async fn confirm_custody_refuses_a_network_chain_mismatch() {
-        let directory = tempfile::tempdir().unwrap();
-
         let cli = IssuerCli::try_parse_from([
             "issuer",
             "confirm-custody",
@@ -3392,7 +3368,7 @@ mod tests {
             panic!("expected the confirm-custody subcommand")
         };
 
-        let error = run_confirm_custody(*args, directory.path(), |_| {
+        let error = run_confirm_custody(*args, |_| {
             panic!("must refuse the mismatch before prompting")
         })
         .await
